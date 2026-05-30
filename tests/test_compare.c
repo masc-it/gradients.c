@@ -193,7 +193,7 @@ static gd_status perturb_synchronize(_gd_backend *self)
 }
 
 static const _gd_backend_vtable g_perturb_vtable = {
-    .type = GD_DEVICE_METAL,
+    .type = GD_DEVICE_CUDA, /* unused slot; METAL is owned by the real backend */
     .name = "perturb_test",
     .init = perturb_init,
     .shutdown = NULL,
@@ -253,7 +253,7 @@ static int test_detects_injected_mismatch(gd_context *ctx)
     gd_tensor *tb = NULL;
     gd_graph *g = NULL;
     gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_device perturb = {GD_DEVICE_METAL, 0};
+    gd_device perturb = {GD_DEVICE_CUDA, 0};
     gd_compare_options opts = {1e-5, 1e-5, false};
     gd_status status = GD_OK;
     const char *err = NULL;

@@ -69,6 +69,11 @@ struct _gd_backend {
 
 /* Backend registration entry points (one per backend). */
 gd_status _gd_cpu_backend_register(gd_context *ctx);
+#if defined(GD_ENABLE_METAL)
+/* Best-effort: returns GD_ERR_UNSUPPORTED (without registering) when no Metal
+ * device or shader library is available, so callers can ignore the result. */
+gd_status _gd_metal_backend_register(gd_context *ctx);
+#endif
 
 #ifdef __cplusplus
 }

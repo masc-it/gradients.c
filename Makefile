@@ -52,6 +52,8 @@ ifeq ($(GD_ENABLE_METAL),1)
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' 2>/dev/null | sort)
 MSRC := $(shell find $(METAL_DIR) -type f -name '*.m' 2>/dev/null | sort)
 METAL_SHADERS := $(shell find $(METAL_DIR) -type f -name '*.metal' 2>/dev/null | sort)
+# Let C/Obj-C sources conditionally compile the Metal registration path.
+CPPFLAGS += -DGD_ENABLE_METAL=1
 OBJCFLAGS := $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c
 LDLIBS += -framework Metal -framework Foundation -framework QuartzCore
 # The .metal shader compiler ships with full Xcode, not the Command Line Tools.

@@ -286,6 +286,7 @@ static gd_status add_value(gd_graph *graph,
     value->producer_node_id = producer_node_id;
     value->desc = *desc;
     value->external = external;
+    value->name = NULL; /* values grow via realloc; name must be set before use */
     *value_id_out = value->id;
     graph->n_values += 1;
     return GD_OK;
@@ -350,10 +351,17 @@ gd_status _gd_graph_emit(gd_graph *graph,
     int out_value_id = 0;
     int i = 0;
     _gd_node *node = NULL;
+    gd_tensor_desc out_desc_copy;
 
     if (graph == NULL || out_desc == NULL || out_tensor == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "_gd_graph_emit argument is NULL");
     }
+    /* Callers may pass an out_desc that aliases graph->values[...].desc (e.g.
+     * autograd reusing an input value's descriptor). import_tensor/add_value
+     * grow that array via realloc, which would dangle the pointer. Copy it up
+     * front so the emit path never reads through a relocated allocation. */
+    out_desc_copy = *out_desc;
+    out_desc = &out_desc_copy;
     if (n_inputs < 0 || n_inputs > _GD_OP_MAX_INPUTS) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "too many op inputs");
     }

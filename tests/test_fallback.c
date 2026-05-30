@@ -64,7 +64,8 @@ static gd_status stub_synchronize(_gd_backend *self)
 }
 
 static const _gd_backend_vtable stub_vtable = {
-    .type = GD_DEVICE_METAL,
+    /* Vulkan slot: Metal is owned by the real backend when auto-registered. */
+    .type = GD_DEVICE_VULKAN,
     .name = "stub",
     .init = stub_init,
     .shutdown = stub_shutdown,
@@ -100,7 +101,7 @@ static gd_status make_f32(gd_context *ctx, int64_t n, const float *data, gd_tens
 int main(void)
 {
     gd_context *ctx = NULL;
-    gd_device metal = {GD_DEVICE_METAL, 0};
+    gd_device stub_dev = {GD_DEVICE_VULKAN, 0};
     int64_t n = 3;
     float a[3] = {1, 2, 3};
     float out[3];
@@ -121,12 +122,12 @@ int main(void)
 
     /* Policy NONE: target backend supports nothing -> loud failure. */
     CHECK_OK(gd_context_set_fallback_policy(ctx, GD_FALLBACK_NONE));
-    CHECK_STATUS(gd_graph_compile(g, metal), GD_ERR_UNSUPPORTED);
+    CHECK_STATUS(gd_graph_compile(g, stub_dev), GD_ERR_UNSUPPORTED);
     CHECK_TRUE(strstr(gd_last_error(), "stub") != NULL);
 
     /* Policy CPU_REF: whole-graph fallback to CPU, correct results. */
     CHECK_OK(gd_context_set_fallback_policy(ctx, GD_FALLBACK_CPU_REF));
-    CHECK_OK(gd_graph_compile(g, metal));
+    CHECK_OK(gd_graph_compile(g, stub_dev));
     CHECK_OK(gd_graph_run(g));
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, scaled, out, sizeof(out)));
     CHECK_TRUE(out[0] == 2.0F && out[1] == 4.0F && out[2] == 6.0F);

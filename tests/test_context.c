@@ -107,7 +107,8 @@ static int test_context(void)
     gd_context *ctx = NULL;
     gd_device cpu = {GD_DEVICE_CPU, 0};
     gd_device unsupported_cpu_index = {GD_DEVICE_CPU, 1};
-    gd_device unsupported = {GD_DEVICE_METAL, 0};
+    /* Vulkan has no backend registered (Metal may be auto-registered on macOS). */
+    gd_device unsupported = {GD_DEVICE_VULKAN, 0};
     gd_compute_policy policy;
 
     CHECK_STATUS(gd_context_create(NULL), GD_ERR_INVALID_ARGUMENT);

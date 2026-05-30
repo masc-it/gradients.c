@@ -48,6 +48,13 @@ gd_status gd_context_create(gd_context **out)
         }
     }
 
+#if defined(GD_ENABLE_METAL)
+    /* Best-effort: register Metal when a GPU + shader library are present.
+     * Failure leaves the context CPU-only; Metal is just another backend. */
+    (void)_gd_metal_backend_register(ctx);
+    _gd_set_last_error(GD_OK, NULL);
+#endif
+
     *out = ctx;
     _gd_set_last_error(GD_OK, NULL);
     return GD_OK;

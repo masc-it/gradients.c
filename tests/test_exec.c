@@ -312,7 +312,8 @@ static int test_virtual_reshape(gd_context *ctx)
 static int test_synchronize_contract(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_device metal = {GD_DEVICE_METAL, 0};
+    /* Vulkan is never registered; Metal may be auto-registered on macOS. */
+    gd_device unregistered = {GD_DEVICE_VULKAN, 0};
     int64_t s2[1] = {2};
     float a[2] = {3, 4};
     float out[2];
@@ -340,7 +341,7 @@ static int test_synchronize_contract(gd_context *ctx)
 
     /* synchronize on an unregistered backend fails loud */
     {
-        gd_status st = gd_synchronize(ctx, metal);
+        gd_status st = gd_synchronize(ctx, unregistered);
         CHECK_TRUE(st == GD_ERR_UNSUPPORTED);
     }
 

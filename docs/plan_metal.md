@@ -50,7 +50,7 @@ kernels. Tracked separately. v1 is F32, one compute kernel per IR node.
 
 ## Phase status checklist
 
-- [ ] M0 — Backend skeleton: device/queue, registration, shared-buffer storage, transfers, synchronize, metallib load, pipeline cache, one kernel (`add`) end-to-end
+- [x] M0 — Backend skeleton: device/queue, registration, shared-buffer storage, transfers, synchronize, metallib load, pipeline cache, one kernel (`add`) end-to-end
 - [ ] M1 — Elementwise + unary kernels (mul, scale, relu, silu, copy, cast)
 - [ ] M2 — Matmul/linear + reductions (matmul, linear, sum, mean, softmax, rms_norm, cross_entropy)
 - [ ] M3 — Backward + optimizer (*_bwd, reduce_to, step_inc, adamw_step, assert_*)
@@ -62,6 +62,31 @@ M1–M3. Each op is "done" only with a passing parity test.
 ---
 
 ## Backend architecture
+
+### Metal API facts (verified against Apple's Metal Programming Guide)
+Local copies in `data/metal/` (cmd_submission, buffers, functions_libraries,
+compute_encoder). The design below is pinned to these:
+- **Coherency boundary is the command buffer.** A shared `MTLBuffer` is
+  CPU-addressable, but the GPU only observes CPU writes made *before* `commit`,
+  and the CPU only observes GPU writes *after* the command buffer reaches
+  `MTLCommandBufferStatusCompleted`. Unified memory does **not** remove the need
+  to synchronize — it makes the P4 blocking-read contract mandatory for
+  correctness, not just ordering.
+- **Long-lived objects** (build once at `init`, reuse): `MTLDevice`,
+  `MTLCommandQueue`, `MTLLibrary`, `MTLComputePipelineState`. **Transient,
+  single-use**: `MTLCommandBuffer`, command encoders (cheap, autoreleased).
+- **Serial encoder ordering.** Commands in one command buffer execute in encode
+  order; a compute command's results are visible to commands encoded after it.
+  So a single `MTLComputeCommandEncoder` with one `dispatchThreads` per node is
+  correct under the default serial dispatch — no manual `memoryBarrier`.
+- **Execution status.** After `waitUntilCompleted`, `commandBuffer.status ==
+  MTLCommandBufferStatusError` signals failure; `commandBuffer.error` carries the
+  reason. Map to `GD_ERR_BACKEND`.
+- **Library load.** `newLibraryWithURL:error:` on the prebuilt `.metallib`;
+  `newFunctionWithName:` returns `nil` if a kernel is absent.
+- **Dispatch sizing.** Use pipeline `maxTotalThreadsPerThreadgroup` and
+  `threadExecutionWidth` to pick threadgroup size; `dispatchThreads:` (non-
+  uniform) avoids manual grid rounding on Apple GPUs.
 
 ### File layout
 ```
@@ -90,24 +115,51 @@ via `newLibraryWithURL:`.
 - `upload`/`download`: `memcpy` to/from `buffer.contents + offset`. `download`
   calls `synchronize` first (P4 blocking contract).
 
+### Backend state (`impl`)
+The `.m` is ARC, so wrap backend-private state in a small Obj-C object holding
+strong references, stored in `backend->impl` via `(__bridge_retained void*)` and
+released (`__bridge_transfer`) in `shutdown`:
+```
+@interface GDMetalState : NSObject
+@property id<MTLDevice> device;
+@property id<MTLCommandQueue> queue;          // long-lived, created once
+@property id<MTLLibrary> library;             // loaded from .metallib at init
+@property NSArray<id<MTLComputePipelineState>> *pipelines; // indexed by op kind
+@property id<MTLCommandBuffer> inFlight;      // last committed buffer, or nil
+@end
+```
+`queue`/`library`/`pipelines` are built once. `inFlight` tracks the committed
+buffer so `synchronize` can wait and `execute` can avoid the re-run coherency
+hazard (below).
+
 ### Execution model (one kernel per node — the GPU_SAFE rung)
 - `compile`: allocate a Metal `gd_storage` for **every** graph value (leaves
   included, unlike CPU_REF which borrows leaf host storage). Mirror
   `cpu_compile`'s table. Record which values are external leaves so `execute`
   can stage their host bytes into the shared buffer before dispatch.
   - leaf staging: read leaf CPU storage host ptr, `memcpy` into the value's
-    Metal buffer. (Both shared; trivially correct.)
-- `execute`: one `id<MTLCommandBuffer>` from the shared queue; for each node,
-  `id<MTLComputeCommandEncoder>`, set the pipeline for the op, bind input/output
-  buffers + a small `params` struct (shapes/strides/attrs) via `setBytes`,
-  dispatch threads, `endEncoding`. After all nodes: `commit` (no wait).
-- `execute_until(node_id)`: same loop bounded by `node_id`, commit + wait (debug
-  partial execution stays CPU-parity-comparable).
-- `synchronize`: `commit`+`waitUntilCompleted` on the in-flight command buffer
-  (track the last committed buffer in `impl`).
+    Metal buffer. Must happen **before** `commit` (coherency rule).
+- `execute`:
+  1. If `inFlight != nil`, `waitUntilCompleted` on it first — we are about to
+     mutate input buffers via CPU writes, which the docs require to precede the
+     next `commit`. This keeps single-run async behavior while making re-runs
+     correct. Clear `inFlight`.
+  2. Stage all external-leaf host bytes into their Metal buffers.
+  3. One `[queue commandBuffer]`; one `[cmdbuf computeCommandEncoder]`; for each
+     node: `setComputePipelineState` for the op, `setBuffer:offset:atIndex:` for
+     inputs/outputs, `setBytes:` a `params` struct, `dispatchThreads:`;
+     `endEncoding` after the loop.
+  4. `commit` (no wait). Store the buffer as `inFlight`.
+- `execute_until(node_id)`: same loop bounded by `node_id`, then commit +
+  `waitUntilCompleted` (debug partial execution stays parity-comparable).
+- `synchronize`: if `inFlight`, `waitUntilCompleted`; check `status`/`error`
+  (→ `GD_ERR_BACKEND`); clear `inFlight`.
+- `download`: `synchronize` first, then `memcpy` from `buffer.contents+off`
+  (blocking, per P4).
 - `value_storage`: return the per-value Metal `gd_storage` + offset. Existing
   `gd_tensor_materialize` / `gd_graph_compare` download through it.
-- `executable_free`: release owned buffers after `waitUntilCompleted`.
+- `executable_free`: `synchronize` (ensure no in-flight buffer references the
+  buffers), then release owned buffers.
 
 ### Kernel dispatch conventions
 - elementwise/unary/copy/cast: 1D grid = numel, `dispatchThreads:` with
@@ -134,7 +186,30 @@ via `newLibraryWithURL:`.
 
 ## M0 — Backend skeleton + first kernel
 
-- [ ] Phase complete
+- [x] Phase complete
+
+Note (landed): `src/backends/metal/{metal_backend.m,kernels.metal,
+metal_kernel_types.h}`. Single TU for M0. `GDMetalState` (ARC) holds
+device/queue/library/pipelines/inFlight; built once at init from
+`gradients.metallib` (path via `GRADIENTS_METALLIB` or `build/gradients.metallib`).
+Unified shared buffers; per-value buffer plan with leaf staging before commit;
+one serial compute encoder, one `dispatchThreads` per node; blocking
+download/synchronize with command-buffer status→`GD_ERR_BACKEND`. Auto-registered
+in `gd_context_create` under `-DGD_ENABLE_METAL=1` (best-effort; CPU-only if no
+GPU/metallib). Backend handle exposed to core via `_gd_storage_handle`. Tests:
+`tests/test_metal.c` (direct add, CPU↔Metal parity incl. broadcast, fallback
+NONE/CPU_REF). Verified clean under ASan (CPU and Metal paths).
+
+**Two latent core bugs found via the Metal heap-churn + ASan and fixed** (both
+pre-existing, masked by the default allocator zeroing realloc'd slots):
+1. `add_value` left `_gd_value.name` uninitialized → `free()` of garbage in
+   `_gd_graph_clear`. Fixed: initialize `name = NULL`.
+2. `_gd_graph_emit` held a caller `out_desc` that can alias
+   `graph->values[].desc`; `import_tensor`/`add_value` realloc that array →
+   use-after-free. Fixed: copy `out_desc` on entry before any growth.
+Several CPU-era tests used `GD_DEVICE_METAL` as the "absent backend" stand-in;
+retargeted to the never-registered `GD_DEVICE_VULKAN` (and the P8/fallback stub
+backends moved to free device slots).
 
 ### Intent
 Stand up the whole pipeline with exactly one op (`add`) so every mechanism is
@@ -284,15 +359,22 @@ green on machines without the shader toolchain.
 - **Leaf staging vs borrowing mismatch.** CPU_REF borrows leaf host storage;
   Metal must copy leaves into device buffers. Mitigation: explicit staging step
   in `execute`, covered by M0 parity (add of two leaves).
-- **Async-free correctness assumptions.** v1 blocks at synchronize/download.
-  Mitigation: P4 contract already defines blocking reads; document that v1 Metal
-  is effectively synchronous; revisit before adding pipelining.
+- **Async-free correctness assumptions.** Per the docs, GPU sees CPU writes only
+  before `commit`, CPU sees GPU writes only after `Completed`. Mitigation: leaf
+  staging happens before `commit`; `download`/`synchronize` block on the
+  in-flight buffer; `execute` waits on any prior in-flight buffer before
+  re-staging inputs. The async window (execute return → read) is preserved for
+  the common single-run case.
 - **metallib discovery at runtime.** Path resolution is environment-sensitive.
   Mitigation: `GRADIENTS_METALLIB` override + graceful non-registration when
   absent; tests set the env to `build/gradients.metallib`.
 - **Storage free during in-flight work.** Spec §9 wants async-safe free.
-  Mitigation: free owned buffers only after `waitUntilCompleted`; note the
-  limitation, defer deferred-free queue until async execution exists.
+  Mitigation: `executable_free` synchronizes before releasing owned buffers; a
+  deferred-free queue keyed on command-buffer completion is deferred until true
+  async execution exists.
+- **Command-buffer failure is silent without a status check.** Mitigation:
+  after every `waitUntilCompleted`, inspect `status`/`error` and surface
+  `GD_ERR_BACKEND` with the localized description.
 - **Parity harness double-execution.** `gd_graph_compare` runs the graph twice,
   unsafe for in-place training graphs. Mitigation: compare forward subgraphs via
   the harness; compare gradients/params via separate single-backend runs (M3/M4

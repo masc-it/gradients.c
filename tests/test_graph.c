@@ -52,7 +52,8 @@ static gd_status failing_build(gd_context *ctx, void *user)
 static int test_lifecycle(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_device metal = {GD_DEVICE_METAL, 0};
+    /* Vulkan is never registered; Metal may be auto-registered on macOS. */
+    gd_device unregistered = {GD_DEVICE_VULKAN, 0};
     gd_graph *g = NULL;
     gd_graph *g2 = NULL;
 
@@ -77,7 +78,7 @@ static int test_lifecycle(gd_context *ctx)
 
     CHECK_STATUS(gd_graph_begin(ctx, g), GD_ERR_INVALID_STATE);
     CHECK_STATUS(gd_graph_run(g), GD_ERR_INVALID_STATE);
-    CHECK_STATUS(gd_graph_compile(g, metal), GD_ERR_UNSUPPORTED);
+    CHECK_STATUS(gd_graph_compile(g, unregistered), GD_ERR_UNSUPPORTED);
     CHECK_OK(gd_graph_compile(g, cpu));
     CHECK_STATUS(gd_graph_compile(g, cpu), GD_ERR_INVALID_STATE);
     CHECK_OK(gd_graph_run(g));

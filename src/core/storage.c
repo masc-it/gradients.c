@@ -214,3 +214,8 @@ const gd_storage_desc *_gd_storage_desc(const gd_storage *storage)
 {
     return storage == NULL ? NULL : &storage->desc;
 }
+
+void *_gd_storage_handle(const gd_storage *storage)
+{
+    return storage == NULL ? NULL : storage->handle;
+}

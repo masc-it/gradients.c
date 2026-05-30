@@ -587,6 +587,250 @@ kernel void gd_embedding(device const float *table           [[buffer(0)]],
     out[gid] = table[id * p.dim + c];
 }
 
+/* ---- Scaled dot-product attention (reference, dense + causal, GQA) -------- */
+
+static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk, int causal, int window)
+{
+    int qpos = i + (Tk - Tq);
+    if (causal && j > qpos) {
+        return false;
+    }
+    if (window > 0 && (qpos - j) >= window) {
+        return false;
+    }
+    return true;
+}
+
+static inline float gd_sdpa_dot(device const float *a, device const float *b, int n)
+{
+    float s = 0.0f;
+    for (int c = 0; c < n; ++c) {
+        s += a[c] * b[c];
+    }
+    return s;
+}
+
+/* Additive attention bias broadcast over [B, Hq, Tq, Tk]. */
+static inline float gd_sdpa_bias_at(device const float *bias,
+                                    constant gd_metal_sdpa_params &p,
+                                    int b, int hq, int i, int j)
+{
+    if (!p.has_bias) {
+        return 0.0f;
+    }
+    int bb = (p.Bb == 1) ? 0 : b;
+    int hb = (p.Hb == 1) ? 0 : hq;
+    int ib = (p.Tqb == 1) ? 0 : i;
+    int jb = (p.Tkb == 1) ? 0 : j;
+    return bias[((bb * p.Hb + hb) * p.Tqb + ib) * p.Tkb + jb];
+}
+
+/* Forward: one thread per (b, hq, i); two-pass stable softmax, no score matrix. */
+kernel void gd_sdpa(device const float *q              [[buffer(0)]],
+                    device const float *k              [[buffer(1)]],
+                    device const float *v              [[buffer(2)]],
+                    device const float *bias           [[buffer(3)]],
+                    device float *out                  [[buffer(4)]],
+                    constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                    uint gid                           [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq;
+    if ((int)gid >= total) {
+        return;
+    }
+    int i = (int)gid % p.Tq;
+    int r = (int)gid / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+    int obase = qbase;
+
+    float m = -INFINITY;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            if (s > m) {
+                m = s;
+            }
+        }
+    }
+    for (int c = 0; c < p.Dh; ++c) {
+        out[obase + c] = 0.0f;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            int vbase = kbase;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            float e = exp(s - m);
+            sum += e;
+            for (int c = 0; c < p.Dh; ++c) {
+                out[obase + c] += e * v[vbase + c];
+            }
+        }
+    }
+    if (sum > 0.0f) {
+        for (int c = 0; c < p.Dh; ++c) {
+            out[obase + c] /= sum;
+        }
+    }
+}
+
+/* Backward dq: one thread per (b, hq, i); recompute softmax stats then dq. */
+kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
+                           device const float *q             [[buffer(1)]],
+                           device const float *k             [[buffer(2)]],
+                           device const float *v             [[buffer(3)]],
+                           device const float *bias          [[buffer(4)]],
+                           device float *dq                  [[buffer(5)]],
+                           constant gd_metal_sdpa_params &p   [[buffer(6)]],
+                           uint gid                          [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq;
+    if ((int)gid >= total) {
+        return;
+    }
+    int i = (int)gid % p.Tq;
+    int r = (int)gid / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+    int gobase = qbase;
+
+    float m = -INFINITY;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            if (s > m) {
+                m = s;
+            }
+        }
+    }
+    float sum = 0.0f;
+    float dsum = 0.0f;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            sum += exp(s - m);
+        }
+    }
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            float pj = exp(s - m) / sum;
+            dsum += pj * gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
+        }
+    }
+    for (int c = 0; c < p.Dh; ++c) {
+        dq[qbase + c] = 0.0f;
+    }
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            float pj = exp(s - m) / sum;
+            float dp = gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
+            float ds = pj * (dp - dsum);
+            for (int c = 0; c < p.Dh; ++c) {
+                dq[qbase + c] += p.scale * ds * k[kbase + c];
+            }
+        }
+    }
+}
+
+/* Backward dk/dv: one thread per (b, hkv, j); loop the query-head group and all
+ * query positions, accumulating into this kv slot (no cross-thread conflict). */
+kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
+                            device const float *q             [[buffer(1)]],
+                            device const float *k             [[buffer(2)]],
+                            device const float *v             [[buffer(3)]],
+                            device const float *bias          [[buffer(4)]],
+                            device float *dk                  [[buffer(5)]],
+                            device float *dv                  [[buffer(6)]],
+                            constant gd_metal_sdpa_params &p   [[buffer(7)]],
+                            uint gid                          [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hkv * p.Tk;
+    if ((int)gid >= total) {
+        return;
+    }
+    int j = (int)gid % p.Tk;
+    int r = (int)gid / p.Tk;
+    int hkv = r % p.Hkv;
+    int b = r / p.Hkv;
+    int group = p.Hq / p.Hkv;
+    int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+
+    for (int c = 0; c < p.Dh; ++c) {
+        dk[kbase + c] = 0.0f;
+        dv[kbase + c] = 0.0f;
+    }
+    for (int g = 0; g < group; ++g) {
+        int hq = hkv * group + g;
+        for (int i = 0; i < p.Tq; ++i) {
+            if (!gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                continue;
+            }
+            int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+            int gobase = qbase;
+            float m = -INFINITY;
+            for (int jj = 0; jj < p.Tk; ++jj) {
+                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
+                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
+                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
+                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
+                    if (s > m) {
+                        m = s;
+                    }
+                }
+            }
+            float sum = 0.0f;
+            float dsum = 0.0f;
+            for (int jj = 0; jj < p.Tk; ++jj) {
+                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
+                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
+                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
+                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
+                    sum += exp(s - m);
+                }
+            }
+            for (int jj = 0; jj < p.Tk; ++jj) {
+                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
+                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
+                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
+                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
+                    float pjj = exp(s - m) / sum;
+                    dsum += pjj * gd_sdpa_dot(go + gobase, v + kb, p.Dh);
+                }
+            }
+            float sj = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
+                       + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+            float pj = exp(sj - m) / sum;
+            float dp = gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
+            float ds = pj * (dp - dsum);
+            for (int c = 0; c < p.Dh; ++c) {
+                dv[kbase + c] += pj * go[gobase + c];
+                dk[kbase + c] += p.scale * ds * q[qbase + c];
+            }
+        }
+    }
+}
+
 /* Rotary position embedding; one thread per (.., head) row. Serves forward and
  * the transpose (backward) rotation via sin_sign. */
 kernel void gd_rope(device const float *x                 [[buffer(0)]],

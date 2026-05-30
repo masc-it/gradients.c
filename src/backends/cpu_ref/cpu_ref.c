@@ -60,8 +60,8 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
     const gd_tensor_desc *out_desc = NULL;
     int i = 0;
 
-    if (node->n_outputs != 0 && node->n_outputs != 1) {
-        return _gd_error(GD_ERR_INTERNAL, "CPU_REF expects zero- or single-output nodes");
+    if (node->n_outputs < 0 || node->n_outputs > 3) {
+        return _gd_error(GD_ERR_INTERNAL, "CPU_REF expects 0..3-output nodes");
     }
 
     for (i = 0; i < node->n_inputs; ++i) {
@@ -70,7 +70,7 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
             return status;
         }
     }
-    if (node->n_outputs == 1) {
+    if (node->n_outputs >= 1) {
         status = value_ptr(exe, node->outputs[0], &out_data, &out_desc);
         if (status != GD_OK) {
             return status;
@@ -190,6 +190,42 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         return _gd_cpu_k_rope(out_desc, out_data, in_data[0], in_desc[1], in_data[1],
                               node->attrs.rope_theta, node->attrs.rope_n_dims,
                               node->attrs.rope_interleaved, -1.0F);
+    case _GD_OP_SDPA: {
+        const gd_tensor_desc *bias_desc = node->attrs.has_bias ? in_desc[3] : NULL;
+        const float *bias = node->attrs.has_bias ? in_data[3] : NULL;
+
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_sdpa(out_desc, out_data, in_desc[0], in_data[0],
+                              in_desc[1], in_data[1], in_desc[2], in_data[2],
+                              bias_desc, bias,
+                              node->attrs.attn_scale, node->attrs.causal,
+                              node->attrs.sliding_window);
+    }
+    case _GD_OP_SDPA_BWD: {
+        /* inputs: go, q, k, v[, bias] ; outputs: dq, dk, dv */
+        void *dk_data = NULL;
+        void *dv_data = NULL;
+        const gd_tensor_desc *dummy = NULL;
+        const gd_tensor_desc *bias_desc = node->attrs.has_bias ? in_desc[4] : NULL;
+        const float *bias = node->attrs.has_bias ? in_data[4] : NULL;
+
+        status = value_ptr(exe, node->outputs[1], &dk_data, &dummy);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = value_ptr(exe, node->outputs[2], &dv_data, &dummy);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_sdpa_bwd(in_desc[1], in_data[1], in_desc[2], in_data[2],
+                                  in_desc[3], in_data[3], bias_desc, bias, in_data[0],
+                                  out_data, dk_data, dv_data,
+                                  node->attrs.attn_scale, node->attrs.causal,
+                                  node->attrs.sliding_window);
+    }
     case _GD_OP_COPY:
         return _gd_cpu_k_copy(out_desc, out_data, in_desc[0], in_data[0]);
     case _GD_OP_RELU_BWD:

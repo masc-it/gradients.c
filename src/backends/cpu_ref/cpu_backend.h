@@ -85,6 +85,22 @@ gd_status _gd_cpu_k_embedding_bwd(const gd_tensor_desc *table_desc, float *dtabl
 gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
                          const gd_tensor_desc *pos_desc, const void *pos,
                          float theta, int n_dims, int interleaved, float sin_sign);
+
+/* Scaled dot-product attention (reference). q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh],
+ * o[B,Tq,Hq,Dh]; grouped-query via Hq/Hkv. */
+gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
+                         const gd_tensor_desc *q_desc, const float *q,
+                         const gd_tensor_desc *k_desc, const float *k,
+                         const gd_tensor_desc *v_desc, const float *v,
+                         const gd_tensor_desc *bias_desc, const float *bias,
+                         float scale, int causal, int window);
+gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
+                             const gd_tensor_desc *k_desc, const float *k,
+                             const gd_tensor_desc *v_desc, const float *v,
+                             const gd_tensor_desc *bias_desc, const float *bias,
+                             const float *go,
+                             float *dq, float *dk, float *dv,
+                             float scale, int causal, int window);
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
                              float *dx,
                              const float *x,

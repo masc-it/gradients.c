@@ -173,13 +173,15 @@ typedef struct gd_sdpa_config {
     float scale;          /* 0 => 1/sqrt(head_dim) */
     bool  causal;
     int   sliding_window; /* 0 => none */
-    int   n_kv_heads;     /* for GQA; 0 => same as q heads */
-    /* block-sparse: NULL => dense (respecting causal/window). */
+    /* block-sparse (G4): NULL => dense (respecting causal/window/bias). */
     gd_tensor *block_mask;/* see §5: int32 [n_q_blocks, max_k_blocks] of key-block ids, -1 padded */
     int   block_q, block_k;
 } gd_sdpa_config;
+/* `bias` (nullable, landed in G2) is an additive score bias broadcast over
+ * [B,Hq,Tq,Tk]: padding masks, ALiBi, relative-position bias. n_kv_heads is
+ * derived from k's shape (GQA). */
 gd_status gd_sdpa(gd_context*, gd_tensor *q, gd_tensor *k, gd_tensor *v,
-                  const gd_sdpa_config*, gd_tensor **out);
+                  gd_tensor *bias, const gd_sdpa_config*, gd_tensor **out);
 ```
 A thin convenience layer (`include/gradients/nn.h`, optional) can offer
 `gd_attention_block`, `gd_mlp_swiglu`, and a `gd_gpt` builder that records the
@@ -216,8 +218,18 @@ cache + sdpa-decode are inference graphs (no `gd_backward`).
 
 ## 5. Block-sparse attention mask model
 
-We separate *what is allowed* (sparsity pattern) from *how it is computed*
-(kernel schedule). The pattern is expressed at **block granularity** over the
+Two complementary masking mechanisms:
+- **Additive bias** (dense, landed in G2): an optional `[B,Hq,Tq,Tk]`-broadcast
+  float tensor added to scores before softmax — padding masks, ALiBi, arbitrary
+  relative-position bias. Cheap to author, fully general, but materializes an
+  O(Tq·Tk) bias (or a broadcast slice). Use for masks/biases that are dense or
+  cheaply broadcast.
+- **Block-sparse schedule** (this section, G4): for *high* sparsity where we
+  want to *skip* work, not just bias it. Expressed at block granularity so the
+  kernel visits only allowed key blocks.
+
+The block-sparse pattern separates *what is allowed* (sparsity pattern) from
+*how it is computed* (kernel schedule), at **block granularity** over the
 (query, key) position grid, which is what hardware-efficient sparse attention
 needs (and what causal/sliding-window degenerate to).
 
@@ -389,6 +401,33 @@ backward correctness of arbitrary graphs, but author the GPT model to prefer the
 head-major, transpose-free path (item 2) so the attention hot path needs no
 permute kernels. `sdpa` therefore takes `[B,T,H,Dh]` directly.
 
+### Why not `[B,H,T,Dh]` (batch-head-first)?
+A reasonable instinct is that GPU attention "wants" `[B,H,T,Dh]` (PyTorch's SDPA
+layout) and that callers must `transpose` into it. For *this* design that is
+backwards:
+- The QKV projection emits `[B,T,d]`; the natural reshape is `[B,T,H,Dh]`
+  (head-major). RoPE and `sdpa` index heads by stride, so the GPT forward path
+  has **zero** transpose nodes. Switching the op to `[B,H,T,Dh]` would *force* a
+  `transpose` (a real kernel + autograd) in every model on the hot path — the
+  opposite of the goal.
+- `sdpa` is a coarse op, not a raw matmul: it owns its internal access pattern.
+  The reference kernels already stride over `(T,H)` with no penalty to
+  correctness.
+
+The genuine, narrower issue is **physical K/V tiling for the fused kernel**
+(G3): in `[B,T,H,Dh]` the per-head key stride is `Hkv·Dh`, so a FlashAttention
+tile gathers strided rows (weaker coalescing). This is a *backend layout-planning*
+concern, resolved inside the kernel, in preference order:
+1. The G3 tiled kernel stages each head's K/V block into threadgroup/scratch
+   memory once per tile (a strided gather on load, then contiguous reuse) — the
+   standard FlashAttention tiling, which already does a blocked load.
+2. A backend-internal repack of K/V to `[B,Hkv,Tk,Dh]` scratch before the
+   attention loop when profitable (the deferred "layout planning" pass).
+3. An opaque `layout` attr on the node letting the backend choose the physical
+   layout it lowered for — never exposed to callers.
+None of these change the public op signature or push a transpose onto users.
+The `[B,T,H,Dh]` contract stays; physical layout is the backend's to optimize.
+
 ---
 
 ## 9. Numerics and dtypes
@@ -475,8 +514,41 @@ CPU+Metal kernels and parity tests before the next phase.
   CPU kernel (fp64 angle math) + Metal kernel (I32 positions). Tests:
   forward parity (both layouts) + gradient parity in `test_metal_gpt.c`, and a
   finite-difference gradcheck in `test_autograd.c`. ASan-clean.
-- [ ] **G2 — SDPA dense+causal**: reference kernel (CPU + Metal `GPU_SAFE`),
-  forward+backward, parity vs unfused subgraph; GQA support. Trainable.
+- [x] **G2 — SDPA dense+causal**: reference kernel (CPU + Metal `GPU_SAFE`),
+  forward+backward, parity; GQA support. Trainable.
+  Landed: `_GD_OP_SDPA`/`_GD_OP_SDPA_BWD`; attrs `attn_scale`/`n_q_heads`/
+  `n_kv_heads`/`head_dim`/`causal`/`sliding_window`; `_gd_infer_sdpa` (4D
+  head-major, Hq%Hkv==0). Public `gd_sdpa` + `gd_sdpa_config`. **Genuine
+  multi-output IR node**: new `_gd_graph_emit_multi` records one node with N
+  produced values/virtual tensors; `cpu_run_node` relaxed to 0..3 outputs; the
+  SDPA backward node yields dq/dk/dv from a single node. Reference forward =
+  two-pass stable softmax (no T² score matrix); reference backward recomputes
+  softmax stats (O(T²)). Metal backward = two kernels under one node (dq per
+  query row, dk/dv per kv row — no atomics, no cross-thread accumulation),
+  dispatched in one encoder via a name-keyed pipeline lookup. CPU + Metal,
+  grouped-query attention, causal/sliding-window predicate. Tests: forward
+  parity (dense+causal, GQA) + dq/dk/dv gradient parity in `test_metal_gpt.c`;
+  finite-difference gradchecks (dense + causal, GQA) in `test_autograd.c`.
+  ASan-clean. (sdpa-vs-unfused-subgraph cross-check subsumed by the
+  finite-difference gradcheck, an independent oracle.)
+
+  Deferred to G3+: tiled FlashAttention forward (online softmax) and FA-2
+  backward; v1 backward is O(T²)-recompute per (b,h) and the dk/dv kernel is
+  O(T²) per kv slot — correctness-first.
+
+  **Additive attention bias (landed).** `gd_sdpa` takes an optional `bias`
+  tensor added to the scaled scores before softmax, broadcast over
+  `[B, Hq, Tq, Tk]` (any axis may be 1). This is the standard SDPA float-mask /
+  attention-bias input and covers **padding masks** (0 / large-negative), **ALiBi**
+  (per-head linear bias), and arbitrary relative-position bias, composing with
+  the causal/window fast path. Because bias is additive-constant in the scores,
+  the dq/dk/dv formulas are unchanged — only the score computation gains a
+  `+ bias` term (forward and the backward stat-recompute). Bias is **constant /
+  non-differentiable in v1** (autograd treats it like positions/targets; learned
+  relative bias grad is a later extension). Validated by a finite-difference
+  gradcheck of q/k/v with a partial-masking bias, plus CPU↔Metal forward+grad
+  parity (`sdpa_bias`). This addresses the "no custom attention mask" gap; the
+  block-sparse path (G4) remains the structured-sparsity complement.
 - [ ] **G3 — SDPA tiled (FlashAttention-style)**: Metal `GPU_FUSED` forward,
   online softmax, parity vs reference; optional logsumexp output.
 - [ ] **G4 — Block-sparse SDPA**: `block_mask` value + host pattern builders

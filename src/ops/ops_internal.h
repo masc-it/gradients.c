@@ -39,5 +39,6 @@ gd_status _gd_infer_cast(gd_tensor *x, gd_dtype dtype, gd_tensor_desc *out);
 gd_status _gd_infer_transpose(gd_tensor *x, const int *perm, int ndim, gd_tensor_desc *out);
 gd_status _gd_infer_embedding(gd_tensor *table, gd_tensor *ids, gd_tensor_desc *out);
 gd_status _gd_infer_rope(gd_tensor *x, gd_tensor *pos_ids, gd_tensor_desc *out);
+gd_status _gd_infer_sdpa(gd_tensor *q, gd_tensor *k, gd_tensor *v, gd_tensor_desc *out);
 
 #endif /* GRADIENTS_OPS_INTERNAL_H */

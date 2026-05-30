@@ -36,6 +36,7 @@ typedef enum _gd_op_kind {
     _GD_OP_TRANSPOSE,
     _GD_OP_EMBEDDING,
     _GD_OP_ROPE,
+    _GD_OP_SDPA,
     _GD_OP_BACKWARD,
     _GD_OP_ZERO_GRAD,
     _GD_OP_OPTIMIZER_STEP,
@@ -52,6 +53,7 @@ typedef enum _gd_op_kind {
     _GD_OP_GELU_BWD,
     _GD_OP_EMBEDDING_BWD,
     _GD_OP_ROPE_BWD,
+    _GD_OP_SDPA_BWD,
     _GD_OP_STEP_INC,
     _GD_OP_ADAMW_STEP,
     _GD_OP_REDUCE_TO
@@ -72,6 +74,12 @@ typedef struct _gd_op_attrs {
     float rope_theta;           /* ROPE: base frequency */
     int rope_n_dims;            /* ROPE: rotary dims (resolved, even, <= head_dim) */
     int rope_interleaved;       /* ROPE: GPT-J interleaved vs NeoX half-split */
+    float attn_scale;           /* SDPA: softmax scale (resolved; 1/sqrt(head_dim)) */
+    int n_q_heads;              /* SDPA: query heads */
+    int n_kv_heads;             /* SDPA: key/value heads (GQA; Hq % Hkv == 0) */
+    int head_dim;               /* SDPA */
+    int causal;                 /* SDPA: causal masking */
+    int sliding_window;         /* SDPA: window size (0 = none) */
     gd_compute_policy compute;   /* MATMUL / LINEAR */
     float lr;                    /* ADAMW */
     float beta1;                 /* ADAMW */
@@ -140,6 +148,19 @@ gd_status _gd_graph_emit(gd_graph *graph,
                          const _gd_op_attrs *attrs,
                          const gd_tensor_desc *out_desc,
                          gd_tensor **out_tensor);
+
+/* Records a multi-output op node: creates `n_outputs` produced values and
+ * returns a new virtual output tensor for each (each owned by the caller,
+ * refcount 1). Used by ops whose backward yields several gradients (e.g. SDPA
+ * -> dq, dk, dv). */
+gd_status _gd_graph_emit_multi(gd_graph *graph,
+                               _gd_op_kind op,
+                               gd_tensor **inputs,
+                               int n_inputs,
+                               const _gd_op_attrs *attrs,
+                               const gd_tensor_desc *out_descs,
+                               int n_outputs,
+                               gd_tensor **out_tensors);
 
 /* Records a node whose single output is bound to an existing materialized
  * tensor `out_external` (used as a write target, e.g. a leaf gradient slot). */

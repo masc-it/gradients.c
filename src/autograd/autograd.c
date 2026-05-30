@@ -446,6 +446,60 @@ static gd_status backward_node(bwd_ctx *b, const _gd_node *node_ref)
         gd_tensor_release(dx);
         return status;
     }
+    case _GD_OP_SDPA: {
+        /* one multi-output node yields dq, dk, dv (recompute-based reference). */
+        gd_tensor *q = NULL, *k = NULL, *v = NULL, *bias = NULL;
+        gd_tensor *grads[3] = {0};
+        gd_tensor *bwd_inputs[5];
+        gd_tensor_desc out_descs[3];
+        int n_bwd = 4;
+
+        status = fwd_tensor(b, node->inputs[0], &q);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = fwd_tensor(b, node->inputs[1], &k);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = fwd_tensor(b, node->inputs[2], &v);
+        if (status != GD_OK) {
+            return status;
+        }
+        out_descs[0] = b->graph->values[node->inputs[0]].desc;
+        out_descs[1] = b->graph->values[node->inputs[1]].desc;
+        out_descs[2] = b->graph->values[node->inputs[2]].desc;
+        bwd_inputs[0] = go;
+        bwd_inputs[1] = q;
+        bwd_inputs[2] = k;
+        bwd_inputs[3] = v;
+        /* bias (if any) is a constant input: needed to recompute softmax, but
+         * not differentiated in v1. */
+        if (node->attrs.has_bias) {
+            status = fwd_tensor(b, node->inputs[3], &bias);
+            if (status != GD_OK) {
+                return status;
+            }
+            bwd_inputs[4] = bias;
+            n_bwd = 5;
+        }
+        status = _gd_graph_emit_multi(b->graph, _GD_OP_SDPA_BWD, bwd_inputs, n_bwd,
+                                      &node->attrs, out_descs, 3, grads);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], grads[0]);
+        if (status == GD_OK) {
+            status = accumulate(b, node->inputs[1], grads[1]);
+        }
+        if (status == GD_OK) {
+            status = accumulate(b, node->inputs[2], grads[2]);
+        }
+        gd_tensor_release(grads[0]);
+        gd_tensor_release(grads[1]);
+        gd_tensor_release(grads[2]);
+        return status;
+    }
     case _GD_OP_CAST:
         return _gd_error(GD_ERR_UNSUPPORTED, "cast backward is not supported in v1");
     default:

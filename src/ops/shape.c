@@ -495,3 +495,53 @@ gd_status _gd_infer_rope(gd_tensor *x, gd_tensor *pos_ids, gd_tensor_desc *out)
     (void)head_dim;
     return gd_tensor_desc_contiguous(dx->dtype, dx->device, dx->ndim, dx->sizes, out);
 }
+
+gd_status _gd_infer_sdpa(gd_tensor *q, gd_tensor *k, gd_tensor *v, gd_tensor_desc *out)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *dq = NULL;
+    const gd_tensor_desc *dk = NULL;
+    const gd_tensor_desc *dv = NULL;
+    int i = 0;
+
+    if (q == NULL || k == NULL || v == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "sdpa argument is NULL");
+    }
+    if (!_gd_dtype_is_float(gd_tensor_dtype(q))) {
+        return _gd_error(GD_ERR_DTYPE, "sdpa requires floating-point inputs");
+    }
+    if (gd_tensor_dtype(q) != gd_tensor_dtype(k) || gd_tensor_dtype(q) != gd_tensor_dtype(v)) {
+        return _gd_error(GD_ERR_DTYPE, "sdpa q/k/v must share dtype");
+    }
+    status = require_same_device(q, k);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = require_same_device(q, v);
+    if (status != GD_OK) {
+        return status;
+    }
+    dq = _gd_tensor_desc_ptr(q);
+    dk = _gd_tensor_desc_ptr(k);
+    dv = _gd_tensor_desc_ptr(v);
+    if (dq->ndim != 4 || dk->ndim != 4 || dv->ndim != 4) {
+        return _gd_error(GD_ERR_SHAPE, "sdpa q/k/v must be 4D [batch, seq, heads, head_dim]");
+    }
+    /* k and v share [batch, seq_k, kv_heads, head_dim]. */
+    for (i = 0; i < 4; ++i) {
+        if (dk->sizes[i] != dv->sizes[i]) {
+            return _gd_error(GD_ERR_SHAPE, "sdpa k and v shapes must match");
+        }
+    }
+    if (dq->sizes[0] != dk->sizes[0]) {
+        return _gd_error(GD_ERR_SHAPE, "sdpa batch mismatch");
+    }
+    if (dq->sizes[3] != dk->sizes[3]) {
+        return _gd_error(GD_ERR_SHAPE, "sdpa head_dim mismatch");
+    }
+    if (dk->sizes[2] == 0 || dq->sizes[2] % dk->sizes[2] != 0) {
+        return _gd_error(GD_ERR_SHAPE, "sdpa query heads must be a multiple of kv heads");
+    }
+    /* output o = [batch, seq_q, q_heads, head_dim] (== q shape). */
+    return gd_tensor_desc_contiguous(dq->dtype, dq->device, 4, dq->sizes, out);
+}

@@ -31,6 +31,8 @@
 @property (strong) id<MTLLibrary> library;
 /* Compute pipelines keyed by _gd_op_kind (NSNumber). */
 @property (strong) NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *pipelines;
+/* Pipelines keyed by function name, for ops needing multiple kernels (SDPA bwd). */
+@property (strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipelinesByName;
 /* Last committed command buffer, or nil once synchronized. */
 @property (strong) id<MTLCommandBuffer> inFlight;
 /* Executable whose external leaves need write-back at synchronize (C pointer). */
@@ -77,6 +79,13 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_EMBEDDING_BWD, "gd_embedding_bwd"},
     {_GD_OP_ROPE, "gd_rope"},
     {_GD_OP_ROPE_BWD, "gd_rope"},
+    {_GD_OP_SDPA, "gd_sdpa"},
+    {_GD_OP_SDPA_BWD, "gd_sdpa_bwd_dq"},
+};
+
+/* Kernels not mapped 1:1 to an op (looked up by name during encode). */
+static const char *const g_metal_extra_kernels[] = {
+    "gd_sdpa_bwd_dkv",
 };
 
 static gd_status metal_dtype_code(gd_dtype dtype, int *out)
@@ -117,6 +126,11 @@ static GDMetalState *state_of(_gd_backend *self)
 static id<MTLComputePipelineState> pipeline_for(GDMetalState *st, _gd_op_kind op)
 {
     return st.pipelines[@((int)op)];
+}
+
+static id<MTLComputePipelineState> pipeline_named(GDMetalState *st, const char *name)
+{
+    return st.pipelinesByName[[NSString stringWithUTF8String:name]];
 }
 
 static int64_t desc_numel(const gd_tensor_desc *desc)
@@ -990,6 +1004,111 @@ static gd_status encode_rope(id<MTLComputeCommandEncoder> enc,
     return GD_OK;
 }
 
+static void fill_sdpa_params(gd_metal_sdpa_params *p,
+                             const gd_tensor_desc *q_desc,
+                             const gd_tensor_desc *k_desc,
+                             const gd_tensor_desc *bias_desc,
+                             const _gd_node *node)
+{
+    p->B = (int)q_desc->sizes[0];
+    p->Tq = (int)q_desc->sizes[1];
+    p->Hq = (int)q_desc->sizes[2];
+    p->Dh = (int)q_desc->sizes[3];
+    p->Tk = (int)k_desc->sizes[1];
+    p->Hkv = (int)k_desc->sizes[2];
+    p->scale = node->attrs.attn_scale;
+    p->causal = node->attrs.causal;
+    p->window = node->attrs.sliding_window;
+    p->has_bias = node->attrs.has_bias ? 1 : 0;
+    p->Bb = bias_desc != NULL ? (int)bias_desc->sizes[0] : 1;
+    p->Hb = bias_desc != NULL ? (int)bias_desc->sizes[1] : 1;
+    p->Tqb = bias_desc != NULL ? (int)bias_desc->sizes[2] : 1;
+    p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
+}
+
+static void encode_sdpa(id<MTLComputeCommandEncoder> enc,
+                        id<MTLComputePipelineState> pso,
+                        _gd_executable *exe,
+                        const _gd_node *node)
+{
+    const gd_tensor_desc *q = &exe->graph->values[node->inputs[0]].desc;
+    const gd_tensor_desc *k = &exe->graph->values[node->inputs[1]].desc;
+    const gd_tensor_desc *bias = node->attrs.has_bias
+                                     ? &exe->graph->values[node->inputs[3]].desc
+                                     : NULL;
+    /* bias is always bound; the kernel only reads it when has_bias. Use q as a
+     * valid placeholder buffer when absent. */
+    int bias_input = node->attrs.has_bias ? node->inputs[3] : node->inputs[0];
+    gd_metal_sdpa_params p;
+    int grid = 0;
+
+    fill_sdpa_params(&p, q, k, bias, node);
+    grid = p.B * p.Hq * p.Tq;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:3];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    if (grid > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)grid);
+    }
+}
+
+/* SDPA backward: dq kernel over query rows, then dk/dv kernel over kv rows. */
+static gd_status encode_sdpa_bwd(_gd_backend *self,
+                                 id<MTLComputeCommandEncoder> enc,
+                                 id<MTLComputePipelineState> dq_pso,
+                                 _gd_executable *exe,
+                                 const _gd_node *node)
+{
+    /* inputs: go(0), q(1), k(2), v(3); outputs: dq(0), dk(1), dv(2). */
+    const gd_tensor_desc *q = &exe->graph->values[node->inputs[1]].desc;
+    const gd_tensor_desc *k = &exe->graph->values[node->inputs[2]].desc;
+    const gd_tensor_desc *bias = node->attrs.has_bias
+                                     ? &exe->graph->values[node->inputs[4]].desc
+                                     : NULL;
+    int bias_input = node->attrs.has_bias ? node->inputs[4] : node->inputs[1];
+    id<MTLComputePipelineState> dkv_pso = pipeline_named(state_of(self), "gd_sdpa_bwd_dkv");
+    gd_metal_sdpa_params p;
+    int dq_grid = 0;
+    int dkv_grid = 0;
+
+    if (dkv_pso == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd_dkv pipeline missing");
+    }
+    fill_sdpa_params(&p, q, k, bias, node);
+    dq_grid = p.B * p.Hq * p.Tq;
+    dkv_grid = p.B * p.Hkv * p.Tk;
+
+    [enc setComputePipelineState:dq_pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0]; /* go */
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1]; /* q */
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2]; /* k */
+    [enc setBuffer:value_buffer(exe, node->inputs[3]) offset:0 atIndex:3]; /* v */
+    [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:4];      /* bias */
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:5]; /* dq */
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    if (dq_grid > 0) {
+        dispatch_1d(enc, dq_pso, (NSUInteger)dq_grid);
+    }
+
+    [enc setComputePipelineState:dkv_pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0]; /* go */
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1]; /* q */
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2]; /* k */
+    [enc setBuffer:value_buffer(exe, node->inputs[3]) offset:0 atIndex:3]; /* v */
+    [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:4];      /* bias */
+    [enc setBuffer:value_buffer(exe, node->outputs[1]) offset:0 atIndex:5]; /* dk */
+    [enc setBuffer:value_buffer(exe, node->outputs[2]) offset:0 atIndex:6]; /* dv */
+    [enc setBytes:&p length:sizeof(p) atIndex:7];
+    if (dkv_grid > 0) {
+        dispatch_1d(enc, dkv_pso, (NSUInteger)dkv_grid);
+    }
+    return GD_OK;
+}
+
 static gd_status encode_node(_gd_backend *self,
                              id<MTLComputeCommandEncoder> enc,
                              _gd_executable *exe,
@@ -1073,6 +1192,11 @@ static gd_status encode_node(_gd_backend *self,
         return encode_rope(enc, pso, exe, node, 1.0F);
     case _GD_OP_ROPE_BWD:
         return encode_rope(enc, pso, exe, node, -1.0F);
+    case _GD_OP_SDPA:
+        encode_sdpa(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_SDPA_BWD:
+        return encode_sdpa_bwd(self, enc, pso, exe, node);
     default:
         return _gd_error(GD_ERR_UNSUPPORTED, "metal op not implemented yet");
     }
@@ -1192,11 +1316,12 @@ static gd_status metal_init(_gd_backend *self, gd_context *ctx, int device_index
         st.queue = queue;
         st.library = library;
         st.pipelines = [NSMutableDictionary dictionary];
+        st.pipelinesByName = [NSMutableDictionary dictionary];
         st.inFlight = nil;
 
         for (k = 0; k < sizeof(g_metal_kernels) / sizeof(g_metal_kernels[0]); ++k) {
-            id<MTLFunction> fn =
-                [library newFunctionWithName:[NSString stringWithUTF8String:g_metal_kernels[k].fn]];
+            NSString *name = [NSString stringWithUTF8String:g_metal_kernels[k].fn];
+            id<MTLFunction> fn = [library newFunctionWithName:name];
             id<MTLComputePipelineState> pso = nil;
 
             if (fn == nil) {
@@ -1207,6 +1332,21 @@ static gd_status metal_init(_gd_backend *self, gd_context *ctx, int device_index
                 return _gd_error(GD_ERR_BACKEND, "failed to create compute pipeline state");
             }
             st.pipelines[@((int)g_metal_kernels[k].op)] = pso;
+            st.pipelinesByName[name] = pso;
+        }
+        for (k = 0; k < sizeof(g_metal_extra_kernels) / sizeof(g_metal_extra_kernels[0]); ++k) {
+            NSString *name = [NSString stringWithUTF8String:g_metal_extra_kernels[k]];
+            id<MTLFunction> fn = [library newFunctionWithName:name];
+            id<MTLComputePipelineState> pso = nil;
+
+            if (fn == nil) {
+                return _gd_error(GD_ERR_BACKEND, "metallib is missing a required kernel");
+            }
+            pso = [device newComputePipelineStateWithFunction:fn error:&error];
+            if (pso == nil) {
+                return _gd_error(GD_ERR_BACKEND, "failed to create compute pipeline state");
+            }
+            st.pipelinesByName[name] = pso;
         }
 
         self->impl = (__bridge_retained void *)st;

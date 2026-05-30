@@ -141,6 +141,24 @@ typedef struct gd_metal_embedding_params {
     int vocab; /* table rows */
 } gd_metal_embedding_params;
 
+/* Scaled dot-product attention. Head-major q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh]. */
+typedef struct gd_metal_sdpa_params {
+    int B;
+    int Tq;
+    int Tk;
+    int Hq;
+    int Hkv;
+    int Dh;
+    float scale;
+    int causal;
+    int window;
+    int has_bias;
+    int Bb;   /* bias broadcast dims over [B, Hq, Tq, Tk] (each 1 or full) */
+    int Hb;
+    int Tqb;
+    int Tkb;
+} gd_metal_sdpa_params;
+
 /* Rotary embedding; one thread per (.., head) row over head_dim. sin_sign is
  * +1 forward, -1 backward (transpose rotation). */
 typedef struct gd_metal_rope_params {

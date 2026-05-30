@@ -294,6 +294,38 @@ typedef struct rope_in {
     gd_tensor *pos;
 } rope_in;
 
+typedef struct sdpa_in {
+    gd_tensor *q;
+    gd_tensor *k;
+    gd_tensor *v;
+    gd_tensor *bias; /* optional additive bias (constant; tests q/k/v grads) */
+    bool causal;
+} sdpa_in;
+
+static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    sdpa_in *s = user; /* q[1,3,2,4], k/v[1,3,1,4] (GQA) -> sdpa -> reshape -> mean */
+    gd_sdpa_config cfg = {0};
+    gd_tensor *y = NULL;
+    gd_tensor *fl = NULL;
+    int64_t flat[1] = {24};
+    gd_status status = GD_OK;
+
+    cfg.causal = s->causal;
+    status = gd_sdpa(ctx, s->q, s->k, s->v, s->bias, &cfg, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_reshape(y, 1, flat, &fl);
+    gd_tensor_release(y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_mean(ctx, fl, 0, false, loss_out);
+    gd_tensor_release(fl);
+    return status;
+}
+
 static gd_status build_rope_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     rope_in *r = user; /* x:[1,2,2,4] (grad) -> rope -> gelu -> reshape[16] -> mean */
@@ -589,6 +621,53 @@ int main(void)
         CHECK_TRUE(gradcheck(ctx, build_rope_sum, &r, in, 1, "rope") == 0);
         gd_tensor_release(r.x);
         gd_tensor_release(r.pos);
+    }
+
+    {
+        /* sdpa with GQA: q[1,3,2,4], k/v[1,3,1,4]; dense and causal. */
+        sdpa_in s = {0};
+        gd_tensor *in[3];
+        int64_t qs[4] = {1, 3, 2, 4};
+        int64_t ks[4] = {1, 3, 1, 4};
+        float qd[24];
+        float kd[12];
+        float vd[12];
+        int j = 0;
+        for (j = 0; j < 24; ++j) {
+            qd[j] = 0.15F * (float)((j % 7) - 3);
+        }
+        for (j = 0; j < 12; ++j) {
+            kd[j] = 0.2F * (float)((j % 5) - 2);
+            vd[j] = 0.1F * (float)((j % 4) - 1);
+        }
+        CHECK_OK(make_grad_input(ctx, 4, qs, qd, &s.q));
+        CHECK_OK(make_grad_input(ctx, 4, ks, kd, &s.k));
+        CHECK_OK(make_grad_input(ctx, 4, ks, vd, &s.v));
+        in[0] = s.q;
+        in[1] = s.k;
+        in[2] = s.v;
+        s.causal = false;
+        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa") == 0);
+        s.causal = true;
+        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_causal") == 0);
+        {
+            /* additive bias broadcast over [B,Hq,Tq,Tk] = [1,1,3,3]; verifies
+             * q/k/v grads are correct in the presence of a bias term. */
+            gd_device cpu = {GD_DEVICE_CPU, 0};
+            gd_tensor_desc bdesc;
+            int64_t bs[4] = {1, 1, 3, 3};
+            float bd[9] = {0.0F, -1e9F, -1e9F, 0.0F, 0.0F, -1e9F, 0.2F, -0.1F, 0.3F};
+            CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 4, bs, &bdesc));
+            CHECK_OK(gd_tensor_empty(ctx, &bdesc, &s.bias));
+            CHECK_OK(gd_tensor_copy_from_cpu(ctx, s.bias, bd, sizeof(bd)));
+            s.causal = false;
+            CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_bias") == 0);
+            gd_tensor_release(s.bias);
+            s.bias = NULL;
+        }
+        gd_tensor_release(s.q);
+        gd_tensor_release(s.k);
+        gd_tensor_release(s.v);
     }
 
     {

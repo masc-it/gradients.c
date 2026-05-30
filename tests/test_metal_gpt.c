@@ -150,6 +150,92 @@ static int test_rope_forward(gd_context *ctx)
     return 0;
 }
 
+/* SDPA + additive-bias parity (forward + q/k/v gradients). */
+static int build_sdpa_bias(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t qs[4] = {1, 3, 4, 4};
+    int64_t ks[4] = {1, 3, 2, 4};
+    int64_t bs[4] = {1, 1, 3, 3};
+    int64_t flat[1] = {48};
+    float qd[48];
+    float kd[24];
+    float vd[24];
+    float bd[9] = {0.0F, -1e9F, -1e9F, 0.1F, 0.0F, -1e9F, 0.2F, -0.1F, 0.3F};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *bias = NULL;
+    gd_tensor *y = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    int i = 0;
+
+    for (i = 0; i < 48; ++i) {
+        qd[i] = 0.1F * (float)((i % 9) - 4);
+    }
+    for (i = 0; i < 24; ++i) {
+        kd[i] = 0.15F * (float)((i % 7) - 3);
+        vd[i] = 0.2F * (float)((i % 5) - 2);
+    }
+    CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
+    CHECK_OK(make_f32(ctx, 4, ks, kd, &k));
+    CHECK_OK(make_f32(ctx, 4, ks, vd, &v));
+    CHECK_OK(make_f32(ctx, 4, bs, bd, &bias));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, bias, NULL, &y));
+    CHECK_OK(gd_gelu(ctx, y, false, &gel));
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    gd_tensor_release(y);
+    gd_tensor_release(gel);
+    gd_tensor_release(fl);
+    gd_tensor_release(bias); /* graph retains it */
+    inputs[0] = q;
+    inputs[1] = k;
+    inputs[2] = v;
+    *n = 3;
+    *loss_out = loss;
+    return 0;
+}
+
+/* SDPA forward parity (dense + causal, grouped-query). */
+static int test_sdpa_forward(gd_context *ctx)
+{
+    int64_t qs[4] = {1, 3, 4, 4};
+    int64_t ks[4] = {1, 3, 2, 4};
+    float qd[48];
+    float kd[24];
+    float vd[24];
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *yd = NULL, *yc = NULL;
+    gd_graph *g = NULL;
+    gd_compare_options opts = {1e-4, 1e-4, false};
+    gd_sdpa_config causal = {0.0F, true, 0};
+    int i = 0;
+
+    for (i = 0; i < 48; ++i) {
+        qd[i] = 0.1F * (float)((i % 9) - 4);
+    }
+    for (i = 0; i < 24; ++i) {
+        kd[i] = 0.15F * (float)((i % 7) - 3);
+        vd[i] = 0.2F * (float)((i % 5) - 2);
+    }
+    CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
+    CHECK_OK(make_f32(ctx, 4, ks, kd, &k));
+    CHECK_OK(make_f32(ctx, 4, ks, vd, &v));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, NULL, &yd));      /* dense */
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &causal, &yc));   /* causal */
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(yd);
+    gd_tensor_release(yc);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(q);
+    gd_tensor_release(k);
+    gd_tensor_release(v);
+    return 0;
+}
+
 /* --- gradient parity harness (mirrors test_metal.c) --- */
 typedef int (*build_loss_fn)(gd_context *ctx, gd_tensor **inputs_out, int *n_out,
                             gd_tensor **loss_out);
@@ -338,6 +424,58 @@ static int build_rope(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **l
     return 0;
 }
 
+static int build_sdpa_impl(gd_context *ctx, gd_tensor **inputs, int *n,
+                           gd_tensor **loss_out, bool causal)
+{
+    int64_t qs[4] = {1, 3, 4, 4};
+    int64_t ks[4] = {1, 3, 2, 4};
+    int64_t flat[1] = {48};
+    float qd[48];
+    float kd[24];
+    float vd[24];
+    gd_sdpa_config cfg = {0};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *y = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    int i = 0;
+
+    for (i = 0; i < 48; ++i) {
+        qd[i] = 0.1F * (float)((i % 9) - 4);
+    }
+    for (i = 0; i < 24; ++i) {
+        kd[i] = 0.15F * (float)((i % 7) - 3);
+        vd[i] = 0.2F * (float)((i % 5) - 2);
+    }
+    cfg.causal = causal;
+    CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
+    CHECK_OK(make_f32(ctx, 4, ks, kd, &k));
+    CHECK_OK(make_f32(ctx, 4, ks, vd, &v));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &y));
+    CHECK_OK(gd_gelu(ctx, y, false, &gel));  /* varied upstream grad into sdpa */
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    gd_tensor_release(y);
+    gd_tensor_release(gel);
+    gd_tensor_release(fl);
+    inputs[0] = q;
+    inputs[1] = k;
+    inputs[2] = v;
+    *n = 3;
+    *loss_out = loss;
+    return 0;
+}
+
+static int build_sdpa(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    return build_sdpa_impl(ctx, inputs, n, loss_out, false);
+}
+
+static int build_sdpa_causal(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    return build_sdpa_impl(ctx, inputs, n, loss_out, true);
+}
+
 int main(void)
 {
     gd_context *ctx = NULL;
@@ -355,8 +493,12 @@ int main(void)
 
     rc |= test_forward_parity(ctx);
     rc |= test_rope_forward(ctx);
+    rc |= test_sdpa_forward(ctx);
     rc |= backward_parity(ctx, build_gelu, "gelu");
     rc |= backward_parity(ctx, build_rope, "rope");
+    rc |= backward_parity(ctx, build_sdpa, "sdpa");
+    rc |= backward_parity(ctx, build_sdpa_causal, "sdpa_causal");
+    rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");
     rc |= backward_parity(ctx, build_gelu_tanh, "gelu_tanh");
     rc |= backward_parity(ctx, build_transpose, "transpose");
     rc |= backward_parity(ctx, build_embedding, "embedding");

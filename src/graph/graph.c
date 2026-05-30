@@ -65,6 +65,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "embedding";
     case _GD_OP_ROPE:
         return "rope";
+    case _GD_OP_SDPA:
+        return "sdpa";
     case _GD_OP_BACKWARD:
         return "backward";
     case _GD_OP_ZERO_GRAD:
@@ -95,6 +97,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "embedding_bwd";
     case _GD_OP_ROPE_BWD:
         return "rope_bwd";
+    case _GD_OP_SDPA_BWD:
+        return "sdpa_bwd";
     case _GD_OP_STEP_INC:
         return "step_inc";
     case _GD_OP_ADAMW_STEP:
@@ -454,6 +458,120 @@ fail:
     gd_tensor_release(*out_tensor);
     *out_tensor = NULL;
     graph->n_values -= 1;
+    return status;
+}
+
+gd_status _gd_graph_emit_multi(gd_graph *graph,
+                               _gd_op_kind op,
+                               gd_tensor **inputs,
+                               int n_inputs,
+                               const _gd_op_attrs *attrs,
+                               const gd_tensor_desc *out_descs,
+                               int n_outputs,
+                               gd_tensor **out_tensors)
+{
+    gd_status status = GD_OK;
+    int input_ids[_GD_OP_MAX_INPUTS];
+    int out_value_ids[_GD_OP_MAX_INPUTS];
+    int *node_inputs = NULL;
+    int *node_outputs = NULL;
+    int node_id = 0;
+    int created = 0;
+    int i = 0;
+    _gd_node *node = NULL;
+
+    if (graph == NULL || out_descs == NULL || out_tensors == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "_gd_graph_emit_multi argument is NULL");
+    }
+    if (n_inputs < 0 || n_inputs > _GD_OP_MAX_INPUTS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "too many op inputs");
+    }
+    if (n_outputs < 1 || n_outputs > _GD_OP_MAX_INPUTS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "unsupported op output count");
+    }
+    if (n_inputs > 0 && inputs == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "op inputs array is NULL");
+    }
+    for (i = 0; i < n_outputs; ++i) {
+        out_tensors[i] = NULL;
+    }
+    if (graph->state != _GD_GRAPH_BUILDING) {
+        return _gd_error(GD_ERR_INVALID_STATE, "graph is not capturing nodes");
+    }
+
+    for (i = 0; i < n_inputs; ++i) {
+        if (inputs[i] == NULL) {
+            return _gd_error(GD_ERR_INVALID_ARGUMENT, "op input tensor is NULL");
+        }
+        status = import_tensor(graph, inputs[i], &input_ids[i]);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+
+    node_id = graph->n_nodes;
+    for (i = 0; i < n_outputs; ++i) {
+        status = add_value(graph, &out_descs[i], node_id, NULL, &out_value_ids[i]);
+        if (status != GD_OK) {
+            goto fail;
+        }
+        status = _gd_tensor_create_virtual(graph, out_value_ids[i], &out_descs[i],
+                                           &out_tensors[i]);
+        if (status != GD_OK) {
+            graph->n_values -= 1; /* discard the value with no tensor */
+            goto fail;
+        }
+        created += 1;
+    }
+
+    status = grow_nodes(graph);
+    if (status != GD_OK) {
+        goto fail;
+    }
+    if (n_inputs > 0) {
+        node_inputs = malloc((size_t)n_inputs * sizeof(*node_inputs));
+        if (node_inputs == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate node inputs");
+            goto fail;
+        }
+        for (i = 0; i < n_inputs; ++i) {
+            node_inputs[i] = input_ids[i];
+        }
+    }
+    node_outputs = malloc((size_t)n_outputs * sizeof(*node_outputs));
+    if (node_outputs == NULL) {
+        status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate node outputs");
+        goto fail;
+    }
+    for (i = 0; i < n_outputs; ++i) {
+        node_outputs[i] = out_value_ids[i];
+    }
+
+    node = &graph->nodes[node_id];
+    *node = (_gd_node){0};
+    node->id = node_id;
+    node->op = op;
+    node->inputs = node_inputs;
+    node->n_inputs = n_inputs;
+    node->outputs = node_outputs;
+    node->n_outputs = n_outputs;
+    if (attrs != NULL) {
+        node->attrs = *attrs;
+    }
+    node->scope = dup_or_null(_gd_context_scope(graph->ctx));
+    graph->n_nodes += 1;
+
+    _gd_set_last_error(GD_OK, NULL);
+    return GD_OK;
+
+fail:
+    free(node_inputs);
+    free(node_outputs);
+    for (i = 0; i < created; ++i) {
+        gd_tensor_release(out_tensors[i]);
+        out_tensors[i] = NULL;
+    }
+    graph->n_values -= created;
     return status;
 }
 

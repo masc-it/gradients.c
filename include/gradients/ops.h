@@ -96,6 +96,35 @@ gd_status gd_rope(gd_context *ctx,
                   const gd_rope_config *config,
                   gd_tensor **out);
 
+/* Scaled dot-product attention. q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh] (head-major);
+ * Hq must be a multiple of Hkv (grouped-query attention). out is q's shape.
+ * NULL config => scale 1/sqrt(Dh), non-causal, no window.
+ *
+ * Layout note: this is head-major [B,T,H,Dh] -- exactly what a QKV projection
+ * produces after reshaping [B,T,d] -> [B,T,H,Dh]. No transpose to [B,H,T,Dh] is
+ * needed (or wanted): RoPE and this op index heads by stride. The physical K/V
+ * tiling preferred by a fused FlashAttention kernel is a backend concern
+ * (internal repack), not a caller responsibility.
+ *
+ * `bias` (nullable) is an additive attention bias added to the scaled scores
+ * before softmax: scores[b,h,i,j] += bias[b,h,i,j]. Its shape is 4D and
+ * broadcast over [B, Hq, Tq, Tk] (any axis may be 1). This expresses padding
+ * masks (0 / large-negative), ALiBi (per-head linear bias), and arbitrary
+ * relative-position bias, and composes with the causal/window fast path. Bias
+ * is treated as a constant (no gradient) in v1. */
+typedef struct gd_sdpa_config {
+    float scale;        /* 0 => 1/sqrt(head_dim) */
+    bool  causal;
+    int   sliding_window; /* 0 => none */
+} gd_sdpa_config;
+gd_status gd_sdpa(gd_context *ctx,
+                  gd_tensor *q,
+                  gd_tensor *k,
+                  gd_tensor *v,
+                  gd_tensor *bias,
+                  const gd_sdpa_config *config,
+                  gd_tensor **out);
+
 gd_status gd_backward(gd_context *ctx, gd_tensor *loss);
 gd_status gd_zero_grad(gd_context *ctx, gd_tensor **params, int n_params);
 

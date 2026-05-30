@@ -1,5 +1,7 @@
 #include "gradients/ops.h"
 
+#include <math.h>
+
 #include "../core/internal.h"
 #include "../core/tensor_internal.h"
 #include "../graph/graph_internal.h"
@@ -505,4 +507,94 @@ gd_status gd_rope(gd_context *ctx,
     inputs[0] = x;
     inputs[1] = pos_ids;
     return _gd_graph_emit(graph, _GD_OP_ROPE, inputs, 2, &attrs, &desc, out);
+}
+
+/* Validates that `bias` broadcasts over the [B, Hq, Tq, Tk] score grid. */
+static gd_status sdpa_check_bias(gd_tensor *bias, const gd_tensor_desc *out_desc,
+                                 const gd_tensor_desc *k_desc)
+{
+    const gd_tensor_desc *db = NULL;
+    int64_t want[4];
+    int i = 0;
+
+    if (gd_tensor_dtype(bias) != out_desc->dtype) {
+        return _gd_error(GD_ERR_DTYPE, "sdpa bias must share dtype with q");
+    }
+    db = _gd_tensor_desc_ptr(bias);
+    if (db->ndim != 4) {
+        return _gd_error(GD_ERR_SHAPE, "sdpa bias must be 4D [B,Hq,Tq,Tk] (broadcastable)");
+    }
+    want[0] = out_desc->sizes[0]; /* B */
+    want[1] = out_desc->sizes[2]; /* Hq */
+    want[2] = out_desc->sizes[1]; /* Tq */
+    want[3] = k_desc->sizes[1];   /* Tk */
+    for (i = 0; i < 4; ++i) {
+        if (db->sizes[i] != 1 && db->sizes[i] != want[i]) {
+            return _gd_error(GD_ERR_SHAPE, "sdpa bias is not broadcastable to [B,Hq,Tq,Tk]");
+        }
+    }
+    return GD_OK;
+}
+
+gd_status gd_sdpa(gd_context *ctx,
+                  gd_tensor *q,
+                  gd_tensor *k,
+                  gd_tensor *v,
+                  gd_tensor *bias,
+                  const gd_sdpa_config *config,
+                  gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *inputs[4];
+    gd_tensor_desc desc;
+    _gd_op_attrs attrs = {0};
+    const gd_tensor_desc *dq = NULL;
+    const gd_tensor_desc *dk = NULL;
+    int head_dim = 0;
+    int n_inputs = 3;
+
+    if (q == NULL || k == NULL || v == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_sdpa argument is NULL");
+    }
+    *out = NULL;
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_sdpa(q, k, v, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    dq = _gd_tensor_desc_ptr(q);
+    dk = _gd_tensor_desc_ptr(k);
+    if (bias != NULL) {
+        if (!gd_device_equal(gd_tensor_device(q), gd_tensor_device(bias))) {
+            return _gd_error(GD_ERR_DEVICE, "sdpa bias must share a device with q");
+        }
+        status = sdpa_check_bias(bias, &desc, dk);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    head_dim = (int)dq->sizes[3];
+    attrs.head_dim = head_dim;
+    attrs.n_q_heads = (int)dq->sizes[2];
+    attrs.n_kv_heads = (int)dk->sizes[2];
+    attrs.attn_scale = (config != NULL && config->scale > 0.0F)
+                           ? config->scale
+                           : (float)(1.0 / sqrt((double)head_dim));
+    attrs.causal = (config != NULL && config->causal) ? 1 : 0;
+    attrs.sliding_window = (config != NULL && config->sliding_window > 0)
+                               ? config->sliding_window
+                               : 0;
+    attrs.has_bias = bias != NULL;
+    inputs[0] = q;
+    inputs[1] = k;
+    inputs[2] = v;
+    if (bias != NULL) {
+        inputs[3] = bias;
+        n_inputs = 4;
+    }
+    return _gd_graph_emit(graph, _GD_OP_SDPA, inputs, n_inputs, &attrs, &desc, out);
 }

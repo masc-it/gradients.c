@@ -23,4 +23,81 @@ typedef struct gd_metal_ew_params {
     int b_sizes[GD_METAL_MAX_DIMS];
 } gd_metal_ew_params;
 
+/* Unary elementwise ops over a contiguous tensor (scale/relu/silu/copy). `scale`
+ * is only read by SCALE; the rest ignore it. */
+typedef struct gd_metal_unary_params {
+    int numel;
+    float scale;
+} gd_metal_unary_params;
+
+/* dtype codes shared with the cast kernel (a small closed set, not the full
+ * gd_dtype enum, so the host maps explicitly). */
+#define GD_METAL_DT_F32 0
+#define GD_METAL_DT_I32 1
+
+typedef struct gd_metal_cast_params {
+    int numel;
+    int src_dtype;  /* GD_METAL_DT_* */
+    int dst_dtype;  /* GD_METAL_DT_* */
+} gd_metal_cast_params;
+
+/* Batched matmul with NumPy-style batch broadcasting and optional transposes.
+ * The shader reproduces the CPU reference's per-batch base-offset computation,
+ * so batch_sizes carry only the leading (rank-2) dims. */
+typedef struct gd_metal_matmul_params {
+    int m;
+    int n;
+    int k;
+    int a_cols;        /* a's last-dim size, for addressing */
+    int b_cols;        /* b's last-dim size */
+    int a_mat;         /* elements per a matrix (a_rows*a_cols) */
+    int b_mat;         /* elements per b matrix */
+    int out_mat;       /* m*n */
+    int trans_a;
+    int trans_b;
+    int batch_ndim;    /* out rank - 2 */
+    int a_batch_ndim;  /* a rank - 2 */
+    int b_batch_ndim;  /* b rank - 2 */
+    int out_batch_sizes[GD_METAL_MAX_DIMS];
+    int a_batch_sizes[GD_METAL_MAX_DIMS];
+    int b_batch_sizes[GD_METAL_MAX_DIMS];
+} gd_metal_matmul_params;
+
+typedef struct gd_metal_linear_params {
+    int rows;
+    int in_features;
+    int out_features;
+    int trans_w;
+    int has_bias;
+} gd_metal_linear_params;
+
+/* sum/mean over one dim: x viewed as [outer, d, inner], reduced over d. */
+typedef struct gd_metal_reduce_params {
+    int outer;
+    int inner;
+    int d;
+    int mean;
+} gd_metal_reduce_params;
+
+/* softmax over one dim: x viewed as [outer, d, inner]. */
+typedef struct gd_metal_softmax_params {
+    int outer;
+    int inner;
+    int d;
+} gd_metal_softmax_params;
+
+typedef struct gd_metal_rmsnorm_params {
+    int rows;
+    int last;
+    float eps;
+} gd_metal_rmsnorm_params;
+
+/* cross_entropy: logits viewed as [outer, classes, inner], scalar mean loss. */
+typedef struct gd_metal_ce_params {
+    int outer;
+    int inner;
+    int classes;
+    int positions;     /* outer*inner */
+} gd_metal_ce_params;
+
 #endif /* GRADIENTS_METAL_KERNEL_TYPES_H */

@@ -46,7 +46,34 @@ typedef struct {
 
 static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_ADD, "gd_add"},
+    {_GD_OP_MUL, "gd_mul"},
+    {_GD_OP_SCALE, "gd_scale"},
+    {_GD_OP_RELU, "gd_relu"},
+    {_GD_OP_SILU, "gd_silu"},
+    {_GD_OP_COPY, "gd_copy"},
+    {_GD_OP_CAST, "gd_cast"},
+    {_GD_OP_MATMUL, "gd_matmul"},
+    {_GD_OP_LINEAR, "gd_linear"},
+    {_GD_OP_SUM, "gd_reduce"},
+    {_GD_OP_MEAN, "gd_reduce"},
+    {_GD_OP_SOFTMAX, "gd_softmax"},
+    {_GD_OP_RMS_NORM, "gd_rms_norm"},
+    {_GD_OP_CROSS_ENTROPY, "gd_cross_entropy"},
 };
+
+static gd_status metal_dtype_code(gd_dtype dtype, int *out)
+{
+    switch (dtype) {
+    case GD_DTYPE_F32:
+        *out = GD_METAL_DT_F32;
+        return GD_OK;
+    case GD_DTYPE_I32:
+        *out = GD_METAL_DT_I32;
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal cast supports F32/I32 only in v1");
+    }
+}
 
 /* ---- Compiled executable: per-value Metal buffer plan -------------------- */
 
@@ -327,42 +354,328 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
+static void dispatch_2d(id<MTLComputeCommandEncoder> enc,
+                        id<MTLComputePipelineState> pso,
+                        NSUInteger w,
+                        NSUInteger h)
+{
+    NSUInteger tw = pso.threadExecutionWidth;
+    NSUInteger th = 1;
+
+    if (tw > w) {
+        tw = w;
+    }
+    if (tw == 0) {
+        tw = 1;
+    }
+    th = pso.maxTotalThreadsPerThreadgroup / tw;
+    if (th > h) {
+        th = h;
+    }
+    if (th == 0) {
+        th = 1;
+    }
+    [enc dispatchThreads:MTLSizeMake(w, h, 1)
+        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+}
+
+static void encode_binary(id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState> pso,
+                          _gd_executable *exe,
+                          const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    const gd_tensor_desc *a_desc = &exe->graph->values[node->inputs[0]].desc;
+    const gd_tensor_desc *b_desc = &exe->graph->values[node->inputs[1]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_ew_params params;
+
+    build_ew_params(&params, out_desc, a_desc, b_desc);
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+}
+
+static void encode_unary(id<MTLComputeCommandEncoder> enc,
+                         id<MTLComputePipelineState> pso,
+                         _gd_executable *exe,
+                         const _gd_node *node,
+                         float scale)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_unary_params params;
+
+    params.numel = (int)numel;
+    params.scale = scale;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&params length:sizeof(params) atIndex:2];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+}
+
+static gd_status encode_cast(id<MTLComputeCommandEncoder> enc,
+                             id<MTLComputePipelineState> pso,
+                             _gd_executable *exe,
+                             const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    const gd_tensor_desc *in_desc = &exe->graph->values[node->inputs[0]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_cast_params params;
+    gd_status status = GD_OK;
+
+    params.numel = (int)numel;
+    status = metal_dtype_code(in_desc->dtype, &params.src_dtype);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = metal_dtype_code(out_desc->dtype, &params.dst_dtype);
+    if (status != GD_OK) {
+        return status;
+    }
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&params length:sizeof(params) atIndex:2];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+    return GD_OK;
+}
+
+static void encode_matmul(id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState> pso,
+                          _gd_executable *exe,
+                          const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    const gd_tensor_desc *a_desc = &exe->graph->values[node->inputs[0]].desc;
+    const gd_tensor_desc *b_desc = &exe->graph->values[node->inputs[1]].desc;
+    int a_rows = (int)a_desc->sizes[a_desc->ndim - 2];
+    int a_cols = (int)a_desc->sizes[a_desc->ndim - 1];
+    int b_rows = (int)b_desc->sizes[b_desc->ndim - 2];
+    int b_cols = (int)b_desc->sizes[b_desc->ndim - 1];
+    gd_metal_matmul_params p;
+    int batch_total = 1;
+    int i = 0;
+
+    memset(&p, 0, sizeof(p));
+    p.m = (int)out_desc->sizes[out_desc->ndim - 2];
+    p.n = (int)out_desc->sizes[out_desc->ndim - 1];
+    p.k = node->attrs.trans_a ? a_rows : a_cols;
+    p.a_cols = a_cols;
+    p.b_cols = b_cols;
+    p.a_mat = a_rows * a_cols;
+    p.b_mat = b_rows * b_cols;
+    p.out_mat = p.m * p.n;
+    p.trans_a = node->attrs.trans_a ? 1 : 0;
+    p.trans_b = node->attrs.trans_b ? 1 : 0;
+    p.batch_ndim = out_desc->ndim - 2;
+    p.a_batch_ndim = a_desc->ndim - 2;
+    p.b_batch_ndim = b_desc->ndim - 2;
+    for (i = 0; i < p.batch_ndim; ++i) {
+        p.out_batch_sizes[i] = (int)out_desc->sizes[i];
+        batch_total *= p.out_batch_sizes[i];
+    }
+    for (i = 0; i < p.a_batch_ndim; ++i) {
+        p.a_batch_sizes[i] = (int)a_desc->sizes[i];
+    }
+    for (i = 0; i < p.b_batch_ndim; ++i) {
+        p.b_batch_sizes[i] = (int)b_desc->sizes[i];
+    }
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    if (p.n > 0 && batch_total * p.m > 0) {
+        dispatch_2d(enc, pso, (NSUInteger)p.n, (NSUInteger)(batch_total * p.m));
+    }
+}
+
+static void encode_linear(id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState> pso,
+                          _gd_executable *exe,
+                          const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    const gd_tensor_desc *x_desc = &exe->graph->values[node->inputs[0]].desc;
+    gd_metal_linear_params p;
+    int bias_input = node->attrs.has_bias ? node->inputs[2] : node->inputs[0];
+
+    p.in_features = (int)x_desc->sizes[x_desc->ndim - 1];
+    p.out_features = (int)out_desc->sizes[out_desc->ndim - 1];
+    p.rows = p.in_features > 0 ? (int)(desc_numel(x_desc) / p.in_features) : 0;
+    p.trans_w = node->attrs.trans_b ? 1 : 0;
+    p.has_bias = node->attrs.has_bias ? 1 : 0;
+
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    /* bias is always bound (placeholder when absent; the kernel guards reads). */
+    [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    if (p.out_features > 0 && p.rows > 0) {
+        dispatch_2d(enc, pso, (NSUInteger)p.out_features, (NSUInteger)p.rows);
+    }
+}
+
+/* Splits a tensor around `dim` into [outer, d, inner] extents. */
+static void split_around_dim(const gd_tensor_desc *desc, int dim,
+                             int *outer, int *d, int *inner)
+{
+    int i = 0;
+    *outer = 1;
+    *inner = 1;
+    *d = (int)desc->sizes[dim];
+    for (i = 0; i < dim; ++i) {
+        *outer *= (int)desc->sizes[i];
+    }
+    for (i = dim + 1; i < desc->ndim; ++i) {
+        *inner *= (int)desc->sizes[i];
+    }
+}
+
+static void encode_reduce(id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState> pso,
+                          _gd_executable *exe,
+                          const _gd_node *node)
+{
+    const gd_tensor_desc *x_desc = &exe->graph->values[node->inputs[0]].desc;
+    gd_metal_reduce_params p;
+
+    split_around_dim(x_desc, node->attrs.dim, &p.outer, &p.d, &p.inner);
+    p.mean = (node->op == _GD_OP_MEAN) ? 1 : 0;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    if (p.outer * p.inner > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)(p.outer * p.inner));
+    }
+}
+
+static void encode_softmax(id<MTLComputeCommandEncoder> enc,
+                           id<MTLComputePipelineState> pso,
+                           _gd_executable *exe,
+                           const _gd_node *node)
+{
+    const gd_tensor_desc *desc = &exe->graph->values[node->outputs[0]].desc;
+    gd_metal_softmax_params p;
+
+    split_around_dim(desc, node->attrs.dim, &p.outer, &p.d, &p.inner);
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    if (p.outer * p.inner > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)(p.outer * p.inner));
+    }
+}
+
+static void encode_rms_norm(id<MTLComputeCommandEncoder> enc,
+                            id<MTLComputePipelineState> pso,
+                            _gd_executable *exe,
+                            const _gd_node *node)
+{
+    const gd_tensor_desc *desc = &exe->graph->values[node->outputs[0]].desc;
+    gd_metal_rmsnorm_params p;
+
+    p.last = (int)desc->sizes[desc->ndim - 1];
+    p.rows = p.last > 0 ? (int)(desc_numel(desc) / p.last) : 0;
+    p.eps = node->attrs.eps;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    if (p.rows > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)p.rows);
+    }
+}
+
+static gd_status encode_cross_entropy(id<MTLComputeCommandEncoder> enc,
+                                      id<MTLComputePipelineState> pso,
+                                      _gd_executable *exe,
+                                      const _gd_node *node)
+{
+    const gd_tensor_desc *logits = &exe->graph->values[node->inputs[0]].desc;
+    const gd_tensor_desc *targets = &exe->graph->values[node->inputs[1]].desc;
+    gd_metal_ce_params p;
+    int dummy = 0;
+
+    if (targets->dtype != GD_DTYPE_I32) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal cross_entropy needs I32 targets in v1");
+    }
+    split_around_dim(logits, node->attrs.dim, &p.outer, &dummy, &p.inner);
+    p.classes = (int)logits->sizes[node->attrs.dim];
+    p.positions = p.outer * p.inner;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    dispatch_1d(enc, pso, 1);
+    return GD_OK;
+}
+
 static gd_status encode_node(_gd_backend *self,
                              id<MTLComputeCommandEncoder> enc,
                              _gd_executable *exe,
                              const _gd_node *node)
 {
-    GDMetalState *st = state_of(self);
-    id<MTLComputePipelineState> pso = pipeline_for(st, node->op);
-    const gd_tensor_desc *out_desc = NULL;
-    int64_t numel = 0;
+    id<MTLComputePipelineState> pso = pipeline_for(state_of(self), node->op);
 
     if (pso == nil) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op");
     }
 
     switch (node->op) {
-    case _GD_OP_ADD: {
-        gd_metal_ew_params params;
-        const gd_tensor_desc *a_desc = &exe->graph->values[node->inputs[0]].desc;
-        const gd_tensor_desc *b_desc = &exe->graph->values[node->inputs[1]].desc;
-
-        out_desc = &exe->graph->values[node->outputs[0]].desc;
-        numel = desc_numel(out_desc);
-        build_ew_params(&params, out_desc, a_desc, b_desc);
-
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
-        [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
-        [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
-        [enc setBytes:&params length:sizeof(params) atIndex:3];
-        if (numel > 0) {
-            dispatch_1d(enc, pso, (NSUInteger)numel);
-        }
+    case _GD_OP_ADD:
+    case _GD_OP_MUL:
+        encode_binary(enc, pso, exe, node);
         return GD_OK;
-    }
+    case _GD_OP_SCALE:
+        encode_unary(enc, pso, exe, node, node->attrs.scale);
+        return GD_OK;
+    case _GD_OP_RELU:
+    case _GD_OP_SILU:
+    case _GD_OP_COPY:
+        encode_unary(enc, pso, exe, node, 0.0F);
+        return GD_OK;
+    case _GD_OP_CAST:
+        return encode_cast(enc, pso, exe, node);
+    case _GD_OP_MATMUL:
+        encode_matmul(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_LINEAR:
+        encode_linear(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_SUM:
+    case _GD_OP_MEAN:
+        encode_reduce(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_SOFTMAX:
+        encode_softmax(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_RMS_NORM:
+        encode_rms_norm(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_CROSS_ENTROPY:
+        return encode_cross_entropy(enc, pso, exe, node);
     default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "metal op not implemented in M0");
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal op not implemented yet");
     }
 }
 

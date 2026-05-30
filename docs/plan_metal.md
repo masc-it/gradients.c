@@ -51,8 +51,8 @@ kernels. Tracked separately. v1 is F32, one compute kernel per IR node.
 ## Phase status checklist
 
 - [x] M0 — Backend skeleton: device/queue, registration, shared-buffer storage, transfers, synchronize, metallib load, pipeline cache, one kernel (`add`) end-to-end
-- [ ] M1 — Elementwise + unary kernels (mul, scale, relu, silu, copy, cast)
-- [ ] M2 — Matmul/linear + reductions (matmul, linear, sum, mean, softmax, rms_norm, cross_entropy)
+- [x] M1 — Elementwise + unary kernels (mul, scale, relu, silu, copy, cast)
+- [x] M2 — Matmul/linear + reductions (matmul, linear, sum, mean, softmax, rms_norm, cross_entropy)
 - [ ] M3 — Backward + optimizer (*_bwd, reduce_to, step_inc, adamw_step, assert_*)
 - [ ] M4 — Full MLP training parity CPU↔Metal (forward tensors + gradients)
 
@@ -243,39 +243,62 @@ staging, encode/commit, synchronize, download, parity. Everything after M0 is
 
 ## M1 — Elementwise and unary kernels
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Ops
-`mul` (elementwise add/mul share a kernel template), `scale`, `relu`, `silu`,
-`copy`, `cast` (F32↔F32 first; integer casts as needed by tests).
+`mul` (shares `gd_binary` with `add`), `scale`, `relu`, `silu`, `copy` (bit-exact
+4-byte word copy), `cast` (F32↔I32 + identity, truncation toward zero matching
+the CPU C cast).
 
-### Changes
-- Kernels in `kernels.metal`; pipelines added to the cache; `supports_node`
-  extended. Broadcast indexing for `mul`/`add` matches `_gd_cpu_k_elementwise`.
+### Changes (landed)
+- Kernels in `kernels.metal`; `gd_metal_unary_params` / `gd_metal_cast_params`
+  added to the shared header; pipeline table + `supports_node` extended; encode
+  split into `encode_binary` / `encode_unary` / `encode_cast`. Cast dtype codes
+  mapped host-side via `metal_dtype_code` (unsupported pairs → `GD_ERR_UNSUPPORTED`).
 
-### Acceptance
-- Per-op parity test (CPU↔METAL) for each, including a broadcast case for the
-  binary ops and a negative-input case for relu/silu.
+### Acceptance (met)
+- `tests/test_metal.c`: combined mul (plain + broadcast), scale, relu, silu
+  parity (CPU↔METAL, tol 1e-4, negative inputs); cast parity F32→I32 (byte-exact)
+  + F32→F32; fallback retargeted to `matmul` (still unimplemented pre-M2).
+  ASan-clean on the Metal path.
+
+Note: `copy` (`_GD_OP_COPY`) has no public forward emitter — it is a
+backward/reshape internal op, so its kernel is exercised by M3 backward parity
+rather than a standalone M1 test. `supports_node` for `cast` cannot see dtypes
+(no graph access), so unsupported cast dtype pairs surface at encode time as
+`GD_ERR_UNSUPPORTED` rather than via clean fallback; acceptable for v1 (tests
+cover F32/I32).
 
 ---
 
 ## M2 — Matmul, linear, reductions
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Ops
-`matmul` (+ `trans_a`/`trans_b`), `linear` (+ `trans_b`/bias), `sum`, `mean`,
-`softmax`, `rms_norm`, `cross_entropy`.
+`matmul` (+ `trans_a`/`trans_b` + batch broadcasting), `linear` (+ `trans_w`/
+bias), `sum`, `mean`, `softmax`, `rms_norm`, `cross_entropy`.
 
-### Changes
-- Naive matmul/linear (2D grid, per-thread dot product). Reductions via
-  threadgroup parallel reduction; softmax uses max-subtract for stability to
-  match CPU. cross_entropy reduces over the class dim.
+### Changes (landed)
+- Naive matmul (2D grid over (n, batch*m), one thread per output; reproduces the
+  CPU batch-broadcast + transpose addressing) and linear (2D grid over
+  (out_features, rows); bias always bound, read only when `has_bias`).
+- Reductions/softmax/rms_norm use **one thread per output row** that loops the
+  reduced axis (not threadgroup reductions yet — correctness-first v1); softmax
+  uses max-subtract to match CPU. cross_entropy is a single-thread scalar
+  reduction (naive) requiring I32 targets (I64 → `GD_ERR_UNSUPPORTED` at encode).
+- Accumulation is in float (CPU uses double); parity holds at 1e-4 for test
+  sizes. Tightening to threadgroup reductions / higher-precision accumulation is
+  deferred to the perf phase.
 
-### Acceptance
-- Parity tests per op; matmul covers transpose flags and a non-square shape;
-  reductions cover `keepdim` and a non-last `dim`. Tolerance 1e-4; tighten where
-  the GPU result is bit-stable.
+### Acceptance (met)
+- `tests/test_metal.c`: matmul (2D, `trans_b`, batched [2,2,3]@[2,3,4]); linear
+  (with/without bias); sum (mid dim), mean (last dim, keepdim), softmax (last
+  dim), rms_norm; cross_entropy scalar with I32 targets. All CPU↔Metal parity at
+  1e-4; ASan-clean. Fallback test now uses `assert_finite` (no Metal kernel).
+
+Note: `supports_node` still can't see dtypes, so cross_entropy with I64 targets
+surfaces `GD_ERR_UNSUPPORTED` at encode rather than via clean fallback.
 
 ---
 

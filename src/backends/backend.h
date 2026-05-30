@@ -1,0 +1,77 @@
+#ifndef GRADIENTS_BACKEND_H
+#define GRADIENTS_BACKEND_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "gradients/context.h"
+#include "gradients/device.h"
+#include "gradients/status.h"
+#include "gradients/tensor.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Forward declarations: backends see the IR/graph opaquely. */
+typedef struct gd_graph gd_graph;
+typedef struct _gd_node _gd_node;
+typedef struct _gd_executable _gd_executable;
+typedef struct _gd_backend _gd_backend;
+
+typedef struct _gd_backend_caps {
+    bool host_visible;          /* can expose CPU-accessible pointers for its storage */
+    bool supports_cpu_ref;      /* is itself the correctness/reference backend */
+    gd_memory_kind default_memory; /* preferred memory kind for fresh tensors */
+} _gd_backend_caps;
+
+typedef struct _gd_backend_vtable {
+    gd_device_type type;
+    const char *name;
+
+    gd_status (*init)(_gd_backend *self, gd_context *ctx, int device_index);
+    void (*shutdown)(_gd_backend *self);
+
+    /* Storage (P1). */
+    gd_status (*storage_alloc)(_gd_backend *self, const gd_storage_desc *desc, void **handle_out);
+    void (*storage_free)(_gd_backend *self, void *handle);
+    gd_status (*storage_host_ptr)(_gd_backend *self, void *handle, void **ptr_out);
+
+    /* Host transfers (P2), blocking in v1. */
+    gd_status (*upload)(_gd_backend *self, void *dst_handle, size_t dst_off,
+                        const void *src, size_t nbytes);
+    gd_status (*download)(_gd_backend *self, void *src_handle, size_t src_off,
+                          void *dst, size_t nbytes);
+
+    /* Execution (P3). */
+    gd_status (*compile)(_gd_backend *self, gd_graph *graph, _gd_executable **out);
+    gd_status (*execute)(_gd_backend *self, _gd_executable *exe);
+    gd_status (*execute_until)(_gd_backend *self, _gd_executable *exe, int node_id); /* nullable */
+    void (*executable_free)(_gd_backend *self, _gd_executable *exe);
+    /* Storage backing a compiled value (for host transfer / materialization). */
+    gd_status (*value_storage)(_gd_backend *self, _gd_executable *exe, int value_id,
+                               gd_storage **storage_out, size_t *offset_out);
+
+    /* Fallback decisions (P5). */
+    bool (*supports_node)(_gd_backend *self, const _gd_node *node);
+
+    /* Ordering (P4). */
+    gd_status (*synchronize)(_gd_backend *self);
+} _gd_backend_vtable;
+
+struct _gd_backend {
+    const _gd_backend_vtable *vt;
+    _gd_backend_caps caps;
+    gd_context *ctx;
+    int device_index;
+    void *impl; /* backend-private state */
+};
+
+/* Backend registration entry points (one per backend). */
+gd_status _gd_cpu_backend_register(gd_context *ctx);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GRADIENTS_BACKEND_H */

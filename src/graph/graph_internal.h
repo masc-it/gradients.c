@@ -1,0 +1,161 @@
+#ifndef GRADIENTS_GRAPH_INTERNAL_H
+#define GRADIENTS_GRAPH_INTERNAL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "gradients/dtype.h"
+#include "gradients/graph.h"
+#include "gradients/tensor.h"
+
+#define _GD_OP_MAX_INPUTS 8
+
+typedef enum _gd_graph_state {
+    _GD_GRAPH_EMPTY = 0,
+    _GD_GRAPH_BUILDING,
+    _GD_GRAPH_FINALIZED,
+    _GD_GRAPH_COMPILED
+} _gd_graph_state;
+
+typedef enum _gd_op_kind {
+    _GD_OP_INVALID = 0,
+    _GD_OP_ADD,
+    _GD_OP_MUL,
+    _GD_OP_SCALE,
+    _GD_OP_MATMUL,
+    _GD_OP_LINEAR,
+    _GD_OP_RELU,
+    _GD_OP_SILU,
+    _GD_OP_SUM,
+    _GD_OP_MEAN,
+    _GD_OP_RMS_NORM,
+    _GD_OP_SOFTMAX,
+    _GD_OP_CROSS_ENTROPY,
+    _GD_OP_CAST,
+    _GD_OP_BACKWARD,
+    _GD_OP_ZERO_GRAD,
+    _GD_OP_OPTIMIZER_STEP,
+    _GD_OP_ASSERT_FINITE,
+    _GD_OP_ASSERT_CLOSE,
+    /* Internal backward/support ops (not part of the public op set). */
+    _GD_OP_COPY,
+    _GD_OP_RELU_BWD,
+    _GD_OP_SILU_BWD,
+    _GD_OP_SOFTMAX_BWD,
+    _GD_OP_SUM_BWD,
+    _GD_OP_MEAN_BWD,
+    _GD_OP_CROSS_ENTROPY_BWD,
+    _GD_OP_STEP_INC,
+    _GD_OP_ADAMW_STEP,
+    _GD_OP_REDUCE_TO
+} _gd_op_kind;
+
+typedef struct _gd_op_attrs {
+    float scale;                 /* SCALE */
+    int dim;                     /* SUM / MEAN / SOFTMAX / CROSS_ENTROPY class dim */
+    bool keepdim;                /* SUM / MEAN */
+    bool trans_a;                /* MATMUL */
+    bool trans_b;                /* MATMUL / LINEAR (trans_w) */
+    bool has_bias;               /* LINEAR */
+    float eps;                   /* RMS_NORM / ADAMW */
+    gd_dtype cast_dtype;         /* CAST */
+    gd_compute_policy compute;   /* MATMUL / LINEAR */
+    float lr;                    /* ADAMW */
+    float beta1;                 /* ADAMW */
+    float beta2;                 /* ADAMW */
+    float weight_decay;          /* ADAMW */
+    float atol;                  /* ASSERT_CLOSE */
+    float rtol;                  /* ASSERT_CLOSE */
+} _gd_op_attrs;
+
+typedef struct _gd_value {
+    int id;
+    int producer_node_id;        /* -1 for external leaf values */
+    gd_tensor_desc desc;
+    gd_tensor *external;          /* retained leaf tensor, NULL for produced values */
+    char *name;                   /* optional debug name */
+} _gd_value;
+
+typedef struct _gd_node {
+    int id;
+    _gd_op_kind op;
+    int *inputs;
+    int n_inputs;
+    int *outputs;
+    int n_outputs;
+    _gd_op_attrs attrs;
+    char *scope;
+    char *name;
+} _gd_node;
+
+typedef struct _gd_backend _gd_backend;
+typedef struct _gd_executable _gd_executable;
+
+struct gd_graph {
+    gd_context *ctx;
+    _gd_graph_state state;
+    gd_device target;
+    bool has_target;
+    bool has_run;
+    _gd_node *nodes;
+    int n_nodes;
+    int node_cap;
+    _gd_value *values;
+    int n_values;
+    int value_cap;
+    gd_tensor **virtual_tensors;  /* weak handles to live virtual output tensors */
+    int n_virtual;
+    int virtual_cap;
+    _gd_backend *backend;         /* selected at compile time */
+    _gd_executable *exec;         /* backend-owned compiled artifact */
+};
+
+const char *_gd_graph_state_name(_gd_graph_state state);
+const char *_gd_op_kind_name(_gd_op_kind op);
+
+gd_status _gd_graph_clear(gd_graph *graph);
+gd_status _gd_graph_note_virtual_tensor_create(gd_graph *graph, gd_tensor *tensor);
+void _gd_graph_note_virtual_tensor_release(gd_graph *graph, gd_tensor *tensor);
+
+/* Records a single-output op node into `graph`, importing each input tensor as a
+ * graph value, creating the output value from `out_desc`, and returning a new
+ * virtual output tensor handle (owned by the caller, refcount 1). */
+gd_status _gd_graph_emit(gd_graph *graph,
+                         _gd_op_kind op,
+                         gd_tensor **inputs,
+                         int n_inputs,
+                         const _gd_op_attrs *attrs,
+                         const gd_tensor_desc *out_desc,
+                         gd_tensor **out_tensor);
+
+/* Records a node whose single output is bound to an existing materialized
+ * tensor `out_external` (used as a write target, e.g. a leaf gradient slot). */
+gd_status _gd_graph_emit_to(gd_graph *graph,
+                            _gd_op_kind op,
+                            gd_tensor **inputs,
+                            int n_inputs,
+                            const _gd_op_attrs *attrs,
+                            gd_tensor *out_external);
+
+/* Records an in-place op node (no produced value) that mutates one or more of
+ * its materialized input tensors directly, e.g. an optimizer step. */
+gd_status _gd_graph_emit_inplace(gd_graph *graph,
+                                 _gd_op_kind op,
+                                 gd_tensor **inputs,
+                                 int n_inputs,
+                                 const _gd_op_attrs *attrs);
+
+/* Backend-routed access: returns the value's storage + byte offset (no host
+ * pointer assumption), for transfers/materialization. */
+gd_status _gd_graph_value_storage(gd_graph *graph,
+                                  int value_id,
+                                  bool require_run,
+                                  gd_storage **storage_out,
+                                  size_t *offset_out,
+                                  const gd_tensor_desc **desc_out);
+gd_status _gd_graph_set_value_name(gd_graph *graph, int value_id, const char *name);
+gd_status _gd_graph_materialize_live_virtuals(gd_graph *graph);
+
+gd_status _gd_graph_dump_text(gd_graph *graph, const char *path);
+
+#endif /* GRADIENTS_GRAPH_INTERNAL_H */

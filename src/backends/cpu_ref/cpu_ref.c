@@ -152,6 +152,44 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
                                        in_desc[1], in_data[1], node->attrs.dim);
     case _GD_OP_CAST:
         return _gd_cpu_k_cast(out_desc, out_data, in_desc[0], in_data[0]);
+    case _GD_OP_GELU:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_gelu(out_desc, out_data, in_data[0], node->attrs.gelu_tanh);
+    case _GD_OP_GELU_BWD:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_gelu_bwd(out_desc, out_data, in_data[0], in_data[1],
+                                  node->attrs.gelu_tanh);
+    case _GD_OP_TRANSPOSE:
+        return _gd_cpu_k_transpose(out_desc, out_data, in_desc[0], in_data[0],
+                                   node->attrs.perm);
+    case _GD_OP_EMBEDDING:
+        return _gd_cpu_k_embedding(out_desc, out_data, in_desc[0], in_data[0],
+                                   in_desc[1], in_data[1]);
+    case _GD_OP_EMBEDDING_BWD:
+        return _gd_cpu_k_embedding_bwd(out_desc, out_data, in_desc[0], in_data[0],
+                                       in_desc[1], in_data[1]);
+    case _GD_OP_ROPE:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_rope(out_desc, out_data, in_data[0], in_desc[1], in_data[1],
+                              node->attrs.rope_theta, node->attrs.rope_n_dims,
+                              node->attrs.rope_interleaved, 1.0F);
+    case _GD_OP_ROPE_BWD:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_rope(out_desc, out_data, in_data[0], in_desc[1], in_data[1],
+                              node->attrs.rope_theta, node->attrs.rope_n_dims,
+                              node->attrs.rope_interleaved, -1.0F);
     case _GD_OP_COPY:
         return _gd_cpu_k_copy(out_desc, out_data, in_desc[0], in_data[0]);
     case _GD_OP_RELU_BWD:

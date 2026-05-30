@@ -32,6 +32,10 @@ typedef enum _gd_op_kind {
     _GD_OP_SOFTMAX,
     _GD_OP_CROSS_ENTROPY,
     _GD_OP_CAST,
+    _GD_OP_GELU,
+    _GD_OP_TRANSPOSE,
+    _GD_OP_EMBEDDING,
+    _GD_OP_ROPE,
     _GD_OP_BACKWARD,
     _GD_OP_ZERO_GRAD,
     _GD_OP_OPTIMIZER_STEP,
@@ -45,6 +49,9 @@ typedef enum _gd_op_kind {
     _GD_OP_SUM_BWD,
     _GD_OP_MEAN_BWD,
     _GD_OP_CROSS_ENTROPY_BWD,
+    _GD_OP_GELU_BWD,
+    _GD_OP_EMBEDDING_BWD,
+    _GD_OP_ROPE_BWD,
     _GD_OP_STEP_INC,
     _GD_OP_ADAMW_STEP,
     _GD_OP_REDUCE_TO
@@ -59,6 +66,12 @@ typedef struct _gd_op_attrs {
     bool has_bias;               /* LINEAR */
     float eps;                   /* RMS_NORM / ADAMW */
     gd_dtype cast_dtype;         /* CAST */
+    bool gelu_tanh;              /* GELU: tanh approximation vs exact erf */
+    int perm[GD_MAX_DIMS];      /* TRANSPOSE: output axis permutation */
+    int perm_ndim;              /* TRANSPOSE: rank of perm */
+    float rope_theta;           /* ROPE: base frequency */
+    int rope_n_dims;            /* ROPE: rotary dims (resolved, even, <= head_dim) */
+    int rope_interleaved;       /* ROPE: GPT-J interleaved vs NeoX half-split */
     gd_compute_policy compute;   /* MATMUL / LINEAR */
     float lr;                    /* ADAMW */
     float beta1;                 /* ADAMW */

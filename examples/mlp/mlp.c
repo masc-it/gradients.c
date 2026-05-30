@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define H 8
 #define N_SAMPLES 4
@@ -124,8 +125,24 @@ int main(void)
     float logit_buf[N_SAMPLES * N_CLASSES];
     float loss_val = 0.0F;
 
+    /* Device selection: GD_DEVICE=metal trains on the GPU when available,
+     * otherwise falls back to CPU_REF. Defaults to CPU. */
+    gd_device target = cpu;
+    const char *dev_env = getenv("GD_DEVICE");
+
     srand(1234U);
     CHECK(gd_context_create(&ctx));
+    if (dev_env != NULL && strcmp(dev_env, "metal") == 0) {
+        gd_device metal = {GD_DEVICE_METAL, 0};
+        if (gd_synchronize(ctx, metal) == GD_OK) {
+            target = metal;
+            printf("device: metal\n");
+        } else {
+            printf("device: cpu (metal unavailable)\n");
+        }
+    } else {
+        printf("device: cpu\n");
+    }
     CHECK(gd_context_set_default_device(ctx, cpu));
 
     /* Data. */
@@ -164,7 +181,7 @@ int main(void)
     CHECK(gd_backward(ctx, loss));
     CHECK(gd_optimizer_step(ctx, opt));
     CHECK(gd_graph_end(ctx));
-    CHECK(gd_graph_compile(train, cpu));
+    CHECK(gd_graph_compile(train, target));
 
     for (step = 1; step <= N_STEPS; ++step) {
         CHECK(gd_graph_run(train));
@@ -184,7 +201,7 @@ int main(void)
     CHECK(gd_graph_begin(ctx, eval));
     CHECK(build_forward(ctx, x, w1, b1, w2, b2, &logits));
     CHECK(gd_graph_end(ctx));
-    CHECK(gd_graph_compile(eval, cpu));
+    CHECK(gd_graph_compile(eval, target));
     CHECK(gd_graph_run(eval));
     CHECK(gd_tensor_copy_to_cpu(ctx, logits, logit_buf, sizeof(logit_buf)));
     CHECK(gd_debug_print_tensor(ctx, logits, N_SAMPLES * N_CLASSES));

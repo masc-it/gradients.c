@@ -92,12 +92,65 @@ typedef struct gd_metal_rmsnorm_params {
     float eps;
 } gd_metal_rmsnorm_params;
 
-/* cross_entropy: logits viewed as [outer, classes, inner], scalar mean loss. */
+/* cross_entropy: logits viewed as [outer, classes, inner], scalar mean loss.
+ * Also used by cross_entropy_bwd. */
 typedef struct gd_metal_ce_params {
     int outer;
     int inner;
     int classes;
     int positions;     /* outer*inner */
 } gd_metal_ce_params;
+
+/* reduce_to: sum `go` (broadcast shape) down into the target shape. */
+typedef struct gd_metal_reduce_to_params {
+    int target_ndim;
+    int target_numel;
+    int go_ndim;
+    int go_numel;
+    int target_sizes[GD_METAL_MAX_DIMS];
+    int go_sizes[GD_METAL_MAX_DIMS];
+} gd_metal_reduce_to_params;
+
+typedef struct gd_metal_adamw_params {
+    int numel;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+} gd_metal_adamw_params;
+
+typedef struct gd_metal_gelu_params {
+    int numel;
+    int tanh_approx;
+} gd_metal_gelu_params;
+
+/* Physical permute of contiguous 4-byte elements. in_strides are element
+ * strides of the contiguous input; out is contiguous. */
+typedef struct gd_metal_transpose_params {
+    int ndim;
+    int numel;
+    int out_sizes[GD_METAL_MAX_DIMS];
+    int in_strides[GD_METAL_MAX_DIMS];
+    int perm[GD_METAL_MAX_DIMS];
+} gd_metal_transpose_params;
+
+typedef struct gd_metal_embedding_params {
+    int n;     /* number of ids */
+    int dim;   /* embedding dimension */
+    int vocab; /* table rows */
+} gd_metal_embedding_params;
+
+/* Rotary embedding; one thread per (.., head) row over head_dim. sin_sign is
+ * +1 forward, -1 backward (transpose rotation). */
+typedef struct gd_metal_rope_params {
+    int rows;        /* numel / head_dim */
+    int heads;       /* size of the heads axis */
+    int head_dim;
+    int n_dims;      /* rotary dims (even, <= head_dim) */
+    int interleaved;
+    float theta;
+    float sin_sign;
+} gd_metal_rope_params;
 
 #endif /* GRADIENTS_METAL_KERNEL_TYPES_H */

@@ -61,6 +61,30 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
                          void *out,
                          const gd_tensor_desc *in_desc,
                          const void *in);
+
+/* GELU (exact erf, or tanh approximation). */
+gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, float *out, const float *x, int tanh_approx);
+gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float *x,
+                             const float *go, int tanh_approx);
+
+/* Physical axis permutation into a contiguous result (any fixed-size dtype). */
+gd_status _gd_cpu_k_transpose(const gd_tensor_desc *out_desc, void *out,
+                              const gd_tensor_desc *in_desc, const void *in,
+                              const int *perm);
+
+/* Row gather and its scatter-add backward. */
+gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, float *out,
+                              const gd_tensor_desc *table_desc, const float *table,
+                              const gd_tensor_desc *ids_desc, const void *ids);
+gd_status _gd_cpu_k_embedding_bwd(const gd_tensor_desc *table_desc, float *dtable,
+                                  const gd_tensor_desc *go_desc, const float *go,
+                                  const gd_tensor_desc *ids_desc, const void *ids);
+
+/* Rotary position embedding. sin_sign = +1 forward, -1 backward (transpose
+ * rotation). x/out are [.., heads, head_dim]; positions index leading rows. */
+gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
+                         const gd_tensor_desc *pos_desc, const void *pos,
+                         float theta, int n_dims, int interleaved, float sin_sign);
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
                              float *dx,
                              const float *x,

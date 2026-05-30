@@ -423,6 +423,183 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
     return GD_OK;
 }
 
+gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, float *out, const float *x, int tanh_approx)
+{
+    int64_t total = desc_numel(desc);
+    int64_t i = 0;
+
+    if (tanh_approx) {
+        const double c = 0.7978845608028654; /* sqrt(2/pi) */
+        for (i = 0; i < total; ++i) {
+            double xv = (double)x[i];
+            double inner = c * (xv + 0.044715 * xv * xv * xv);
+            out[i] = (float)(0.5 * xv * (1.0 + tanh(inner)));
+        }
+    } else {
+        const double inv_sqrt2 = 0.7071067811865476;
+        for (i = 0; i < total; ++i) {
+            double xv = (double)x[i];
+            out[i] = (float)(0.5 * xv * (1.0 + erf(xv * inv_sqrt2)));
+        }
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float *x,
+                             const float *go, int tanh_approx)
+{
+    int64_t total = desc_numel(desc);
+    int64_t i = 0;
+
+    if (tanh_approx) {
+        const double c = 0.7978845608028654; /* sqrt(2/pi) */
+        for (i = 0; i < total; ++i) {
+            double xv = (double)x[i];
+            double u = c * (xv + 0.044715 * xv * xv * xv);
+            double t = tanh(u);
+            double du = c * (1.0 + 3.0 * 0.044715 * xv * xv);
+            double g = 0.5 * (1.0 + t) + 0.5 * xv * (1.0 - t * t) * du;
+            dx[i] = (float)((double)go[i] * g);
+        }
+    } else {
+        const double inv_sqrt2 = 0.7071067811865476;
+        const double inv_sqrt2pi = 0.3989422804014327;
+        for (i = 0; i < total; ++i) {
+            double xv = (double)x[i];
+            double cdf = 0.5 * (1.0 + erf(xv * inv_sqrt2));
+            double pdf = inv_sqrt2pi * exp(-0.5 * xv * xv);
+            dx[i] = (float)((double)go[i] * (cdf + xv * pdf));
+        }
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_transpose(const gd_tensor_desc *out_desc, void *out,
+                              const gd_tensor_desc *in_desc, const void *in,
+                              const int *perm)
+{
+    size_t elem = gd_dtype_sizeof(out_desc->dtype);
+    int64_t total = desc_numel(out_desc);
+    int64_t in_strides[GD_MAX_DIMS];
+    int64_t out_index[GD_MAX_DIMS];
+    int ndim = out_desc->ndim;
+    int64_t stride = 1;
+    int64_t lin = 0;
+    int k = 0;
+
+    if (elem == 0U) {
+        return _gd_error(GD_ERR_DTYPE, "transpose requires a fixed-size dtype");
+    }
+    if (in_desc->ndim != ndim) {
+        return _gd_error(GD_ERR_SHAPE, "transpose rank mismatch");
+    }
+    for (k = ndim - 1; k >= 0; --k) {
+        in_strides[k] = stride;
+        stride *= in_desc->sizes[k];
+    }
+    for (lin = 0; lin < total; ++lin) {
+        int64_t in_off = 0;
+        unravel(lin, out_desc, out_index);
+        for (k = 0; k < ndim; ++k) {
+            in_off += out_index[k] * in_strides[perm[k]];
+        }
+        memcpy((unsigned char *)out + (size_t)lin * elem,
+               (const unsigned char *)in + (size_t)in_off * elem, elem);
+    }
+    return GD_OK;
+}
+
+static int64_t embedding_id(const gd_tensor_desc *ids_desc, const void *ids, int64_t p)
+{
+    if (ids_desc->dtype == GD_DTYPE_I64) {
+        return ((const int64_t *)ids)[p];
+    }
+    return (int64_t)((const int32_t *)ids)[p];
+}
+
+gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, float *out,
+                              const gd_tensor_desc *table_desc, const float *table,
+                              const gd_tensor_desc *ids_desc, const void *ids)
+{
+    int64_t vocab = table_desc->sizes[0];
+    int64_t dim = table_desc->sizes[1];
+    int64_t n = desc_numel(ids_desc);
+    int64_t p = 0;
+
+    (void)out_desc;
+    for (p = 0; p < n; ++p) {
+        int64_t id = embedding_id(ids_desc, ids, p);
+        if (id < 0 || id >= vocab) {
+            return _gd_error(GD_ERR_SHAPE, "embedding id out of range");
+        }
+        memcpy(out + p * dim, table + id * dim, (size_t)dim * sizeof(float));
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_embedding_bwd(const gd_tensor_desc *table_desc, float *dtable,
+                                  const gd_tensor_desc *go_desc, const float *go,
+                                  const gd_tensor_desc *ids_desc, const void *ids)
+{
+    int64_t vocab = table_desc->sizes[0];
+    int64_t dim = table_desc->sizes[1];
+    int64_t n = desc_numel(ids_desc);
+    int64_t p = 0;
+    int64_t c = 0;
+
+    (void)go_desc;
+    for (p = 0; p < vocab * dim; ++p) {
+        dtable[p] = 0.0F;
+    }
+    for (p = 0; p < n; ++p) {
+        int64_t id = embedding_id(ids_desc, ids, p);
+        if (id < 0 || id >= vocab) {
+            return _gd_error(GD_ERR_SHAPE, "embedding id out of range");
+        }
+        for (c = 0; c < dim; ++c) {
+            dtable[id * dim + c] += go[p * dim + c];
+        }
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
+                         const gd_tensor_desc *pos_desc, const void *pos,
+                         float theta, int n_dims, int interleaved, float sin_sign)
+{
+    int ndim = desc->ndim;
+    int64_t head_dim = desc->sizes[ndim - 1];
+    int64_t heads = desc->sizes[ndim - 2];
+    int64_t rows = desc_numel(desc) / head_dim;
+    int half = n_dims / 2;
+    int64_t r = 0;
+
+    for (r = 0; r < rows; ++r) {
+        int64_t pos_idx = r / heads;
+        int64_t p = embedding_id(pos_desc, pos, pos_idx);
+        int64_t base = r * head_dim;
+        int i = 0;
+        int64_t d = 0;
+
+        for (d = n_dims; d < head_dim; ++d) {
+            out[base + d] = x[base + d];
+        }
+        for (i = 0; i < half; ++i) {
+            double inv = pow((double)theta, -(2.0 * (double)i) / (double)n_dims);
+            double angle = (double)p * inv;
+            double c = cos(angle);
+            double s = sin(angle) * (double)sin_sign;
+            int a = interleaved ? (2 * i) : i;
+            int bb = interleaved ? (2 * i + 1) : (i + half);
+            double x1 = (double)x[base + a];
+            double x2 = (double)x[base + bb];
+            out[base + a] = (float)(x1 * c - x2 * s);
+            out[base + bb] = (float)(x1 * s + x2 * c);
+        }
+    }
+    return GD_OK;
+}
+
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
                              float *dx,
                              const float *x,

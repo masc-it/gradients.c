@@ -365,6 +365,270 @@ static int test_metal_cross_entropy_parity(gd_context *ctx)
     return 0;
 }
 
+static int64_t tensor_numel(gd_tensor *t)
+{
+    int64_t n = 1;
+    int i = 0;
+    for (i = 0; i < gd_tensor_ndim(t); ++i) {
+        n *= gd_tensor_size(t, i);
+    }
+    return n;
+}
+
+/* A backward-graph builder: creates its own (deterministic) input tensors,
+ * records the forward ops, and returns the scalar loss. Inputs that require
+ * grad are returned in `inputs_out`. */
+typedef int (*build_loss_fn)(gd_context *ctx, gd_tensor **inputs_out, int *n_out,
+                            gd_tensor **loss_out);
+
+/* Runs build->backward on `dev`, capturing each input's gradient into gbuf. */
+static int run_grads(gd_context *ctx, gd_device dev, build_loss_fn build,
+                     float gbuf[][64], int64_t numel[], int *n_inputs)
+{
+    gd_tensor *inputs[4] = {0};
+    gd_tensor *loss = NULL;
+    gd_graph *g = NULL;
+    int n = 0;
+    int i = 0;
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    if (build(ctx, inputs, &n, &loss) != 0) {
+        return 1;
+    }
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, dev));
+    CHECK_OK(gd_graph_run(g));
+
+    for (i = 0; i < n; ++i) {
+        gd_tensor *grad = NULL;
+        numel[i] = tensor_numel(inputs[i]);
+        CHECK_OK(gd_tensor_grad(inputs[i], &grad));
+        CHECK_TRUE(grad != NULL);
+        CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gbuf[i], (size_t)numel[i] * sizeof(float)));
+    }
+    *n_inputs = n;
+
+    gd_tensor_release(loss);
+    CHECK_OK(gd_graph_destroy(g));
+    for (i = 0; i < n; ++i) {
+        gd_tensor_release(inputs[i]);
+    }
+    return 0;
+}
+
+/* Compares CPU vs Metal gradients for a backward graph builder. */
+static int backward_parity(gd_context *ctx, build_loss_fn build, const char *name)
+{
+    float gcpu[4][64];
+    float gmtl[4][64];
+    int64_t ncpu[4];
+    int64_t nmtl[4];
+    int n_cpu = 0;
+    int n_mtl = 0;
+    int i = 0;
+    int64_t j = 0;
+
+    if (run_grads(ctx, CPU, build, gcpu, ncpu, &n_cpu) != 0) {
+        fprintf(stderr, "%s: CPU run failed\n", name);
+        return 1;
+    }
+    if (run_grads(ctx, METAL, build, gmtl, nmtl, &n_mtl) != 0) {
+        fprintf(stderr, "%s: METAL run failed\n", name);
+        return 1;
+    }
+    CHECK_TRUE(n_cpu == n_mtl);
+    for (i = 0; i < n_cpu; ++i) {
+        CHECK_TRUE(ncpu[i] == nmtl[i]);
+        for (j = 0; j < ncpu[i]; ++j) {
+            if (!close_to(gcpu[i][j], gmtl[i][j])) {
+                fprintf(stderr, "%s: grad[%d][%lld] cpu=%g metal=%g\n",
+                        name, i, (long long)j, (double)gcpu[i][j], (double)gmtl[i][j]);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* matmul -> relu -> sum -> mean: relu_bwd, sum_bwd, mean_bwd, matmul backward. */
+static int build_mlp(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sx[2] = {2, 3};
+    int64_t sw[2] = {3, 4};
+    float xd[6] = {1, -2, 3, -4, 5, -6};
+    float wd[12] = {0.1F, -0.2F, 0.3F, -0.4F, 0.5F, -0.6F,
+                    0.7F, -0.8F, 0.9F, -1.0F, 1.1F, -1.2F};
+    gd_tensor *x = NULL, *w = NULL, *h = NULL, *a = NULL, *s = NULL, *loss = NULL;
+
+    CHECK_OK(make_f32(ctx, 2, sx, xd, &x));
+    CHECK_OK(make_f32(ctx, 2, sw, wd, &w));
+    CHECK_OK(gd_tensor_set_requires_grad(x, true));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_matmul(ctx, x, w, &h));
+    CHECK_OK(gd_relu(ctx, h, &a));
+    CHECK_OK(gd_sum(ctx, a, 1, false, &s));
+    CHECK_OK(gd_mean(ctx, s, 0, false, &loss));
+    gd_tensor_release(h);
+    gd_tensor_release(a);
+    gd_tensor_release(s);
+    inputs[0] = x;
+    inputs[1] = w;
+    *n = 2;
+    *loss_out = loss;
+    return 0;
+}
+
+/* softmax -> mul(broadcast) -> sum -> mean: softmax_bwd, reduce_to, sum/mean_bwd. */
+static int build_softmax(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sx[2] = {2, 4};
+    int64_t sw[1] = {4};
+    float xd[8] = {0.5F, -1.0F, 2.0F, 0.3F, -0.7F, 1.2F, 0.0F, -0.4F};
+    float wd[4] = {1.0F, -2.0F, 0.5F, 3.0F};
+    gd_tensor *x = NULL, *wt = NULL, *y = NULL, *m = NULL, *s = NULL, *loss = NULL;
+
+    CHECK_OK(make_f32(ctx, 2, sx, xd, &x));
+    CHECK_OK(make_f32(ctx, 1, sw, wd, &wt));
+    CHECK_OK(gd_tensor_set_requires_grad(x, true));
+    CHECK_OK(gd_tensor_set_requires_grad(wt, true));
+    CHECK_OK(gd_softmax(ctx, x, 1, &y));
+    CHECK_OK(gd_mul(ctx, y, wt, &m));
+    CHECK_OK(gd_sum(ctx, m, 1, false, &s));
+    CHECK_OK(gd_mean(ctx, s, 0, false, &loss));
+    gd_tensor_release(y);
+    gd_tensor_release(m);
+    gd_tensor_release(s);
+    inputs[0] = x;
+    inputs[1] = wt;
+    *n = 2;
+    *loss_out = loss;
+    return 0;
+}
+
+/* silu -> mean: silu_bwd, mean_bwd. */
+static int build_silu(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sx[1] = {6};
+    float xd[6] = {1.0F, -2.0F, 0.5F, -0.3F, 2.0F, -1.5F};
+    gd_tensor *x = NULL, *a = NULL, *loss = NULL;
+
+    CHECK_OK(make_f32(ctx, 1, sx, xd, &x));
+    CHECK_OK(gd_tensor_set_requires_grad(x, true));
+    CHECK_OK(gd_silu(ctx, x, &a));
+    CHECK_OK(gd_mean(ctx, a, 0, false, &loss));
+    gd_tensor_release(a);
+    inputs[0] = x;
+    *n = 1;
+    *loss_out = loss;
+    return 0;
+}
+
+/* cross_entropy -> backward: cross_entropy_bwd. */
+static int build_ce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sl[2] = {3, 5};
+    int64_t st[1] = {3};
+    float ld[15] = {2.0F, 1.0F, 0.1F, -1.0F, 0.5F,
+                    0.2F, 3.0F, -0.5F, 1.5F, 0.0F,
+                    -1.0F, 0.3F, 2.2F, 0.7F, 1.1F};
+    int32_t td[3] = {0, 1, 2};
+    gd_tensor *logits = NULL, *targets = NULL, *loss = NULL;
+
+    CHECK_OK(make_f32(ctx, 2, sl, ld, &logits));
+    CHECK_OK(make_i32(ctx, 1, st, td, &targets));
+    CHECK_OK(gd_tensor_set_requires_grad(logits, true));
+    CHECK_OK(gd_cross_entropy(ctx, logits, targets, 1, &loss));
+    gd_tensor_release(targets); /* graph retains it */
+    inputs[0] = logits;
+    *n = 1;
+    *loss_out = loss;
+    return 0;
+}
+
+static int test_metal_backward_parity(gd_context *ctx)
+{
+    if (backward_parity(ctx, build_mlp, "mlp") != 0) return 1;
+    if (backward_parity(ctx, build_softmax, "softmax") != 0) return 1;
+    if (backward_parity(ctx, build_silu, "silu") != 0) return 1;
+    if (backward_parity(ctx, build_ce, "cross_entropy") != 0) return 1;
+    return 0;
+}
+
+/* AdamW reference (double precision), matching the CPU_REF kernel. */
+static void ref_adamw(float *p, float *m, float *v, const float *g, int n, int t,
+                      float lr, float b1, float b2, float eps, float wd)
+{
+    double bc1 = 1.0 - pow((double)b1, (double)t);
+    double bc2 = 1.0 - pow((double)b2, (double)t);
+    int i = 0;
+    for (i = 0; i < n; ++i) {
+        double mi = (double)b1 * (double)m[i] + (1.0 - (double)b1) * (double)g[i];
+        double vi = (double)b2 * (double)v[i] + (1.0 - (double)b2) * (double)g[i] * (double)g[i];
+        double mhat = mi / bc1;
+        double vhat = vi / bc2;
+        double pp = (double)p[i];
+        m[i] = (float)mi;
+        v[i] = (float)vi;
+        pp -= (double)lr * (double)wd * pp;
+        pp -= (double)lr * mhat / (sqrt(vhat) + (double)eps);
+        p[i] = (float)pp;
+    }
+}
+
+/* AdamW on Metal: in-place param/m/v/step updates + write-back over 3 steps. */
+static int test_metal_adamw(gd_context *ctx)
+{
+    float pinit[3] = {1.0F, -2.0F, 0.5F};
+    float g[3] = {0.5F, -1.0F, 0.25F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *graph = NULL;
+    float ref_p[3], ref_m[3] = {0, 0, 0}, ref_v[3] = {0, 0, 0};
+    float got[3];
+    int step = 0, i = 0;
+    int64_t s3[1] = {3};
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.01F;
+    memcpy(ref_p, pinit, sizeof(pinit));
+
+    CHECK_OK(make_f32(ctx, 1, s3, pinit, &param));
+    CHECK_OK(gd_tensor_set_requires_grad(param, true));
+    CHECK_OK(gd_adamw_create(ctx, &param, 1, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, METAL));
+
+    for (step = 1; step <= 3; ++step) {
+        CHECK_OK(gd_graph_run(graph));
+        ref_adamw(ref_p, ref_m, ref_v, g, 3, step, cfg.lr, cfg.beta1, cfg.beta2, cfg.eps,
+                  cfg.weight_decay);
+        CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, got, sizeof(got)));
+        for (i = 0; i < 3; ++i) {
+            CHECK_TRUE(close_to(got[i], ref_p[i]));
+        }
+    }
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(param);
+    return 0;
+}
+
 /* Fallback policy at dispatch: assert_finite has no Metal kernel (debug op). */
 static int test_metal_fallback(gd_context *ctx)
 {
@@ -427,6 +691,8 @@ int main(void)
     rc |= test_metal_linear_parity(ctx);
     rc |= test_metal_reduce_parity(ctx);
     rc |= test_metal_cross_entropy_parity(ctx);
+    rc |= test_metal_backward_parity(ctx);
+    rc |= test_metal_adamw(ctx);
     rc |= test_metal_fallback(ctx);
 
     gd_context_destroy(ctx);

@@ -389,3 +389,109 @@ gd_status _gd_infer_cast(gd_tensor *x, gd_dtype dtype, gd_tensor_desc *out)
     dx = _gd_tensor_desc_ptr(x);
     return gd_tensor_desc_contiguous(dtype, dx->device, dx->ndim, dx->sizes, out);
 }
+
+gd_status _gd_infer_transpose(gd_tensor *x, const int *perm, int ndim, gd_tensor_desc *out)
+{
+    const gd_tensor_desc *dx = NULL;
+    int64_t sizes[GD_MAX_DIMS];
+    bool seen[GD_MAX_DIMS] = {0};
+    int i = 0;
+
+    if (x == NULL || perm == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "transpose argument is NULL");
+    }
+    dx = _gd_tensor_desc_ptr(x);
+    if (ndim != dx->ndim) {
+        return _gd_error(GD_ERR_SHAPE, "transpose perm rank must match tensor rank");
+    }
+    for (i = 0; i < ndim; ++i) {
+        int axis = perm[i];
+        if (axis < 0 || axis >= ndim || seen[axis]) {
+            return _gd_error(GD_ERR_SHAPE, "transpose perm must be a permutation");
+        }
+        seen[axis] = true;
+        sizes[i] = dx->sizes[axis];
+    }
+    return gd_tensor_desc_contiguous(dx->dtype, dx->device, ndim, sizes, out);
+}
+
+gd_status _gd_infer_embedding(gd_tensor *table, gd_tensor *ids, gd_tensor_desc *out)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *dt = NULL;
+    const gd_tensor_desc *di = NULL;
+    int64_t sizes[GD_MAX_DIMS];
+    int i = 0;
+
+    if (table == NULL || ids == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "embedding argument is NULL");
+    }
+    if (!_gd_dtype_is_float(gd_tensor_dtype(table))) {
+        return _gd_error(GD_ERR_DTYPE, "embedding table must be floating-point");
+    }
+    if (!_gd_dtype_is_integer(gd_tensor_dtype(ids))) {
+        return _gd_error(GD_ERR_DTYPE, "embedding ids must be I32 or I64");
+    }
+    status = require_same_device(table, ids);
+    if (status != GD_OK) {
+        return status;
+    }
+    dt = _gd_tensor_desc_ptr(table);
+    di = _gd_tensor_desc_ptr(ids);
+    if (dt->ndim != 2) {
+        return _gd_error(GD_ERR_SHAPE, "embedding table must be 2D [vocab, dim]");
+    }
+    if (di->ndim < 1 || di->ndim + 1 > GD_MAX_DIMS) {
+        return _gd_error(GD_ERR_SHAPE, "embedding ids rank is out of range");
+    }
+    for (i = 0; i < di->ndim; ++i) {
+        sizes[i] = di->sizes[i];
+    }
+    sizes[di->ndim] = dt->sizes[1];
+    return gd_tensor_desc_contiguous(dt->dtype, dt->device, di->ndim + 1, sizes, out);
+}
+
+gd_status _gd_infer_rope(gd_tensor *x, gd_tensor *pos_ids, gd_tensor_desc *out)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *dx = NULL;
+    const gd_tensor_desc *dp = NULL;
+    int64_t heads = 0;
+    int64_t head_dim = 0;
+    int64_t pos_rows = 1;
+    int64_t pos_numel = 1;
+    int i = 0;
+
+    if (x == NULL || pos_ids == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "rope argument is NULL");
+    }
+    if (!_gd_dtype_is_float(gd_tensor_dtype(x))) {
+        return _gd_error(GD_ERR_DTYPE, "rope input must be floating-point");
+    }
+    if (!_gd_dtype_is_integer(gd_tensor_dtype(pos_ids))) {
+        return _gd_error(GD_ERR_DTYPE, "rope position ids must be I32 or I64");
+    }
+    status = require_same_device(x, pos_ids);
+    if (status != GD_OK) {
+        return status;
+    }
+    dx = _gd_tensor_desc_ptr(x);
+    dp = _gd_tensor_desc_ptr(pos_ids);
+    if (dx->ndim < 2) {
+        return _gd_error(GD_ERR_SHAPE, "rope input must be at least [.., heads, head_dim]");
+    }
+    heads = dx->sizes[dx->ndim - 2];
+    head_dim = dx->sizes[dx->ndim - 1];
+    for (i = 0; i < dx->ndim - 2; ++i) {
+        pos_rows *= dx->sizes[i];
+    }
+    for (i = 0; i < dp->ndim; ++i) {
+        pos_numel *= dp->sizes[i];
+    }
+    if (pos_numel != pos_rows) {
+        return _gd_error(GD_ERR_SHAPE, "rope position count must equal product of leading dims");
+    }
+    (void)heads;
+    (void)head_dim;
+    return gd_tensor_desc_contiguous(dx->dtype, dx->device, dx->ndim, dx->sizes, out);
+}

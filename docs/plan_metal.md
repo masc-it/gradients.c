@@ -53,8 +53,8 @@ kernels. Tracked separately. v1 is F32, one compute kernel per IR node.
 - [x] M0 — Backend skeleton: device/queue, registration, shared-buffer storage, transfers, synchronize, metallib load, pipeline cache, one kernel (`add`) end-to-end
 - [x] M1 — Elementwise + unary kernels (mul, scale, relu, silu, copy, cast)
 - [x] M2 — Matmul/linear + reductions (matmul, linear, sum, mean, softmax, rms_norm, cross_entropy)
-- [ ] M3 — Backward + optimizer (*_bwd, reduce_to, step_inc, adamw_step, assert_*)
-- [ ] M4 — Full MLP training parity CPU↔Metal (forward tensors + gradients)
+- [x] M3 — Backward + optimizer (*_bwd, reduce_to, step_inc, adamw_step, assert_*)
+- [x] M4 — Full MLP training parity CPU↔Metal (forward tensors + gradients)
 
 M0 is the keystone; M1–M3 are independent op batches once M0 lands. M4 depends on
 M1–M3. Each op is "done" only with a passing parity test.
@@ -304,48 +304,66 @@ surfaces `GD_ERR_UNSUPPORTED` at encode rather than via clean fallback.
 
 ## M3 — Backward and optimizer
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Ops
 `relu_bwd`, `silu_bwd`, `softmax_bwd`, `sum_bwd`, `mean_bwd`,
-`cross_entropy_bwd`, `reduce_to`, `step_inc`, `adamw_step`, and (optional, debug)
-`assert_finite` / `assert_close`.
+`cross_entropy_bwd`, `reduce_to`, `step_inc`, `adamw_step`. `copy` (M1) is now
+exercised here. `assert_*` intentionally left unsupported (debug ops → CPU
+fallback).
 
-### Changes
-- Mirror the CPU backward kernels. `adamw_step` and `step_inc` mutate parameter/
-  state buffers in place (in-place nodes, `n_outputs == 0`); encode them as
-  compute dispatches over the param buffers.
-- `assert_*`: either implement as a kernel writing a flag buffer that `execute`
-  checks post-sync, or leave unsupported (forces CPU fallback for debug graphs).
-  Decision recorded at implementation; not required for M4.
+### Changes (landed)
+- Mirror the CPU backward kernels. `reduce_to` is a naive single-thread
+  scatter-add (zeroes the target, then accumulates in CPU order). `step_inc`
+  and `adamw_step` are in-place nodes (`n_outputs == 0`) dispatched over the
+  param buffers; `adamw` reads the step scalar from its buffer.
+- **External write-back (key correctness piece).** CPU_REF borrows leaf storage
+  so in-place updates are automatically visible; Metal stages leaves into
+  separate buffers, so after execution it copies every external value's Metal
+  buffer back to the owning CPU tensor storage (`writeback_externals`). This
+  makes optimizer param/state updates and gradient slots (written via
+  `emit_to`) visible to ordinary CPU-tensor reads.
+- **`execute` is now synchronous** (commit + `waitUntilCompleted` + write-back
+  before returning). Required because grad/param tensors are materialized CPU
+  tensors read via `copy_to_cpu`, a path that never routes through the Metal
+  backend and so would never trigger `synchronize`. v1 accepts this; a future
+  async path would defer write-back to `gd_synchronize`.
 
-### Acceptance
-- Parity tests per backward op. `adamw_step` parity: run N steps on CPU and
-  Metal from identical init, compare params each step (note: `gd_graph_compare`
-  v1 runs a graph twice, so test optimizer parity by two separate single-backend
-  runs and compare materialized params, not via the double-run harness).
+### Acceptance (met)
+- `tests/test_metal.c`: CPU↔Metal gradient parity (separate per-device runs with
+  fresh inputs, compared at 1e-4) for `mlp` (matmul/relu/sum/mean backward),
+  `softmax` (softmax_bwd + mul-broadcast reduce_to), `silu` (silu_bwd), and
+  `cross_entropy` (cross_entropy_bwd). AdamW: 3 in-place steps on Metal match the
+  double-precision reference at 1e-4 (exercises step_inc + adamw + write-back +
+  multi-run re-staging). ASan-clean.
 
 ---
 
 ## M4 — Full MLP training parity
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Intent
-The headline proof: the MLP from [`plan_mlp.md`] trains on Metal and agrees with
-CPU_REF on forward activations and gradients.
+The headline proof: the XOR MLP (`linear→relu→linear→cross_entropy`) trains on
+Metal and agrees with CPU_REF on forward activations, gradients, and parameters.
 
-### Changes
-- A test/example building the MLP forward+backward+step graph, compiled and run
-  on METAL, with forward-tensor and gradient comparison against CPU_REF.
-- Use `gd_graph_compare` for the forward subgraph; for gradients/optimizer use
-  separate single-backend runs comparing materialized leaf grads/params (avoids
-  the double-execution side-effect limitation of the v1 harness).
+### Changes (landed)
+- `tests/test_metal_mlp.c`: forward parity via `gd_graph_compare` (side-effect-
+  free forward graph), gradient parity via separate per-device backward runs
+  with identical deterministic init, and multi-step (8) AdamW training parity
+  comparing final params + loss.
+- `examples/mlp/mlp.c`: device selectable via `GD_DEVICE=metal` (graceful CPU
+  fallback when unavailable); the train + eval graphs compile to the chosen
+  target. Demonstrates the full path in a real program, not just tests.
 
-### Acceptance
-- Forward activations match within 1e-4 node-by-node.
-- Leaf gradients match within 1e-4.
-- A few AdamW steps keep parameters in agreement within tolerance.
+### Acceptance (met)
+- Forward activations match within 1e-4 (harness reports no mismatch).
+- Leaf gradients (w1/b1/w2/b2) match within 1e-4.
+- 8 AdamW steps keep params + loss in agreement within 1e-3 (looser to absorb
+  float-GPU vs double-CPU accumulation drift).
+- End-to-end: the example reaches 4/4 XOR accuracy on Metal with a loss
+  trajectory matching CPU (0.000016 at step 3000); logits agree to ~4 decimals
+  after 3000 steps. ASan-clean.
 
 ---
 

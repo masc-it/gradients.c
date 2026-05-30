@@ -359,6 +359,93 @@ static gd_status backward_node(bwd_ctx *b, const _gd_node *node_ref)
         gd_tensor_release(din);
         return status;
     }
+    case _GD_OP_GELU: {
+        gd_tensor *x = NULL;
+        gd_tensor *dx = NULL;
+        gd_tensor *inputs[2];
+        _gd_op_attrs attrs = {0};
+
+        status = fwd_tensor(b, node->inputs[0], &x);
+        if (status != GD_OK) {
+            return status;
+        }
+        attrs.gelu_tanh = node->attrs.gelu_tanh;
+        inputs[0] = x;
+        inputs[1] = go;
+        status = emit_custom(b, _GD_OP_GELU_BWD, inputs, 2, &attrs,
+                             _gd_tensor_desc_ptr(x), &dx);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], dx);
+        gd_tensor_release(dx);
+        return status;
+    }
+    case _GD_OP_TRANSPOSE: {
+        /* dx = transpose(go, inverse_perm). */
+        const gd_tensor_desc *in_desc = &b->graph->values[node->inputs[0]].desc;
+        gd_tensor *dx = NULL;
+        _gd_op_attrs attrs = {0};
+        int i = 0;
+
+        attrs.perm_ndim = node->attrs.perm_ndim;
+        for (i = 0; i < node->attrs.perm_ndim; ++i) {
+            attrs.perm[node->attrs.perm[i]] = i;
+        }
+        status = emit_custom(b, _GD_OP_TRANSPOSE, &go, 1, &attrs, in_desc, &dx);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], dx);
+        gd_tensor_release(dx);
+        return status;
+    }
+    case _GD_OP_EMBEDDING: {
+        /* Only the table has a gradient (scatter-add of go by id). */
+        const gd_tensor_desc *table_desc = &b->graph->values[node->inputs[0]].desc;
+        gd_tensor *ids = NULL;
+        gd_tensor *dtable = NULL;
+        gd_tensor *inputs[2];
+
+        status = fwd_tensor(b, node->inputs[1], &ids);
+        if (status != GD_OK) {
+            return status;
+        }
+        inputs[0] = go;
+        inputs[1] = ids;
+        status = emit_custom(b, _GD_OP_EMBEDDING_BWD, inputs, 2, NULL, table_desc, &dtable);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], dtable);
+        gd_tensor_release(dtable);
+        return status;
+    }
+    case _GD_OP_ROPE: {
+        /* dx = R(-theta) go (transpose rotation): same kernel, conjugated sin. */
+        const gd_tensor_desc *in_desc = &b->graph->values[node->inputs[0]].desc;
+        gd_tensor *pos = NULL;
+        gd_tensor *dx = NULL;
+        gd_tensor *inputs[2];
+        _gd_op_attrs attrs = {0};
+
+        status = fwd_tensor(b, node->inputs[1], &pos);
+        if (status != GD_OK) {
+            return status;
+        }
+        attrs.rope_theta = node->attrs.rope_theta;
+        attrs.rope_n_dims = node->attrs.rope_n_dims;
+        attrs.rope_interleaved = node->attrs.rope_interleaved;
+        inputs[0] = go;
+        inputs[1] = pos;
+        status = emit_custom(b, _GD_OP_ROPE_BWD, inputs, 2, &attrs, in_desc, &dx);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], dx);
+        gd_tensor_release(dx);
+        return status;
+    }
     case _GD_OP_CAST:
         return _gd_error(GD_ERR_UNSUPPORTED, "cast backward is not supported in v1");
     default:

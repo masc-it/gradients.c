@@ -57,6 +57,14 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "cross_entropy";
     case _GD_OP_CAST:
         return "cast";
+    case _GD_OP_GELU:
+        return "gelu";
+    case _GD_OP_TRANSPOSE:
+        return "transpose";
+    case _GD_OP_EMBEDDING:
+        return "embedding";
+    case _GD_OP_ROPE:
+        return "rope";
     case _GD_OP_BACKWARD:
         return "backward";
     case _GD_OP_ZERO_GRAD:
@@ -81,6 +89,12 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "mean_bwd";
     case _GD_OP_CROSS_ENTROPY_BWD:
         return "cross_entropy_bwd";
+    case _GD_OP_GELU_BWD:
+        return "gelu_bwd";
+    case _GD_OP_EMBEDDING_BWD:
+        return "embedding_bwd";
+    case _GD_OP_ROPE_BWD:
+        return "rope_bwd";
     case _GD_OP_STEP_INC:
         return "step_inc";
     case _GD_OP_ADAMW_STEP:

@@ -381,3 +381,128 @@ gd_status gd_cast(gd_context *ctx, gd_tensor *x, gd_dtype dtype, gd_tensor **out
     attrs.cast_dtype = dtype;
     return _gd_graph_emit(graph, _GD_OP_CAST, &x, 1, &attrs, &desc, out);
 }
+
+gd_status gd_gelu(gd_context *ctx, gd_tensor *x, bool tanh_approx, gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor_desc desc;
+    _gd_op_attrs attrs = {0};
+
+    if (x == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gelu argument is NULL");
+    }
+    *out = NULL;
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_unary_float(x, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    attrs.gelu_tanh = tanh_approx;
+    return _gd_graph_emit(graph, _GD_OP_GELU, &x, 1, &attrs, &desc, out);
+}
+
+gd_status gd_transpose(gd_context *ctx,
+                       gd_tensor *x,
+                       const int *perm,
+                       int ndim,
+                       gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor_desc desc;
+    _gd_op_attrs attrs = {0};
+    int i = 0;
+
+    if (x == NULL || perm == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_transpose argument is NULL");
+    }
+    *out = NULL;
+    if (ndim < 0 || ndim > GD_MAX_DIMS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_transpose ndim is out of range");
+    }
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_transpose(x, perm, ndim, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    attrs.perm_ndim = ndim;
+    for (i = 0; i < ndim; ++i) {
+        attrs.perm[i] = perm[i];
+    }
+    return _gd_graph_emit(graph, _GD_OP_TRANSPOSE, &x, 1, &attrs, &desc, out);
+}
+
+gd_status gd_embedding(gd_context *ctx,
+                       gd_tensor *table,
+                       gd_tensor *ids,
+                       gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *inputs[2];
+    gd_tensor_desc desc;
+
+    if (table == NULL || ids == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_embedding argument is NULL");
+    }
+    *out = NULL;
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_embedding(table, ids, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    inputs[0] = table;
+    inputs[1] = ids;
+    return _gd_graph_emit(graph, _GD_OP_EMBEDDING, inputs, 2, NULL, &desc, out);
+}
+
+gd_status gd_rope(gd_context *ctx,
+                  gd_tensor *x,
+                  gd_tensor *pos_ids,
+                  const gd_rope_config *config,
+                  gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *inputs[2];
+    gd_tensor_desc desc;
+    _gd_op_attrs attrs = {0};
+    const gd_tensor_desc *dx = NULL;
+    int64_t head_dim = 0;
+    int n_dims = 0;
+
+    if (x == NULL || pos_ids == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_rope argument is NULL");
+    }
+    *out = NULL;
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_rope(x, pos_ids, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    dx = _gd_tensor_desc_ptr(x);
+    head_dim = dx->sizes[dx->ndim - 1];
+    n_dims = (config != NULL && config->n_dims > 0) ? config->n_dims : (int)head_dim;
+    if (n_dims % 2 != 0 || n_dims > (int)head_dim) {
+        return _gd_error(GD_ERR_SHAPE, "rope n_dims must be even and <= head_dim");
+    }
+    attrs.rope_theta = (config != NULL && config->theta > 0.0F) ? config->theta : 10000.0F;
+    attrs.rope_n_dims = n_dims;
+    attrs.rope_interleaved = (config != NULL && config->interleaved) ? 1 : 0;
+    inputs[0] = x;
+    inputs[1] = pos_ids;
+    return _gd_graph_emit(graph, _GD_OP_ROPE, inputs, 2, &attrs, &desc, out);
+}

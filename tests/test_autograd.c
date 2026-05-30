@@ -232,6 +232,113 @@ static gd_status build_silu_sum(gd_context *ctx, void *user, gd_tensor **loss_ou
     return status;
 }
 
+static gd_status build_gelu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user;
+    gd_tensor *y = NULL;
+    gd_status status = gd_gelu(ctx, t->a, false, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 0, false, loss_out);
+    gd_tensor_release(y);
+    return status;
+}
+
+static gd_status build_gelu_tanh_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user;
+    gd_tensor *y = NULL;
+    gd_status status = gd_gelu(ctx, t->a, true, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 0, false, loss_out);
+    gd_tensor_release(y);
+    return status;
+}
+
+static gd_status build_transpose_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user; /* a:[2,3] -> transpose [3,2] -> gelu -> sum -> scalar */
+    gd_tensor *tr = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *r = NULL;
+    int perm[2] = {1, 0};
+    gd_status status = gd_transpose(ctx, t->a, perm, 2, &tr);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_gelu(ctx, tr, false, &y); /* nonlinearity: grad not constant */
+    gd_tensor_release(tr);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 1, false, &r); /* [3,2]->[3] */
+    gd_tensor_release(y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, r, 0, false, loss_out);
+    gd_tensor_release(r);
+    return status;
+}
+
+typedef struct emb_in {
+    gd_tensor *table;
+    gd_tensor *ids;
+} emb_in;
+
+typedef struct rope_in {
+    gd_tensor *x;
+    gd_tensor *pos;
+} rope_in;
+
+static gd_status build_rope_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    rope_in *r = user; /* x:[1,2,2,4] (grad) -> rope -> gelu -> reshape[16] -> mean */
+    gd_tensor *y = NULL;
+    gd_tensor *gel = NULL;
+    gd_tensor *fl = NULL;
+    int64_t flat[1] = {16};
+    gd_status status = gd_rope(ctx, r->x, r->pos, NULL, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_gelu(ctx, y, false, &gel);
+    gd_tensor_release(y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_reshape(gel, 1, flat, &fl);
+    gd_tensor_release(gel);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_mean(ctx, fl, 0, false, loss_out);
+    gd_tensor_release(fl);
+    return status;
+}
+
+static gd_status build_embedding_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    emb_in *e = user; /* table:[V,d] (grad), ids -> emb[N,d] -> sum -> scalar */
+    gd_tensor *emb = NULL;
+    gd_tensor *r = NULL;
+    gd_status status = gd_embedding(ctx, e->table, e->ids, &emb);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, emb, 1, false, &r); /* [N,d]->[N] */
+    gd_tensor_release(emb);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, r, 0, false, loss_out);
+    gd_tensor_release(r);
+    return status;
+}
+
 static gd_status build_matmul_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     two_in *t = user;
@@ -417,9 +524,71 @@ int main(void)
         CHECK_TRUE(gradcheck(ctx, build_square_mean, &t, in, 1, "square_mean") == 0);
         CHECK_TRUE(gradcheck(ctx, build_scale_relu_sum, &t, in, 1, "scale_relu") == 0);
         CHECK_TRUE(gradcheck(ctx, build_silu_sum, &t, in, 1, "silu") == 0);
+        CHECK_TRUE(gradcheck(ctx, build_gelu_sum, &t, in, 1, "gelu") == 0);
+        CHECK_TRUE(gradcheck(ctx, build_gelu_tanh_sum, &t, in, 1, "gelu_tanh") == 0);
         CHECK_TRUE(gradcheck(ctx, build_reshape_sum, &t, in, 1, "reshape") == 0);
         gd_tensor_release(t.a);
         gd_tensor_release(t.b);
+    }
+
+    {
+        /* transpose: a[2,3] -> [3,2] */
+        two_in t = {0};
+        gd_tensor *in[1];
+        int64_t s23[2] = {2, 3};
+        float adata[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
+        CHECK_OK(make_grad_input(ctx, 2, s23, adata, &t.a));
+        in[0] = t.a;
+        CHECK_TRUE(gradcheck(ctx, build_transpose_sum, &t, in, 1, "transpose") == 0);
+        gd_tensor_release(t.a);
+    }
+
+    {
+        /* embedding: table[5,4] (grad) gathered by ids[6] with repeats. */
+        emb_in e = {0};
+        gd_tensor *in[1];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc idesc;
+        int64_t vs[2] = {5, 4};
+        int64_t is[1] = {6};
+        float tdata[20];
+        int32_t ids[6] = {0, 2, 2, 4, 1, 2};
+        int k = 0;
+        for (k = 0; k < 20; ++k) {
+            tdata[k] = 0.1F * (float)(k - 10);
+        }
+        CHECK_OK(make_grad_input(ctx, 2, vs, tdata, &e.table));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, is, &idesc));
+        CHECK_OK(gd_tensor_empty(ctx, &idesc, &e.ids));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, e.ids, ids, sizeof(ids)));
+        in[0] = e.table;
+        CHECK_TRUE(gradcheck(ctx, build_embedding_sum, &e, in, 1, "embedding") == 0);
+        gd_tensor_release(e.table);
+        gd_tensor_release(e.ids);
+    }
+
+    {
+        /* rope: x[1,2,2,4] (grad) with positions {0,1}. */
+        rope_in r = {0};
+        gd_tensor *in[1];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc pdesc;
+        int64_t xs[4] = {1, 2, 2, 4};
+        int64_t ps[2] = {1, 2};
+        float xd[16];
+        int32_t pid[2] = {0, 1};
+        int k = 0;
+        for (k = 0; k < 16; ++k) {
+            xd[k] = 0.2F * (float)(k - 8);
+        }
+        CHECK_OK(make_grad_input(ctx, 4, xs, xd, &r.x));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 2, ps, &pdesc));
+        CHECK_OK(gd_tensor_empty(ctx, &pdesc, &r.pos));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, r.pos, pid, sizeof(pid)));
+        in[0] = r.x;
+        CHECK_TRUE(gradcheck(ctx, build_rope_sum, &r, in, 1, "rope") == 0);
+        gd_tensor_release(r.x);
+        gd_tensor_release(r.pos);
     }
 
     {

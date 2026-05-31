@@ -99,6 +99,26 @@ kernel void gd_silu(device const float *x            [[buffer(0)]],
     out[gid] = v / (1.0f + exp(-v));
 }
 
+/* Fused SwiGLU activation: hh = silu(gate) * up. Produces `act = silu(gate)` as
+ * a second output so the unfused backward (mul_bwd reads act, silu_bwd reads
+ * gate) is unchanged. Bit-identical to gd_silu followed by gd_mul on equal
+ * shapes. See docs/metal_gpu_fuse.md F1. */
+kernel void gd_silu_mul(device const float *gate         [[buffer(0)]],
+                        device const float *up           [[buffer(1)]],
+                        device float *hh                 [[buffer(2)]],
+                        device float *act                [[buffer(3)]],
+                        constant gd_metal_unary_params &p [[buffer(4)]],
+                        uint gid                          [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.numel) {
+        return;
+    }
+    float v = gate[gid];
+    float a = v / (1.0f + exp(-v));
+    act[gid] = a;
+    hh[gid] = a * up[gid];
+}
+
 /* Identity/reshape copy of contiguous 4-byte elements (F32/I32); bit-exact. */
 kernel void gd_copy(device const uint *x             [[buffer(0)]],
                     device uint *out                 [[buffer(1)]],

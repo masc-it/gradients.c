@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* White-box hook from the Metal backend: count of fusions applied at compile.
+ * Lets this test assert a fusion actually engaged (parity alone can't, since a
+ * silent fallback to the unfused path would still pass). */
+extern unsigned long _gd_metal_fusions_applied(void);
+
 #define CHECK_OK(expr)                                                            \
     do {                                                                          \
         gd_status status_ = (expr);                                               \
@@ -476,6 +481,54 @@ static int build_sdpa_causal(gd_context *ctx, gd_tensor **inputs, int *n, gd_ten
     return build_sdpa_impl(ctx, inputs, n, loss_out, true);
 }
 
+/* F1: fused SwiGLU silu+mul. Checks CPU<->Metal parity of the whole fwd+bwd
+ * graph AND that the fusion engaged (so a silent fallback can't hide a missed
+ * fusion or a broken fused kernel). */
+static int test_swiglu_fusion(gd_context *ctx)
+{
+    enum { SG_N = 4 * 8 };
+    float gate_d[SG_N];
+    float up_d[SG_N];
+    int64_t s2[2] = {4, 8};
+    int64_t flat[1] = {SG_N};
+    gd_compare_options opts = {1e-4, 1e-4, false};
+    gd_tensor *gate = NULL, *up = NULL, *act = NULL, *hh = NULL, *fl = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    unsigned long n0 = 0, n1 = 0;
+    int i = 0;
+
+    for (i = 0; i < SG_N; ++i) {
+        gate_d[i] = 0.1F * (float)((i % 11) - 5);
+        up_d[i] = 0.2F * (float)((i % 7) - 3);
+    }
+    CHECK_OK(make_f32(ctx, 2, s2, gate_d, &gate));
+    CHECK_OK(make_f32(ctx, 2, s2, up_d, &up));
+    CHECK_OK(gd_tensor_set_requires_grad(gate, true));
+    CHECK_OK(gd_tensor_set_requires_grad(up, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_silu(ctx, gate, &act));
+    CHECK_OK(gd_mul(ctx, act, up, &hh));
+    CHECK_OK(gd_tensor_reshape(hh, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(act);
+    gd_tensor_release(hh);
+    gd_tensor_release(fl);
+    gd_tensor_release(loss);
+
+    n0 = _gd_metal_fusions_applied();
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+    n1 = _gd_metal_fusions_applied();
+    CHECK_TRUE(n1 > n0); /* the silu+mul fusion must have engaged */
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(gate);
+    gd_tensor_release(up);
+    return 0;
+}
+
 /* Multi-block SDPA parity (forward + backward via gd_graph_compare). The tiny-T
  * builders above fit in a single tile (BQ=64, BK=16) and run through the 64-float
  * gradient harness, so they never exercise the B1 causal block-skip. T=130 spans
@@ -562,6 +615,7 @@ int main(void)
     rc |= test_sdpa_multiblock(ctx, 130, 48); /* causal + sliding window */
     rc |= test_sdpa_multiblock(ctx, 600, 0);  /* causal, split-K (3 splits) */
     rc |= test_sdpa_multiblock(ctx, 600, 48); /* causal + window, split-K */
+    rc |= test_swiglu_fusion(ctx);            /* F1 fused silu+mul + fired check */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");
     rc |= backward_parity(ctx, build_gelu_tanh, "gelu_tanh");
     rc |= backward_parity(ctx, build_transpose, "transpose");

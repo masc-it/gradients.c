@@ -14,6 +14,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <limits.h>
 #include <string.h>
 
 #include "../backend.h"
@@ -100,6 +101,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dq_reduce",
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_reduce",
+    "gd_silu_mul", /* F1: fused SwiGLU activation */
 };
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
@@ -202,7 +204,18 @@ struct _gd_executable {
      * group head, so execute skips it. Set by metal_plan_fusions at compile;
      * all-zero means no fusion (the identity plan). */
     uint8_t *node_absorbed;
+    /* For a fused head node, the node id of the producer it absorbs (or -1).
+     * encode routes such heads to their fused kernel; the fused pipeline lives
+     * in node_pso2[head]. */
+    int *node_fused_src;
 };
+
+/* White-box counter so tests can assert a fusion actually engaged (a silent
+ * fallback to the unfused path would otherwise pass parity unnoticed). Declared
+ * here (no public header); tests reference it with a local extern. */
+static unsigned long g_metal_fusions_applied = 0UL;
+unsigned long _gd_metal_fusions_applied(void);
+unsigned long _gd_metal_fusions_applied(void) { return g_metal_fusions_applied; }
 
 /* ---- Helpers ------------------------------------------------------------- */
 
@@ -454,6 +467,7 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe->node_pso2);
     free(exe->node_pso3);
     free(exe->node_absorbed);
+    free(exe->node_fused_src);
     if (exe->node_scratch != NULL) {
         for (i = 0; i < exe->n_plan; ++i) {
             gd_storage_release(exe->node_scratch[i]);
@@ -588,12 +602,95 @@ static gd_status alias_copy_values(_gd_executable *exe)
  * Phase F0 ships this hook with NO patterns: node_absorbed stays all-zero, so
  * the executable runs every node exactly as the unfused plan (identity pass).
  * Patterns are added incrementally; see docs/metal_gpu_fuse.md. */
+/* Returns the lowest node index that consumes `value_id`, or INT_MAX if none.
+ * Used as the legality gate when a fused head relocates an intermediate's
+ * production to its own (later) position: every consumer must run at or after
+ * the head, else it would read the value before the fused kernel writes it. */
+static int value_min_consumer(const gd_graph *graph, int value_id)
+{
+    int best = INT_MAX;
+    int i = 0;
+    for (i = 0; i < graph->n_nodes; ++i) {
+        const _gd_node *node = &graph->nodes[i];
+        int j = 0;
+        for (j = 0; j < node->n_inputs; ++j) {
+            if (node->inputs[j] == value_id) {
+                if (i < best) {
+                    best = i;
+                }
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+/* F1 pattern: silu(gate) -> mul(., up). The mul (head) absorbs the silu and is
+ * encoded by gd_silu_mul, which writes both hh = silu(gate)*up and act =
+ * silu(gate). act stays materialized (the unfused backward reads it), so the
+ * win is one fewer dispatch plus the mul no longer reloading act from DRAM.
+ * Legality: head is MUL; its first input is produced by a single-output SILU;
+ * silu's act is not consumed by any node before the head (so relocating its
+ * production to the head is safe); inputs share the head's shape (no
+ * broadcast). */
+static bool try_fuse_silu_mul(GDMetalState *st, const gd_graph *graph,
+                              _gd_executable *exe, int head_idx)
+{
+    const _gd_node *head = &graph->nodes[head_idx];
+    int act_id = 0;
+    int silu_idx = 0;
+    const _gd_node *silu = NULL;
+    const gd_tensor_desc *out_d = NULL;
+    const gd_tensor_desc *up_d = NULL;
+
+    if (head->op != _GD_OP_MUL || head->n_inputs != 2 || head->n_outputs != 1) {
+        return false;
+    }
+    act_id = head->inputs[0];
+    if (act_id < 0 || act_id >= exe->n_values) {
+        return false;
+    }
+    silu_idx = exe->graph->values[act_id].producer_node_id;
+    if (silu_idx < 0 || silu_idx >= graph->n_nodes) {
+        return false;
+    }
+    silu = &graph->nodes[silu_idx];
+    if (silu->op != _GD_OP_SILU || silu->n_inputs != 1 || silu->n_outputs != 1 ||
+        silu->outputs[0] != act_id) {
+        return false;
+    }
+    /* No node may read `act` before the head (production is relocated to head). */
+    if (value_min_consumer(graph, act_id) < head_idx) {
+        return false;
+    }
+    /* Equal shapes: the fused kernel is contiguous numel, no broadcast. */
+    out_d = &exe->graph->values[head->outputs[0]].desc;
+    up_d = &exe->graph->values[head->inputs[1]].desc;
+    if (desc_numel(out_d) != desc_numel(up_d) ||
+        desc_numel(out_d) != desc_numel(&exe->graph->values[silu->inputs[0]].desc)) {
+        return false;
+    }
+    exe->node_pso2[head_idx] = (__bridge void *)pipeline_named(st, "gd_silu_mul");
+    if (exe->node_pso2[head_idx] == NULL) {
+        return false; /* kernel missing: fall back to unfused */
+    }
+    exe->node_fused_src[head_idx] = silu_idx;
+    exe->node_absorbed[silu_idx] = 1;
+    g_metal_fusions_applied++;
+    return true;
+}
+
 static void metal_plan_fusions(_gd_backend *self, const gd_graph *graph,
                                _gd_executable *exe)
 {
-    (void)self;
-    (void)graph;
-    (void)exe;
+    GDMetalState *st = state_of(self);
+    int i = 0;
+    for (i = 0; i < graph->n_nodes; ++i) {
+        if (exe->node_absorbed[i]) {
+            continue;
+        }
+        (void)try_fuse_silu_mul(st, graph, exe, i);
+    }
 }
 
 static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable **out)
@@ -675,11 +772,14 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
         exe->node_pso3 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso3));
         exe->node_scratch = calloc((size_t)graph->n_nodes, sizeof(*exe->node_scratch));
         exe->node_absorbed = calloc((size_t)graph->n_nodes, sizeof(*exe->node_absorbed));
+        exe->node_fused_src = calloc((size_t)graph->n_nodes, sizeof(*exe->node_fused_src));
         if (exe->node_pso == NULL || exe->node_pso2 == NULL || exe->node_pso3 == NULL ||
-            exe->node_scratch == NULL || exe->node_absorbed == NULL) {
+            exe->node_scratch == NULL || exe->node_absorbed == NULL ||
+            exe->node_fused_src == NULL) {
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
             goto fail;
         }
+        memset(exe->node_fused_src, 0xFF, (size_t)graph->n_nodes * sizeof(*exe->node_fused_src)); /* -1 */
         for (j = 0; j < graph->n_nodes; ++j) {
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
@@ -929,6 +1029,32 @@ static void encode_unary(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
     [enc setBytes:&params length:sizeof(params) atIndex:2];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+}
+
+/* F1 fused SwiGLU: encode gd_silu_mul for a MUL head that absorbed a SILU.
+ * gate = silu input, up = head input 1, hh = head output, act = silu output
+ * (kept materialized for the unfused backward). */
+static void encode_fused_silu_mul(id<MTLComputeCommandEncoder> enc,
+                                  id<MTLComputePipelineState> pso,
+                                  _gd_executable *exe,
+                                  const _gd_node *head,
+                                  const _gd_node *silu)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[head->outputs[0]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_unary_params params;
+
+    params.numel = (int)numel;
+    params.scale = 0.0F;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, silu->inputs[0]) offset:0 atIndex:0];  /* gate */
+    [enc setBuffer:value_buffer(exe, head->inputs[1]) offset:0 atIndex:1];  /* up */
+    [enc setBuffer:value_buffer(exe, head->outputs[0]) offset:0 atIndex:2]; /* hh */
+    [enc setBuffer:value_buffer(exe, silu->outputs[0]) offset:0 atIndex:3]; /* act */
+    [enc setBytes:&params length:sizeof(params) atIndex:4];
     if (numel > 0) {
         dispatch_1d(enc, pso, (NSUInteger)numel);
     }
@@ -1963,7 +2089,12 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             @autoreleasepool {
                 id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                status = encode_node(self, enc, exe, node, pso, pso2, pso3, scratch);
+                if (exe->node_fused_src[i] >= 0) {
+                    encode_fused_silu_mul(enc, pso2, exe, node,
+                                          &exe->graph->nodes[exe->node_fused_src[i]]);
+                } else {
+                    status = encode_node(self, enc, exe, node, pso, pso2, pso3, scratch);
+                }
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;
@@ -2003,7 +2134,12 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
                 id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
                     ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
-                status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2, pso3, scratch);
+                if (exe->node_fused_src[i] >= 0) {
+                    encode_fused_silu_mul(enc, pso2, exe, &exe->graph->nodes[i],
+                                          &exe->graph->nodes[exe->node_fused_src[i]]);
+                } else {
+                    status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2, pso3, scratch);
+                }
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;

@@ -145,11 +145,18 @@ no-op on correctness and perf before any kernel exists.
   Deferred to the first pattern (F1): the consumers map, the legality predicate,
   `node_fused_kind` + the fused-encode dispatch branch, and the fusion-fired
   assertion (nothing to observe until a pattern exists).
-- [ ] F1 — **First kernel: SwiGLU `silu`+`mul`** (infra shakedown, small kernel).
-  `act=silu(gate)` is single-consumer (`mul`); fuse forward into one kernel
-  `hh = silu(gate)·up`. Backward needs `silu(gate)` and `up` → **recompute
-  `silu(gate)`** in the (modified) backward so `act` is never materialized.
-  Proves the whole pipeline end-to-end with low kernel risk.
+- [x] F1 — **SwiGLU `silu`+`mul`** (infra shakedown). Landed: `gd_silu_mul`
+  kernel (writes `hh = silu(gate)·up` **and** `act = silu(gate)`), the consumers
+  analysis (`value_min_consumer`), the `try_fuse_silu_mul` legality predicate,
+  `node_fused_src` + the fused-encode dispatch in both execute paths, and a
+  white-box `_gd_metal_fusions_applied()` counter + a parity/fired test
+  (`test_swiglu_fusion`). **Kept `act` materialized** (so the unfused backward is
+  unchanged) rather than recompute — simplest correct first kernel.
+  Validated: 6 fusions in the 6-layer GPT, CPU↔Metal parity 1e-4, GPT train
+  parity, ASan-clean. **Perf: neutral / within noise** — `silu` fwd ~3 ms -> ~0
+  (absorbed into `mul`), 6 fewer dispatches, step 408 ms unchanged (~0.4%). The
+  value is the proven pipeline; the perf payoff is F2. Dropping `act` (recompute
+  in a fused backward) is deferred — it needs a fused backward and buys little.
 - [ ] F2 — **Headline kernel: `linear`→`cross_entropy`** (LM head). Logits are
   forward-only (no backward reads them) → drop the `[B,T,V]` materialization;
   forward streams the loss, backward recomputes `softmax` to form `dlogits`.

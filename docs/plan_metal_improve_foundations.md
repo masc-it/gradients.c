@@ -1055,8 +1055,10 @@ should be attention backward (`sdpa_bwd`), especially for the user workload wher
 `361.3 -> 328.4 ms`; T=512 user workload `sdpa_bwd 642.6 -> 610.5 ms`, step
 `1731 -> 1697 ms`. Then parallelized split-K `dq/dkv` reductions over channels:
 T=256 `sdpa_bwd 113.5 -> 111.9 ms`, step `328.4 -> 318.9 ms`; T=512 `sdpa_bwd
-610.5 -> 584.9 ms`, step `1697 -> 1620 ms` (tracked in
-`plan_block_sparse_sdpa_metal.md` §6.4–§6.5).
+610.5 -> 584.9 ms`, step `1697 -> 1620 ms`. Then fused the split stats+dq scan:
+T=256 `sdpa_bwd 111.9 -> 99.7 ms`, step `318.9 -> 309.2 ms`; T=512 `sdpa_bwd
+584.9 -> 519.8 ms`, step `1620 -> 1596 ms` (tracked in
+`plan_block_sparse_sdpa_metal.md` §6.4–§6.6).
 
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)

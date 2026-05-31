@@ -95,10 +95,8 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
     "gd_sdpa_splitk",  /* split-K forward (long context) */
     "gd_sdpa_combine", /* split-K combine pass */
-    "gd_sdpa_bwd_stats_split",
-    "gd_sdpa_bwd_stats_combine",
-    "gd_sdpa_bwd_dq_split",
-    "gd_sdpa_bwd_dq_reduce",
+    "gd_sdpa_bwd_stats_dq_split",
+    "gd_sdpa_bwd_stats_dq_combine",
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
@@ -111,7 +109,7 @@ static const char *const g_metal_extra_kernels[] = {
 typedef struct {
     int64_t stats_off;      /* final (m,l,D): B*Hq*Tq*3 */
     int64_t stats_part_off; /* per-split (m,l,raw): B*Hq*Tq*S*3 */
-    int64_t dq_part_off;    /* per-split dq: B*Hq*Tq*S*Dh */
+    int64_t dq_part_off;    /* per-split dq fused partials (acc,ks): B*Hq*Tq*S*2*Dh */
     int64_t dkv_part_off;   /* per-split dk,dv: B*Hkv*Tk*S*2*Dh */
     int64_t total;          /* total floats */
 } sdpa_bwd_layout;
@@ -126,7 +124,7 @@ static sdpa_bwd_layout sdpa_bwd_scratch_layout(int B, int Hq, int Hkv,
     o.stats_part_off = off;
     off += (int64_t)B * Hq * Tq * S * 3;
     o.dq_part_off = off;
-    off += (int64_t)B * Hq * Tq * S * Dh;
+    off += (int64_t)B * Hq * Tq * S * 2 * Dh;
     o.dkv_part_off = off;
     off += (int64_t)B * Hkv * Tk * S * 2 * Dh;
     o.total = off;
@@ -1804,10 +1802,8 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
             NSUInteger q_rows = (NSUInteger)(p.B * p.Hq * p.Tq);
             NSUInteger kv_rows = (NSUInteger)(p.B * p.Hkv * p.Tk);
             GDMetalState *st = state_of(self);
-            id<MTLComputePipelineState> ss_pso = pipeline_named(st, "gd_sdpa_bwd_stats_split");
-            id<MTLComputePipelineState> sc_pso = pipeline_named(st, "gd_sdpa_bwd_stats_combine");
-            id<MTLComputePipelineState> dqs_pso = pipeline_named(st, "gd_sdpa_bwd_dq_split");
-            id<MTLComputePipelineState> dqr_pso = pipeline_named(st, "gd_sdpa_bwd_dq_reduce");
+            id<MTLComputePipelineState> sdq_pso = pipeline_named(st, "gd_sdpa_bwd_stats_dq_split");
+            id<MTLComputePipelineState> sdqc_pso = pipeline_named(st, "gd_sdpa_bwd_stats_dq_combine");
             id<MTLComputePipelineState> dks_pso = pipeline_named(st, "gd_sdpa_bwd_dkv_split");
             id<MTLComputePipelineState> dkr_pso = pipeline_named(st, "gd_sdpa_bwd_dkv_reduce");
             id<MTLBuffer> go_b = value_buffer(exe, node->inputs[0]);
@@ -1817,51 +1813,33 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
             id<MTLBuffer> bias_b = value_buffer(exe, bias_input);
             MTLSize tg = MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1);
 
-            if (ss_pso == nil || sc_pso == nil || dqs_pso == nil || dqr_pso == nil ||
-                dks_pso == nil || dkr_pso == nil) {
+            if (sdq_pso == nil || sdqc_pso == nil || dks_pso == nil || dkr_pso == nil) {
                 return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd split-K pipeline missing");
             }
             p.n_splits = nsplit;
 
-            /* stats: per-split partial (m,l,raw) -> merge to (m,l,D). */
-            [enc setComputePipelineState:ss_pso];
+            /* Fused stats+dq: per-split (m,l,raw,acc,ksum) -> final stats+dq.
+             * This removes the old second key scan in the dq split pass. */
+            [enc setComputePipelineState:sdq_pso];
             [enc setBuffer:go_b offset:0 atIndex:0];
             [enc setBuffer:q_b offset:0 atIndex:1];
             [enc setBuffer:k_b offset:0 atIndex:2];
             [enc setBuffer:v_b offset:0 atIndex:3];
             [enc setBuffer:bias_b offset:0 atIndex:4];
             [enc setBuffer:stats_buf offset:spart_b atIndex:5];
-            [enc setBytes:&p length:sizeof(p) atIndex:6];
+            [enc setBuffer:stats_buf offset:dqpart_b atIndex:6];
+            [enc setBytes:&p length:sizeof(p) atIndex:7];
             if (qsplit_groups > 0) {
                 [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1) threadsPerThreadgroup:tg];
             }
-            [enc setComputePipelineState:sc_pso];
+            [enc setComputePipelineState:sdqc_pso];
             [enc setBuffer:stats_buf offset:spart_b atIndex:0];
-            [enc setBuffer:stats_buf offset:stat_b atIndex:1];
-            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            [enc setBuffer:stats_buf offset:dqpart_b atIndex:1];
+            [enc setBuffer:stats_buf offset:stat_b atIndex:2];
+            [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
+            [enc setBytes:&p length:sizeof(p) atIndex:4];
             if (q_rows > 0) {
-                dispatch_1d(enc, sc_pso, q_rows);
-            }
-
-            /* dq: per-split partial sums -> reduce. */
-            [enc setComputePipelineState:dqs_pso];
-            [enc setBuffer:go_b offset:0 atIndex:0];
-            [enc setBuffer:q_b offset:0 atIndex:1];
-            [enc setBuffer:k_b offset:0 atIndex:2];
-            [enc setBuffer:v_b offset:0 atIndex:3];
-            [enc setBuffer:bias_b offset:0 atIndex:4];
-            [enc setBuffer:stats_buf offset:dqpart_b atIndex:5];
-            [enc setBytes:&p length:sizeof(p) atIndex:6];
-            [enc setBuffer:stats_buf offset:stat_b atIndex:7];
-            if (qsplit_groups > 0) {
-                [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1) threadsPerThreadgroup:tg];
-            }
-            [enc setComputePipelineState:dqr_pso];
-            [enc setBuffer:stats_buf offset:dqpart_b atIndex:0];
-            [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
-            [enc setBytes:&p length:sizeof(p) atIndex:2];
-            if (q_rows > 0) {
-                dispatch_1d(enc, dqr_pso, q_rows * (NSUInteger)p.Dh);
+                dispatch_1d(enc, sdqc_pso, q_rows * (NSUInteger)p.Dh);
             }
 
             /* dk/dv: per-split partial sums -> reduce. */

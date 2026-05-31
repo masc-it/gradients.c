@@ -268,7 +268,8 @@ required gradient-slot writes. Attention retune then changed the active baseline
 `sdpa_bwd` `129.6 -> 113.5 ms` and user-workload T=512 `sdpa_bwd` `642.6 ->
 610.5 ms`. A follow-up parallelized split-K reductions over channels, further
 cutting T=512 `sdpa_bwd` `610.5 -> 584.9 ms` and user-workload step `1697 ->
-1620 ms`.
+1620 ms`. Then fusing the split stats+dq scan cut T=512 `sdpa_bwd` `584.9 ->
+519.8 ms` and user-workload step `1620 -> 1596 ms`.
 
 (Fill as F2+ land; use post-CE/tail-triage/split-retune clean-release baselines.)
 

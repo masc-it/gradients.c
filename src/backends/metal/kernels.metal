@@ -1695,21 +1695,33 @@ static inline int gd_sdpa_split_len(int T, int n)
     return (len < GD_SDPA_BK) ? GD_SDPA_BK : len;
 }
 
-kernel void gd_sdpa_bwd_stats_split(device const float *go          [[buffer(0)]],
-                                    device const float *q           [[buffer(1)]],
-                                    device const float *k           [[buffer(2)]],
-                                    device const float *v           [[buffer(3)]],
-                                    device const float *bias        [[buffer(4)]],
-                                    device float *part              [[buffer(5)]],
-                                    constant gd_metal_sdpa_params &p [[buffer(6)]],
-                                    uint tgid [[threadgroup_position_in_grid]],
-                                    uint tid  [[thread_index_in_threadgroup]])
+/* Fused stats+dq split pass. For each query row and key split, stream keys once
+ * and accumulate the scalar softmax stats plus two vector partials:
+ *   raw = sum e * dp
+ *   acc = sum e * dp * k
+ *   ksum = sum e * k
+ * where e is exp(score - m_split) under the split-local online max and
+ * dp = dot(dO_i, V_j). The combine pass merges split-local sums with the same
+ * max correction as FlashAttention and writes both final stats (for dkv) and dq:
+ *   D  = raw / l
+ *   dq = scale * (acc/l - D * ksum/l)
+ * This removes the old second full key scan in gd_sdpa_bwd_dq_split. */
+kernel void gd_sdpa_bwd_stats_dq_split(device const float *go          [[buffer(0)]],
+                                       device const float *q           [[buffer(1)]],
+                                       device const float *k           [[buffer(2)]],
+                                       device const float *v           [[buffer(3)]],
+                                       device const float *bias        [[buffer(4)]],
+                                       device float *stats_part        [[buffer(5)]],
+                                       device float *dq_part           [[buffer(6)]],
+                                       constant gd_metal_sdpa_params &p [[buffer(7)]],
+                                       uint tgid [[threadgroup_position_in_grid]],
+                                       uint tid  [[thread_index_in_threadgroup]])
 {
     threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
     threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
 
     int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
-    int s = (int)tgid % p.n_splits;
+    int sp = (int)tgid % p.n_splits;
     int t2 = (int)tgid / p.n_splits;
     int qb = t2 % n_qb;
     int r = t2 / n_qb;
@@ -1723,9 +1735,13 @@ kernel void gd_sdpa_bwd_stats_split(device const float *go          [[buffer(0)]
 
     float qreg[GD_SDPA_DHT];
     float goreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    float ksum[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
         qreg[c] = active ? q[qbase + c] : 0.0f;
         goreg[c] = active ? go[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+        ksum[c] = 0.0f;
     }
     float m = -INFINITY;
     float l = 0.0f;
@@ -1733,7 +1749,7 @@ kernel void gd_sdpa_bwd_stats_split(device const float *go          [[buffer(0)]
 
     int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
     int slen = gd_sdpa_split_len(p.Tk, p.n_splits);
-    int k_lo = s * slen;
+    int k_lo = sp * slen;
     int k_hi = k_lo + slen;
     if (k_hi > kb_end) {
         k_hi = kb_end;
@@ -1767,6 +1783,11 @@ kernel void gd_sdpa_bwd_stats_split(device const float *go          [[buffer(0)]
                     float e = exp(ss - mnew);
                     l = l * corr + e;
                     raw = raw * corr + e * dp;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        float kc = ksh[jj * p.Dh + c];
+                        acc[c] = acc[c] * corr + e * dp * kc;
+                        ksum[c] = ksum[c] * corr + e * kc;
+                    }
                     m = mnew;
                 }
             }
@@ -1774,147 +1795,24 @@ kernel void gd_sdpa_bwd_stats_split(device const float *go          [[buffer(0)]
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (active) {
-        int base = (((b * p.Hq + hq) * p.Tq + i) * p.n_splits + s) * 3;
-        part[base + 0] = m;
-        part[base + 1] = l;
-        part[base + 2] = raw;
-    }
-}
-
-/* Merge stats partials (m, l, raw) into final (m, l, D=raw/l). */
-kernel void gd_sdpa_bwd_stats_combine(device const float *part      [[buffer(0)]],
-                                      device float *stats           [[buffer(1)]],
-                                      constant gd_metal_sdpa_params &p [[buffer(2)]],
-                                      uint gid [[thread_position_in_grid]])
-{
-    int total = p.B * p.Hq * p.Tq;
-    if ((int)gid >= total) {
-        return;
-    }
-    int i = (int)gid % p.Tq;
-    int r = (int)gid / p.Tq;
-    int hq = r % p.Hq;
-    int b = r / p.Hq;
-    float m = -INFINITY;
-    float l = 0.0f;
-    float raw = 0.0f;
-    for (int s = 0; s < p.n_splits; ++s) {
-        int base = (((b * p.Hq + hq) * p.Tq + i) * p.n_splits + s) * 3;
-        float ls = part[base + 1];
-        if (ls <= 0.0f) {
-            continue;
-        }
-        float ms = part[base + 0];
-        float mnew = (ms > m) ? ms : m;
-        float corr_o = exp(m - mnew);
-        float corr_s = exp(ms - mnew);
-        l = l * corr_o + ls * corr_s;
-        raw = raw * corr_o + part[base + 2] * corr_s;
-        m = mnew;
-    }
-    int sb = ((b * p.Hq + hq) * p.Tq + i) * 3;
-    stats[sb + 0] = m;
-    stats[sb + 1] = l;
-    stats[sb + 2] = (l > 0.0f) ? (raw / l) : 0.0f;
-}
-
-kernel void gd_sdpa_bwd_dq_split(device const float *go             [[buffer(0)]],
-                                 device const float *q              [[buffer(1)]],
-                                 device const float *k              [[buffer(2)]],
-                                 device const float *v              [[buffer(3)]],
-                                 device const float *bias           [[buffer(4)]],
-                                 device float *part                 [[buffer(5)]],
-                                 constant gd_metal_sdpa_params &p    [[buffer(6)]],
-                                 device const float *stats          [[buffer(7)]],
-                                 uint tgid [[threadgroup_position_in_grid]],
-                                 uint tid  [[thread_index_in_threadgroup]])
-{
-    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
-    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
-
-    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
-    int s = (int)tgid % p.n_splits;
-    int t2 = (int)tgid / p.n_splits;
-    int qb = t2 % n_qb;
-    int r = t2 / n_qb;
-    int hq = r % p.Hq;
-    int b = r / p.Hq;
-    int group = p.Hq / p.Hkv;
-    int hkv = hq / group;
-    int i = qb * GD_SDPA_BQ + (int)tid;
-    bool active = i < p.Tq;
-    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
-    int sbase = active ? (((b * p.Hq + hq) * p.Tq + i) * 3) : 0;
-    float m = active ? stats[sbase + 0] : 0.0f;
-    float l = active ? stats[sbase + 1] : 0.0f;
-    float D = active ? stats[sbase + 2] : 0.0f;
-
-    float qreg[GD_SDPA_DHT];
-    float goreg[GD_SDPA_DHT];
-    float dqacc[GD_SDPA_DHT];
-    for (int c = 0; c < p.Dh; ++c) {
-        qreg[c] = active ? q[qbase + c] : 0.0f;
-        goreg[c] = active ? go[qbase + c] : 0.0f;
-        dqacc[c] = 0.0f;
-    }
-    bool run = active && l > 0.0f;
-
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
-    int slen = gd_sdpa_split_len(p.Tk, p.n_splits);
-    int k_lo = s * slen;
-    int k_hi = k_lo + slen;
-    if (k_hi > kb_end) {
-        k_hi = kb_end;
-    }
-    for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
-        int tile = k_hi - kb;
-        if (tile > GD_SDPA_BK) {
-            tile = GD_SDPA_BK;
-        }
-        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
-            int jj = idx / p.Dh;
-            int c = idx % p.Dh;
-            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
-            ksh[jj * p.Dh + c] = k[kbase + c];
-            vsh[jj * p.Dh + c] = v[kbase + c];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (run) {
-            for (int jj = 0; jj < tile; ++jj) {
-                int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-                    float ss = 0.0f;
-                    float dp = 0.0f;
-                    for (int c = 0; c < p.Dh; ++c) {
-                        ss += qreg[c] * ksh[jj * p.Dh + c];
-                        dp += goreg[c] * vsh[jj * p.Dh + c];
-                    }
-                    ss = p.scale * ss + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-                    float pj = exp(ss - m) / l;
-                    float ds = pj * (dp - D);
-                    for (int c = 0; c < p.Dh; ++c) {
-                        dqacc[c] += p.scale * ds * ksh[jj * p.Dh + c];
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (active) {
-        int base = (((b * p.Hq + hq) * p.Tq + i) * p.n_splits + s) * p.Dh;
+        int sbase = (((b * p.Hq + hq) * p.Tq + i) * p.n_splits + sp) * 3;
+        int vbase = (((b * p.Hq + hq) * p.Tq + i) * p.n_splits + sp) * 2 * p.Dh;
+        stats_part[sbase + 0] = m;
+        stats_part[sbase + 1] = l;
+        stats_part[sbase + 2] = raw;
         for (int c = 0; c < p.Dh; ++c) {
-            part[base + c] = dqacc[c];
+            dq_part[vbase + c] = acc[c];
+            dq_part[vbase + p.Dh + c] = ksum[c];
         }
     }
 }
 
-/* Sum per-split dq partials. One thread owns one (row, channel) so the Dh loop
- * is parallelized; the old one-thread-per-row version serialized all 64 channels
- * and was visible once split-K moved work into partial reductions. */
-kernel void gd_sdpa_bwd_dq_reduce(device const float *part          [[buffer(0)]],
-                                  device float *dq                  [[buffer(1)]],
-                                  constant gd_metal_sdpa_params &p   [[buffer(2)]],
-                                  uint gid [[thread_position_in_grid]])
+kernel void gd_sdpa_bwd_stats_dq_combine(device const float *stats_part [[buffer(0)]],
+                                         device const float *dq_part    [[buffer(1)]],
+                                         device float *stats            [[buffer(2)]],
+                                         device float *dq               [[buffer(3)]],
+                                         constant gd_metal_sdpa_params &p [[buffer(4)]],
+                                         uint gid [[thread_position_in_grid]])
 {
     int total = p.B * p.Hq * p.Tq * p.Dh;
     if ((int)gid >= total) {
@@ -1926,13 +1824,39 @@ kernel void gd_sdpa_bwd_dq_reduce(device const float *part          [[buffer(0)]
     int r = row / p.Tq;
     int hq = r % p.Hq;
     int b = r / p.Hq;
-    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
-    int pbase = ((b * p.Hq + hq) * p.Tq + i) * p.n_splits * p.Dh;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float raw = 0.0f;
     float acc = 0.0f;
-    for (int s = 0; s < p.n_splits; ++s) {
-        acc += part[pbase + s * p.Dh + c];
+    float ksum = 0.0f;
+    for (int sp = 0; sp < p.n_splits; ++sp) {
+        int sbase = (row * p.n_splits + sp) * 3;
+        float ls = stats_part[sbase + 1];
+        if (ls <= 0.0f) {
+            continue;
+        }
+        float ms = stats_part[sbase + 0];
+        float mnew = (ms > m) ? ms : m;
+        float corr_o = exp(m - mnew);
+        float corr_s = exp(ms - mnew);
+        int vbase = (row * p.n_splits + sp) * 2 * p.Dh;
+        l = l * corr_o + ls * corr_s;
+        raw = raw * corr_o + stats_part[sbase + 2] * corr_s;
+        acc = acc * corr_o + dq_part[vbase + c] * corr_s;
+        ksum = ksum * corr_o + dq_part[vbase + p.Dh + c] * corr_s;
+        m = mnew;
     }
-    dq[qbase + c] = acc;
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float D = raw * inv_l;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+    dq[qbase + c] = p.scale * (acc * inv_l - D * ksum * inv_l);
+    if (c == 0) {
+        int sb = ((b * p.Hq + hq) * p.Tq + i) * 3;
+        stats[sb + 0] = m;
+        stats[sb + 1] = l;
+        stats[sb + 2] = D;
+    }
 }
 
 kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]],

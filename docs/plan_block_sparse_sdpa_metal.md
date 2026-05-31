@@ -336,6 +336,55 @@ Simple tile probes after this were negative and reverted:
 Keep BQ=64, BK=16 on M1; next gains need kernel-structure changes, not these
 simple tile-size knobs.
 
+### 6.6 Kernel-structure win — fuse stats + dq split scan (2026-05-31)
+
+Subpass isolation (temporary local returns inside the split path, not shipped)
+showed T=512 `sdpa_bwd` was roughly:
+- stats split+combine: ~102 ms
+- dq split+reduce incremental: ~195 ms
+- dkv split+reduce incremental: ~287 ms
+
+The stats and dq split passes both scan the same key tiles and compute the same
+`score=q·k` and `dp=dO·v`. Replaced the separate stats + dq split path with a
+single `gd_sdpa_bwd_stats_dq_split` plus `gd_sdpa_bwd_stats_dq_combine`.
+For each query row and key split, the fused split pass streams keys once and
+accumulates:
+
+```text
+m,l             online softmax max / exp-sum for the split
+raw             sum_j exp(score_j-m) * dp_j
+acc[c]          sum_j exp(score_j-m) * dp_j * k_j[c]
+ksum[c]         sum_j exp(score_j-m) * k_j[c]
+```
+
+The combine pass merges split partials with the usual online-softmax correction
+across split maxima, writes final stats `(m,l,D=raw/l)` for the dk/dv pass, and
+writes:
+
+```text
+dq[c] = scale * (acc[c]/l - (raw/l) * (ksum[c]/l))
+```
+
+Scratch change: `dq_part` now stores `(acc, ksum)` (2*Dh floats per row/split)
+instead of direct partial `dq` (Dh floats). This increases split scratch but
+removes one full key scan and the old dq split/reduce kernels. Old split stats/dq
+kernels were removed instead of keeping dead fallback code.
+
+```text
+B=4,T=256,6L, S=2:
+  before: sdpa_bwd 111.9 ms, step 318.9 ms, 3211 tok/s
+  after:  sdpa_bwd  99.7 ms, step 309.2 ms, 3311 tok/s
+
+B=8,T=512,6L, S=4:
+  before: sdpa_bwd 584.9 ms, step 1619.9 ms, 2529 tok/s
+  after:  sdpa_bwd 519.8 ms, step 1596.1 ms, 2566 tok/s
+```
+
+Validation: `make check` green, GPT train parity green, ASan `test_metal_gpt`
+clean. Learning: deleting a duplicate score/dp scan is worth more than further
+split/tile-size tuning; remaining dominant attention work is now the dk/dv split
+scan, whose register pressure is the next likely ceiling.
+
 ---
 
 ## 7. Reporting rule
@@ -370,6 +419,8 @@ When marking a phase done, record:
 | Split retune | 512 | 206.9 ms | 610.5 ms | 1696.6 ms | 2414 | B=8 user workload, S=4 |
 | Split reduce parallel | 256 | 47.6 ms | 111.9 ms | 318.9 ms | 3211 | one thread per (row,channel) reduce |
 | Split reduce parallel | 512 | 207.8 ms | 584.9 ms | 1619.9 ms | 2529 | B=8 user workload |
+| Fused stats+dq split | 256 | ~55 ms | 99.7 ms | 309.2 ms | 3311 | removes duplicate qk/dO·v scan for dq |
+| Fused stats+dq split | 512 | ~219 ms | 519.8 ms | 1596.1 ms | 2566 | B=8 user workload |
 
 B1 is correct (parity green) and neutral on wall-time for causal. B1.5/B1.5b
 split-K land the forward and backward at their throughput floors (§6.2–§6.3):

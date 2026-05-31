@@ -44,13 +44,13 @@ static float nrand(uint64_t *state)
 static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64_t *sizes,
                               float scale, int ones, uint64_t *rng, gd_tensor **slot)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_device device = gd_context_default_device(g->ctx);
     gd_tensor_desc desc;
     gd_tensor *t = NULL;
     int64_t numel = 1;
     float *buf = NULL;
     int i = 0;
-    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, ndim, sizes, &desc);
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, device, ndim, sizes, &desc);
 
     if (status != GD_OK) {
         return status;

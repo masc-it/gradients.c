@@ -76,6 +76,7 @@ int main(void)
     } else {
         printf("device: cpu\n");
     }
+    CHECK(gd_context_set_default_device(ctx, target));
 
     /* Fixed sequence; target is the next token (last wraps to the first). */
     srand(7u);
@@ -87,7 +88,7 @@ int main(void)
         tgt[i] = tok[(i + 1) % SEQ];
     }
 
-    CHECK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 2, shape, &idesc));
+    CHECK(gd_tensor_desc_contiguous(GD_DTYPE_I32, target, 2, shape, &idesc));
     CHECK(gd_tensor_empty(ctx, &idesc, &tokens));
     CHECK(gd_tensor_copy_from_cpu(ctx, tokens, tok, sizeof(tok)));
     CHECK(gd_tensor_empty(ctx, &idesc, &positions));

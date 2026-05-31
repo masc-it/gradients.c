@@ -137,10 +137,10 @@ layout/fusion, but each task must improve or clarify GPU_SAFE independently.
 - [x] P0 — Common `GD_PROFILE` infrastructure for all backends
 - [x] P1 — Metal profiling counters and per-op timing/cost report
 - [x] P2 — Honest benchmark/release build target
-- [ ] P3 — Device-resident parameters and optimizer state
+- [x] P3 — Device-resident parameters and optimizer state
 - [ ] P4 — Lazy writeback: download only on explicit CPU read/sync need
 - [ ] P5 — Dirty-tracked staging: upload only changed host leaves
-- [ ] P6 — Async run boundary: remove unconditional post-run wait where safe
+- [x] P6 — Async run boundary: remove unconditional post-run wait where safe
 - [x] P7 — Zero-copy reshape/copy aliasing for metadata-only copies
 - [ ] P8 — Precomputed Metal executable encode plan
 - [ ] P9 — GPU_SAFE kernel upgrades batch 1: reductions/norm/CE/reduce_to
@@ -404,7 +404,7 @@ Validation:
 
 ## P3 — Device-resident parameters and optimizer state
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Intent
 Stop treating Metal params/state as CPU leaves copied into shadow Metal buffers
@@ -455,7 +455,52 @@ Prefer context default if it aligns with existing design.
 - Profile shows reduced stage/writeback bytes/counts.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Completed.
+
+Numbers (`GD_PROFILE=summary GD_PROFILE_BACKEND=metal GD_DEVICE=metal make bench-gpt`):
+
+```text
+before P3/P6:
+  uploads=0 downloads=8
+  allocs=286 allocated_bytes=864332
+  stage_leaves items=51022 bytes=188512192 ms≈14.9
+  writeback_externals items=51022 bytes=188512192 ms≈20.1
+  metal_wait count=601 ms≈12740.7
+  wall warm release≈13.09s
+
+after P3/P6:
+  uploads=24 upload_bytes=78660   # one-time CPU -> Metal initialization
+  downloads=8 download_bytes=2076 # loss/logits reads only
+  allocs=264 allocated_bytes=785740
+  stage_leaves items=0 bytes=0 ms≈0.0
+  writeback_externals items=0 bytes=0 ms≈0.0
+  metal_wait count=8 ms≈7950.9
+  metal_encode ms≈4450.8
+  wall warm release≈12.58s
+```
+
+Choices:
+- `gd_gpt_create` now honors `gd_context_default_device(ctx)` for parameter
+  creation. No public GPT config change.
+- `examples/gpt/gpt.c` sets the context default device after resolving
+  `GD_DEVICE`, and creates token/position/target tensors on the same target.
+- AdamW state already followed parameter device through `make_state_like`; the
+  optimizer step scalar follows context default device.
+- Metal compile aliases external leaf storage when the external tensor is already
+  Metal-backed, contiguous, same device index, and has zero storage offset.
+- CPU-backed external leaves retain old shadow-buffer behavior for safety.
+
+Learnings:
+- Device-resident leaves remove all per-step staging/writeback in GPT.
+- Allocation count drops because Metal no longer creates shadow buffers for
+  Metal-backed leaves (`286 -> 264` allocations in profile).
+- Wall-time win is modest because remaining cost is still tiny-kernel execution
+  and command-buffer waits.
+
+Validation:
+- `GD_DEVICE=metal make gpt`
+- `GD_PROFILE=summary GD_PROFILE_BACKEND=metal GD_DEVICE=metal make bench-gpt`
+- `make check`
 
 ---
 
@@ -542,7 +587,7 @@ _To fill when done: numbers, choices, learnings, validation._
 
 ## P6 — Async run boundary: remove unconditional post-run wait where safe
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Intent
 Let `gd_graph_run()` enqueue Metal work and return when no immediate CPU-visible
@@ -569,7 +614,38 @@ commit.
 - Profile shows lower per-step host wait in no-read loops.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Completed for safe/device-resident executables.
+
+Numbers after P3/P6 (`GD_PROFILE=summary GD_PROFILE_BACKEND=metal GD_DEVICE=metal make bench-gpt`):
+
+```text
+metal_wait count: 601 -> 8
+metal_wait ms:    ~12740.7 -> ~7950.9
+metal_encode ms:  ~63.9 -> ~4450.8
+wall warm release: ~13.09s -> ~12.58s
+```
+
+Choices:
+- Metal executables now track whether any CPU-backed external leaves require
+  staging/writeback.
+- If staging is needed, old conservative behavior remains: wait before CPU
+  shadow-buffer mutation and wait/writeback after run.
+- If staging/writeback is not needed (device-resident GPT path), `gd_graph_run`
+  commits work and returns; blocking downloads and `gd_synchronize` wait on the
+  latest queued command buffer.
+- Waiting on the latest command buffer is sufficient for one serial Metal queue:
+  earlier command buffers are ordered before it by Metal queue semantics.
+
+Learnings:
+- Async boundary moved wait time from every `gd_graph_run` to the 8 blocking
+  downloads in GPT (loss prints + final logits), as intended.
+- Total wall-time gain is modest because the GPU still executes the same many
+  tiny kernels. Host encode time rises because the CPU can now run ahead until
+  Metal/driver backpressure appears.
+
+Validation:
+- `GD_PROFILE=summary GD_PROFILE_BACKEND=metal GD_DEVICE=metal make bench-gpt`
+- `make check`
 
 ---
 
@@ -837,6 +913,9 @@ Fill this table as phases land.
 |---|---|---|---:|---:|---|
 | baseline | debug `-O0` | `make gpt` | ~2.87s | ~4.8 | CPU |
 | baseline | debug `-O0` | `GD_DEVICE=metal make gpt` | ~13.07s | ~21.8 | Metal GPU_SAFE |
+| P2 | release `-O2` | `make bench-gpt` | ~0.78s | ~1.3 | CPU warm build |
+| P2 | release `-O2` | `GD_DEVICE=metal make bench-gpt` | ~13.09s | ~21.8 | before P3/P6 |
+| P3+P6 | release `-O2` | `GD_DEVICE=metal make bench-gpt` | ~12.58s | ~21.0 | device-resident leaves, async run boundary |
 
 ---
 

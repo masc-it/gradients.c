@@ -108,14 +108,17 @@ static gd_status metal_dtype_code(gd_dtype dtype, int *out)
 
 typedef struct gd_metal_value {
     gd_storage *storage;   /* retained METAL buffer storage; copy/reshape values may alias */
-    gd_tensor *external;   /* borrowed CPU leaf source, NULL for produced values */
-    size_t leaf_offset;    /* byte offset of the leaf data inside its CPU storage */
+    gd_tensor *external;   /* borrowed leaf source, NULL for produced values */
+    size_t leaf_offset;    /* byte offset of the leaf data inside its source storage */
+    bool external_alias;   /* true when storage directly aliases a Metal external leaf */
 } gd_metal_value;
 
 struct _gd_executable {
     const gd_graph *graph;
     int n_values;
     gd_metal_value *values;
+    bool needs_stage;
+    bool needs_writeback;
 };
 
 /* ---- Helpers ------------------------------------------------------------- */
@@ -210,7 +213,7 @@ static gd_status writeback_externals(_gd_backend *self, _gd_executable *exe)
         size_t nbytes = 0U;
         gd_status status = GD_OK;
 
-        if (v->external == NULL) {
+        if (v->external == NULL || v->external_alias) {
             continue;
         }
         dst = gd_tensor_storage(v->external);
@@ -346,6 +349,21 @@ static bool can_alias_copy_value(const gd_graph *graph, const _gd_node *node)
     return in_bytes == out_bytes;
 }
 
+static void refresh_external_flags(_gd_executable *exe)
+{
+    int i = 0;
+
+    exe->needs_stage = false;
+    exe->needs_writeback = false;
+    for (i = 0; i < exe->n_values; ++i) {
+        if (exe->values[i].external != NULL && !exe->values[i].external_alias) {
+            exe->needs_stage = true;
+            exe->needs_writeback = true;
+            return;
+        }
+    }
+}
+
 static gd_status alias_copy_values(_gd_executable *exe)
 {
     int i = 0;
@@ -410,11 +428,24 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
         if (status != GD_OK) {
             goto fail;
         }
-        sdesc = (gd_storage_desc){{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
-                                  nbytes, alignment};
-        status = gd_storage_create(graph->ctx, &sdesc, &storage);
-        if (status != GD_OK) {
-            goto fail;
+        if (value->external != NULL &&
+            gd_tensor_storage(value->external) != NULL &&
+            gd_storage_device(gd_tensor_storage(value->external)).type == GD_DEVICE_METAL &&
+            gd_storage_device(gd_tensor_storage(value->external)).index == self->device_index &&
+            value->desc.storage_offset_bytes == 0) {
+            storage = gd_tensor_storage(value->external);
+            status = gd_storage_retain(storage);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            exe->values[i].external_alias = true;
+        } else {
+            sdesc = (gd_storage_desc){{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
+                                      nbytes, alignment};
+            status = gd_storage_create(graph->ctx, &sdesc, &storage);
+            if (status != GD_OK) {
+                goto fail;
+            }
         }
         exe->values[i].storage = storage;
         exe->values[i].external = value->external; /* borrowed; graph retains it */
@@ -426,6 +457,7 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
     if (status != GD_OK) {
         goto fail;
     }
+    refresh_external_flags(exe);
 
     *out = exe;
     return GD_OK;
@@ -453,7 +485,7 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
         size_t nbytes = 0U;
         gd_status status = GD_OK;
 
-        if (v->external == NULL) {
+        if (v->external == NULL || v->external_alias) {
             continue;
         }
         src = gd_tensor_storage(v->external);
@@ -1365,15 +1397,21 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
     gd_status status = GD_OK;
     int i = 0;
 
-    /* About to mutate input buffers via CPU writes: any prior command buffer
-     * must complete first (coherency). */
-    status = metal_synchronize(self);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = stage_leaves(self, exe);
-    if (status != GD_OK) {
-        return status;
+    /* If CPU-backed leaves must be staged, any prior command buffer using the
+     * shadow buffers must complete before the CPU mutates them (Metal coherency).
+     * Fully device-resident graphs can queue runs on the serial command queue. */
+    if (exe->needs_stage) {
+        status = metal_synchronize(self);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = stage_leaves(self, exe);
+        if (status != GD_OK) {
+            return status;
+        }
+    } else {
+        _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_STAGE_LEAVES,
+                                 0U, 0U, 0U);
     }
 
     {
@@ -1404,11 +1442,13 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                                      _gd_profile_now_ns() - encode_start, 0U, count);
         }
     }
-    /* v1 is effectively synchronous: external-leaf mutations (grad slots,
-     * optimizer state) must be visible to plain CPU-tensor reads after
-     * gd_graph_run, which never route through this backend. Wait + write back
-     * now. (A truly async path would defer this to gd_synchronize.) */
-    return metal_synchronize(self);
+    if (exe->needs_writeback) {
+        /* CPU-backed external mutations must remain visible to plain CPU tensor
+         * reads after gd_graph_run. Device-resident graphs defer waiting until
+         * gd_synchronize or a blocking download. */
+        return metal_synchronize(self);
+    }
+    return GD_OK;
 }
 
 static gd_status metal_execute(_gd_backend *self, _gd_executable *exe)

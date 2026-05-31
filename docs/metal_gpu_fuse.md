@@ -76,12 +76,13 @@ of fusion for training is often the (forward + matching backward) pair.
 - Parity is guaranteed at **group boundaries** (graph outputs + any value with an
   outside consumer); fusion-internal values may not exist on Metal.
 
-> Out of scope here (separate, model-layout track): **fused QKV / gate-up
-> projection** — concatenating `Wq|Wk|Wv` (and `Wgate|Wup`) into one weight so the
-> three/two sibling GEMMs that read `n` become one larger GEMM. That is the
-> single biggest GPT structural win, but it is a *weight-layout change at model
-> construction* (`gd_gpt_create` / `gd_gpt_forward`), not a fused kernel, and
-> needs none of the machinery below. Track it in the GPT model plan, do it first.
+> **Sibling note — fused QKV / gate-up projection (phase M1).** Concatenating
+> `Wq|Wk|Wv` (and `Wgate|Wup`) into one weight so the three/two sibling GEMMs that
+> read `n` become one larger GEMM is the single biggest GPT structural win. It is
+> a *weight-layout change at model construction* (`gd_gpt_create` /
+> `gd_gpt_forward`), **not** a lowering-pass fusion, and needs none of the
+> machinery above. It is tracked here (phase M1) for a coherent roadmap/order,
+> but is implemented in the model track (`nn.c`), not the Metal backend.
 
 ---
 
@@ -135,6 +136,10 @@ no-op on correctness and perf before any kernel exists.
 
 ## 5. Phases
 
+Agreed order (escalating risk, bank value early): **M1 → F2a → F2b**, after the
+already-landed F0/F1. M1 is orthogonal (model track) and can proceed in
+parallel; F2a de-risks the tiled GEMM+softmax kernel that F2b reuses.
+
 - [x] F0 — **Fusion infrastructure (identity pass).** Landed the executable
   plumbing: `_gd_executable.node_absorbed` (per-node skip flag, calloc'd/freed),
   the `metal_plan_fusions(self, graph, exe)` hook called at end of `compile`
@@ -157,6 +162,15 @@ no-op on correctness and perf before any kernel exists.
   (absorbed into `mul`), 6 fewer dispatches, step 408 ms unchanged (~0.4%). The
   value is the proven pipeline; the perf payoff is F2. Dropping `act` (recompute
   in a fused backward) is deferred — it needs a fused backward and buys little.
+- [ ] M1 — **Fused QKV + gate/up projection (model layout, not a lowering-pass
+  fusion).** Concatenate `Wq|Wk|Wv` and `Wgate|Wup` at construction so each
+  block's sibling projections that read the normed input become one larger,
+  more-efficient `gd_linear` + slices. Implemented in `nn.c` /
+  `gd_gpt_create` / `gd_gpt_forward`; **no Metal backend changes**. Biggest safe
+  training GEMM win; do first. Watch the interaction with F1: gate/up become
+  slices of one tensor, so confirm the `silu→mul` recognizer still matches
+  `silu(gate_slice)` (or teach legality to see through a metadata-only slice).
+  Cross-ref: GPT model plan (`plan_gpt.md`).
 - [ ] F2 — **`matmul`/`linear`→`cross_entropy`** (LM head). Investigated; scope is
   bigger than first framed (it is a cut-cross-entropy kernel). Key findings:
   - The logits claim "forward-only" is **false in training**: `logits` is

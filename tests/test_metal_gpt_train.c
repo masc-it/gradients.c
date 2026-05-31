@@ -53,7 +53,8 @@ static gd_gpt_config tiny_config(void)
     c.max_seq_len = GPT_T;
     c.rope_theta = 10000.0f;
     c.norm_eps = 1e-5f;
-    c.mlp_kind = GD_GPT_MLP_SWIGLU;
+    c.mlp_kind = GD_GPT_MLP_POWLU;
+    c.powlu_m = 3.0f;
     c.tie_embeddings = true;
     return c;
 }

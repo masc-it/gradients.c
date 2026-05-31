@@ -1,5 +1,6 @@
 #include "gradients/nn.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -24,9 +25,9 @@ struct gd_gpt {
     gd_tensor **wv;
     gd_tensor **wo;
     gd_tensor **ln2;
-    gd_tensor **w_gate; /* swiglu gate / gelu fc */
-    gd_tensor **w_up;   /* swiglu up (NULL for gelu) */
-    gd_tensor **w_down; /* swiglu/gelu down (proj) */
+    gd_tensor **w_gate; /* powlu/swiglu gate / gelu fc */
+    gd_tensor **w_up;   /* powlu/swiglu value projection (NULL for gelu) */
+    gd_tensor **w_down; /* powlu/swiglu/gelu down (proj) */
 };
 
 /* Deterministic PRNG (splitmix64-ish) so two models built from the same seed
@@ -128,6 +129,17 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     if (cfg.norm_eps <= 0.0f) {
         cfg.norm_eps = 1e-5f;
     }
+    if (cfg.powlu_m == 0.0f) {
+        cfg.powlu_m = 3.0f;
+    }
+    if (cfg.mlp_kind != GD_GPT_MLP_POWLU && cfg.mlp_kind != GD_GPT_MLP_SWIGLU &&
+        cfg.mlp_kind != GD_GPT_MLP_GELU) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid gpt mlp kind");
+    }
+    if (cfg.mlp_kind == GD_GPT_MLP_POWLU &&
+        (!isfinite(cfg.powlu_m) || cfg.powlu_m <= 0.0f || cfg.powlu_m >= 10.0f)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "powlu_m must satisfy 0 < m < 10");
+    }
     d = cfg.d_model;
     dff = cfg.d_ff;
     Hq = cfg.n_heads;
@@ -205,7 +217,7 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
             (void)snprintf(name, sizeof(name), "blk.%d.w_gate", l);
             status = create_param(g, name, 2, s_in_ff, wscale, 0, &rng, &g->w_gate[l]);
         }
-        if (status == GD_OK && cfg.mlp_kind == GD_GPT_MLP_SWIGLU) {
+        if (status == GD_OK && cfg.mlp_kind != GD_GPT_MLP_GELU) {
             (void)snprintf(name, sizeof(name), "blk.%d.w_up", l);
             status = create_param(g, name, 2, s_in_ff, wscale, 0, &rng, &g->w_up[l]);
         }
@@ -310,7 +322,10 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
     *out_p = NULL;
     s = gd_rms_norm(ctx, h, g->ln2[l], c->norm_eps, &n);
     if (s == GD_OK) { s = gd_linear(ctx, n, g->w_gate[l], NULL, &gate); }
-    if (c->mlp_kind == GD_GPT_MLP_SWIGLU) {
+    if (c->mlp_kind == GD_GPT_MLP_POWLU) {
+        if (s == GD_OK) { s = gd_linear(ctx, n, g->w_up[l], NULL, &up); }
+        if (s == GD_OK) { s = gd_powlu(ctx, up, gate, c->powlu_m, &hh); }
+    } else if (c->mlp_kind == GD_GPT_MLP_SWIGLU) {
         if (s == GD_OK) { s = gd_silu(ctx, gate, &act); }
         if (s == GD_OK) { s = gd_linear(ctx, n, g->w_up[l], NULL, &up); }
         if (s == GD_OK) { s = gd_mul(ctx, act, up, &hh); }

@@ -2,7 +2,7 @@
  * Tiny GPT training demo with gradients.c.
  *
  * Trains a small decoder-only transformer (embedding -> [RMSNorm -> GQA
- * attention with RoPE -> RMSNorm -> SwiGLU MLP] x L -> RMSNorm -> tied LM head)
+ * attention with RoPE -> RMSNorm -> PowLU MLP] x L -> RMSNorm -> tied LM head)
  * to predict the next token of a fixed sequence, then reports per-position
  * accuracy via a forward pass.
  *
@@ -106,7 +106,8 @@ int main(void)
     cfg.max_seq_len = SEQ;
     cfg.rope_theta = 10000.0F;
     cfg.norm_eps = 1e-5F;
-    cfg.mlp_kind = GD_GPT_MLP_SWIGLU;
+    cfg.mlp_kind = GD_GPT_MLP_POWLU;
+    cfg.powlu_m = 3.0F;
     cfg.tie_embeddings = true;
     CHECK(gd_gpt_create(ctx, &cfg, 0xABCDEFu, &model));
     CHECK(gd_gpt_parameters(model, &params, &n_params));

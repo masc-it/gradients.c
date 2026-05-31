@@ -365,6 +365,32 @@ static int test_metal_reduce_parity(gd_context *ctx)
     return 0;
 }
 
+/* PowLU primitive forward parity across branch points. */
+static int test_metal_powlu_parity(gd_context *ctx)
+{
+    int64_t s8[1] = {8};
+    float x1[8] = {1.0F, -0.5F, 0.25F, 2.0F, -1.5F, 0.75F, -2.0F, 1.25F};
+    float x2[8] = {-20.0F, -1.0e-4F, 0.0F, 1.0e-8F, 1.0e-4F, 0.5F, 3.0F, 20.0F};
+    gd_tensor *tx1 = NULL, *tx2 = NULL, *y = NULL;
+    gd_graph *g = NULL;
+    gd_compare_options opts = {2e-4, 2e-4, false};
+
+    CHECK_OK(make_f32(ctx, 1, s8, x1, &tx1));
+    CHECK_OK(make_f32(ctx, 1, s8, x2, &tx2));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_powlu(ctx, tx1, tx2, 3.0F, &y));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(y);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(tx1);
+    gd_tensor_release(tx2);
+    return 0;
+}
+
 /* cross_entropy parity: scalar mean loss, I32 targets. */
 static int test_metal_cross_entropy_parity(gd_context *ctx)
 {
@@ -590,6 +616,28 @@ static int build_silu(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **l
     return 0;
 }
 
+/* powlu -> mean: powlu_bwd multi-output dx1/dx2. */
+static int build_powlu(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sx[1] = {6};
+    float x1d[6] = {1.0F, -0.5F, 0.25F, 2.0F, -1.5F, 0.75F};
+    float x2d[6] = {-2.0F, -0.25F, 0.3F, 0.7F, 2.0F, 5.0F};
+    gd_tensor *x1 = NULL, *x2 = NULL, *y = NULL, *loss = NULL;
+
+    CHECK_OK(make_f32(ctx, 1, sx, x1d, &x1));
+    CHECK_OK(make_f32(ctx, 1, sx, x2d, &x2));
+    CHECK_OK(gd_tensor_set_requires_grad(x1, true));
+    CHECK_OK(gd_tensor_set_requires_grad(x2, true));
+    CHECK_OK(gd_powlu(ctx, x1, x2, 3.0F, &y));
+    CHECK_OK(gd_mean(ctx, y, 0, false, &loss));
+    gd_tensor_release(y);
+    inputs[0] = x1;
+    inputs[1] = x2;
+    *n = 2;
+    *loss_out = loss;
+    return 0;
+}
+
 /* cross_entropy -> backward: cross_entropy_bwd. */
 static int build_ce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
 {
@@ -647,6 +695,7 @@ static int test_metal_backward_parity(gd_context *ctx, int mps_enabled)
     if (backward_parity(ctx, build_mlp, "mlp") != 0) return 1;
     if (backward_parity(ctx, build_softmax, "softmax") != 0) return 1;
     if (backward_parity(ctx, build_silu, "silu") != 0) return 1;
+    if (backward_parity(ctx, build_powlu, "powlu") != 0) return 1;
     if (backward_parity(ctx, build_ce, "cross_entropy") != 0) return 1;
     if (mps_enabled && backward_parity(ctx, build_lmce, "lm_cross_entropy") != 0) return 1;
     return 0;
@@ -844,6 +893,7 @@ int main(void)
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);
     rc |= test_metal_reduce_parity(ctx);
+    rc |= test_metal_powlu_parity(ctx);
     rc |= test_metal_cross_entropy_parity(ctx);
     if (mps_enabled) {
         rc |= test_metal_lm_cross_entropy_parity(ctx);

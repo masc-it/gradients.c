@@ -26,6 +26,7 @@ typedef enum _gd_op_kind {
     _GD_OP_LINEAR,
     _GD_OP_RELU,
     _GD_OP_SILU,
+    _GD_OP_POWLU,
     _GD_OP_SUM,
     _GD_OP_MEAN,
     _GD_OP_RMS_NORM,
@@ -47,6 +48,7 @@ typedef enum _gd_op_kind {
     _GD_OP_COPY,
     _GD_OP_RELU_BWD,
     _GD_OP_SILU_BWD,
+    _GD_OP_POWLU_BWD,
     _GD_OP_SOFTMAX_BWD,
     _GD_OP_SUM_BWD,
     _GD_OP_MEAN_BWD,
@@ -71,6 +73,7 @@ typedef struct _gd_op_attrs {
     bool trans_b;                /* MATMUL / LINEAR (trans_w) */
     bool has_bias;               /* LINEAR */
     float eps;                   /* RMS_NORM / ADAMW */
+    float powlu_m;               /* POWLU */
     gd_dtype cast_dtype;         /* CAST */
     bool gelu_tanh;              /* GELU: tanh approximation vs exact erf */
     int perm[GD_MAX_DIMS];      /* TRANSPOSE: output axis permutation */

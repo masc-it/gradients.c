@@ -48,6 +48,12 @@ gd_status gd_linear_ex(gd_context *ctx,
 
 gd_status gd_relu(gd_context *ctx, gd_tensor *x, gd_tensor **out);
 gd_status gd_silu(gd_context *ctx, gd_tensor *x, gd_tensor **out);
+/* PowLU gated activation: out = x1 * f(x2, m). m must satisfy 0 < m < 10. */
+gd_status gd_powlu(gd_context *ctx,
+                   gd_tensor *x1,
+                   gd_tensor *x2,
+                   float m,
+                   gd_tensor **out);
 gd_status gd_sum(gd_context *ctx, gd_tensor *x, int dim, bool keepdim, gd_tensor **out);
 gd_status gd_mean(gd_context *ctx, gd_tensor *x, int dim, bool keepdim, gd_tensor **out);
 gd_status gd_rms_norm(gd_context *ctx,

@@ -23,6 +23,8 @@
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
  *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
  *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
+ *   GD_BENCH_MLP=powlu|swiglu|gelu (default powlu)
+ *   GD_POWLU_M=3.0            PowLU exponent parameter
  *
  * Defaults describe a ~8M-parameter model. GD_PROFILE=summary works as usual.
  */
@@ -50,6 +52,15 @@ static int env_int(const char *name, int fallback)
         return fallback;
     }
     return (int)strtol(v, NULL, 10);
+}
+
+static float env_float(const char *name, float fallback)
+{
+    const char *v = getenv(name);
+    if (v == NULL || v[0] == '\0') {
+        return fallback;
+    }
+    return strtof(v, NULL);
 }
 
 static double now_ms(void)
@@ -101,7 +112,7 @@ static double forward_gflops(const gd_gpt_config *c, int B, int T)
               + 2.0 * bt * (Hq * Dh) * d;       /* out proj */
     /* QK^T and P*V. */
     attn_score = 4.0 * (double)B * Hq * (double)T * (double)T * Dh;
-    /* SwiGLU: gate, up, down. */
+    /* Gated MLP (PowLU/SwiGLU): gate, up, down. GELU is overestimated here. */
     mlp = 6.0 * bt * d * dff;
     per_layer = attn_proj + attn_score + mlp;
     head = 2.0 * bt * d * V;
@@ -175,7 +186,16 @@ int main(void)
     cfg.max_seq_len = T;
     cfg.rope_theta = 10000.0F;
     cfg.norm_eps = 1e-5F;
-    cfg.mlp_kind = GD_GPT_MLP_SWIGLU;
+    cfg.mlp_kind = GD_GPT_MLP_POWLU;
+    cfg.powlu_m = env_float("GD_POWLU_M", 3.0F);
+    {
+        const char *mlp_env = getenv("GD_BENCH_MLP");
+        if (mlp_env != NULL && strcmp(mlp_env, "swiglu") == 0) {
+            cfg.mlp_kind = GD_GPT_MLP_SWIGLU;
+        } else if (mlp_env != NULL && strcmp(mlp_env, "gelu") == 0) {
+            cfg.mlp_kind = GD_GPT_MLP_GELU;
+        }
+    }
     cfg.tie_embeddings = true;
 
     if (cfg.d_model != cfg.n_heads * cfg.head_dim) {
@@ -229,6 +249,11 @@ int main(void)
     printf("  config      : d_model=%d layers=%d heads=%d kv_heads=%d head_dim=%d d_ff=%d vocab=%d\n",
            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.d_ff,
            cfg.vocab_size);
+    if (cfg.mlp_kind == GD_GPT_MLP_POWLU) {
+        printf("  mlp         : powlu m=%.3g\n", (double)cfg.powlu_m);
+    } else {
+        printf("  mlp         : %s\n", cfg.mlp_kind == GD_GPT_MLP_SWIGLU ? "swiglu" : "gelu");
+    }
     printf("  batch x seq : %d x %d\n", B, T);
     printf("  iters       : %d (warmup %d)\n", iters, warmup);
     printf("  fwd GFLOP   : %.3f   step GFLOP: %.3f\n", fwd_gflop, step_gflop);

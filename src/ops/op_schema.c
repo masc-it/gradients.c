@@ -220,6 +220,39 @@ gd_status gd_silu(gd_context *ctx, gd_tensor *x, gd_tensor **out)
     return emit_unary_float(ctx, _GD_OP_SILU, x, out);
 }
 
+gd_status gd_powlu(gd_context *ctx,
+                   gd_tensor *x1,
+                   gd_tensor *x2,
+                   float m,
+                   gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *inputs[2];
+    gd_tensor_desc desc;
+    _gd_op_attrs attrs = {0};
+
+    if (x1 == NULL || x2 == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_powlu argument is NULL");
+    }
+    *out = NULL;
+    if (!isfinite(m) || m <= 0.0F || m >= 10.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "powlu m must satisfy 0 < m < 10");
+    }
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_powlu(x1, x2, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    attrs.powlu_m = m;
+    inputs[0] = x1;
+    inputs[1] = x2;
+    return _gd_graph_emit(graph, _GD_OP_POWLU, inputs, 2, &attrs, &desc, out);
+}
+
 static gd_status emit_reduce(gd_context *ctx,
                              _gd_op_kind op,
                              gd_tensor *x,

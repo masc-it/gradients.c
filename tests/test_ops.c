@@ -1,5 +1,6 @@
 #include "gradients/gradients.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -111,6 +112,62 @@ static int test_elementwise(gd_context *ctx)
     gd_tensor_release(b);
     gd_tensor_release(b_bad);
     gd_tensor_release(bi);
+    return 0;
+}
+
+static int test_powlu_schema(gd_context *ctx)
+{
+    int64_t s23[2] = {2, 3};
+    int64_t s24[2] = {2, 4};
+    float x1d[6] = {1.0F, -0.5F, 0.25F, 2.0F, -1.5F, 0.75F};
+    float x2d[6] = {-20.0F, -1.0e-4F, 0.0F, 1.0e-8F, 1.0e-4F, 20.0F};
+    float got[6];
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor *x1 = NULL;
+    gd_tensor *x2 = NULL;
+    gd_tensor *bad_shape = NULL;
+    gd_tensor *xi = NULL;
+    gd_tensor *out = NULL;
+    gd_tensor *bad_out = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, s23, &x1));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, s23, &x2));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, s24, &bad_shape));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 2, s23, &xi));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x1, x1d, sizeof(x1d)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x2, x2d, sizeof(x2d)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+
+    CHECK_OK(gd_powlu(ctx, x1, x2, 3.0F, &out));
+    CHECK_TRUE(check_shape(out, 2, s23) == 0);
+    CHECK_TRUE(gd_tensor_dtype(out) == GD_DTYPE_F32);
+
+    CHECK_STATUS(gd_powlu(ctx, x1, x2, 0.0F, &bad_out), GD_ERR_INVALID_ARGUMENT);
+    CHECK_TRUE(bad_out == NULL);
+    CHECK_STATUS(gd_powlu(ctx, x1, x2, 10.0F, &bad_out), GD_ERR_INVALID_ARGUMENT);
+    CHECK_TRUE(bad_out == NULL);
+    CHECK_STATUS(gd_powlu(ctx, x1, bad_shape, 3.0F, &bad_out), GD_ERR_SHAPE);
+    CHECK_TRUE(bad_out == NULL);
+    CHECK_STATUS(gd_powlu(ctx, x1, xi, 3.0F, &bad_out), GD_ERR_DTYPE);
+    CHECK_TRUE(bad_out == NULL);
+
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, out, got, sizeof(got)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(isfinite(got[i]));
+    }
+    gd_tensor_release(out);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(x1);
+    gd_tensor_release(x2);
+    gd_tensor_release(bad_shape);
+    gd_tensor_release(xi);
     return 0;
 }
 
@@ -363,7 +420,8 @@ int main(void)
     gd_context *ctx = NULL;
 
     CHECK_OK(gd_context_create(&ctx));
-    if (test_elementwise(ctx) != 0 || test_matmul(ctx) != 0 || test_linear(ctx) != 0 ||
+    if (test_elementwise(ctx) != 0 || test_powlu_schema(ctx) != 0 ||
+        test_matmul(ctx) != 0 || test_linear(ctx) != 0 ||
         test_reduce_softmax_ce_cast(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;

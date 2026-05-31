@@ -1,5 +1,6 @@
 #include "cpu_backend.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -103,6 +104,76 @@ gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, float *out, const float *x)
 
     for (i = 0; i < total; ++i) {
         out[i] = x[i] / (1.0F + expf(-x[i]));
+    }
+    return GD_OK;
+}
+
+static float sigmoidf_stable(float x)
+{
+    if (x >= 0.0F) {
+        float e = expf(-x);
+        return 1.0F / (1.0F + e);
+    }
+    {
+        float e = expf(x);
+        return e / (1.0F + e);
+    }
+}
+
+static float powlu_gate(float z, float m)
+{
+    float s = sigmoidf_stable(z);
+    if (z <= 0.0F) {
+        return z * s;
+    }
+    {
+        float r = sqrtf(z > 0.0F ? z : 0.0F);
+        float a = m / (r + 1.0F);
+        return powf(z, a) * s;
+    }
+}
+
+static float powlu_gate_grad(float z, float m)
+{
+    float s = sigmoidf_stable(z);
+    if (z <= 0.0F) {
+        return s * (1.0F + z * (1.0F - s));
+    }
+    {
+        float r = sqrtf(z > 0.0F ? z : 0.0F);
+        float rp1 = r + 1.0F;
+        float a = m / rp1;
+        float g = powf(z, a);
+        float da = -m / (2.0F * r * rp1 * rp1);
+        float lz = logf(z > FLT_MIN ? z : FLT_MIN);
+        return g * s * (a / z + da * lz + (1.0F - s));
+    }
+}
+
+gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, float *out,
+                          const float *x1, const float *x2, float m)
+{
+    int64_t total = desc_numel(desc);
+    int64_t i = 0;
+
+    for (i = 0; i < total; ++i) {
+        out[i] = x1[i] * powlu_gate(x2[i], m);
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2,
+                              const float *x1, const float *x2, const float *go,
+                              float m)
+{
+    int64_t total = desc_numel(desc);
+    int64_t i = 0;
+
+    for (i = 0; i < total; ++i) {
+        float gate = powlu_gate(x2[i], m);
+        float grad = powlu_gate_grad(x2[i], m);
+        dx1[i] = go[i] * gate;
+        dx2[i] = go[i] * x1[i] * grad;
     }
     return GD_OK;
 }

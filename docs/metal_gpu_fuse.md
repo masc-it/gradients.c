@@ -38,7 +38,8 @@ The GPT op chains we fuse against (`nn.c`):
 attn: n=rms_norm(x,ln1) -> linear(wq)|linear(wk)|linear(wv) (all read n)
       -> rope(q),rope(k) -> sdpa -> linear(wo) -> add(x,.)
 mlp:  n=rms_norm(h,ln2) -> linear(w_gate)|linear(w_up) (both read n)
-      -> silu(gate) -> mul(.,up) -> linear(w_down) -> add(h,.)
+      -> powlu(up,gate) -> linear(w_down) -> add(h,.)
+legacy swiglu: silu(gate) -> mul(.,up) remains as an ablation path/F1 fusion
 head: rms_norm(x,ln_f) -> linear(w_lmhead) -> cross_entropy
 ```
 

@@ -232,6 +232,32 @@ static gd_status build_silu_sum(gd_context *ctx, void *user, gd_tensor **loss_ou
     return status;
 }
 
+static gd_status build_powlu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user;
+    gd_tensor *y = NULL;
+    gd_status status = gd_powlu(ctx, t->a, t->b, 3.0F, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 0, false, loss_out);
+    gd_tensor_release(y);
+    return status;
+}
+
+static gd_status build_powlu_m2_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user;
+    gd_tensor *y = NULL;
+    gd_status status = gd_powlu(ctx, t->a, t->b, 2.0F, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 0, false, loss_out);
+    gd_tensor_release(y);
+    return status;
+}
+
 static gd_status build_gelu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     two_in *t = user;
@@ -587,6 +613,8 @@ int main(void)
         CHECK_TRUE(gradcheck(ctx, build_square_mean, &t, in, 1, "square_mean") == 0);
         CHECK_TRUE(gradcheck(ctx, build_scale_relu_sum, &t, in, 1, "scale_relu") == 0);
         CHECK_TRUE(gradcheck(ctx, build_silu_sum, &t, in, 1, "silu") == 0);
+        CHECK_TRUE(gradcheck(ctx, build_powlu_sum, &t, in, 2, "powlu") == 0);
+        CHECK_TRUE(gradcheck(ctx, build_powlu_m2_sum, &t, in, 2, "powlu_m2") == 0);
         CHECK_TRUE(gradcheck(ctx, build_gelu_sum, &t, in, 1, "gelu") == 0);
         CHECK_TRUE(gradcheck(ctx, build_gelu_tanh_sum, &t, in, 1, "gelu_tanh") == 0);
         CHECK_TRUE(gradcheck(ctx, build_reshape_sum, &t, in, 1, "reshape") == 0);

@@ -80,6 +80,11 @@ typedef struct gd_metal_unary_params {
     float scale;
 } gd_metal_unary_params;
 
+typedef struct gd_metal_powlu_params {
+    int numel;
+    float m;
+} gd_metal_powlu_params;
+
 /* dtype codes shared with the cast kernel (a small closed set, not the full
  * gd_dtype enum, so the host maps explicitly). */
 #define GD_METAL_DT_F32 0

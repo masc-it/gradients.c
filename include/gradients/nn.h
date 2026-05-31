@@ -18,8 +18,9 @@ extern "C" {
  * collected for the optimizer via gd_gpt_parameters. */
 
 typedef enum gd_gpt_mlp_kind {
-    GD_GPT_MLP_SWIGLU = 0, /* down(silu(gate(x)) * up(x)) */
-    GD_GPT_MLP_GELU        /* proj(gelu(fc(x))) */
+    GD_GPT_MLP_POWLU = 0, /* down(powlu(up(x), gate(x), m)) */
+    GD_GPT_MLP_SWIGLU,    /* legacy: down(silu(gate(x)) * up(x)) */
+    GD_GPT_MLP_GELU       /* proj(gelu(fc(x))) */
 } gd_gpt_mlp_kind;
 
 typedef struct gd_gpt_config {
@@ -34,6 +35,7 @@ typedef struct gd_gpt_config {
     float rope_theta;  /* 0 => 10000 */
     float norm_eps;    /* 0 => 1e-5 */
     gd_gpt_mlp_kind mlp_kind;
+    float powlu_m;     /* 0 => 3.0; valid 0 < m < 10 */
     bool tie_embeddings; /* LM head shares the token embedding */
 } gd_gpt_config;
 

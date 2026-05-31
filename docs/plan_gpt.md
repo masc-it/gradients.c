@@ -6,7 +6,7 @@ Goal: specify everything required to build and train a **state-of-the-art
 decoder-only transformer (GPT-style)** in gradients.c, and run efficient
 inference, on both **CPU_REF** and **Metal**. Scope includes RoPE positional
 encoding, scaled dot-product attention (SDPA) with a **block-sparse** kernel
-path, grouped-query attention (GQA), a SwiGLU/GELU MLP, RMSNorm pre-norm blocks,
+path, grouped-query attention (GQA), a PowLU/SwiGLU/GELU MLP, RMSNorm pre-norm blocks,
 weight-tied LM head, and a **KV cache** for autoregressive decode.
 
 This is a *what to build* document. It defines the new public ops, the IR
@@ -68,17 +68,19 @@ rms_norm -> qkv projection (linear, no bias) -> split q[B,T,Hq,Dh], k,v[B,T,Hkv,
          -> SDPA(q, k, v, mask)   (causal; optional block-sparse)   -> o[B,T,Hq,Dh]
          -> merge heads -> out projection (linear) -> residual add
 ```
-MLP block (SwiGLU default; GELU selectable):
+MLP block (PowLU default; SwiGLU/GELU selectable):
 ```
 rms_norm -> w_gate: linear(d, d_ff), w_up: linear(d, d_ff)
-         -> silu(gate) * up    (SwiGLU)   [or gelu(linear) for vanilla GPT]
+         -> powlu(up, gate, m=3)   (PowLU default)
          -> w_down: linear(d_ff, d)
 ```
+Legacy alternatives keep the same parameter layout for SwiGLU (`silu(gate) * up`)
+or use only `w_gate` for vanilla GELU.
 
 Configuration surface (`gd_gpt_config`): `vocab_size V`, `d_model d`,
 `n_layers L`, `n_heads Hq`, `n_kv_heads Hkv` (Hkv==Hq → MHA; 1 → MQA; else GQA),
 `head_dim Dh` (d == Hq*Dh), `d_ff`, `max_seq_len`, `rope_theta`, `norm_eps`,
-`mlp_kind {SWIGLU, GELU}`, `tie_embeddings`, `attn_mask` (see §5).
+`mlp_kind {POWLU, SWIGLU, GELU}`, `powlu_m`, `tie_embeddings`, `attn_mask` (see §5).
 
 ---
 
@@ -105,7 +107,7 @@ CPU↔Metal parity test):
 | `add3`/residual | (optional) fuse residual adds | not required; `add` suffices |
 | `kv_cache_append` | write new k,v into cache slots | inference-only; in-place external write (KV tensors) |
 
-Reuse without new ops: SwiGLU = `silu(gate) * up` via existing `silu`+`mul`;
+PowLU now has a fused two-input op (`gd_powlu(up, gate, m)`) and is the default GPT MLP. Legacy SwiGLU remains expressible as `silu(gate) * up` via existing `silu`+`mul`;
 RMSNorm exists; LM head = `matmul`/`linear` with tied weight; residual = `add`;
 loss = `cross_entropy`.
 
@@ -185,9 +187,9 @@ gd_status gd_sdpa(gd_context*, gd_tensor *q, gd_tensor *k, gd_tensor *v,
                   gd_tensor *bias, const gd_sdpa_config*, gd_tensor **out);
 ```
 A thin convenience layer (`include/gradients/nn.h`, optional) can offer
-`gd_attention_block`, `gd_mlp_swiglu`, and a `gd_gpt` builder that records the
-whole model into the active graph; these are pure compositions of the ops above
-and need no backend support.
+`gd_attention_block`, `gd_mlp_powlu`/legacy SwiGLU, and a `gd_gpt` builder that
+records the whole model into the active graph; these are pure compositions of
+the ops above and need no backend support.
 
 ---
 
@@ -601,16 +603,16 @@ CPU+Metal kernels and parity tests before the next phase.
 - [ ] **G4 — Block-sparse SDPA**: `block_mask` value + host pattern builders
   (causal, sliding-window, custom); kernel visits allowed blocks; parity vs
   dense-masked reference. (Forward-first; sparse backward deferred.)
-- [x] **G5 — GPT model assembly**: `nn.h` builders (attention block, SwiGLU/GELU
+- [x] **G5 — GPT model assembly**: `nn.h` builders (attention block, PowLU/SwiGLU/GELU
   MLP, full `gd_gpt`), weight tying, RMSNorm pre-norm. Tiny-GPT training parity
   (CPU↔Metal) + overfit sanity.
   Landed: `include/gradients/nn.h` + `src/nn/nn.c` — `gd_gpt_config` (V/d/L/heads/
-  kv_heads/head_dim/d_ff/rope_theta/eps/mlp_kind/tie_embeddings),
+  kv_heads/head_dim/d_ff/rope_theta/eps/mlp_kind/powlu_m/tie_embeddings),
   `gd_gpt_create` (deterministic seeded init, params owned by an internal
   `gd_module`), `gd_gpt_parameters`, `gd_gpt_destroy`, `gd_gpt_forward`. Pure
   composition of existing ops: embedding → [pre-norm: separate Q/K/V linears →
   reshape to heads → RoPE(q,k) → SDPA(causal, GQA) → merge → out-proj →
-  residual; pre-norm SwiGLU/GELU MLP → residual] ×L → final RMSNorm → tied LM
+  residual; pre-norm PowLU/SwiGLU/GELU MLP → residual] ×L → final RMSNorm → tied LM
   head (`matmul_ex` trans_b on the embedding) or untied linear. Separate Q/K/V
   projections avoid slicing virtual tensors; head reshapes use the contiguous
   `COPY`. **RMSNorm autograd added** (was missing — dx and dweight reference

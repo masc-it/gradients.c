@@ -70,6 +70,7 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_SCALE, "gd_scale"},
     {_GD_OP_RELU, "gd_relu"},
     {_GD_OP_SILU, "gd_silu"},
+    {_GD_OP_POWLU, "gd_powlu"},
     {_GD_OP_COPY, "gd_copy"},
     {_GD_OP_CAST, "gd_cast"},
     {_GD_OP_MATMUL, "gd_matmul_tiled"},
@@ -81,6 +82,7 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_CROSS_ENTROPY, "gd_cross_entropy"},
     {_GD_OP_RELU_BWD, "gd_relu_bwd"},
     {_GD_OP_SILU_BWD, "gd_silu_bwd"},
+    {_GD_OP_POWLU_BWD, "gd_powlu_bwd"},
     {_GD_OP_SOFTMAX_BWD, "gd_softmax_bwd"},
     {_GD_OP_SUM_BWD, "gd_sum_bwd"},
     {_GD_OP_MEAN_BWD, "gd_sum_bwd"},
@@ -1425,6 +1427,50 @@ static void encode_unary(id<MTLComputeCommandEncoder> enc,
 /* F1 fused SwiGLU: encode gd_silu_mul for a MUL head that absorbed a SILU.
  * gate = silu input, up = head input 1, hh = head output, act = silu output
  * (kept materialized for the unfused backward). */
+static void encode_powlu(id<MTLComputeCommandEncoder> enc,
+                         id<MTLComputePipelineState> pso,
+                         _gd_executable *exe,
+                         const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_powlu_params p;
+
+    p.numel = (int)numel;
+    p.m = node->attrs.powlu_m;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+}
+
+static void encode_powlu_bwd(id<MTLComputeCommandEncoder> enc,
+                             id<MTLComputePipelineState> pso,
+                             _gd_executable *exe,
+                             const _gd_node *node)
+{
+    const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+    int64_t numel = desc_numel(out_desc);
+    gd_metal_powlu_params p;
+
+    p.numel = (int)numel;
+    p.m = node->attrs.powlu_m;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
+    [enc setBuffer:value_buffer(exe, node->outputs[1]) offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    if (numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)numel);
+    }
+}
+
 static void encode_fused_silu_mul(id<MTLComputeCommandEncoder> enc,
                                   id<MTLComputePipelineState> pso,
                                   _gd_executable *exe,
@@ -2715,6 +2761,9 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_SILU:
         encode_unary(enc, pso, exe, node, 0.0F);
         return GD_OK;
+    case _GD_OP_POWLU:
+        encode_powlu(enc, pso, exe, node);
+        return GD_OK;
     case _GD_OP_COPY:
         if (node->n_inputs == 1 && node->n_outputs == 1 &&
             exe->values[node->inputs[0]].storage == exe->values[node->outputs[0]].storage) {
@@ -2747,6 +2796,9 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_RELU_BWD:
     case _GD_OP_SILU_BWD:
         encode_unary_bwd(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_POWLU_BWD:
+        encode_powlu_bwd(enc, pso, exe, node);
         return GD_OK;
     case _GD_OP_SOFTMAX_BWD:
         encode_softmax_bwd(enc, pso, exe, node);

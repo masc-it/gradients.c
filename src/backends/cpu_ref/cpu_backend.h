@@ -17,6 +17,11 @@ gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
 gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, float *out, const float *x, float scale);
 gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, float *out, const float *x);
 gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, float *out, const float *x);
+gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, float *out,
+                          const float *x1, const float *x2, float m);
+gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2,
+                              const float *x1, const float *x2, const float *go,
+                              float m);
 gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
                            float *out,
                            const gd_tensor_desc *a_desc,

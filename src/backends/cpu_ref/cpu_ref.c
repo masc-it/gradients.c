@@ -104,6 +104,13 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
             return status;
         }
         return _gd_cpu_k_silu(out_desc, out_data, in_data[0]);
+    case _GD_OP_POWLU:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_powlu(out_desc, out_data, in_data[0], in_data[1],
+                               node->attrs.powlu_m);
     case _GD_OP_MATMUL:
         status = require_f32(out_desc);
         if (status != GD_OK) {
@@ -262,6 +269,24 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
             return status;
         }
         return _gd_cpu_k_silu_bwd(out_desc, out_data, in_data[0], in_data[1]);
+    case _GD_OP_POWLU_BWD: {
+        void *dx2_data = NULL;
+        const gd_tensor_desc *dummy = NULL;
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (node->n_outputs != 2) {
+            return _gd_error(GD_ERR_INTERNAL, "powlu_bwd expects 2 outputs");
+        }
+        status = value_ptr(exe, node->outputs[1], &dx2_data, &dummy);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_powlu_bwd(out_desc, out_data, dx2_data,
+                                   in_data[0], in_data[1], in_data[2],
+                                   node->attrs.powlu_m);
+    }
     case _GD_OP_SOFTMAX_BWD:
         status = require_f32(out_desc);
         if (status != GD_OK) {

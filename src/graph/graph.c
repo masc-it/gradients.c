@@ -45,6 +45,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "relu";
     case _GD_OP_SILU:
         return "silu";
+    case _GD_OP_POWLU:
+        return "powlu";
     case _GD_OP_SUM:
         return "sum";
     case _GD_OP_MEAN:
@@ -85,6 +87,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "relu_bwd";
     case _GD_OP_SILU_BWD:
         return "silu_bwd";
+    case _GD_OP_POWLU_BWD:
+        return "powlu_bwd";
     case _GD_OP_SOFTMAX_BWD:
         return "softmax_bwd";
     case _GD_OP_SUM_BWD:

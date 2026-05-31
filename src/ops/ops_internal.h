@@ -14,6 +14,7 @@ bool _gd_dtype_is_integer(gd_dtype dtype);
  * descriptor and validates v1 dtype/device rules. */
 gd_status _gd_infer_elementwise(gd_tensor *a, gd_tensor *b, gd_tensor_desc *out);
 gd_status _gd_infer_unary_float(gd_tensor *x, gd_tensor_desc *out);
+gd_status _gd_infer_powlu(gd_tensor *x1, gd_tensor *x2, gd_tensor_desc *out);
 gd_status _gd_infer_matmul(gd_tensor *a,
                            gd_tensor *b,
                            bool trans_a,

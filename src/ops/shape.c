@@ -111,6 +111,39 @@ gd_status _gd_infer_unary_float(gd_tensor *x, gd_tensor_desc *out)
     return gd_tensor_desc_contiguous(dx->dtype, dx->device, dx->ndim, dx->sizes, out);
 }
 
+gd_status _gd_infer_powlu(gd_tensor *x1, gd_tensor *x2, gd_tensor_desc *out)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *d1 = NULL;
+    const gd_tensor_desc *d2 = NULL;
+    int i = 0;
+
+    if (x1 == NULL || x2 == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "powlu argument is NULL");
+    }
+    if (gd_tensor_dtype(x1) != gd_tensor_dtype(x2)) {
+        return _gd_error(GD_ERR_DTYPE, "powlu inputs must share dtype");
+    }
+    if (!_gd_dtype_is_float(gd_tensor_dtype(x1))) {
+        return _gd_error(GD_ERR_DTYPE, "powlu requires floating-point inputs");
+    }
+    status = require_same_device(x1, x2);
+    if (status != GD_OK) {
+        return status;
+    }
+    d1 = _gd_tensor_desc_ptr(x1);
+    d2 = _gd_tensor_desc_ptr(x2);
+    if (d1->ndim != d2->ndim) {
+        return _gd_error(GD_ERR_SHAPE, "powlu inputs must have equal shape");
+    }
+    for (i = 0; i < d1->ndim; ++i) {
+        if (d1->sizes[i] != d2->sizes[i]) {
+            return _gd_error(GD_ERR_SHAPE, "powlu inputs must have equal shape");
+        }
+    }
+    return gd_tensor_desc_contiguous(d1->dtype, d1->device, d1->ndim, d1->sizes, out);
+}
+
 gd_status _gd_infer_matmul(gd_tensor *a,
                            gd_tensor *b,
                            bool trans_a,

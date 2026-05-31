@@ -264,6 +264,38 @@ static gd_status backward_node(bwd_ctx *b, const _gd_node *node_ref)
         gd_tensor_release(dx);
         return status;
     }
+    case _GD_OP_POWLU: {
+        gd_tensor *x1 = NULL;
+        gd_tensor *x2 = NULL;
+        gd_tensor *grads[2] = {NULL, NULL};
+        gd_tensor *inputs[3];
+        gd_tensor_desc out_descs[2];
+
+        status = fwd_tensor(b, node->inputs[0], &x1);
+        if (status == GD_OK) {
+            status = fwd_tensor(b, node->inputs[1], &x2);
+        }
+        if (status != GD_OK) {
+            return status;
+        }
+        inputs[0] = x1;
+        inputs[1] = x2;
+        inputs[2] = go;
+        out_descs[0] = b->graph->values[node->inputs[0]].desc;
+        out_descs[1] = b->graph->values[node->inputs[1]].desc;
+        status = _gd_graph_emit_multi(b->graph, _GD_OP_POWLU_BWD, inputs, 3,
+                                      &node->attrs, out_descs, 2, grads);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], grads[0]);
+        if (status == GD_OK) {
+            status = accumulate(b, node->inputs[1], grads[1]);
+        }
+        gd_tensor_release(grads[0]);
+        gd_tensor_release(grads[1]);
+        return status;
+    }
     case _GD_OP_MATMUL:
         return matmul_backward(b, go, node->inputs[0], node->inputs[1],
                                node->attrs.trans_a, node->attrs.trans_b,

@@ -102,7 +102,12 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_silu_mul", /* F1: fused SwiGLU activation */
     "gd_cross_entropy_reduce",
     "gd_embedding_bwd_scatter",
+    "gd_rms_norm_wbwd_reduce",
 };
+
+/* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in
+ * kernels.metal (power of two for the tree reduction). */
+#define GD_METAL_RMS_TG 256
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
  * and offsets). When n_splits==1 only the stats region is used (the original
@@ -784,7 +789,23 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
-            if (op == _GD_OP_EMBEDDING_BWD) {
+            if (op == _GD_OP_RMS_NORM_WBWD) {
+                const gd_tensor_desc *x_desc = &graph->values[node->inputs[0]].desc;
+                int last = (int)x_desc->sizes[x_desc->ndim - 1];
+                int rows = last > 0 ? (int)(desc_numel(x_desc) / last) : 0;
+                int row_blocks = (rows + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_rms_norm_wbwd_reduce");
+                if (row_blocks > 0 && last > 0) {
+                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
+                                             GD_MEM_UNIFIED,
+                                             (size_t)row_blocks * (size_t)last * sizeof(float),
+                                             sizeof(float)};
+                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
+                    if (status != GD_OK) {
+                        goto fail;
+                    }
+                }
+            } else if (op == _GD_OP_EMBEDDING_BWD) {
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_embedding_bwd_scatter");
             } else if (op == _GD_OP_CROSS_ENTROPY) {
                 const gd_tensor_desc *logits = &graph->values[node->inputs[0]].desc;
@@ -1000,10 +1021,6 @@ static void dispatch_gemm_tiles(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreadgroups:MTLSizeMake(gx, gy, batch)
         threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
 }
-
-/* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in
- * kernels.metal (power of two for the tree reduction). */
-#define GD_METAL_RMS_TG 256
 
 /* Dispatches `groups` threadgroups of GD_METAL_RMS_TG threads (one threadgroup
  * per reduced row, or per channel tile). */
@@ -1957,10 +1974,12 @@ static void encode_rms_norm_bwd(id<MTLComputeCommandEncoder> enc,
     }
 }
 
-static void encode_rms_norm_wbwd(id<MTLComputeCommandEncoder> enc,
-                                 id<MTLComputePipelineState> pso,
-                                 _gd_executable *exe,
-                                 const _gd_node *node)
+static gd_status encode_rms_norm_wbwd(id<MTLComputeCommandEncoder> enc,
+                                       id<MTLComputePipelineState> pso,
+                                       id<MTLComputePipelineState> reduce_pso,
+                                       id<MTLBuffer> scratch,
+                                       _gd_executable *exe,
+                                       const _gd_node *node)
 {
     /* dweight: inputs x(0), go(1); output dweight [last]. dims from x. */
     const gd_tensor_desc *x_desc = &exe->graph->values[node->inputs[0]].desc;
@@ -1969,16 +1988,29 @@ static void encode_rms_norm_wbwd(id<MTLComputeCommandEncoder> enc,
     p.last = (int)x_desc->sizes[x_desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(desc_numel(x_desc) / p.last) : 0;
     p.eps = node->attrs.eps;
+    if (p.rows <= 0 || p.last <= 0) {
+        return GD_OK;
+    }
+    if (reduce_pso == nil || scratch == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal rms_norm_wbwd scratch/pipeline missing");
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
-    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBuffer:scratch offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    if (p.last > 0) {
-        /* One threadgroup per channel tile of GD_METAL_RMS_TG channels. */
-        NSUInteger groups = ((NSUInteger)p.last + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
-        dispatch_reduce_groups(enc, groups);
+    {
+        NSUInteger row_blocks = ((NSUInteger)p.rows + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
+        NSUInteger channel_blocks = ((NSUInteger)p.last + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(row_blocks * channel_blocks, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_RMS_TG, 1, 1)];
     }
+    [enc setComputePipelineState:reduce_pso];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch_1d(enc, reduce_pso, (NSUInteger)p.last);
+    return GD_OK;
 }
 
 static gd_status encode_node(_gd_backend *self,
@@ -2083,8 +2115,7 @@ static gd_status encode_node(_gd_backend *self,
         encode_rms_norm_bwd(enc, pso, exe, node);
         return GD_OK;
     case _GD_OP_RMS_NORM_WBWD:
-        encode_rms_norm_wbwd(enc, pso, exe, node);
-        return GD_OK;
+        return encode_rms_norm_wbwd(enc, pso, pso2, scratch, exe, node);
     default:
         return _gd_error(GD_ERR_UNSUPPORTED, "metal op not implemented yet");
     }

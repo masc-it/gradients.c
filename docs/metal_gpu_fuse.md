@@ -271,7 +271,9 @@ cutting T=512 `sdpa_bwd` `610.5 -> 584.9 ms` and user-workload step `1697 ->
 1620 ms`. Then fusing the split stats+dq scan cut T=512 `sdpa_bwd` `584.9 ->
 519.8 ms` and user-workload step `1620 -> 1596 ms`. Finally, `embedding_bwd`
 was switched from gather-by-vocab to zero+atomic scatter, cutting T=512
-`embedding_bwd` `48.7 -> 0.76 ms` and step `1596 -> 1548 ms`.
+`embedding_bwd` `48.7 -> 0.76 ms` and step `1596 -> 1548 ms`. `rms_norm_wbwd`
+then got row-block partial reductions, cutting T=512 `38.1 -> 9.0 ms` and step
+`1548 -> 1533 ms`.
 
 (Fill as F2+ land; use post-CE/tail-triage/split-retune clean-release baselines.)
 

@@ -1087,6 +1087,29 @@ clean. Learning: deterministic gather avoids atomics but scales with vocab and i
 wrong for large sparse-update embeddings; atomic scatter is the right GPU shape
 for the current tokenizer/embedding workload.
 
+### 2026-05-31 rms_norm_wbwd row-block partials
+
+After embedding_bwd, `rms_norm_wbwd` was the next largest safe tail kernel
+(~38 ms at B=8,T=512). The previous kernel used one threadgroup per channel tile;
+each channel thread serially scanned all rows while row threads only cooperated to
+compute `rms_inv` for a tile. That left the row dimension under-parallelized.
+
+Implemented two dispatches under the same IR op:
+1. pass 1: one threadgroup per `(row_block, channel_tile)` writes partial
+   dweight sums to scratch;
+2. pass 2: one thread per channel reduces row-block partials.
+
+Numbers (M1 Pro, clean release, 6L GPT):
+```text
+B=4,T=256: rms_norm_wbwd ~10.9 -> 6.2 ms, step 296.8 -> 290.7 ms, tok/s 3523
+B=8,T=512: rms_norm_wbwd 38.1 -> 9.0 ms, step 1548 -> 1533 ms, tok/s 2672
+```
+
+Validation: `make check` green, GPT train parity green, ASan `test_metal_gpt`
+clean. Learning: for long sequences, weight-gradient reductions need both row and
+channel parallelism; a single channel-tile grid underutilizes the GPU even if
+per-row `rms_inv` is cached.
+
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)
 - `GD_PROFILE=trace ... make gpt-bench` per-op attribution before/after

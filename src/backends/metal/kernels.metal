@@ -547,51 +547,64 @@ kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
     }
 }
 
-/* RMSNorm backward dweight = sum_r go[r,c] * x[r,c] * rms_inv[r]. One threadgroup
- * per channel-tile; the per-row rms_inv is computed cooperatively once per row
- * tile and cached in threadgroup memory, instead of being recomputed for every
- * channel (the previous one-thread-per-channel kernel recomputed it `last`
- * times, which dominated GPT's backward). */
+/* RMSNorm backward dweight = sum_r go[r,c] * x[r,c] * rms_inv[r]. Pass 1 writes
+ * one partial per (row-block, channel); pass 2 reduces row-block partials. This
+ * parallelizes the row dimension for long sequences instead of one channel
+ * thread serially scanning every row. */
 kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
                              device const float *go              [[buffer(1)]],
-                             device float *dweight               [[buffer(2)]],
+                             device float *partial               [[buffer(2)]],
                              constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
                              uint tgid  [[threadgroup_position_in_grid]],
                              uint tid    [[thread_index_in_threadgroup]],
                              uint tgsz   [[threads_per_threadgroup]])
 {
     threadgroup float inv_sh[GD_RMS_TG];
-    int c = (int)(tgid * tgsz + tid);
+    int row_blocks = (p.rows + (int)tgsz - 1) / (int)tgsz;
+    int rb = (int)tgid % row_blocks;
+    int cb = (int)tgid / row_blocks;
+    int c = cb * (int)tgsz + (int)tid;
+    int row0 = rb * (int)tgsz;
+    int tile = p.rows - row0;
     float acc = 0.0f;
+    if (tile > (int)tgsz) {
+        tile = (int)tgsz;
+    }
 
-    for (int rb = 0; rb < p.rows; rb += GD_RMS_TG) {
-        int tile = p.rows - rb;
-        if (tile > GD_RMS_TG) {
-            tile = GD_RMS_TG;
+    if ((int)tid < tile) {
+        int rbase = (row0 + (int)tid) * p.last;
+        float ss = 0.0f;
+        for (int cc = 0; cc < p.last; ++cc) {
+            float v = x[rbase + cc];
+            ss += v * v;
         }
-        /* Cooperatively compute rms_inv for the rows in this tile (one row per
-         * thread for tid < tile). */
-        if ((int)tid < tile) {
-            int rbase = (rb + (int)tid) * p.last;
-            float ss = 0.0f;
-            for (int cc = 0; cc < p.last; ++cc) {
-                float v = x[rbase + cc];
-                ss += v * v;
-            }
-            inv_sh[tid] = 1.0f / sqrt(ss / (float)p.last + p.eps);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (c < p.last) {
-            for (int i = 0; i < tile; ++i) {
-                int rbase = (rb + i) * p.last;
-                acc += go[rbase + c] * x[rbase + c] * inv_sh[i];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv_sh[tid] = 1.0f / sqrt(ss / (float)p.last + p.eps);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (c < p.last) {
-        dweight[c] = acc;
+        for (int i = 0; i < tile; ++i) {
+            int rbase = (row0 + i) * p.last;
+            acc += go[rbase + c] * x[rbase + c] * inv_sh[i];
+        }
+        partial[rb * p.last + c] = acc;
     }
+}
+
+kernel void gd_rms_norm_wbwd_reduce(device const float *partial      [[buffer(0)]],
+                                    device float *dweight            [[buffer(1)]],
+                                    constant gd_metal_rmsnorm_params &p [[buffer(2)]],
+                                    uint gid                         [[thread_position_in_grid]])
+{
+    int c = (int)gid;
+    if (c >= p.last) {
+        return;
+    }
+    int row_blocks = (p.rows + GD_RMS_TG - 1) / GD_RMS_TG;
+    float acc = 0.0f;
+    for (int rb = 0; rb < row_blocks; ++rb) {
+        acc += partial[rb * p.last + c];
+    }
+    dweight[c] = acc;
 }
 
 /* Mean cross-entropy to a single scalar. One threadgroup: each thread sums the

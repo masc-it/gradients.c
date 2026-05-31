@@ -385,6 +385,12 @@ clean. Learning: deleting a duplicate score/dp scan is worth more than further
 split/tile-size tuning; remaining dominant attention work is now the dk/dv split
 scan, whose register pressure is the next likely ceiling.
 
+Negative dkv probe (reverted): split `dkv_split` into separate `dv_split` and
+`dk_split` kernels to reduce per-thread register arrays. It was much slower
+(T=512 `sdpa_bwd` ~748 ms vs ~520 ms) because `dv_split` recomputes the q·k dot
+for every pair; extra arithmetic dominates any occupancy/register relief. Keep
+combined dk/dv so q·k and dO·v are shared.
+
 ---
 
 ## 7. Reporting rule

@@ -506,6 +506,8 @@ gd_status _gd_cpu_k_cross_entropy(float *out,
 }
 
 gd_status _gd_cpu_k_lm_cross_entropy(float *out,
+                                     float *row_max,
+                                     float *row_sum,
                                      const gd_tensor_desc *hidden_desc,
                                      const float *hidden,
                                      const gd_tensor_desc *weight_desc,
@@ -550,6 +552,8 @@ gd_status _gd_cpu_k_lm_cross_entropy(float *out,
             }
             sum += exp(s - max_val);
         }
+        row_max[n] = (float)max_val;
+        row_sum[n] = (float)sum;
         loss += -(target_logit - max_val - log(sum));
     }
     out[0] = (float)(loss / (double)N);
@@ -1154,7 +1158,9 @@ gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
                                          const float *weight,
                                          const gd_tensor_desc *targets_desc,
                                          const void *targets,
-                                         const float *go_scalar)
+                                         const float *go_scalar,
+                                         const float *row_max,
+                                         const float *row_sum)
 {
     int64_t D = hidden_desc->sizes[hidden_desc->ndim - 1];
     int64_t V = weight_desc->sizes[0];
@@ -1172,26 +1178,10 @@ gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
 
     for (int64_t n = 0; n < N; ++n) {
         int64_t target = is_i64 ? ((const int64_t *)targets)[n] : (int64_t)((const int32_t *)targets)[n];
-        double max_val = -HUGE_VAL;
-        double sum = 0.0;
+        double max_val = (double)row_max[n];
+        double sum = (double)row_sum[n];
         if (target < 0 || target >= V) {
             return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy target out of range");
-        }
-        for (int64_t v = 0; v < V; ++v) {
-            double s = 0.0;
-            for (int64_t d = 0; d < D; ++d) {
-                s += (double)hidden[n * D + d] * (double)weight[v * D + d];
-            }
-            if (s > max_val) {
-                max_val = s;
-            }
-        }
-        for (int64_t v = 0; v < V; ++v) {
-            double s = 0.0;
-            for (int64_t d = 0; d < D; ++d) {
-                s += (double)hidden[n * D + d] * (double)weight[v * D + d];
-            }
-            sum += exp(s - max_val);
         }
         for (int64_t v = 0; v < V; ++v) {
             double s = 0.0;

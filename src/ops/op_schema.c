@@ -403,7 +403,10 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
     gd_status status = GD_OK;
     gd_graph *graph = NULL;
     gd_tensor *inputs[3];
-    gd_tensor_desc desc;
+    gd_tensor *outs[3] = {NULL, NULL, NULL};
+    gd_tensor_desc out_descs[3];
+    const gd_tensor_desc *dh = NULL;
+    const gd_tensor_desc *dt = NULL;
 
     if (hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_lm_cross_entropy argument is NULL");
@@ -413,14 +416,30 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_infer_lm_cross_entropy(hidden, weight, targets, &desc);
+    status = _gd_infer_lm_cross_entropy(hidden, weight, targets, &out_descs[0]);
     if (status != GD_OK) {
         return status;
     }
+    dh = _gd_tensor_desc_ptr(hidden);
+    dt = _gd_tensor_desc_ptr(targets);
+    status = gd_tensor_desc_contiguous(dh->dtype, dh->device, dt->ndim, dt->sizes,
+                                       &out_descs[1]);
+    if (status != GD_OK) {
+        return status;
+    }
+    out_descs[2] = out_descs[1];
     inputs[0] = hidden;
     inputs[1] = weight;
     inputs[2] = targets;
-    return _gd_graph_emit(graph, _GD_OP_LM_CROSS_ENTROPY, inputs, 3, NULL, &desc, loss);
+    status = _gd_graph_emit_multi(graph, _GD_OP_LM_CROSS_ENTROPY, inputs, 3, NULL,
+                                  out_descs, 3, outs);
+    if (status != GD_OK) {
+        return status;
+    }
+    *loss = outs[0];
+    gd_tensor_release(outs[1]);
+    gd_tensor_release(outs[2]);
+    return GD_OK;
 }
 
 gd_status gd_cast(gd_context *ctx, gd_tensor *x, gd_dtype dtype, gd_tensor **out)

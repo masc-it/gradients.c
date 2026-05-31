@@ -97,24 +97,24 @@ Forward:
 for row n:
   max = max_v dot(hidden[n], weight[v])
   sum = Σ_v exp(dot - max)
+  save row_max[n], row_sum[n]
   loss += -(target_logit - max - log(sum))
 loss /= N
 ```
 
-Backward:
+Backward consumes the saved `row_max` / `row_sum` aux outputs:
 
 ```text
 dhidden = 0
 dweight = 0
 for row n:
-  recompute max/sum
   for class v:
     dlogit = (softmax_v - onehot_v) * go / N
     dhidden[n] += dlogit * weight[v]
     dweight[v] += dlogit * hidden[n]
 ```
 
-No logits/dlogits tensor is allocated.
+No logits/dlogits tensor is allocated. Aux stats cost is only `2*N*sizeof(float)`.
 
 ---
 
@@ -136,18 +136,13 @@ kernel: losses[row] = -(target_logit - m - log(sum))
 kernel: reduce mean loss
 ```
 
-Backward:
+Backward consumes the forward op's saved `m/sum` aux outputs and emits gradients
+without full `dlogits`:
 
 ```text
-# recompute row stats
 for chunk:
   MPS:    logits_chunk = hidden_flat @ weight_chunk^T
-  kernel: update m/sum
-
-# emit gradients without full dlogits
-for chunk:
-  MPS:    logits_chunk = hidden_flat @ weight_chunk^T
-  kernel: overwrite logits_chunk with dlogits_chunk
+  kernel: overwrite logits_chunk with dlogits_chunk using saved m/sum
   MPS:    dhidden += dlogits_chunk @ weight_chunk
   MPS:    dweight_chunk = dlogits_chunk^T @ hidden_flat
 ```
@@ -156,14 +151,18 @@ for chunk:
 `dweight_chunk` writes disjoint weight rows, so no accumulation between chunks is
 needed.
 
+Persistent aux outputs:
+
+```text
+row_max [N]
+row_sum [N]
+```
+
 Scratch layout:
 
 ```text
-logits_chunk [N, C]
-row_max      [N]
-row_sum      [N]
-target_logit [N]
-row_losses   [N]
+forward: logits_chunk [N, C] + target_logit [N] + row_losses [N]
+backward: logits_chunk [N, C]
 ```
 
 This uses the existing shared Metal scratch arena, so peak scratch is the max
@@ -193,23 +192,27 @@ New coverage:
 
 ## 6. Performance notes
 
-Bench environment: release gpt-bench, `GD_METAL_MPS=1`, `GD_BENCH_FUSED_LMCE=1`, model default
-`d_model=320 layers=6 heads=5 d_ff=1280 vocab=8000`.
+Bench environment: release gpt-bench, `GD_METAL_MPS=1`, `GD_BENCH_FUSED_LMCE=1`.
+The gpt-bench default model is now `d_model=256 layers=6 heads=4 d_ff=1024 vocab=8000`.
 
-Baseline before fused LMCE (MPS + scratch arena + SDPA tuning):
+Current default-model baseline (unfused logits path):
 
 ```text
-T256 B4:  ~192 ms, ~5334 tok/s
-T512 B8: ~1098 ms, ~3729 tok/s
-T1024 B4 smoke: ~1965 ms, ~2084 tok/s
+T256 B4: 160.6 ms best, 6375 tok/s
+T512 B8: 847.3 ms best, 4834 tok/s
 ```
 
-Fused LMCE v1 (`C=1024`):
+Fused LMCE with saved forward stats (`C=1024`):
 
 ```text
-T256 B4:  229.0 ms best, 4472 tok/s
-T512 B8: 1145.0 ms best, 3577 tok/s
-T1024 B4 smoke: 2046.7 ms, 2001 tok/s
+T256 B4: 177.3 ms best, 5776 tok/s
+T512 B8: 903.8 ms best, 4532 tok/s
+```
+
+Old 320-wide model comparison after saved-stats patch:
+
+```text
+T512 B8: 1131.2 ms best, 3621 tok/s  # was ~1145 ms before saved stats
 ```
 
 Chunk-size probe at `T512 B8`:

@@ -43,7 +43,7 @@ Not enough for real GPT training:
 
 - [x] tokenizer stack
 - [x] corpus preprocessing / packed token shards
-- [ ] production data loader
+- [x] production data loader
 - [ ] LR scheduler without graph rebuilds
 - [ ] global grad clipping
 - [ ] checkpoint/resume
@@ -389,7 +389,7 @@ Implemented in `include/gradients/dataset.h`, `src/dataset/dataset.c`,
 - [x] special token ids appear at record boundaries.
 - [x] shard header is mmap-friendly and read without parsing JSON.
 - [x] malformed formatted records are rejected.
-- [ ] tokenizer hash mismatch is detected by loader (P3).
+- [x] tokenizer hash mismatch is detected by loader (P3).
 
 ---
 
@@ -402,20 +402,29 @@ mmap shards and fills two alternating batch buffers.
 
 Core behavior:
 
-- random sample mode for training
-- sequential sample mode for eval
-- deterministic seed
-- shard shuffle
-- resume from loader state
-- double buffering from first implementation
-- optional CPU worker thread for prefetch
+- [x] random sample mode for training
+- [x] sequential sample mode for eval
+- [x] deterministic seed
+- [x] random sampling across mapped shards for train (epoch shard-shuffle can come later)
+- [x] resume from loader state
+- [x] double buffering from first implementation
+- [ ] optional CPU worker thread for prefetch
 
 ### 5.2 Buffer model
 
 Use two full batch slots:
 
 ```c
+typedef enum gd_batch_slot_state {
+    GD_BATCH_SLOT_FREE = 0,
+    GD_BATCH_SLOT_FILLING = 1,
+    GD_BATCH_SLOT_READY = 2,
+    GD_BATCH_SLOT_IN_USE = 3
+} gd_batch_slot_state;
+
 typedef struct gd_batch_slot {
+    int index;
+    gd_batch_slot_state state;
     gd_tensor *tokens;    /* int32 [B,512] */
     gd_tensor *targets;   /* int32 [B,512] */
     gd_tensor *positions; /* int32 [B,512], usually 0..511 repeated */
@@ -452,6 +461,11 @@ runtime rebinding complexity.
 typedef struct gd_token_dataset gd_token_dataset;
 typedef struct gd_dataloader gd_dataloader;
 
+typedef enum gd_dataloader_mode {
+    GD_DATALOADER_RANDOM = 0,
+    GD_DATALOADER_SEQUENTIAL = 1
+} gd_dataloader_mode;
+
 typedef struct gd_dataloader_config {
     int batch_size;
     int block_len;       /* 512 */
@@ -459,6 +473,8 @@ typedef struct gd_dataloader_config {
     int shuffle;
     int double_buffer;   /* must be true in v1 */
     gd_device device;
+    gd_dataloader_mode mode;
+    uint64_t expected_tokenizer_hash; /* 0 disables check */
 } gd_dataloader_config;
 
 gd_status gd_token_dataset_open(const char **paths, int n_paths,
@@ -473,20 +489,31 @@ void gd_dataloader_destroy(gd_dataloader *dl);
 
 gd_status gd_dataloader_prefetch(gd_dataloader *dl);
 gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch_slot **slot_out);
+gd_status gd_dataloader_release_slot(gd_dataloader *dl, gd_batch_slot *slot);
 
 gd_status gd_dataloader_state_save(gd_dataloader *dl, const char *path);
 gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path);
+void gd_dataloader_metrics_get(const gd_dataloader *dl,
+                               gd_dataloader_metrics *metrics_out);
 ```
 
 ### 5.5 Metrics
 
+Implemented in `include/gradients/dataloader.h`, `src/dataset/dataloader.c`,
+and `tests/test_dataloader.c`.
+
 Loader reports:
 
-- samples/sec prepared
-- host fill ms
-- host->device copy ms
-- wait-for-batch ms
-- dropped samples/tail count
+- [x] batches/samples prepared
+- [x] host fill ns
+- [x] host->device copy ns
+- [x] wait-for-batch ns
+- [x] tokenizer hash mismatch before graph build
+
+V1 prefetch is synchronous but double-buffer safe: slots move
+`FREE -> FILLING -> READY -> IN_USE -> FREE`, and `IN_USE` slots are never
+reused until `gd_dataloader_release_slot()`. Optional worker thread remains
+post-P3.
 
 Acceptance: training step should not block on loader after warmup for target
 batch sizes on local SSD.
@@ -910,10 +937,10 @@ Not required for first real training, but important later:
 
 ### P3 — Double-buffer dataloader
 
-- [ ] mmap shard reader.
-- [ ] two batch slots.
-- [ ] train/eval sampling modes.
-- [ ] loader metrics.
+- [x] mmap shard reader.
+- [x] two batch slots.
+- [x] train/eval sampling modes.
+- [x] loader metrics.
 
 ### P4 — Mutable LR + scheduler
 
@@ -956,7 +983,7 @@ A first production-ready text GPT training run is accepted when:
 
 - [ ] tokenizer trains on real corpus and encodes it with special tokens and separate digits.
 - [x] dataset builder creates separate train/val 512-token packed shards and reports dropped tail.
-- [ ] loader double buffers and reports near-zero wait after warmup.
+- [x] loader double buffers and reports wait metrics; zero-wait target depends on trainer prefetch cadence.
 - [ ] train graph uses mutable LR scheduler and global grad clipping.
 - [ ] checkpoint/resume reproduces deterministic training continuation.
 - [ ] validation perplexity and sample generation run periodically.

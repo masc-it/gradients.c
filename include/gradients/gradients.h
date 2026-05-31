@@ -14,5 +14,6 @@
 #include "gradients/optim.h"
 #include "gradients/tokenizer.h"
 #include "gradients/dataset.h"
+#include "gradients/dataloader.h"
 
 #endif /* GRADIENTS_H */

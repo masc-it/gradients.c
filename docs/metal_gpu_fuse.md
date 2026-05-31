@@ -157,10 +157,30 @@ no-op on correctness and perf before any kernel exists.
   (absorbed into `mul`), 6 fewer dispatches, step 408 ms unchanged (~0.4%). The
   value is the proven pipeline; the perf payoff is F2. Dropping `act` (recompute
   in a fused backward) is deferred — it needs a fused backward and buys little.
-- [ ] F2 — **Headline kernel: `linear`→`cross_entropy`** (LM head). Logits are
-  forward-only (no backward reads them) → drop the `[B,T,V]` materialization;
-  forward streams the loss, backward recomputes `softmax` to form `dlogits`.
-  Biggest single tail item (~50 ms incl. bwd).
+- [ ] F2 — **`matmul`/`linear`→`cross_entropy`** (LM head). Investigated; scope is
+  bigger than first framed (it is a cut-cross-entropy kernel). Key findings:
+  - The logits claim "forward-only" is **false in training**: `logits` is
+    consumed by both `cross_entropy` (fwd) **and** `cross_entropy_bwd` (which
+    recomputes softmax). So a forward-only fusion is illegal in a training graph
+    (the legality gate refuses; it would only fire for eval/inference graphs).
+  - The real training win is eliminating **`dlogits[N,V]`** in the backward
+    (~32 ms at T=256; ~131 MB / much larger at T=512,B=8). That needs the head
+    grad matmuls (`d_normed = dlogits@wte`, `d_wte = dlogits^T@normed`) to
+    **recompute `dlogits` in-tile** from materialized `logits` + per-row softmax
+    stats — i.e. a cut-cross-entropy backward. `d_wte` is the hard part
+    (cross-token reduction; can't drop `dlogits` without a tiled recompute GEMM).
+  - A naive row-oriented fused forward (one threadgroup/row, GEMV + online
+    softmax) would **regress** the forward, because it discards the efficient
+    tiled reg-blocked GEMM. A non-regressing fused forward must itself be tiled.
+  Conclusion: F2 is a substantial, specialized, tiled kernel project (fwd + the
+  harder cut-CE bwd), not an F1-style increment. Split into F2a/F2b below.
+- [ ] F2a — *(optional, eval-only)* tiled fused `matmul`→`cross_entropy` forward
+  that streams the loss without materializing logits. Legality gates it to graphs
+  where `logits` has a single consumer (the CE) → fires for eval, safely falls
+  back in training. Must be tiled to avoid regressing the GEMM.
+- [ ] F2b — **cut-cross-entropy backward** (the training win): per-row softmax
+  stats + recompute `dlogits` inside the two head-grad matmul tiles, dropping the
+  `[N,V]` `dlogits` materialization. The high-value, high-effort core of F2.
 - [ ] F3 — *(later, if warranted)* RoPE folded into SDPA q/k staging.
 - [ ] F4 — *(later, partial)* residual `add` + `rms_norm` reload-merge.
 

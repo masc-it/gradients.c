@@ -446,6 +446,48 @@ static gd_status backward_node(bwd_ctx *b, const _gd_node *node_ref)
         gd_tensor_release(dx);
         return status;
     }
+    case _GD_OP_RMS_NORM: {
+        /* inputs: x(0), weight(1). dx and dweight via two reference kernels. */
+        gd_tensor *x = NULL;
+        gd_tensor *weight = NULL;
+        gd_tensor *dx = NULL;
+        gd_tensor *dw = NULL;
+        gd_tensor *dx_inputs[3];
+        gd_tensor *dw_inputs[2];
+        _gd_op_attrs attrs = {0};
+        /* Snapshot by value: emitting RMS_NORM_BWD grows the values array, which
+         * would dangle pointers into graph->values before the second emit. */
+        gd_tensor_desc x_desc = b->graph->values[node->inputs[0]].desc;
+        gd_tensor_desc w_desc = b->graph->values[node->inputs[1]].desc;
+
+        attrs.eps = node->attrs.eps;
+        status = fwd_tensor(b, node->inputs[0], &x);
+        if (status == GD_OK) {
+            status = fwd_tensor(b, node->inputs[1], &weight);
+        }
+        if (status != GD_OK) {
+            return status;
+        }
+        dx_inputs[0] = x;
+        dx_inputs[1] = weight;
+        dx_inputs[2] = go;
+        status = emit_custom(b, _GD_OP_RMS_NORM_BWD, dx_inputs, 3, &attrs, &x_desc, &dx);
+        if (status == GD_OK) {
+            status = accumulate(b, node->inputs[0], dx);
+        }
+        gd_tensor_release(dx);
+        if (status != GD_OK) {
+            return status;
+        }
+        dw_inputs[0] = x;
+        dw_inputs[1] = go;
+        status = emit_custom(b, _GD_OP_RMS_NORM_WBWD, dw_inputs, 2, &attrs, &w_desc, &dw);
+        if (status == GD_OK) {
+            status = accumulate(b, node->inputs[1], dw);
+        }
+        gd_tensor_release(dw);
+        return status;
+    }
     case _GD_OP_SDPA: {
         /* one multi-output node yields dq, dk, dv (recompute-based reference). */
         gd_tensor *q = NULL, *k = NULL, *v = NULL, *bias = NULL;

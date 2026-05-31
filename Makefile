@@ -83,9 +83,11 @@ EXAMPLE_BINS := $(patsubst %.c,$(BUILD_DIR)/%,$(EXAMPLE_SRC))
 
 MLP_SRC := $(EXAMPLE_DIR)/mlp/mlp.c
 MLP_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/mlp/mlp
+GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
+GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp examples docs-check clean list
+.PHONY: help all build check test tests mlp gpt examples docs-check clean list
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -93,6 +95,7 @@ help:
 	@printf '%s\n' '  make test        build library + tests, then run all tests'
 	@printf '%s\n' '  make check       build, run docs checks, then run tests'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
+	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
 	@printf '%s\n' '  make list        show discovered source/test/example files'
@@ -127,6 +130,15 @@ else
 	@$(MAKE) --no-print-directory $(MLP_BIN)
 	@printf '[mlp] run %s\n' '$(MLP_BIN)'
 	@$(MLP_BIN)
+endif
+
+gpt: build
+ifeq ($(wildcard $(GPT_SRC)),)
+	@printf '[gpt] missing %s; skipped\n' '$(GPT_SRC)'
+else
+	@$(MAKE) --no-print-directory $(GPT_BIN)
+	@printf '[gpt] run %s (GD_DEVICE=%s)\n' '$(GPT_BIN)' '$(GD_DEVICE)'
+	@$(GPT_BIN)
 endif
 
 examples: build $(EXAMPLE_BINS)

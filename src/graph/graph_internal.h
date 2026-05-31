@@ -54,6 +54,8 @@ typedef enum _gd_op_kind {
     _GD_OP_EMBEDDING_BWD,
     _GD_OP_ROPE_BWD,
     _GD_OP_SDPA_BWD,
+    _GD_OP_RMS_NORM_BWD,
+    _GD_OP_RMS_NORM_WBWD,
     _GD_OP_STEP_INC,
     _GD_OP_ADAMW_STEP,
     _GD_OP_REDUCE_TO

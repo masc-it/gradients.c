@@ -554,9 +554,24 @@ CPU+Metal kernels and parity tests before the next phase.
 - [ ] **G4 — Block-sparse SDPA**: `block_mask` value + host pattern builders
   (causal, sliding-window, custom); kernel visits allowed blocks; parity vs
   dense-masked reference. (Forward-first; sparse backward deferred.)
-- [ ] **G5 — GPT model assembly**: `nn.h` builders (attention block, SwiGLU/GELU
+- [x] **G5 — GPT model assembly**: `nn.h` builders (attention block, SwiGLU/GELU
   MLP, full `gd_gpt`), weight tying, RMSNorm pre-norm. Tiny-GPT training parity
   (CPU↔Metal) + overfit sanity.
+  Landed: `include/gradients/nn.h` + `src/nn/nn.c` — `gd_gpt_config` (V/d/L/heads/
+  kv_heads/head_dim/d_ff/rope_theta/eps/mlp_kind/tie_embeddings),
+  `gd_gpt_create` (deterministic seeded init, params owned by an internal
+  `gd_module`), `gd_gpt_parameters`, `gd_gpt_destroy`, `gd_gpt_forward`. Pure
+  composition of existing ops: embedding → [pre-norm: separate Q/K/V linears →
+  reshape to heads → RoPE(q,k) → SDPA(causal, GQA) → merge → out-proj →
+  residual; pre-norm SwiGLU/GELU MLP → residual] ×L → final RMSNorm → tied LM
+  head (`matmul_ex` trans_b on the embedding) or untied linear. Separate Q/K/V
+  projections avoid slicing virtual tensors; head reshapes use the contiguous
+  `COPY`. **RMSNorm autograd added** (was missing — dx and dweight reference
+  kernels, CPU+Metal, gradchecked). Tests (`test_metal_gpt_train.c`): CPU↔Metal
+  forward parity (`gd_graph_compare` on the full forward), 5-step training parity
+  (params+loss within 1e-3), and a CPU overfit (loss 2.78 → 0.0000 on a tiny
+  next-token sequence). ASan-clean (caught + fixed another desc-aliasing UAF in
+  the new RMSNorm backward).
 - [ ] **G6 — KV cache + decode**: `kv_append`, prefill/decode graphs,
   `past_len` runtime scalar, host generation driver; prefill+decode == full
   forward parity. `examples/gpt/` greedy generation on CPU and Metal.

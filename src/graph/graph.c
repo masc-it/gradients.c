@@ -99,6 +99,10 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "rope_bwd";
     case _GD_OP_SDPA_BWD:
         return "sdpa_bwd";
+    case _GD_OP_RMS_NORM_BWD:
+        return "rms_norm_bwd";
+    case _GD_OP_RMS_NORM_WBWD:
+        return "rms_norm_wbwd";
     case _GD_OP_STEP_INC:
         return "step_inc";
     case _GD_OP_ADAMW_STEP:

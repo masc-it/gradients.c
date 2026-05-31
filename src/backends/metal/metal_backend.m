@@ -81,6 +81,8 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_ROPE_BWD, "gd_rope"},
     {_GD_OP_SDPA, "gd_sdpa"},
     {_GD_OP_SDPA_BWD, "gd_sdpa_bwd_dq"},
+    {_GD_OP_RMS_NORM_BWD, "gd_rms_norm_bwd"},
+    {_GD_OP_RMS_NORM_WBWD, "gd_rms_norm_wbwd"},
 };
 
 /* Kernels not mapped 1:1 to an op (looked up by name during encode). */
@@ -1109,6 +1111,51 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
     return GD_OK;
 }
 
+static void encode_rms_norm_bwd(id<MTLComputeCommandEncoder> enc,
+                                id<MTLComputePipelineState> pso,
+                                _gd_executable *exe,
+                                const _gd_node *node)
+{
+    /* dx: inputs x(0), weight(1), go(2); output dx (x shape). */
+    const gd_tensor_desc *desc = &exe->graph->values[node->outputs[0]].desc;
+    gd_metal_rmsnorm_params p;
+
+    p.last = (int)desc->sizes[desc->ndim - 1];
+    p.rows = p.last > 0 ? (int)(desc_numel(desc) / p.last) : 0;
+    p.eps = node->attrs.eps;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    if (p.rows > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)p.rows);
+    }
+}
+
+static void encode_rms_norm_wbwd(id<MTLComputeCommandEncoder> enc,
+                                 id<MTLComputePipelineState> pso,
+                                 _gd_executable *exe,
+                                 const _gd_node *node)
+{
+    /* dweight: inputs x(0), go(1); output dweight [last]. dims from x. */
+    const gd_tensor_desc *x_desc = &exe->graph->values[node->inputs[0]].desc;
+    gd_metal_rmsnorm_params p;
+
+    p.last = (int)x_desc->sizes[x_desc->ndim - 1];
+    p.rows = p.last > 0 ? (int)(desc_numel(x_desc) / p.last) : 0;
+    p.eps = node->attrs.eps;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    if (p.last > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)p.last);
+    }
+}
+
 static gd_status encode_node(_gd_backend *self,
                              id<MTLComputeCommandEncoder> enc,
                              _gd_executable *exe,
@@ -1197,6 +1244,12 @@ static gd_status encode_node(_gd_backend *self,
         return GD_OK;
     case _GD_OP_SDPA_BWD:
         return encode_sdpa_bwd(self, enc, pso, exe, node);
+    case _GD_OP_RMS_NORM_BWD:
+        encode_rms_norm_bwd(enc, pso, exe, node);
+        return GD_OK;
+    case _GD_OP_RMS_NORM_WBWD:
+        encode_rms_norm_wbwd(enc, pso, exe, node);
+        return GD_OK;
     default:
         return _gd_error(GD_ERR_UNSUPPORTED, "metal op not implemented yet");
     }

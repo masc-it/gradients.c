@@ -284,6 +284,60 @@ kernel void gd_rms_norm(device const float *x               [[buffer(0)]],
     }
 }
 
+/* RMSNorm backward dx; one thread per row. */
+kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
+                            device const float *weight          [[buffer(1)]],
+                            device const float *go              [[buffer(2)]],
+                            device float *dx                    [[buffer(3)]],
+                            constant gd_metal_rmsnorm_params &p  [[buffer(4)]],
+                            uint gid                            [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.rows) {
+        return;
+    }
+    int r = (int)gid;
+    int base = r * p.last;
+    float sumsq = 0.0f;
+    for (int c = 0; c < p.last; ++c) {
+        float v = x[base + c];
+        sumsq += v * v;
+    }
+    float inv = 1.0f / sqrt(sumsq / (float)p.last + p.eps);
+    float inv3 = inv * inv * inv;
+    float A = 0.0f;
+    for (int c = 0; c < p.last; ++c) {
+        A += go[base + c] * weight[c] * x[base + c];
+    }
+    for (int c = 0; c < p.last; ++c) {
+        dx[base + c] = inv * go[base + c] * weight[c] - x[base + c] * inv3 * A / (float)p.last;
+    }
+}
+
+/* RMSNorm backward dweight; one thread per channel, reducing over rows. */
+kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
+                             device const float *go              [[buffer(1)]],
+                             device float *dweight               [[buffer(2)]],
+                             constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
+                             uint gid                            [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.last) {
+        return;
+    }
+    int c = (int)gid;
+    float acc = 0.0f;
+    for (int r = 0; r < p.rows; ++r) {
+        int base = r * p.last;
+        float sumsq = 0.0f;
+        for (int cc = 0; cc < p.last; ++cc) {
+            float v = x[base + cc];
+            sumsq += v * v;
+        }
+        float inv = 1.0f / sqrt(sumsq / (float)p.last + p.eps);
+        acc += go[base + c] * x[base + c] * inv;
+    }
+    dweight[c] = acc;
+}
+
 /* Mean cross-entropy to a single scalar; naive single-thread reduction (v1).
  * Targets are int32; class index assumed valid (matches a validated graph). */
 kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],

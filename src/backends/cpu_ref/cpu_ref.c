@@ -174,6 +174,20 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
     case _GD_OP_EMBEDDING_BWD:
         return _gd_cpu_k_embedding_bwd(out_desc, out_data, in_desc[0], in_data[0],
                                        in_desc[1], in_data[1]);
+    case _GD_OP_RMS_NORM_BWD:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_rms_norm_bwd(out_desc, out_data, in_data[0], in_data[1],
+                                      in_data[2], node->attrs.eps);
+    case _GD_OP_RMS_NORM_WBWD:
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_rms_norm_wbwd(in_desc[0], out_data, in_data[0], in_data[1],
+                                       node->attrs.eps);
     case _GD_OP_ROPE:
         status = require_f32(out_desc);
         if (status != GD_OK) {

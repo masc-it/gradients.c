@@ -316,6 +316,67 @@ gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
     return GD_OK;
 }
 
+gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, float *dx,
+                                 const float *x, const float *weight,
+                                 const float *go, float eps)
+{
+    int64_t last = desc->sizes[desc->ndim - 1];
+    int64_t rows = desc_numel(desc) / last;
+    int64_t r = 0;
+
+    for (r = 0; r < rows; ++r) {
+        double sumsq = 0.0;
+        double inv = 0.0;
+        double inv3 = 0.0;
+        double A = 0.0; /* sum_c go_c * w_c * x_c */
+        int64_t c = 0;
+
+        for (c = 0; c < last; ++c) {
+            double v = (double)x[r * last + c];
+            sumsq += v * v;
+        }
+        inv = 1.0 / sqrt(sumsq / (double)last + (double)eps);
+        inv3 = inv * inv * inv;
+        for (c = 0; c < last; ++c) {
+            A += (double)go[r * last + c] * (double)weight[c] * (double)x[r * last + c];
+        }
+        for (c = 0; c < last; ++c) {
+            double gi = (double)go[r * last + c];
+            double xi = (double)x[r * last + c];
+            double wi = (double)weight[c];
+            dx[r * last + c] = (float)(inv * gi * wi - xi * inv3 * A / (double)last);
+        }
+    }
+    return GD_OK;
+}
+
+gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
+                                  const float *x, const float *go, float eps)
+{
+    int64_t last = x_desc->sizes[x_desc->ndim - 1];
+    int64_t rows = desc_numel(x_desc) / last;
+    int64_t r = 0;
+    int64_t c = 0;
+
+    for (c = 0; c < last; ++c) {
+        dweight[c] = 0.0F;
+    }
+    for (r = 0; r < rows; ++r) {
+        double sumsq = 0.0;
+        double inv = 0.0;
+
+        for (c = 0; c < last; ++c) {
+            double v = (double)x[r * last + c];
+            sumsq += v * v;
+        }
+        inv = 1.0 / sqrt(sumsq / (double)last + (double)eps);
+        for (c = 0; c < last; ++c) {
+            dweight[c] += (float)((double)go[r * last + c] * (double)x[r * last + c] * inv);
+        }
+    }
+    return GD_OK;
+}
+
 gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const gd_tensor_desc *logits_desc,
                                   const float *logits,

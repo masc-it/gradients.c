@@ -371,6 +371,25 @@ static gd_status build_embedding_sum(gd_context *ctx, void *user, gd_tensor **lo
     return status;
 }
 
+static gd_status build_rms_norm_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    two_in *t = user; /* a:[2,3] (x, grad), b:[3] (weight, grad) -> rms_norm -> mean */
+    gd_tensor *y = NULL;
+    gd_tensor *r = NULL;
+    gd_status status = gd_rms_norm(ctx, t->a, t->b, 1e-5F, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, y, 1, false, &r); /* [2,3]->[2] */
+    gd_tensor_release(y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_sum(ctx, r, 0, false, loss_out);
+    gd_tensor_release(r);
+    return status;
+}
+
 static gd_status build_matmul_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     two_in *t = user;
@@ -573,6 +592,23 @@ int main(void)
         in[0] = t.a;
         CHECK_TRUE(gradcheck(ctx, build_transpose_sum, &t, in, 1, "transpose") == 0);
         gd_tensor_release(t.a);
+    }
+
+    {
+        /* rms_norm: x[2,3] (grad) + weight[3] (grad). */
+        two_in t = {0};
+        gd_tensor *in[2];
+        int64_t s23[2] = {2, 3};
+        int64_t s3[1] = {3};
+        float xd[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
+        float wd[3] = {1.0F, 0.5F, -0.8F};
+        CHECK_OK(make_grad_input(ctx, 2, s23, xd, &t.a));
+        CHECK_OK(make_grad_input(ctx, 1, s3, wd, &t.b));
+        in[0] = t.a;
+        in[1] = t.b;
+        CHECK_TRUE(gradcheck(ctx, build_rms_norm_sum, &t, in, 2, "rms_norm") == 0);
+        gd_tensor_release(t.a);
+        gd_tensor_release(t.b);
     }
 
     {

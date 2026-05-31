@@ -10,6 +10,7 @@
 #include "gradients/graph.h"
 #include "gradients/ops.h"
 #include "gradients/module.h"
+#include "gradients/nn.h"
 #include "gradients/optim.h"
 
 #endif /* GRADIENTS_H */

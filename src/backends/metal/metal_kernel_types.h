@@ -43,7 +43,7 @@
  * pass merges the splits. Splits are auto-selected from Tk: ceil(Tk/SPLIT_MIN)
  * capped at SPLIT_MAX, so short sequences resolve to 1 split and stay on the
  * existing single-pass kernel (no scratch, no regression). */
-#define GD_METAL_SDPA_SPLIT_MIN 256
+#define GD_METAL_SDPA_SPLIT_MIN 128
 #define GD_METAL_SDPA_SPLIT_MAX 8
 
 /* Elementwise binary ops (add/mul) with NumPy-style right-aligned broadcasting.

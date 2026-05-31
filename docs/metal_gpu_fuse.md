@@ -251,11 +251,24 @@ fusion fired).
 |---|---:|---:|---:|---:|---:|---|
 | baseline | 256 | ~180 | ~500 | 408 ms | 2510 | post GEMM+attention work |
 | F1 SwiGLU | 256 | ~178 | -6 | 408 ms | 2509 | perf-neutral; fusion infra proven |
-| GPU_SAFE CE revisit | 256 | CE 49.5 -> 1.9 | +1 dispatch | 358.7 ms | 2855 | outside fusion; CE occupancy fix |
-| GPU_SAFE CE revisit | 512 | n/a | +1 dispatch | 1693 ms | 2420 | B=8 user workload; best step |
+| GPU_SAFE CE revisit + O3 bench | 256 | CE 49.5 -> 2.0 | +1 dispatch | 361.3 ms | 2834 | clean release profile; CE occupancy fix |
+| GPU_SAFE CE revisit + O3 bench | 512 | CE ~6.6 | +1 dispatch | 1731.4 ms | 2366 | B=8 user workload; clean release best |
 | baseline | 1024 | ~190 | ~500 | 2965 ms | 1381 | pre-CE revisit |
 
-(Fill as F2+ land; refresh baselines after GPU_SAFE CE revisit.)
+Post-CE clean release profile (B=4,T=256): `sdpa_bwd` 129.6 ms, `matmul`
+83.1, `sdpa` 53.2, `linear` 37.4, tail (`add`/`copy`/`adamw_step`/
+`reduce_to`) ~65.8 combined, CE fwd+bwd 2.0. User workload (B=8,T=512):
+`sdpa_bwd` 642.6 ms, `matmul` 245.7, `sdpa` 224.1, `linear` 104.6,
+`embedding_bwd` 48.4, `rms_norm_wbwd` 37.8, tail (`add`/`copy`/`adamw_step`/
+`reduce_to`) ~82.1, CE fwd+bwd 6.6. Tail triage found only one safe small win:
+`reduce_to` leading-batch fast path (`[B,...]->[...]`) cut T=256 `16.6 -> 14.6
+ms` and T=512 `20.4 -> 15.0 ms`; AdamW pow-hoist did not help and copy is mostly
+required gradient-slot writes. Attention retune then changed the active baseline:
+`GD_METAL_SDPA_SPLIT_MIN=128` gives T=256 S=2 and T=512 S=4, cutting T=256
+`sdpa_bwd` `129.6 -> 113.5 ms` and user-workload T=512 `sdpa_bwd` `642.6 ->
+610.5 ms`.
+
+(Fill as F2+ land; use post-CE/tail-triage/split-retune clean-release baselines.)
 
 ---
 

@@ -239,9 +239,13 @@ block-skip (B1) already minimizes (it caps each split at `kb_end`). To go below
 375 ms one must raise *per-kernel throughput* (vectorized/`simdgroup` dot
 products, higher occupancy), not split further — the same lever as the GEMM
 plan, and one that would lift the backward kernels too. Hence S=4
-(`SPLIT_MIN=256`) is chosen: fewer splits = less scratch/overhead at the same
-speed. End-to-end (T=1024): step `3708 -> 3561 ms`, `1110 -> 1150 tok/s` — modest
-because `sdpa_bwd` (~1333 ms, not yet split: B1.5b) now dominates attention.
+(`SPLIT_MIN=256`) was initially chosen for the T=1024 data: fewer splits = less
+scratch/overhead at the same speed. End-to-end (T=1024): step `3708 -> 3561 ms`,
+`1110 -> 1150 tok/s` — modest because `sdpa_bwd` (~1333 ms, not yet split: B1.5b)
+now dominates attention. 2026-05-31 retune after CE fixes found the user workload
+(T=512,B=8) benefits from splitting earlier: `SPLIT_MIN=128` gives S=2 at T=256
+and S=4 at T=512, improving both fwd and bwd without observed short-context
+regression (see §6.4).
 
 Learning: split-K is the right tool to escape the causal critical-path wall, but
 it converts a latency problem into a throughput problem; beyond the point where
@@ -260,7 +264,7 @@ regression); ASan-clean.
 ```text
 sdpa_bwd gpu_ms (B=4, 6 layers, GD_PROFILE=trace):
   T          before (B1.5)   B1.5b split-K
-  256        128  (S=1)      128   (S=1, unchanged)
+  256        128  (S=1)      128   (S=1, unchanged; retuned later to S=2)
   1024       1333 (S=1)      1094  (S=4)   1.22x
   2048       —               4127  (S=8)
 end-to-end step (real, B=4):
@@ -275,6 +279,31 @@ both forward and backward split, attention at T=1024 went `476+1333 = 1809 ms`
 1104 tok/s. The remaining attention cost is now throughput-bound; further gains
 need per-kernel throughput work (vectorized/`simdgroup` dot products, higher
 occupancy), which is shared with the GEMM plan and lifts every compute kernel.
+
+### 6.4 Retune — split earlier for current GPT workload (2026-05-31)
+
+After CE was parallelized, attention again became the dominant wall-clock cost,
+especially for the user workload B=8,T=512 (`sdpa`+`sdpa_bwd` ≈ 50% of step).
+The original split policy (`SPLIT_MIN=256`) meant T=512 used S=2 and T=256 stayed
+single-pass. A quick A/B showed the critical path was still too long at T=512 and
+even T=256 benefits from modest splitting:
+
+```text
+B=8,T=512,6L trace:
+  no split (S=1)          sdpa 234.1 ms   sdpa_bwd 661.3 ms
+  old policy (S=2)        sdpa 224.1 ms   sdpa_bwd 642.6 ms
+  retuned (S=4, min=128)  sdpa 206.9 ms   sdpa_bwd 610.5 ms
+  S=8 (min=64)            sdpa 211.9 ms   sdpa_bwd 638.9 ms
+
+B=4,T=256,6L:
+  old policy (S=1)        sdpa 53.2 ms    sdpa_bwd 129.6 ms  step 361.3 ms
+  retuned (S=2, min=128)  sdpa 47.0 ms    sdpa_bwd 113.5 ms  step 328.4 ms
+```
+
+Decision: set `GD_METAL_SDPA_SPLIT_MIN=128`. S=8 still over-splits (scratch and
+reduction overhead exceed the critical-path win), but S=2/S=4 is a better point
+for current T=256/T=512 training. Validation: `make check` green, GPT train
+parity green, ASan `test_metal_gpt` clean.
 
 ---
 
@@ -306,6 +335,8 @@ When marking a phase done, record:
 | B1.5b split-K bwd | 256 | 52 ms | 128 ms | 496 ms | 2065 | S=1, unchanged (no regression) |
 | B1.5b split-K bwd | 1024 | 362 ms | 1094 ms | 3316 ms | 1235 | S=4; bwd 1.22× (§6.3) |
 | B1.5b split-K bwd | 2048 | 1358 ms | 4127 ms | 11240 ms | 729 | S=8 |
+| Split retune | 256 | 47 ms | 113.5 ms | 328.4 ms | 3118 | S=2 (`SPLIT_MIN=128`), post-CE/O3 baseline |
+| Split retune | 512 | 206.9 ms | 610.5 ms | 1696.6 ms | 2414 | B=8 user workload, S=4 |
 
 B1 is correct (parity green) and neutral on wall-time for causal. B1.5/B1.5b
 split-K land the forward and backward at their throughput floors (§6.2–§6.3):

@@ -27,7 +27,7 @@ CPPFLAGS ?= -I$(INCLUDE_DIR)
 CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
           -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
           -Wmissing-prototypes -Wno-unused-parameter
-BENCH_CFLAGS ?= -std=c11 -O2 -DNDEBUG -Wall -Wextra -Wpedantic -Werror \
+BENCH_CFLAGS ?= -std=c11 -O3 -ffast-math -DNDEBUG -Wall -Wextra -Wpedantic -Werror \
                 -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
                 -Wmissing-prototypes -Wno-unused-parameter
 LDFLAGS ?=

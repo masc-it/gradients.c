@@ -1009,16 +1009,51 @@ before CE revisit (post F1): cross_entropy 17.5 ms, cross_entropy_bwd ~32 ms,
                              step ~408 ms, ~2509 tok/s
 after bwd only:              cross_entropy 17.5 ms, cross_entropy_bwd 1.56 ms,
                              step 376.6 ms, 2719 tok/s
-after fwd+bwd:               cross_entropy 0.54 ms, cross_entropy_bwd 1.39 ms,
+after fwd+bwd (initial):     cross_entropy 0.54 ms, cross_entropy_bwd 1.39 ms,
                              step 358.7 ms, 2855 tok/s
+after fwd+bwd (clean release, BENCH_CFLAGS=-O3 -ffast-math):
+                             cross_entropy 0.56 ms, cross_entropy_bwd 1.44 ms,
+                             step 361.3 ms, 2834 tok/s
 ```
-User workload (B=8,T=512,6L): best step **1905 ms -> 1693 ms**, tokens/s
-**2150 -> 2420** (~12.6% faster).
+User workload (B=8,T=512,6L): best step **1905 ms -> 1731 ms**, tokens/s
+**2150 -> 2366** (~10.0% faster; earlier no-parallel run saw 1693 ms / 2420 tok/s).
+Clean release trace after CE: `sdpa_bwd` 642.6 ms, `matmul` 245.7, `sdpa`
+224.1, `linear` 104.6, `embedding_bwd` 48.4, `rms_norm_wbwd` 37.8,
+`reduce_to` 20.4, `adamw_step` 16.5, CE fwd+bwd 6.6.
 
 Validation: `make check` green, GPT train parity green, `test_metal_gpt` ASan
 clean. Learning: the CE tail was under-parallelization/occupancy, not primarily
 materialization bandwidth; this makes cut-cross-entropy fusion lower priority
 until profiling shows CE is still hot after the safe kernel fix.
+
+### 2026-05-31 tail triage after CE
+
+Clean release profile (BENCH_CFLAGS=`-O3 -ffast-math`) made the post-CE shape
+clear:
+- T=256: `sdpa_bwd` 129.6 ms, `matmul` 83.1, `sdpa` 53.2, `linear` 37.4,
+  tail (`add`/`copy`/`adamw_step`/`reduce_to`) ~65.8, CE fwd+bwd 2.0.
+- T=512,B=8: `sdpa_bwd` 642.6 ms, `matmul` 245.7, `sdpa` 224.1, `linear`
+  104.6, tail ~82.1, CE fwd+bwd 6.6.
+
+Quick wins checked:
+- `reduce_to`: all GPT instances are leading-batch reductions (`[B,...] -> [...]`,
+  B=4/8). Added a fast path: `out[i] = sum_b go[b*N+i]`, bypassing generic
+  coordinate/divmod logic. Trace: T=256 `16.6 -> 14.6 ms`; T=512 `20.4 -> 15.0
+  ms`. End-to-end is small/noisy (`~361 -> ~359 ms` at T=256; `~1731 -> ~1728
+  ms` at T=512) but the kernel is simpler and safe.
+- `adamw_step`: tried hoisting bias-correction `pow(beta,t)` to once per
+  threadgroup. No measurable win (barrier/threadgroup state cancelled it, or the
+  compiler/runtime already made pow cheap enough). Reverted; do not ship.
+- `copy`: 48 reshape copies already alias-skip; the remaining 56 are external
+  gradient-slot writes before AdamW. Avoiding them changes public gradient
+  side-effect semantics, so not a quick GPU_SAFE win.
+
+Conclusion: tail has no large low-risk win left at this size. Active next target
+should be attention backward (`sdpa_bwd`), especially for the user workload where
+`sdpa`+`sdpa_bwd` is ~50% of step. Immediate follow-up retuned attention split-K
+(`GD_METAL_SDPA_SPLIT_MIN 256 -> 128`): T=256 `sdpa_bwd 129.6 -> 113.5 ms`, step
+`361.3 -> 328.4 ms`; T=512 user workload `sdpa_bwd 642.6 -> 610.5 ms`, step
+`1731 -> 1697 ms` (tracked in `plan_block_sparse_sdpa_metal.md` §6.4).
 
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)

@@ -826,6 +826,27 @@ kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
         return;
     }
 
+    /* Fast path for the dominant GPT case: reduce only extra leading dims,
+     * e.g. [B, M, N] -> [M, N]. Both tensors are contiguous, so each output
+     * element is a short strided sum over leading slices. Avoids the generic
+     * coordinate/divmod path for millions of elements with reduce_count=4/8. */
+    if (p.go_ndim == p.target_ndim + 1) {
+        bool leading_only = true;
+        for (int i = 0; i < p.target_ndim; ++i) {
+            if (p.go_sizes[i + 1] != p.target_sizes[i]) {
+                leading_only = false;
+            }
+        }
+        if (leading_only) {
+            float acc = 0.0f;
+            for (int r = 0; r < p.go_sizes[0]; ++r) {
+                acc += go[r * p.target_numel + t];
+            }
+            out[t] = acc;
+            return;
+        }
+    }
+
     /* Target coordinates (contiguous target). */
     int tcoord[GD_METAL_MAX_DIMS];
     int lin = t;

@@ -1060,6 +1060,33 @@ T=256 `sdpa_bwd 111.9 -> 99.7 ms`, step `318.9 -> 309.2 ms`; T=512 `sdpa_bwd
 584.9 -> 519.8 ms`, step `1620 -> 1596 ms` (tracked in
 `plan_block_sparse_sdpa_metal.md` §6.4–§6.6).
 
+### 2026-05-31 embedding_bwd revisit: atomic scatter
+
+Post-attention profile made `embedding_bwd` the largest non-GEMM/non-attention
+single op on the user workload (~49 ms). The old Metal kernel used a deterministic
+scatter-free gather formulation: one thread per `(vocab, channel)` scanned all
+`n_ids`, O(`vocab*dim*n_ids`). That was good enough when it removed a serial
+cliff, but at GPT scale it still does billions of id comparisons.
+
+Replaced it with two dispatches under the same IR op:
+1. zero `dtable` with one thread per table element;
+2. scatter-add one thread per `(token, channel)` using `atomic_float` add.
+
+Work becomes O(`vocab*dim + n_ids*dim`). Duplicate token ids are accumulated with
+relaxed atomics, so addition order can differ from CPU_REF, but the existing
+Metal parity/training tolerances remain green.
+
+Numbers (M1 Pro, clean release, 6L GPT):
+```text
+B=4,T=256: embedding_bwd 12.6 -> 0.63 ms, step 309.2 -> 296.8 ms, tok/s 3450
+B=8,T=512: embedding_bwd 48.7 -> 0.76 ms, step 1596 -> 1548 ms, tok/s 2646
+```
+
+Validation: `make check` green, GPT train parity green, ASan `test_metal_gpt`
+clean. Learning: deterministic gather avoids atomics but scales with vocab and is
+wrong for large sparse-update embeddings; atomic scatter is the right GPU shape
+for the current tokenizer/embedding workload.
+
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)
 - `GD_PROFILE=trace ... make gpt-bench` per-op attribution before/after

@@ -101,6 +101,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
     "gd_cross_entropy_reduce",
+    "gd_embedding_bwd_scatter",
 };
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
@@ -783,7 +784,9 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
-            if (op == _GD_OP_CROSS_ENTROPY) {
+            if (op == _GD_OP_EMBEDDING_BWD) {
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_embedding_bwd_scatter");
+            } else if (op == _GD_OP_CROSS_ENTROPY) {
                 const gd_tensor_desc *logits = &graph->values[node->inputs[0]].desc;
                 int dim = node->attrs.dim;
                 int64_t positions = 0;
@@ -1583,6 +1586,7 @@ static gd_status encode_embedding(id<MTLComputeCommandEncoder> enc,
 
 static gd_status encode_embedding_bwd(id<MTLComputeCommandEncoder> enc,
                                       id<MTLComputePipelineState> pso,
+                                      id<MTLComputePipelineState> scatter_pso,
                                       _gd_executable *exe,
                                       const _gd_node *node)
 {
@@ -1597,16 +1601,27 @@ static gd_status encode_embedding_bwd(id<MTLComputeCommandEncoder> enc,
     p.dim = (int)table->sizes[1];
     p.vocab = (int)table->sizes[0];
     p.n = p.dim > 0 ? (int)(desc_numel(go) / p.dim) : 0;
+    if (scatter_pso == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal embedding_bwd scatter pipeline missing");
+    }
     [enc setComputePipelineState:pso];
-    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
-    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
-    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
-    [enc setBytes:&p length:sizeof(p) atIndex:3];
-    /* One thread per dtable element (vocab*dim). */
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:0];
+    [enc setBytes:&p length:sizeof(p) atIndex:1];
     {
         int total = p.vocab * p.dim;
         if (total > 0) {
             dispatch_1d(enc, pso, (NSUInteger)total);
+        }
+    }
+    [enc setComputePipelineState:scatter_pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    {
+        int total = p.n * p.dim;
+        if (total > 0) {
+            dispatch_1d(enc, scatter_pso, (NSUInteger)total);
         }
     }
     return GD_OK;
@@ -2054,7 +2069,7 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_EMBEDDING:
         return encode_embedding(enc, pso, exe, node);
     case _GD_OP_EMBEDDING_BWD:
-        return encode_embedding_bwd(enc, pso, exe, node);
+        return encode_embedding_bwd(enc, pso, pso2, exe, node);
     case _GD_OP_ROPE:
         return encode_rope(enc, pso, exe, node, 1.0F);
     case _GD_OP_ROPE_BWD:

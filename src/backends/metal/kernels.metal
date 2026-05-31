@@ -2031,26 +2031,36 @@ kernel void gd_rope(device const float *x                 [[buffer(0)]],
     }
 }
 
-/* Scatter-add backward. One thread owns one dtable element (v, c) and sums the
- * gradient rows whose id == v, avoiding atomics and the serial scan. Work per
- * thread is O(n_ids); total O(vocab*dim*n_ids) spread across vocab*dim threads. */
-kernel void gd_embedding_bwd(device const float *go               [[buffer(0)]],
-                             device const int *ids                [[buffer(1)]],
-                             device float *dtable                 [[buffer(2)]],
-                             constant gd_metal_embedding_params &p [[buffer(3)]],
+/* Embedding backward: zero the dense table gradient, then scatter-add one
+ * gradient element per (token,row-channel) with atomic float adds. This changes
+ * the old deterministic gather-by-vocab O(vocab*dim*n_ids) kernel into
+ * O(vocab*dim + n_ids*dim). Atomic order can differ for duplicate token ids, but
+ * remains within the GPU parity tolerances used for training. */
+kernel void gd_embedding_bwd(device float *dtable                 [[buffer(0)]],
+                             constant gd_metal_embedding_params &p [[buffer(1)]],
                              uint gid                            [[thread_position_in_grid]])
 {
     int idx = (int)gid;
-    if (idx >= p.vocab * p.dim) {
+    if (idx < p.vocab * p.dim) {
+        dtable[idx] = 0.0f;
+    }
+}
+
+kernel void gd_embedding_bwd_scatter(device const float *go               [[buffer(0)]],
+                                     device const int *ids                [[buffer(1)]],
+                                     device atomic_float *dtable          [[buffer(2)]],
+                                     constant gd_metal_embedding_params &p [[buffer(3)]],
+                                     uint gid                            [[thread_position_in_grid]])
+{
+    int idx = (int)gid;
+    int total = p.n * p.dim;
+    if (idx >= total) {
         return;
     }
-    int v = idx / p.dim;
+    int row = idx / p.dim;
     int c = idx % p.dim;
-    float acc = 0.0f;
-    for (int row = 0; row < p.n; ++row) {
-        if (ids[row] == v) {
-            acc += go[row * p.dim + c];
-        }
+    int v = ids[row];
+    if (v >= 0 && v < p.vocab) {
+        atomic_fetch_add_explicit(&dtable[v * p.dim + c], go[idx], memory_order_relaxed);
     }
-    dtable[idx] = acc;
 }

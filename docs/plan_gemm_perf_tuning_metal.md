@@ -190,8 +190,12 @@ us how much headroom A is chasing.
 - [ ] T0 — GEMM microbench + shape sweep harness (square, vocab-skinny, batched)
   committed under `tests/`/`bench/`, plus oracle parity diff against the scalar
   tiled kernel. Establishes the measurement loop.
-- [ ] T1 — Option C: register-blocked / `float4` scalar GEMM (matmul + linear),
-  parity-gated, autotune tile sizes by hand, report microbench + end-to-end.
+- [x] T1 — Option C: register-blocked / `float4` GEMM (matmul + linear),
+  parity-gated. **Done — see §9.** Replaced the 1-thread-per-output 16×16 tiled
+  kernels with 64×64 thread-tile blocking: each thread owns a 4×4 micro-tile
+  (`float4` accumulators + `float4` inner reads), `BK=8` K-tiles staged in
+  threadgroup memory. Handles all shapes (bounds-checked) + transpose/batch, so
+  it is a drop-in for the old kernels.
 - [ ] T2 — Option B spike: `MPSMatrixMultiplication` behind `GD_METAL_MPS=1`,
   buffer aliasing + transpose/batch mapping, microbench vs C, decide keep/drop.
 - [ ] T3 — Option A: `simdgroup_matrix` kernel for the qualifying square-ish
@@ -223,12 +227,57 @@ When marking a phase done, record in this doc:
 |---|---|---|---:|---|
 | P10 | 512³ | scalar tiled 16×16 | ~289 | naive was ~169 |
 | baseline | B=4 T=256 step | scalar tiled | ~164 (step) | GEMM ~206ms of ~500ms (~41%) |
+| T1 | B=4 T=256 step | 64×64 reg-blocked | ~201 (step) | matmul 148->81ms, linear 57->38ms; 2065->2511 tok/s |
+| T1 | B=4 T=1024 step | 64×64 reg-blocked | ~136 (step) | matmul 558->248ms (2.25×), linear 196->102ms (1.92×) |
 
-(Fill as T1–T4 land.)
+(Fill as T2–T4 land.)
+
+## 8. T1 findings — register-blocked / float4 GEMM
+
+Replaced both tiled GEMM kernels (`gd_matmul_tiled`, `gd_linear_tiled`, same
+names/op-map) with 64×64 thread-tile blocking: a 16×16 threadgroup (256 threads)
+computes a 64×64 output block; each thread owns a 4×4 micro-tile held as
+`float4 acc[4]`; the K dimension streams in `BK=8` tiles staged into threadgroup
+memory; the inner loop loads one `float4` row of A and B from threadgroup memory
+and does 4 fused `acc[i] += a[i]*bvec` ops. Bounds checks on every staged load
+and every store keep it a drop-in for all shapes (incl. the non-multiple V=8000
+LM head) plus `trans_a/trans_b`, weight transpose, bias, and batch broadcast.
+
+Numbers (`GD_PROFILE=trace`, B=4, 6 layers):
+
+```text
+            T=256                 T=1024
+matmul      148 -> 81 ms (1.83x)   558 -> 248 ms (2.25x)
+linear       57 -> 38 ms (1.50x)   196 -> 102 ms (1.92x)
+step        496 -> 407 ms          3316 -> 2950 ms
+GFLOP/s     165 -> 201             121 -> 136
+tokens/s   2065 -> 2511           1235 -> 1388
+```
+
+Validation: CPU↔Metal parity at 1e-4 (`test_metal` matmul/linear across
+square/skinny/transposed/batched shapes), GPT train parity, ASan-clean.
+
+Learnings / choices:
+- **Arithmetic intensity is the lever.** The old kernel reissued a threadgroup
+  load per FMA (1 thread/output); the 4×4 micro-tile reuses each loaded A/B
+  `float4` across 16 FMAs, cutting threadgroup-load and barrier traffic per FLOP
+  ~4×. That, not raw `float4`, is the bulk of the win.
+- **Low register pressure helped occupancy.** `acc[4]` (16 floats) + two `float4`
+  operands is far lighter than the SDPA kernels' 64-float register arrays, so
+  the GEMM kernel keeps high occupancy — a contrast worth noting vs §6.x of the
+  block-sparse plan where occupancy was the SDPA ceiling.
+- **Bigger micro-tiles (8×8) not yet tried.** Would raise intensity further but
+  needs `float4`-pair accumulators and more threadgroup memory; left for a later
+  pass since T1 already shifted the canonical workload to ~201 GFLOP/s.
+- **End-to-end vs kernel multiple (Amdahl, §1.1).** matmul ~2.25× / linear
+  ~1.9×, but the T=1024 step only moved 3316->2950 (1.12×) because attention +
+  the tail still dominate; the canonical T=256 step moved 496->407 (1.22×),
+  matching GEMM's ~41% share. Reaching matrix-unit peak (Option A,
+  `simdgroup_matrix`) is the remaining GEMM ceiling.
 
 ---
 
-## 8. Risks
+## 9. Risks
 
 - **On-device tuning dependency.** Option A peak requires iterating tile sizes /
   occupancy on real hardware; without a tight measurement loop it can land

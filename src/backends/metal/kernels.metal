@@ -220,11 +220,18 @@ kernel void gd_matmul_tiled(device const float *a              [[buffer(0)]],
                             uint3 tgpos [[threadgroup_position_in_grid]],
                             uint3 lid   [[thread_position_in_threadgroup]])
 {
-    threadgroup float As[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
-    threadgroup float Bs[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+    threadgroup float As[GD_METAL_GEMM_BK][GD_METAL_GEMM_BM];
+    threadgroup float Bs[GD_METAL_GEMM_BK][GD_METAL_GEMM_BN];
+    const int nthreads = (GD_METAL_GEMM_BN / GD_METAL_GEMM_TN)
+                       * (GD_METAL_GEMM_BM / GD_METAL_GEMM_TM);
 
-    int col = (int)(tgpos.x * GD_METAL_GEMM_TILE + lid.x);
-    int row = (int)(tgpos.y * GD_METAL_GEMM_TILE + lid.y);
+    int tx = (int)lid.x; /* 0 .. BN/TN */
+    int ty = (int)lid.y; /* 0 .. BM/TM */
+    int tid = ty * (GD_METAL_GEMM_BN / GD_METAL_GEMM_TN) + tx;
+    int m0 = (int)tgpos.y * GD_METAL_GEMM_BM; /* first output row of block */
+    int n0 = (int)tgpos.x * GD_METAL_GEMM_BN; /* first output col of block */
+    int row0 = m0 + ty * GD_METAL_GEMM_TM;
+    int col0 = n0 + tx * GD_METAL_GEMM_TN;
     int batch_lin = (int)tgpos.z;
 
     int bidx[GD_METAL_MAX_DIMS];
@@ -248,32 +255,60 @@ kernel void gd_matmul_tiled(device const float *a              [[buffer(0)]],
         b_bstride *= p.b_batch_sizes[i];
     }
 
-    float acc = 0.0f;
-    int n_tiles = (p.k + GD_METAL_GEMM_TILE - 1) / GD_METAL_GEMM_TILE;
+    float4 acc[GD_METAL_GEMM_TM];
+    for (int tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
+        acc[tm] = float4(0.0f);
+    }
+    int n_tiles = (p.k + GD_METAL_GEMM_BK - 1) / GD_METAL_GEMM_BK;
     for (int t = 0; t < n_tiles; ++t) {
-        int a_k = t * GD_METAL_GEMM_TILE + (int)lid.x;
-        int b_k = t * GD_METAL_GEMM_TILE + (int)lid.y;
-
-        if (row < p.m && a_k < p.k) {
-            int a_off = p.trans_a ? (a_k * p.a_cols + row) : (row * p.a_cols + a_k);
-            As[lid.y][lid.x] = a[a_base + a_off];
-        } else {
-            As[lid.y][lid.x] = 0.0f;
+        int kbase = t * GD_METAL_GEMM_BK;
+        for (int e = tid; e < GD_METAL_GEMM_BK * GD_METAL_GEMM_BM; e += nthreads) {
+            int kr = e / GD_METAL_GEMM_BM;
+            int mr = e % GD_METAL_GEMM_BM;
+            int gr = m0 + mr;
+            int gk = kbase + kr;
+            float val = 0.0f;
+            if (gr < p.m && gk < p.k) {
+                int a_off = p.trans_a ? (gk * p.a_cols + gr) : (gr * p.a_cols + gk);
+                val = a[a_base + a_off];
+            }
+            As[kr][mr] = val;
         }
-        if (col < p.n && b_k < p.k) {
-            int b_off = p.trans_b ? (col * p.b_cols + b_k) : (b_k * p.b_cols + col);
-            Bs[lid.y][lid.x] = b[b_base + b_off];
-        } else {
-            Bs[lid.y][lid.x] = 0.0f;
+        for (int e = tid; e < GD_METAL_GEMM_BK * GD_METAL_GEMM_BN; e += nthreads) {
+            int kr = e / GD_METAL_GEMM_BN;
+            int nc = e % GD_METAL_GEMM_BN;
+            int gk = kbase + kr;
+            int gc = n0 + nc;
+            float val = 0.0f;
+            if (gc < p.n && gk < p.k) {
+                int b_off = p.trans_b ? (gc * p.b_cols + gk) : (gk * p.b_cols + gc);
+                val = b[b_base + b_off];
+            }
+            Bs[kr][nc] = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = 0; i < GD_METAL_GEMM_TILE; ++i) {
-            acc += As[lid.y][i] * Bs[i][lid.x];
+        for (int kk = 0; kk < GD_METAL_GEMM_BK; ++kk) {
+            float4 breg = *(threadgroup float4 *)(&Bs[kk][tx * GD_METAL_GEMM_TN]);
+            float4 areg = *(threadgroup float4 *)(&As[kk][ty * GD_METAL_GEMM_TM]);
+            acc[0] += areg.x * breg;
+            acc[1] += areg.y * breg;
+            acc[2] += areg.z * breg;
+            acc[3] += areg.w * breg;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (row < p.m && col < p.n) {
-        out[batch_lin * p.out_mat + row * p.n + col] = acc;
+    for (int tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
+        int gr = row0 + tm;
+        if (gr >= p.m) {
+            continue;
+        }
+        float vals[4] = {acc[tm].x, acc[tm].y, acc[tm].z, acc[tm].w};
+        for (int tn = 0; tn < GD_METAL_GEMM_TN; ++tn) {
+            int gc = col0 + tn;
+            if (gc < p.n) {
+                out[batch_lin * p.out_mat + gr * p.n + gc] = vals[tn];
+            }
+        }
     }
 }
 
@@ -288,37 +323,69 @@ kernel void gd_linear_tiled(device const float *x               [[buffer(0)]],
                             uint3 tgpos [[threadgroup_position_in_grid]],
                             uint3 lid   [[thread_position_in_threadgroup]])
 {
-    threadgroup float Xs[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
-    threadgroup float Ws[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+    threadgroup float Xs[GD_METAL_GEMM_BK][GD_METAL_GEMM_BM];
+    threadgroup float Ws[GD_METAL_GEMM_BK][GD_METAL_GEMM_BN];
+    const int nthreads = (GD_METAL_GEMM_BN / GD_METAL_GEMM_TN)
+                       * (GD_METAL_GEMM_BM / GD_METAL_GEMM_TM);
 
-    int o = (int)(tgpos.x * GD_METAL_GEMM_TILE + lid.x);
-    int r = (int)(tgpos.y * GD_METAL_GEMM_TILE + lid.y);
+    int tx = (int)lid.x;
+    int ty = (int)lid.y;
+    int tid = ty * (GD_METAL_GEMM_BN / GD_METAL_GEMM_TN) + tx;
+    int r0 = (int)tgpos.y * GD_METAL_GEMM_BM; /* first row of block */
+    int o0 = (int)tgpos.x * GD_METAL_GEMM_BN; /* first out-feature of block */
+    int row0 = r0 + ty * GD_METAL_GEMM_TM;
+    int col0 = o0 + tx * GD_METAL_GEMM_TN;
 
-    float acc = 0.0f;
-    int n_tiles = (p.in_features + GD_METAL_GEMM_TILE - 1) / GD_METAL_GEMM_TILE;
+    float4 acc[GD_METAL_GEMM_TM];
+    for (int tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
+        acc[tm] = float4(0.0f);
+    }
+    int n_tiles = (p.in_features + GD_METAL_GEMM_BK - 1) / GD_METAL_GEMM_BK;
     for (int t = 0; t < n_tiles; ++t) {
-        int x_k = t * GD_METAL_GEMM_TILE + (int)lid.x;
-        int w_k = t * GD_METAL_GEMM_TILE + (int)lid.y;
-
-        if (r < p.rows && x_k < p.in_features) {
-            Xs[lid.y][lid.x] = x[r * p.in_features + x_k];
-        } else {
-            Xs[lid.y][lid.x] = 0.0f;
+        int kbase = t * GD_METAL_GEMM_BK;
+        for (int e = tid; e < GD_METAL_GEMM_BK * GD_METAL_GEMM_BM; e += nthreads) {
+            int kr = e / GD_METAL_GEMM_BM;
+            int mr = e % GD_METAL_GEMM_BM;
+            int gr = r0 + mr;
+            int gk = kbase + kr;
+            Xs[kr][mr] = (gr < p.rows && gk < p.in_features)
+                             ? x[gr * p.in_features + gk] : 0.0f;
         }
-        if (o < p.out_features && w_k < p.in_features) {
-            int w_off = p.trans_w ? (o * p.in_features + w_k) : (w_k * p.out_features + o);
-            Ws[lid.y][lid.x] = w[w_off];
-        } else {
-            Ws[lid.y][lid.x] = 0.0f;
+        for (int e = tid; e < GD_METAL_GEMM_BK * GD_METAL_GEMM_BN; e += nthreads) {
+            int kr = e / GD_METAL_GEMM_BN;
+            int nc = e % GD_METAL_GEMM_BN;
+            int gk = kbase + kr;
+            int gc = o0 + nc;
+            float val = 0.0f;
+            if (gc < p.out_features && gk < p.in_features) {
+                int w_off = p.trans_w ? (gc * p.in_features + gk) : (gk * p.out_features + gc);
+                val = w[w_off];
+            }
+            Ws[kr][nc] = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = 0; i < GD_METAL_GEMM_TILE; ++i) {
-            acc += Xs[lid.y][i] * Ws[i][lid.x];
+        for (int kk = 0; kk < GD_METAL_GEMM_BK; ++kk) {
+            float4 wreg = *(threadgroup float4 *)(&Ws[kk][tx * GD_METAL_GEMM_TN]);
+            float4 xreg = *(threadgroup float4 *)(&Xs[kk][ty * GD_METAL_GEMM_TM]);
+            acc[0] += xreg.x * wreg;
+            acc[1] += xreg.y * wreg;
+            acc[2] += xreg.z * wreg;
+            acc[3] += xreg.w * wreg;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (r < p.rows && o < p.out_features) {
-        out[r * p.out_features + o] = (p.has_bias ? bias[o] : 0.0f) + acc;
+    for (int tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
+        int gr = row0 + tm;
+        if (gr >= p.rows) {
+            continue;
+        }
+        float vals[4] = {acc[tm].x, acc[tm].y, acc[tm].z, acc[tm].w};
+        for (int tn = 0; tn < GD_METAL_GEMM_TN; ++tn) {
+            int gc = col0 + tn;
+            if (gc < p.out_features) {
+                out[gr * p.out_features + gc] = (p.has_bias ? bias[gc] : 0.0f) + vals[tn];
+            }
+        }
     }
 }
 

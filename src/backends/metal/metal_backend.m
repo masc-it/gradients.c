@@ -847,12 +847,13 @@ static void dispatch_gemm_tiles(id<MTLComputeCommandEncoder> enc,
                                 NSUInteger rows,
                                 NSUInteger batch)
 {
-    NSUInteger tile = GD_METAL_GEMM_TILE;
-    NSUInteger gx = (cols + tile - 1) / tile;
-    NSUInteger gy = (rows + tile - 1) / tile;
+    NSUInteger gx = (cols + GD_METAL_GEMM_BN - 1) / GD_METAL_GEMM_BN;
+    NSUInteger gy = (rows + GD_METAL_GEMM_BM - 1) / GD_METAL_GEMM_BM;
+    NSUInteger tx = GD_METAL_GEMM_BN / GD_METAL_GEMM_TN;
+    NSUInteger ty = GD_METAL_GEMM_BM / GD_METAL_GEMM_TM;
 
     [enc dispatchThreadgroups:MTLSizeMake(gx, gy, batch)
-        threadsPerThreadgroup:MTLSizeMake(tile, tile, 1)];
+        threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
 }
 
 /* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in

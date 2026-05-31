@@ -13,6 +13,19 @@
  * the host dispatches matching threadgroup dimensions. */
 #define GD_METAL_GEMM_TILE 16
 
+/* Register-blocked GEMM: one threadgroup computes a GEMM_BM x GEMM_BN output
+ * block, streaming K in GEMM_BK-deep tiles through threadgroup memory; each
+ * thread owns a GEMM_TM x GEMM_TN micro-tile in registers (float4 rows when
+ * GEMM_TN==4), so A/B values loaded once are reused across TM*TN FMAs. This
+ * raises arithmetic intensity far above the 1-thread-per-output tiled kernel.
+ * Threads per group = (GEMM_BN/GEMM_TN) x (GEMM_BM/GEMM_TM). Keep TN==4 so the
+ * inner accumulator is a float4. */
+#define GD_METAL_GEMM_BM 64
+#define GD_METAL_GEMM_BN 64
+#define GD_METAL_GEMM_BK 8
+#define GD_METAL_GEMM_TM 4
+#define GD_METAL_GEMM_TN 4
+
 /* FlashAttention-style tiled SDPA forward: query-block (threads per group), key
  * tile (staged in threadgroup memory), and the max head_dim the tiled kernel
  * supports. The host falls back to the reference SDPA kernel when

@@ -328,6 +328,14 @@ Learning: at the retuned split counts, reduction overhead matters — especially
 for `dkv_reduce`, which writes both dk and dv. This is still GPU_SAFE inside one
 IR node (`sdpa_bwd`), and keeps the split partial format unchanged.
 
+Simple tile probes after this were negative and reverted:
+- `GD_METAL_SDPA_BK 16 -> 32`: much slower (T=512 `sdpa_bwd` ~1076 ms). Extra
+  threadgroup memory / register pressure dominates fewer barriers.
+- `GD_METAL_SDPA_BQ 64 -> 32`: much slower (T=512 `sdpa_bwd` ~1050 ms). More
+  groups / less work per group loses to overhead and lower per-group efficiency.
+Keep BQ=64, BK=16 on M1; next gains need kernel-structure changes, not these
+simple tile-size knobs.
+
 ---
 
 ## 7. Reporting rule

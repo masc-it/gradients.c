@@ -58,6 +58,7 @@ tokens[B,T] (int32)
   -> x = rms_norm(x, w_lnf)
   -> logits = x @ Wte^T            (weight-tied LM head)         # logits[B,T,V]
   -> loss = cross_entropy(logits, targets)                      # training
+     OR loss = lm_cross_entropy(x, Wte, targets)                # fused tied-LM training
 ```
 
 Attention block (per layer), with GQA:

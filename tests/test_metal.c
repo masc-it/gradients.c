@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK_OK(expr)                                                            \
@@ -20,6 +21,13 @@
             return 1;                                                             \
         }                                                                         \
     } while (0)
+
+static int env_flag_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0 &&
+           strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
 
 static const gd_device CPU = {GD_DEVICE_CPU, 0};
 static const gd_device METAL = {GD_DEVICE_METAL, 0};
@@ -386,6 +394,42 @@ static int test_metal_cross_entropy_parity(gd_context *ctx)
     return 0;
 }
 
+/* fused LM-head cross_entropy parity: loss only. */
+static int test_metal_lm_cross_entropy_parity(gd_context *ctx)
+{
+    int64_t sh[2] = {3, 4};
+    int64_t sw[2] = {5, 4};
+    int64_t st[1] = {3};
+    float hd[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                    0.7F, -0.8F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float wd[20];
+    int32_t td[3] = {0, 3, 4};
+    gd_tensor *h = NULL, *w = NULL, *targets = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    gd_compare_options opts = {1e-4, 1e-4, false};
+    int i = 0;
+
+    for (i = 0; i < 20; ++i) {
+        wd[i] = 0.03F * (float)(i - 7);
+    }
+    CHECK_OK(make_f32(ctx, 2, sh, hd, &h));
+    CHECK_OK(make_f32(ctx, 2, sw, wd, &w));
+    CHECK_OK(make_i32(ctx, 1, st, td, &targets));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_lm_cross_entropy(ctx, h, w, targets, &loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(loss);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(h);
+    gd_tensor_release(w);
+    gd_tensor_release(targets);
+    return 0;
+}
+
 static int64_t tensor_numel(gd_tensor *t)
 {
     int64_t n = 1;
@@ -568,12 +612,43 @@ static int build_ce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **los
     return 0;
 }
 
-static int test_metal_backward_parity(gd_context *ctx)
+/* lm_cross_entropy -> backward: fused d_hidden,d_weight. */
+static int build_lmce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sh[2] = {3, 4};
+    int64_t sw[2] = {5, 4};
+    int64_t st[1] = {3};
+    float hd[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                    0.7F, -0.8F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float wd[20];
+    int32_t td[3] = {0, 3, 4};
+    gd_tensor *h = NULL, *w = NULL, *targets = NULL, *loss = NULL;
+    int i = 0;
+
+    for (i = 0; i < 20; ++i) {
+        wd[i] = 0.03F * (float)(i - 7);
+    }
+    CHECK_OK(make_f32(ctx, 2, sh, hd, &h));
+    CHECK_OK(make_f32(ctx, 2, sw, wd, &w));
+    CHECK_OK(make_i32(ctx, 1, st, td, &targets));
+    CHECK_OK(gd_tensor_set_requires_grad(h, true));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_lm_cross_entropy(ctx, h, w, targets, &loss));
+    gd_tensor_release(targets); /* graph retains it */
+    inputs[0] = h;
+    inputs[1] = w;
+    *n = 2;
+    *loss_out = loss;
+    return 0;
+}
+
+static int test_metal_backward_parity(gd_context *ctx, int mps_enabled)
 {
     if (backward_parity(ctx, build_mlp, "mlp") != 0) return 1;
     if (backward_parity(ctx, build_softmax, "softmax") != 0) return 1;
     if (backward_parity(ctx, build_silu, "silu") != 0) return 1;
     if (backward_parity(ctx, build_ce, "cross_entropy") != 0) return 1;
+    if (mps_enabled && backward_parity(ctx, build_lmce, "lm_cross_entropy") != 0) return 1;
     return 0;
 }
 
@@ -748,6 +823,7 @@ int main(void)
 {
     gd_context *ctx = NULL;
     int rc = 0;
+    int mps_enabled = env_flag_enabled("GD_METAL_MPS");
 
     if (gd_context_create(&ctx) != GD_OK) {
         fprintf(stderr, "context create failed: %s\n", gd_last_error());
@@ -769,7 +845,10 @@ int main(void)
     rc |= test_metal_linear_parity(ctx);
     rc |= test_metal_reduce_parity(ctx);
     rc |= test_metal_cross_entropy_parity(ctx);
-    rc |= test_metal_backward_parity(ctx);
+    if (mps_enabled) {
+        rc |= test_metal_lm_cross_entropy_parity(ctx);
+    }
+    rc |= test_metal_backward_parity(ctx, mps_enabled);
     rc |= test_metal_adamw(ctx);
     rc |= test_metal_lazy_writeback(ctx);
     rc |= test_metal_fallback(ctx);

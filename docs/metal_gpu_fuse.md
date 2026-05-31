@@ -186,13 +186,11 @@ assumption.
   d_model (real GPT ≥768) and on tiny models where launch overhead dominates, not
   at this bench's d=320 where GEMMs already saturate. Revisit when targeting a
   larger model; not worth the slice-op + copy machinery now.
-- [ ] F2 — **`matmul`/`linear`→`cross_entropy`** (LM head). Investigated; scope is
-  bigger than first framed (it is a cut-cross-entropy kernel). **2026-05-31
-  update:** the CE tail turned out to be mostly under-parallelized GPU_SAFE
-  kernels, not logits/`dlogits` materialization bandwidth. A CE occupancy fix
-  landed in the foundations track (`cross_entropy` 17.5 -> 0.54 ms,
-  `cross_entropy_bwd` ~32 -> 1.39 ms; T=256 step 408 -> 358.7 ms). Therefore
-  F2 is lower priority until a fresh profile shows CE still hot. Key findings:
+- [x] F2 — **explicit fused tied-LM-head cross_entropy**. Implemented as
+  `gd_lm_cross_entropy(hidden, weight, targets)` plus `gd_gpt_forward_loss`, not
+  as a hidden rewrite. It chunks vocab and uses MPS GEMMs to avoid full
+  `logits`/`dlogits` materialization when callers do not need logits. See
+  `docs/plan_lm_cross_entropy_fusion.md`. Key findings:
   - The logits claim "forward-only" is **false in training**: `logits` is
     consumed by both `cross_entropy` (fwd) **and** `cross_entropy_bwd` (which
     recomputes softmax). So a forward-only fusion is illegal in a training graph
@@ -207,15 +205,15 @@ assumption.
   - A naive row-oriented fused forward (one threadgroup/row, GEMV + online
     softmax) would **regress** the forward, because it discards the efficient
     tiled reg-blocked GEMM. A non-regressing fused forward must itself be tiled.
-  Conclusion: F2 is a substantial, specialized, tiled kernel project (fwd + the
-  harder cut-CE bwd), not an F1-style increment. Split into F2a/F2b below.
-- [ ] F2a — *(optional, eval-only)* tiled fused `matmul`→`cross_entropy` forward
-  that streams the loss without materializing logits. Legality gates it to graphs
-  where `logits` has a single consumer (the CE) → fires for eval, safely falls
-  back in training. Must be tiled to avoid regressing the GEMM.
-- [ ] F2b — **cut-cross-entropy backward** (the training win): per-row softmax
-  stats + recompute `dlogits` inside the two head-grad matmul tiles, dropping the
-  `[N,V]` `dlogits` materialization. The high-value, high-effort core of F2.
+  v1 result: memory-headroom win, speed-neutral/slower at V=8000 because chunked
+  MPS overhead outweighs logits allocation savings. Metal v1 requires
+  `GD_METAL_MPS=1` and benchmark opt-in `GD_BENCH_FUSED_LMCE=1`; consider
+  planner/default only under memory pressure or larger vocab.
+- [ ] F2a — improve fused LMCE speed with lower-overhead kernels or a runtime
+  chunk-size knob. Current chunk-size sweep at T512/B8 showed 512..8000 all near
+  1150 ms, so dispatch/recompute overhead dominates more than chunk size.
+- [ ] F2b — planner/default policy: choose fused LMCE only when logits are not
+  otherwise consumed and memory pressure or vocab size makes it net-positive.
 - [ ] F3 — *(later, if warranted)* RoPE folded into SDPA q/k staging.
 - [ ] F4 — *(later, partial)* residual `add` + `rms_norm` reload-merge.
 

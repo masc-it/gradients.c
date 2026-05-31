@@ -330,24 +330,23 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
     return s;
 }
 
-gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
-                         gd_tensor *tokens, gd_tensor *positions,
-                         gd_tensor **logits_out)
+static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
+                                    gd_tensor *tokens, gd_tensor *positions,
+                                    gd_tensor **normed_out)
 {
     gd_status s = GD_OK;
     int64_t B = 0, T = 0;
     gd_tensor *x = NULL;
     gd_tensor *normed = NULL;
-    gd_tensor *logits = NULL;
     int l = 0;
 
     if (ctx == NULL || gpt == NULL || tokens == NULL || positions == NULL ||
-        logits_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward argument is NULL");
+        normed_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt_forward_normed argument is NULL");
     }
-    *logits_out = NULL;
+    *normed_out = NULL;
     if (gd_tensor_ndim(tokens) != 2) {
-        return _gd_error(GD_ERR_SHAPE, "gd_gpt_forward tokens must be [batch, seq]");
+        return _gd_error(GD_ERR_SHAPE, "gpt tokens must be [batch, seq]");
     }
     B = gd_tensor_size(tokens, 0);
     T = gd_tensor_size(tokens, 1);
@@ -370,6 +369,28 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
     if (s == GD_OK) {
         s = gd_rms_norm(ctx, x, gpt->ln_f, gpt->cfg.norm_eps, &normed);
     }
+    gd_tensor_release(x);
+    if (s != GD_OK) {
+        gd_tensor_release(normed);
+        return s;
+    }
+    *normed_out = normed;
+    return GD_OK;
+}
+
+gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
+                         gd_tensor *tokens, gd_tensor *positions,
+                         gd_tensor **logits_out)
+{
+    gd_status s = GD_OK;
+    gd_tensor *normed = NULL;
+    gd_tensor *logits = NULL;
+
+    if (logits_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward argument is NULL");
+    }
+    *logits_out = NULL;
+    s = gpt_forward_normed(ctx, gpt, tokens, positions, &normed);
     if (s == GD_OK) {
         if (gpt->cfg.tie_embeddings) {
             gd_matmul_desc md = {false, true, gd_compute_policy_default()};
@@ -378,8 +399,6 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
             s = gd_linear(ctx, normed, gpt->w_head, NULL, &logits);
         }
     }
-
-    gd_tensor_release(x);
     gd_tensor_release(normed);
     if (s != GD_OK) {
         gd_tensor_release(logits);
@@ -387,4 +406,32 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
     }
     *logits_out = logits;
     return GD_OK;
+}
+
+gd_status gd_gpt_forward_loss(gd_context *ctx, gd_gpt *gpt,
+                              gd_tensor *tokens, gd_tensor *positions,
+                              gd_tensor *targets, gd_tensor **loss_out)
+{
+    gd_status s = GD_OK;
+    gd_tensor *normed = NULL;
+    gd_tensor *logits = NULL;
+
+    if (loss_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward_loss argument is NULL");
+    }
+    *loss_out = NULL;
+    s = gpt_forward_normed(ctx, gpt, tokens, positions, &normed);
+    if (s == GD_OK) {
+        if (gpt->cfg.tie_embeddings) {
+            s = gd_lm_cross_entropy(ctx, normed, gpt->wte, targets, loss_out);
+        } else {
+            s = gd_linear(ctx, normed, gpt->w_head, NULL, &logits);
+            if (s == GD_OK) {
+                s = gd_cross_entropy(ctx, logits, targets, 2, loss_out);
+            }
+        }
+    }
+    gd_tensor_release(normed);
+    gd_tensor_release(logits);
+    return s;
 }

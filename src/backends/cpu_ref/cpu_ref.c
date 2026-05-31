@@ -150,6 +150,14 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         }
         return _gd_cpu_k_cross_entropy(out_data, in_desc[0], in_data[0],
                                        in_desc[1], in_data[1], node->attrs.dim);
+    case _GD_OP_LM_CROSS_ENTROPY:
+        status = require_f32(in_desc[0]);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_lm_cross_entropy(out_data, in_desc[0], in_data[0],
+                                          in_desc[1], in_data[1],
+                                          in_desc[2], in_data[2]);
     case _GD_OP_CAST:
         return _gd_cpu_k_cast(out_desc, out_data, in_desc[0], in_data[0]);
     case _GD_OP_GELU:
@@ -277,6 +285,21 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         return _gd_cpu_k_cross_entropy_bwd(in_desc[0], out_data, in_data[0],
                                            in_desc[1], in_data[1], in_data[2],
                                            node->attrs.dim);
+    case _GD_OP_LM_CROSS_ENTROPY_BWD: {
+        void *dw_data = NULL;
+        const gd_tensor_desc *dummy = NULL;
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = value_ptr(exe, node->outputs[1], &dw_data, &dummy);
+        if (status != GD_OK) {
+            return status;
+        }
+        return _gd_cpu_k_lm_cross_entropy_bwd(in_desc[0], out_data, in_data[0],
+                                              in_desc[1], dw_data, in_data[1],
+                                              in_desc[2], in_data[2], in_data[3]);
+    }
     case _GD_OP_STEP_INC:
         status = require_f32(in_desc[0]);
         if (status != GD_OK) {

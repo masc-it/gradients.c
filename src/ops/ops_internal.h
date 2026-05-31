@@ -35,6 +35,10 @@ gd_status _gd_infer_cross_entropy(gd_tensor *logits,
                                   int class_dim,
                                   int *norm_dim_out,
                                   gd_tensor_desc *out);
+gd_status _gd_infer_lm_cross_entropy(gd_tensor *hidden,
+                                     gd_tensor *weight,
+                                     gd_tensor *targets,
+                                     gd_tensor_desc *out);
 gd_status _gd_infer_cast(gd_tensor *x, gd_dtype dtype, gd_tensor_desc *out);
 gd_status _gd_infer_transpose(gd_tensor *x, const int *perm, int ndim, gd_tensor_desc *out);
 gd_status _gd_infer_embedding(gd_tensor *table, gd_tensor *ids, gd_tensor_desc *out);

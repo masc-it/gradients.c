@@ -37,6 +37,10 @@
  * threads divided into key lanes over head_dim channels. */
 #define GD_METAL_SDPA_DKV_KEYS 8
 
+/* Fused LM-head cross entropy processes vocab in chunks so logits/dlogits
+ * scratch is [N,chunk] instead of [N,V]. */
+#define GD_METAL_LMCE_CHUNK 1024
+
 /* Split-K / flash-decoding for long-context forward SDPA. A causal kernel is
  * critical-path bound: the heaviest query block must scan all Tk keys, and that
  * one threadgroup saturates the GPU regardless of how many lighter blocks the
@@ -141,6 +145,15 @@ typedef struct gd_metal_ce_params {
     int classes;
     int positions;     /* outer*inner */
 } gd_metal_ce_params;
+
+typedef struct gd_metal_lmce_params {
+    int rows;
+    int dim;
+    int vocab;
+    int chunk_start;
+    int chunk_size;
+    int first_chunk;
+} gd_metal_lmce_params;
 
 /* reduce_to: sum `go` (broadcast shape) down into the target shape. */
 typedef struct gd_metal_reduce_to_params {

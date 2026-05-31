@@ -53,6 +53,12 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
                          gd_tensor *tokens, gd_tensor *positions,
                          gd_tensor **logits_out);
 
+/* Records forward + mean CE loss. For tied embeddings this may use a fused
+ * LM-head CE op that avoids materializing logits. */
+gd_status gd_gpt_forward_loss(gd_context *ctx, gd_gpt *gpt,
+                              gd_tensor *tokens, gd_tensor *positions,
+                              gd_tensor *targets, gd_tensor **loss_out);
+
 #ifdef __cplusplus
 }
 #endif

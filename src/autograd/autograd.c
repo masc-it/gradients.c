@@ -346,6 +346,47 @@ static gd_status backward_node(bwd_ctx *b, const _gd_node *node_ref)
         gd_tensor_release(dlogits);
         return status;
     }
+    case _GD_OP_LM_CROSS_ENTROPY: {
+        gd_tensor *hidden = NULL;
+        gd_tensor *weight = NULL;
+        gd_tensor *targets = NULL;
+        gd_tensor *grads[2] = {NULL, NULL};
+        gd_tensor *inputs[4];
+        gd_tensor_desc out_descs[2];
+
+        status = fwd_tensor(b, node->inputs[0], &hidden);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = fwd_tensor(b, node->inputs[1], &weight);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = fwd_tensor(b, node->inputs[2], &targets);
+        if (status != GD_OK) {
+            return status;
+        }
+        inputs[0] = hidden;
+        inputs[1] = weight;
+        inputs[2] = targets;
+        inputs[3] = go;
+        out_descs[0] = b->graph->values[node->inputs[0]].desc;
+        out_descs[1] = b->graph->values[node->inputs[1]].desc;
+        status = _gd_graph_emit_multi(b->graph, _GD_OP_LM_CROSS_ENTROPY_BWD,
+                                      inputs, 4, NULL, out_descs, 2, grads);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = accumulate(b, node->inputs[0], grads[0]);
+        gd_tensor_release(grads[0]);
+        if (status != GD_OK) {
+            gd_tensor_release(grads[1]);
+            return status;
+        }
+        status = accumulate(b, node->inputs[1], grads[1]);
+        gd_tensor_release(grads[1]);
+        return status;
+    }
     case _GD_OP_COPY: {
         /* Reshape/identity: gradient flows back reshaped to the input shape. */
         const gd_tensor_desc *in_desc = &b->graph->values[node->inputs[0]].desc;

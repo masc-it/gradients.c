@@ -16,14 +16,15 @@
  *   GD_BENCH_WARMUP=N         warmup iterations excluded from timing (default 3)
  *   GD_BENCH_B / GD_BENCH_T   batch / sequence length (default 1 / 128)
  *   GD_BENCH_VOCAB            vocab size (default 8000)
- *   GD_BENCH_DMODEL           model width (default 320)
+ *   GD_BENCH_DMODEL           model width (default 256)
  *   GD_BENCH_LAYERS           number of blocks (default 6)
- *   GD_BENCH_HEADS            query heads (default 5)
+ *   GD_BENCH_HEADS            query heads (default 4)
  *   GD_BENCH_KV_HEADS         key/value heads (default = heads)
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
- *   GD_BENCH_DFF              MLP hidden size (default 1280)
+ *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
+ *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
  *
- * Defaults describe a ~12M-parameter model. GD_PROFILE=summary works as usual.
+ * Defaults describe a ~8M-parameter model. GD_PROFILE=summary works as usual.
  */
 
 #include "gradients/gradients.h"
@@ -116,6 +117,7 @@ int main(void)
     const char *dev_env = getenv("GD_DEVICE");
     const char *mode_env = getenv("GD_BENCH_MODE");
     int train_mode = (mode_env == NULL) || (strcmp(mode_env, "fwd") != 0);
+    int fused_lmce = env_int("GD_BENCH_FUSED_LMCE", 0) != 0;
 
     int B = env_int("GD_BENCH_B", 1);
     int T = env_int("GD_BENCH_T", 128);
@@ -164,12 +166,12 @@ int main(void)
     CHECK(gd_context_set_default_device(ctx, target));
 
     cfg.vocab_size = env_int("GD_BENCH_VOCAB", 8000);
-    cfg.d_model = env_int("GD_BENCH_DMODEL", 320);
+    cfg.d_model = env_int("GD_BENCH_DMODEL", 256);
     cfg.n_layers = env_int("GD_BENCH_LAYERS", 6);
-    cfg.n_heads = env_int("GD_BENCH_HEADS", 5);
+    cfg.n_heads = env_int("GD_BENCH_HEADS", 4);
     cfg.n_kv_heads = env_int("GD_BENCH_KV_HEADS", cfg.n_heads);
     cfg.head_dim = env_int("GD_BENCH_HEAD_DIM", 64);
-    cfg.d_ff = env_int("GD_BENCH_DFF", 1280);
+    cfg.d_ff = env_int("GD_BENCH_DFF", 4 * cfg.d_model);
     cfg.max_seq_len = T;
     cfg.rope_theta = 10000.0F;
     cfg.norm_eps = 1e-5F;
@@ -221,7 +223,8 @@ int main(void)
     /* Print the setup up front so a long/slow run is observable immediately. */
     printf("gpt_bench\n");
     printf("  device      : %s\n", target.type == GD_DEVICE_METAL ? "metal" : "cpu");
-    printf("  mode        : %s\n", train_mode ? "train (fwd+bwd+adamw)" : "forward");
+    printf("  mode        : %s%s\n", train_mode ? "train (fwd+bwd+adamw)" : "forward",
+           (train_mode && fused_lmce) ? " + fused_lmce" : "");
     printf("  params      : %ld (%.2fM)\n", total_params, (double)total_params / 1e6);
     printf("  config      : d_model=%d layers=%d heads=%d kv_heads=%d head_dim=%d d_ff=%d vocab=%d\n",
            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.d_ff,
@@ -240,11 +243,17 @@ int main(void)
 
     CHECK(gd_graph_create(ctx, &g));
     CHECK(gd_graph_begin(ctx, g));
-    CHECK(gd_gpt_forward(ctx, model, tokens, positions, &logits));
-    if (train_mode) {
-        CHECK(gd_cross_entropy(ctx, logits, targets, 2, &loss));
+    if (train_mode && fused_lmce) {
+        CHECK(gd_gpt_forward_loss(ctx, model, tokens, positions, targets, &loss));
         CHECK(gd_backward(ctx, loss));
         CHECK(gd_optimizer_step(ctx, opt));
+    } else {
+        CHECK(gd_gpt_forward(ctx, model, tokens, positions, &logits));
+        if (train_mode) {
+            CHECK(gd_cross_entropy(ctx, logits, targets, 2, &loss));
+            CHECK(gd_backward(ctx, loss));
+            CHECK(gd_optimizer_step(ctx, opt));
+        }
     }
     CHECK(gd_graph_end(ctx));
     printf("  compiling graph...\n");

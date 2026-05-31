@@ -361,6 +361,35 @@ gd_status gd_cross_entropy(gd_context *ctx,
     return _gd_graph_emit(graph, _GD_OP_CROSS_ENTROPY, inputs, 2, &attrs, &desc, loss);
 }
 
+gd_status gd_lm_cross_entropy(gd_context *ctx,
+                              gd_tensor *hidden,
+                              gd_tensor *weight,
+                              gd_tensor *targets,
+                              gd_tensor **loss)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *inputs[3];
+    gd_tensor_desc desc;
+
+    if (hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_lm_cross_entropy argument is NULL");
+    }
+    *loss = NULL;
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = _gd_infer_lm_cross_entropy(hidden, weight, targets, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    inputs[0] = hidden;
+    inputs[1] = weight;
+    inputs[2] = targets;
+    return _gd_graph_emit(graph, _GD_OP_LM_CROSS_ENTROPY, inputs, 3, NULL, &desc, loss);
+}
+
 gd_status gd_cast(gd_context *ctx, gd_tensor *x, gd_dtype dtype, gd_tensor **out)
 {
     gd_status status = GD_OK;

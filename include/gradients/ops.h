@@ -61,6 +61,15 @@ gd_status gd_cross_entropy(gd_context *ctx,
                            gd_tensor *targets,
                            int class_dim,
                            gd_tensor **loss);
+
+/* Fused tied-LM-head cross entropy. Computes mean CE of
+ * logits = hidden @ weight^T without materializing logits. hidden is [..., D],
+ * weight is [V, D], targets has shape hidden.shape without the last dim. */
+gd_status gd_lm_cross_entropy(gd_context *ctx,
+                              gd_tensor *hidden,
+                              gd_tensor *weight,
+                              gd_tensor *targets,
+                              gd_tensor **loss);
 gd_status gd_cast(gd_context *ctx, gd_tensor *x, gd_dtype dtype, gd_tensor **out);
 
 /* GELU activation. tanh_approx selects the tanh approximation; otherwise the

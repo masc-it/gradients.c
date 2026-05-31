@@ -636,6 +636,9 @@ gd_status gd_rms_norm(gd_context *ctx, gd_tensor *x, gd_tensor *weight,
 gd_status gd_softmax(gd_context *ctx, gd_tensor *x, int dim, gd_tensor **out);
 gd_status gd_cross_entropy(gd_context *ctx, gd_tensor *logits, gd_tensor *targets,
                            int class_dim, gd_tensor **loss);
+gd_status gd_lm_cross_entropy(gd_context *ctx, gd_tensor *hidden,
+                              gd_tensor *weight, gd_tensor *targets,
+                              gd_tensor **loss);
 
 gd_status gd_cast(gd_context *ctx, gd_tensor *x, gd_dtype dtype,
                   gd_tensor **out);
@@ -664,6 +667,7 @@ Shape rules:
 - Negative `dim` values are accepted for reduction/softmax/cross-entropy and normalized against rank.
 - `keepdim=true` preserves rank with reduced dim size 1.
 - `gd_cross_entropy` returns scalar mean loss over all non-class positions.
+- `gd_lm_cross_entropy(hidden, weight, targets)` computes scalar mean CE for `hidden[...,D] @ weight[V,D]^T` without requiring a materialized logits tensor; `targets` has shape `hidden.shape[:-1]`.
 
 Dtype rules:
 
@@ -673,6 +677,7 @@ Dtype rules:
 - `gd_compute_policy` controls math/accumulation dtype for matmul/linear/reductions/norms where supported.
 - `gd_softmax` output dtype matches input dtype; compute may use policy/internal higher precision.
 - `gd_cross_entropy` logits must be floating/quant-dequant-supported, targets must be `I32` or `I64`, loss dtype follows accum dtype.
+- `gd_lm_cross_entropy` hidden/weight must be floating with matching dtype, targets must be `I32` or `I64`, and loss dtype follows hidden dtype.
 - `gd_cast` is explicit; implicit casts are not inserted by v1 graph builder.
 
 Device/layout rules:

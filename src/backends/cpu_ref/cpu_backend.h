@@ -57,6 +57,13 @@ gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const gd_tensor_desc *targets_desc,
                                   const void *targets,
                                   int class_dim);
+gd_status _gd_cpu_k_lm_cross_entropy(float *out,
+                                     const gd_tensor_desc *hidden_desc,
+                                     const float *hidden,
+                                     const gd_tensor_desc *weight_desc,
+                                     const float *weight,
+                                     const gd_tensor_desc *targets_desc,
+                                     const void *targets);
 gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
                          void *out,
                          const gd_tensor_desc *x_desc,
@@ -132,6 +139,15 @@ gd_status _gd_cpu_k_cross_entropy_bwd(const gd_tensor_desc *logits_desc,
                                       const void *targets,
                                       const float *go_scalar,
                                       int class_dim);
+gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
+                                         float *dhidden,
+                                         const float *hidden,
+                                         const gd_tensor_desc *weight_desc,
+                                         float *dweight,
+                                         const float *weight,
+                                         const gd_tensor_desc *targets_desc,
+                                         const void *targets,
+                                         const float *go_scalar);
 
 /* Sums `go` (broadcasted output shape) down into `out` (target shape). */
 gd_status _gd_cpu_k_reduce_to(const gd_tensor_desc *target_desc,

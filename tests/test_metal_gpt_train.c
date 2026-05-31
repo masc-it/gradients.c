@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK_OK(expr)                                                            \
@@ -22,6 +23,13 @@
             return 1;                                                             \
         }                                                                         \
     } while (0)
+
+static int env_flag_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0 &&
+           strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
 
 static const gd_device CPU = {GD_DEVICE_CPU, 0};
 static const gd_device METAL = {GD_DEVICE_METAL, 0};
@@ -96,6 +104,29 @@ static int test_forward_parity(gd_context *ctx, gd_tensor *tokens, gd_tensor *po
     CHECK_OK(gd_gpt_forward(ctx, gpt, tokens, pos, &logits));
     CHECK_OK(gd_graph_end(ctx));
     gd_tensor_release(logits);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_gpt_destroy(gpt);
+    return 0;
+}
+
+static int test_forward_loss_parity(gd_context *ctx, gd_tensor *tokens,
+                                    gd_tensor *pos, gd_tensor *targets)
+{
+    gd_gpt *gpt = NULL;
+    gd_gpt_config cfg = tiny_config();
+    gd_graph *g = NULL;
+    gd_tensor *loss = NULL;
+    gd_compare_options opts = {2e-4, 2e-4, false};
+
+    CHECK_OK(gd_gpt_create(ctx, &cfg, GPT_SEED, &gpt));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_forward_loss(ctx, gpt, tokens, pos, targets, &loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(loss);
 
     CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
 
@@ -266,6 +297,7 @@ int main(void)
     gd_tensor *targets = NULL;
     int rc = 0;
     int metal = 0;
+    int mps_enabled = env_flag_enabled("GD_METAL_MPS");
 
     if (gd_context_create(&ctx) != GD_OK) {
         fprintf(stderr, "context create failed: %s\n", gd_last_error());
@@ -280,6 +312,9 @@ int main(void)
     rc |= test_overfit(ctx, tokens, pos, targets); /* CPU-only, always runs */
     if (metal) {
         rc |= test_forward_parity(ctx, tokens, pos);
+        if (mps_enabled) {
+            rc |= test_forward_loss_parity(ctx, tokens, pos, targets);
+        }
         rc |= test_train_parity(ctx, tokens, pos, targets);
     } else {
         printf("test_metal_gpt_train: metal unavailable, ran CPU overfit only\n");

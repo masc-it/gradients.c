@@ -373,6 +373,61 @@ gd_status _gd_infer_cross_entropy(gd_tensor *logits,
     return gd_tensor_desc_contiguous(dl->dtype, dl->device, 0, NULL, out);
 }
 
+gd_status _gd_infer_lm_cross_entropy(gd_tensor *hidden,
+                                     gd_tensor *weight,
+                                     gd_tensor *targets,
+                                     gd_tensor_desc *out)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *dh = NULL;
+    const gd_tensor_desc *dw = NULL;
+    const gd_tensor_desc *dt = NULL;
+    int i = 0;
+
+    if (hidden == NULL || weight == NULL || targets == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy argument is NULL");
+    }
+    if (gd_tensor_dtype(hidden) != gd_tensor_dtype(weight)) {
+        return _gd_error(GD_ERR_DTYPE, "lm_cross_entropy hidden and weight must share dtype");
+    }
+    if (!_gd_dtype_is_float(gd_tensor_dtype(hidden))) {
+        return _gd_error(GD_ERR_DTYPE, "lm_cross_entropy hidden/weight must be floating-point");
+    }
+    if (!_gd_dtype_is_integer(gd_tensor_dtype(targets))) {
+        return _gd_error(GD_ERR_DTYPE, "lm_cross_entropy targets must be I32 or I64");
+    }
+    status = require_same_device(hidden, weight);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = require_same_device(hidden, targets);
+    if (status != GD_OK) {
+        return status;
+    }
+
+    dh = _gd_tensor_desc_ptr(hidden);
+    dw = _gd_tensor_desc_ptr(weight);
+    dt = _gd_tensor_desc_ptr(targets);
+    if (dh->ndim < 1) {
+        return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy hidden must have rank >= 1");
+    }
+    if (dw->ndim != 2) {
+        return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy weight must be [vocab, dim]");
+    }
+    if (dw->sizes[1] != dh->sizes[dh->ndim - 1]) {
+        return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy hidden dim must match weight dim");
+    }
+    if (dt->ndim != dh->ndim - 1) {
+        return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy targets rank mismatch");
+    }
+    for (i = 0; i < dt->ndim; ++i) {
+        if (dt->sizes[i] != dh->sizes[i]) {
+            return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy targets shape mismatch");
+        }
+    }
+    return gd_tensor_desc_contiguous(dh->dtype, dh->device, 0, NULL, out);
+}
+
 gd_status _gd_infer_cast(gd_tensor *x, gd_dtype dtype, gd_tensor_desc *out)
 {
     const gd_tensor_desc *dx = NULL;

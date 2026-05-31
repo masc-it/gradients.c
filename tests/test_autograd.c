@@ -491,6 +491,18 @@ static gd_status build_ce(gd_context *ctx, void *user, gd_tensor **loss_out)
     return gd_cross_entropy(ctx, t->logits, t->targets, 1, loss_out);
 }
 
+typedef struct lmce_in {
+    gd_tensor *hidden;
+    gd_tensor *weight;
+    gd_tensor *targets;
+} lmce_in;
+
+static gd_status build_lmce(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    lmce_in *t = user;
+    return gd_lm_cross_entropy(ctx, t->hidden, t->weight, t->targets, loss_out);
+}
+
 typedef struct mlp_in {
     gd_tensor *x;
     gd_tensor *w1;
@@ -821,6 +833,30 @@ int main(void)
         in[0] = t.logits;
         CHECK_TRUE(gradcheck(ctx, build_ce, &t, in, 1, "cross_entropy") == 0);
         gd_tensor_release(t.logits);
+        gd_tensor_release(t.targets);
+    }
+
+    {
+        lmce_in t = {0};
+        gd_tensor *in[2];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc tdesc;
+        int64_t hs[2] = {2, 3};
+        int64_t ws[2] = {4, 3};
+        int32_t targets[2] = {2, 0};
+        float hd[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
+        float wd[12] = {0.05F, -0.03F, 0.07F, 0.11F, -0.13F, 0.17F,
+                        -0.19F, 0.23F, -0.29F, 0.31F, -0.37F, 0.41F};
+        CHECK_OK(make_grad_input(ctx, 2, hs, hd, &t.hidden));
+        CHECK_OK(make_grad_input(ctx, 2, ws, wd, &t.weight));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
+        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
+        in[0] = t.hidden;
+        in[1] = t.weight;
+        CHECK_TRUE(gradcheck(ctx, build_lmce, &t, in, 2, "lm_cross_entropy") == 0);
+        gd_tensor_release(t.hidden);
+        gd_tensor_release(t.weight);
         gd_tensor_release(t.targets);
     }
 

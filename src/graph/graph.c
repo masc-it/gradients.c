@@ -55,6 +55,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "softmax";
     case _GD_OP_CROSS_ENTROPY:
         return "cross_entropy";
+    case _GD_OP_LM_CROSS_ENTROPY:
+        return "lm_cross_entropy";
     case _GD_OP_CAST:
         return "cast";
     case _GD_OP_GELU:
@@ -91,6 +93,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "mean_bwd";
     case _GD_OP_CROSS_ENTROPY_BWD:
         return "cross_entropy_bwd";
+    case _GD_OP_LM_CROSS_ENTROPY_BWD:
+        return "lm_cross_entropy_bwd";
     case _GD_OP_GELU_BWD:
         return "gelu_bwd";
     case _GD_OP_EMBEDDING_BWD:

@@ -70,6 +70,7 @@ gd_status gd_storage_create(gd_context *ctx,
         free(storage);
         return status;
     }
+    _gd_profile_record_alloc(ctx, backend, desc->nbytes);
 
     _gd_refcount_init(&storage->refcount);
     storage->desc = *desc;
@@ -101,6 +102,7 @@ void gd_storage_release(gd_storage *storage)
         return;
     }
     if (_gd_refcount_release(&storage->refcount) != 0) {
+        _gd_profile_record_free(storage->backend->ctx, storage->backend, storage->desc.nbytes);
         storage->backend->vt->storage_free(storage->backend, storage->handle);
         free(storage);
     }
@@ -154,7 +156,15 @@ gd_status gd_storage_copy_from_cpu(gd_context *ctx,
     if (dst->backend->vt->upload == NULL) {
         return _gd_error(GD_ERR_UNSUPPORTED, "backend does not implement host upload");
     }
-    return dst->backend->vt->upload(dst->backend, dst->handle, dst_offset, src, nbytes);
+    {
+        uint64_t start = _gd_profile_enabled(ctx) ? _gd_profile_now_ns() : 0U;
+        gd_status status = dst->backend->vt->upload(dst->backend, dst->handle, dst_offset,
+                                                    src, nbytes);
+        if (start != 0U) {
+            _gd_profile_record_upload(ctx, dst->backend, _gd_profile_now_ns() - start, nbytes);
+        }
+        return status;
+    }
 }
 
 gd_status gd_storage_copy_to_cpu(gd_context *ctx,
@@ -172,7 +182,16 @@ gd_status gd_storage_copy_to_cpu(gd_context *ctx,
     if (src->backend->vt->download == NULL) {
         return _gd_error(GD_ERR_UNSUPPORTED, "backend does not implement host download");
     }
-    return src->backend->vt->download(src->backend, src->handle, src_offset, dst, nbytes);
+    {
+        uint64_t start = _gd_profile_enabled(ctx) ? _gd_profile_now_ns() : 0U;
+        gd_status status = src->backend->vt->download(src->backend, src->handle, src_offset,
+                                                      dst, nbytes);
+        if (start != 0U) {
+            _gd_profile_record_download(ctx, src->backend, _gd_profile_now_ns() - start,
+                                        nbytes, true);
+        }
+        return status;
+    }
 }
 
 size_t gd_storage_nbytes(const gd_storage *storage)

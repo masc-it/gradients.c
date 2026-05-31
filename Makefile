@@ -27,6 +27,9 @@ CPPFLAGS ?= -I$(INCLUDE_DIR)
 CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
           -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
           -Wmissing-prototypes -Wno-unused-parameter
+BENCH_CFLAGS ?= -std=c11 -O2 -DNDEBUG -Wall -Wextra -Wpedantic -Werror \
+                -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
+                -Wmissing-prototypes -Wno-unused-parameter
 LDFLAGS ?=
 LDLIBS ?= -lm
 
@@ -87,7 +90,7 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt examples docs-check clean list
+.PHONY: help all build check test tests mlp gpt bench-gpt examples docs-check clean list
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -96,6 +99,7 @@ help:
 	@printf '%s\n' '  make check       build, run docs checks, then run tests'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
+	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT benchmark'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
 	@printf '%s\n' '  make list        show discovered source/test/example files'
@@ -140,6 +144,9 @@ else
 	@printf '[gpt] run %s (GD_DEVICE=%s)\n' '$(GPT_BIN)' '$(GD_DEVICE)'
 	@$(GPT_BIN)
 endif
+
+bench-gpt:
+	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' gpt
 
 examples: build $(EXAMPLE_BINS)
 ifeq ($(strip $(EXAMPLE_BINS)),)

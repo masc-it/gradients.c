@@ -107,7 +107,7 @@ static gd_status metal_dtype_code(gd_dtype dtype, int *out)
 /* ---- Compiled executable: per-value Metal buffer plan -------------------- */
 
 typedef struct gd_metal_value {
-    gd_storage *storage;   /* owned METAL buffer storage, one per value */
+    gd_storage *storage;   /* retained METAL buffer storage; copy/reshape values may alias */
     gd_tensor *external;   /* borrowed CPU leaf source, NULL for produced values */
     size_t leaf_offset;    /* byte offset of the leaf data inside its CPU storage */
 } gd_metal_value;
@@ -199,11 +199,15 @@ static gd_status metal_storage_host_ptr(_gd_backend *self, void *handle, void **
 static gd_status writeback_externals(_gd_backend *self, _gd_executable *exe)
 {
     int i = 0;
+    uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+    size_t bytes = 0U;
+    uint64_t count = 0U;
 
     for (i = 0; i < exe->n_values; ++i) {
         gd_metal_value *v = &exe->values[i];
         gd_storage *dst = NULL;
         void *src = NULL;
+        size_t nbytes = 0U;
         gd_status status = GD_OK;
 
         if (v->external == NULL) {
@@ -213,15 +217,21 @@ static gd_status writeback_externals(_gd_backend *self, _gd_executable *exe)
         if (dst == NULL) {
             continue;
         }
+        nbytes = gd_storage_nbytes(v->storage);
+        bytes += nbytes;
+        count += 1U;
         status = gd_storage_data_cpu(v->storage, &src);
         if (status != GD_OK) {
             return status;
         }
-        status = gd_storage_copy_from_cpu(self->ctx, dst, v->leaf_offset, src,
-                                          gd_storage_nbytes(v->storage));
+        status = gd_storage_copy_from_cpu(self->ctx, dst, v->leaf_offset, src, nbytes);
         if (status != GD_OK) {
             return status;
         }
+    }
+    if (start != 0U) {
+        _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WRITEBACK,
+                                 _gd_profile_now_ns() - start, bytes, count);
     }
     return GD_OK;
 }
@@ -235,7 +245,14 @@ static gd_status metal_synchronize(_gd_backend *self)
     if (cmd == nil) {
         return GD_OK;
     }
-    [cmd waitUntilCompleted];
+    {
+        uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+        [cmd waitUntilCompleted];
+        if (start != 0U) {
+            _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WAIT,
+                                     _gd_profile_now_ns() - start, 0U, 1U);
+        }
+    }
     st.inFlight = nil;
     st.inFlightExe = NULL;
     if (cmd.status == MTLCommandBufferStatusError) {
@@ -294,6 +311,70 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe);
 }
 
+static bool can_alias_copy_value(const gd_graph *graph, const _gd_node *node)
+{
+    const _gd_value *in = NULL;
+    const _gd_value *out = NULL;
+    size_t in_bytes = 0U;
+    size_t out_bytes = 0U;
+    size_t alignment = 0U;
+
+    if (graph == NULL || node == NULL || node->op != _GD_OP_COPY ||
+        node->n_inputs != 1 || node->n_outputs != 1) {
+        return false;
+    }
+    if (node->inputs[0] < 0 || node->inputs[0] >= graph->n_values ||
+        node->outputs[0] < 0 || node->outputs[0] >= graph->n_values) {
+        return false;
+    }
+    in = &graph->values[node->inputs[0]];
+    out = &graph->values[node->outputs[0]];
+    if (out->external != NULL) {
+        return false; /* emit_to copy must write the external target. */
+    }
+    if (in->desc.dtype != out->desc.dtype || !gd_device_equal(in->desc.device, out->desc.device) ||
+        in->desc.quant != out->desc.quant ||
+        in->desc.storage_offset_bytes != 0 || out->desc.storage_offset_bytes != 0 ||
+        in->desc.layout != GD_LAYOUT_CONTIGUOUS || out->desc.layout != GD_LAYOUT_CONTIGUOUS) {
+        return false;
+    }
+    if (gd_tensor_desc_nbytes(&in->desc, &in_bytes, &alignment) != GD_OK ||
+        gd_tensor_desc_nbytes(&out->desc, &out_bytes, &alignment) != GD_OK) {
+        _gd_set_last_error(GD_OK, NULL);
+        return false;
+    }
+    return in_bytes == out_bytes;
+}
+
+static gd_status alias_copy_values(_gd_executable *exe)
+{
+    int i = 0;
+
+    for (i = 0; i < exe->graph->n_nodes; ++i) {
+        const _gd_node *node = &exe->graph->nodes[i];
+        int input = 0;
+        int output = 0;
+        gd_status status = GD_OK;
+
+        if (!can_alias_copy_value(exe->graph, node)) {
+            continue;
+        }
+        input = node->inputs[0];
+        output = node->outputs[0];
+        if (exe->values[input].storage == exe->values[output].storage) {
+            continue;
+        }
+        status = gd_storage_retain(exe->values[input].storage);
+        if (status != GD_OK) {
+            return status;
+        }
+        gd_storage_release(exe->values[output].storage);
+        exe->values[output].storage = exe->values[input].storage;
+        exe->values[output].leaf_offset = exe->values[input].leaf_offset;
+    }
+    return GD_OK;
+}
+
 static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable **out)
 {
     gd_status status = GD_OK;
@@ -341,6 +422,11 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             value->external != NULL ? (size_t)value->desc.storage_offset_bytes : 0U;
     }
 
+    status = alias_copy_values(exe);
+    if (status != GD_OK) {
+        goto fail;
+    }
+
     *out = exe;
     return GD_OK;
 
@@ -356,11 +442,15 @@ fail:
 static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
 {
     int i = 0;
+    uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+    size_t bytes = 0U;
+    uint64_t count = 0U;
 
     for (i = 0; i < exe->n_values; ++i) {
         gd_metal_value *v = &exe->values[i];
         gd_storage *src = NULL;
         void *dst = NULL;
+        size_t nbytes = 0U;
         gd_status status = GD_OK;
 
         if (v->external == NULL) {
@@ -370,15 +460,21 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
         if (src == NULL) {
             return _gd_error(GD_ERR_INVALID_STATE, "metal leaf input has no storage");
         }
+        nbytes = gd_storage_nbytes(v->storage);
+        bytes += nbytes;
+        count += 1U;
         status = gd_storage_data_cpu(v->storage, &dst);
         if (status != GD_OK) {
             return status;
         }
-        status = gd_storage_copy_to_cpu(self->ctx, src, v->leaf_offset, dst,
-                                        gd_storage_nbytes(v->storage));
+        status = gd_storage_copy_to_cpu(self->ctx, src, v->leaf_offset, dst, nbytes);
         if (status != GD_OK) {
             return status;
         }
+    }
+    if (start != 0U) {
+        _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_STAGE_LEAVES,
+                                 _gd_profile_now_ns() - start, bytes, count);
     }
     return GD_OK;
 }
@@ -1177,7 +1273,15 @@ static gd_status encode_node(_gd_backend *self,
         return GD_OK;
     case _GD_OP_RELU:
     case _GD_OP_SILU:
+        encode_unary(enc, pso, exe, node, 0.0F);
+        return GD_OK;
     case _GD_OP_COPY:
+        if (node->n_inputs == 1 && node->n_outputs == 1 &&
+            exe->values[node->inputs[0]].storage == exe->values[node->outputs[0]].storage) {
+            _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_COPY_ALIAS,
+                                     0U, 0U, 1U);
+            return GD_OK;
+        }
         encode_unary(enc, pso, exe, node, 0.0F);
         return GD_OK;
     case _GD_OP_CAST:
@@ -1272,21 +1376,33 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
         return status;
     }
 
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    {
+        uint64_t encode_start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-        for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
-            status = encode_node(self, enc, exe, &exe->graph->nodes[i]);
-            if (status != GD_OK) {
-                [enc endEncoding];
-                return status;
+            for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
+                status = encode_node(self, enc, exe, &exe->graph->nodes[i]);
+                if (status != GD_OK) {
+                    [enc endEncoding];
+                    return status;
+                }
             }
+            [enc endEncoding];
+            [cmd commit];
+            st.inFlight = cmd;
+            st.inFlightExe = exe;
         }
-        [enc endEncoding];
-        [cmd commit];
-        st.inFlight = cmd;
-        st.inFlightExe = exe;
+        if (encode_start != 0U) {
+            uint64_t count = 0U;
+            if (last_node >= 0) {
+                int capped = last_node < exe->graph->n_nodes ? last_node : exe->graph->n_nodes - 1;
+                count = capped >= 0 ? (uint64_t)capped + 1U : 0U;
+            }
+            _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_ENCODE,
+                                     _gd_profile_now_ns() - encode_start, 0U, count);
+        }
     }
     /* v1 is effectively synchronous: external-leaf mutations (grad slots,
      * optimizer state) must be visible to plain CPU-tensor reads after

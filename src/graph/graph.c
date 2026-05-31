@@ -924,7 +924,14 @@ gd_status gd_graph_compile(gd_graph *graph, gd_device target)
     }
 
     graph_free_executable(graph);
-    status = backend->vt->compile(backend, graph, &graph->exec);
+    {
+        uint64_t start = _gd_profile_enabled(graph->ctx) ? _gd_profile_now_ns() : 0U;
+        status = backend->vt->compile(backend, graph, &graph->exec);
+        if (start != 0U) {
+            _gd_profile_record_compile(graph->ctx, backend, _gd_profile_now_ns() - start,
+                                       graph->nodes, graph->n_nodes);
+        }
+    }
     if (status != GD_OK) {
         graph->exec = NULL;
         return status;
@@ -950,7 +957,14 @@ gd_status gd_graph_run(gd_graph *graph)
         return _gd_error(GD_ERR_INVALID_STATE, "graph must be compiled before run");
     }
 
-    status = graph->backend->vt->execute(graph->backend, graph->exec);
+    {
+        uint64_t start = _gd_profile_enabled(graph->ctx) ? _gd_profile_now_ns() : 0U;
+        status = graph->backend->vt->execute(graph->backend, graph->exec);
+        if (start != 0U) {
+            _gd_profile_record_run(graph->ctx, graph->backend, _gd_profile_now_ns() - start,
+                                   graph->nodes, graph->n_nodes);
+        }
+    }
     if (status != GD_OK) {
         return status;
     }
@@ -1099,7 +1113,14 @@ gd_status gd_graph_run_until(gd_graph *graph, int node_id)
         return _gd_error(GD_ERR_UNSUPPORTED, "backend does not support partial execution");
     }
 
-    status = graph->backend->vt->execute_until(graph->backend, graph->exec, node_id);
+    {
+        uint64_t start = _gd_profile_enabled(graph->ctx) ? _gd_profile_now_ns() : 0U;
+        status = graph->backend->vt->execute_until(graph->backend, graph->exec, node_id);
+        if (start != 0U) {
+            _gd_profile_record_run(graph->ctx, graph->backend, _gd_profile_now_ns() - start,
+                                   graph->nodes, node_id + 1);
+        }
+    }
     if (status != GD_OK) {
         return status;
     }

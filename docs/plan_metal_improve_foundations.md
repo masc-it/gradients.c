@@ -1270,6 +1270,9 @@ Fill this table as phases land.
 | P9 | release `-O2` | metal 12.39M GPT train, T=64 (gpt-bench) | ~0.372s/iter | — | ~30x vs pre-P9 ~11.4s; CPU ref ~2.66s |
 | P13 | release `-O2` | metal 12.39M GPT train, T=64 (gpt-bench) | ~0.345s/iter | — | RMSNorm family parallelized; rest now bounded by sdpa_bwd (G3) |
 | P4 | release `-O2` | CPU-backed params, Metal graph, 100 steps, 1 read | — | ~1.12 ms/run | wait/writeback per-run O(steps)->1; CPU-backed path now async |
+| G3 | release `-O2` | metal 12.39M GPT train, T=64 (gpt-bench) | ~0.101s/iter | — | FA-2 sdpa_bwd: 298.9->56.7ms; step 345->101ms; 14->48 GFLOP/s (tracked in plan_gpt.md) |
+| baseline | release `-O2` | metal 12.39M GPT train, **B=4 T=256** (gpt-bench) | ~1.370s/iter | — | canonical workload; 60 GFLOP/s, attention-bound (sdpa+bwd 74%) |
+| G3-tiled | release `-O2` | metal 12.39M GPT train, **B=4 T=256** (gpt-bench) | ~0.500s/iter | — | FlashAttention tiling fwd+bwd: sdpa 264.9->48.4, sdpa_bwd 847.8->127.8ms; 60->164 GFLOP/s, 2055 tok/s; now GEMM-bound |
 
 ---
 

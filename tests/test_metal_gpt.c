@@ -476,6 +476,62 @@ static int build_sdpa_causal(gd_context *ctx, gd_tensor **inputs, int *n, gd_ten
     return build_sdpa_impl(ctx, inputs, n, loss_out, true);
 }
 
+/* Multi-block SDPA parity (forward + backward via gd_graph_compare). The tiny-T
+ * builders above fit in a single tile (BQ=64, BK=16) and run through the 64-float
+ * gradient harness, so they never exercise the B1 causal block-skip. T=130 spans
+ * 3 query blocks and 9 key blocks, forcing the kb_end < Tk and qb_start > 0
+ * paths; window=48 additionally checks that the per-element predicate still masks
+ * correctly alongside the block skip. gd_graph_compare diffs every node value and
+ * gradient across CPU and Metal, so no fixed-size copy buffer is involved. */
+static int test_sdpa_multiblock(gd_context *ctx, int window)
+{
+    enum { MB_B = 2, MB_H = 2, MB_T = 130, MB_DH = 32, MB_N = MB_B * MB_H * MB_T * MB_DH };
+    static float qd[MB_N];
+    static float kd[MB_N];
+    static float vd[MB_N];
+    int64_t qs[4] = {MB_B, MB_H, MB_T, MB_DH};
+    int64_t flat[1] = {MB_N};
+    gd_compare_options opts = {1e-4, 1e-4, false};
+    gd_sdpa_config cfg = {0};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *y = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    for (i = 0; i < MB_N; ++i) {
+        qd[i] = 0.1F * (float)((i % 9) - 4);
+        kd[i] = 0.15F * (float)((i % 7) - 3);
+        vd[i] = 0.2F * (float)((i % 5) - 2);
+    }
+    cfg.causal = true;
+    cfg.sliding_window = window;
+    CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
+    CHECK_OK(make_f32(ctx, 4, qs, kd, &k));
+    CHECK_OK(make_f32(ctx, 4, qs, vd, &v));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &y));
+    CHECK_OK(gd_gelu(ctx, y, false, &gel)); /* varied upstream grad into sdpa */
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(y);
+    gd_tensor_release(gel);
+    gd_tensor_release(fl);
+    gd_tensor_release(loss);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(q);
+    gd_tensor_release(k);
+    gd_tensor_release(v);
+    return 0;
+}
+
 int main(void)
 {
     gd_context *ctx = NULL;
@@ -498,6 +554,8 @@ int main(void)
     rc |= backward_parity(ctx, build_rope, "rope");
     rc |= backward_parity(ctx, build_sdpa, "sdpa");
     rc |= backward_parity(ctx, build_sdpa_causal, "sdpa_causal");
+    rc |= test_sdpa_multiblock(ctx, 0);  /* causal, multi-block */
+    rc |= test_sdpa_multiblock(ctx, 48); /* causal + sliding window */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");
     rc |= backward_parity(ctx, build_gelu_tanh, "gelu_tanh");
     rc |= backward_parity(ctx, build_transpose, "transpose");

@@ -81,7 +81,7 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_EMBEDDING_BWD, "gd_embedding_bwd"},
     {_GD_OP_ROPE, "gd_rope"},
     {_GD_OP_ROPE_BWD, "gd_rope"},
-    {_GD_OP_SDPA, "gd_sdpa"},
+    {_GD_OP_SDPA, "gd_sdpa_tiled"},
     {_GD_OP_SDPA_BWD, "gd_sdpa_bwd_dq"},
     {_GD_OP_RMS_NORM_BWD, "gd_rms_norm_bwd"},
     {_GD_OP_RMS_NORM_WBWD, "gd_rms_norm_wbwd"},
@@ -90,6 +90,8 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
 /* Kernels not mapped 1:1 to an op (looked up by name during encode). */
 static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv",
+    "gd_sdpa_bwd_stats",
+    "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
 };
 
 static gd_status metal_dtype_code(gd_dtype dtype, int *out)
@@ -131,6 +133,8 @@ struct _gd_executable {
     int n_plan;
     void **node_pso;   /* primary pipeline per node id, or NULL */
     void **node_pso2;  /* secondary pipeline (e.g. sdpa_bwd dkv), or NULL */
+    void **node_pso3;  /* tertiary pipeline (e.g. sdpa_bwd stats), or NULL */
+    gd_storage **node_scratch; /* per-node device scratch (e.g. sdpa_bwd stats), or NULL */
 };
 
 /* ---- Helpers ------------------------------------------------------------- */
@@ -378,9 +382,16 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
         }
         free(exe->values);
     }
-    /* node_pso/node_pso2 hold unretained __bridge pointers; just free the arrays. */
+    /* node_pso* hold unretained __bridge pointers; just free the arrays. */
     free(exe->node_pso);
     free(exe->node_pso2);
+    free(exe->node_pso3);
+    if (exe->node_scratch != NULL) {
+        for (i = 0; i < exe->n_plan; ++i) {
+            gd_storage_release(exe->node_scratch[i]);
+        }
+        free(exe->node_scratch);
+    }
     free(exe);
 }
 
@@ -577,15 +588,33 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
 
         exe->node_pso = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso));
         exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
-        if (exe->node_pso == NULL || exe->node_pso2 == NULL) {
+        exe->node_pso3 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso3));
+        exe->node_scratch = calloc((size_t)graph->n_nodes, sizeof(*exe->node_scratch));
+        if (exe->node_pso == NULL || exe->node_pso2 == NULL || exe->node_pso3 == NULL ||
+            exe->node_scratch == NULL) {
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
             goto fail;
         }
         for (j = 0; j < graph->n_nodes; ++j) {
-            _gd_op_kind op = graph->nodes[j].op;
+            const _gd_node *node = &graph->nodes[j];
+            _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
             if (op == _GD_OP_SDPA_BWD) {
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_dkv");
+                exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_stats");
+                /* Per-query stats scratch [m, l, D] = B*Hq*Tq*3 floats. q is
+                 * input 1: [B, Tq, Hq, Dh]. */
+                {
+                    const gd_tensor_desc *qd = &graph->values[node->inputs[1]].desc;
+                    int64_t nstats = qd->sizes[0] * qd->sizes[2] * qd->sizes[1] * 3;
+                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
+                                             GD_MEM_UNIFIED,
+                                             (size_t)nstats * sizeof(float), sizeof(float)};
+                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
+                    if (status != GD_OK) {
+                        goto fail;
+                    }
+                }
             }
         }
     }
@@ -1334,7 +1363,8 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
 }
 
-static void encode_sdpa(id<MTLComputeCommandEncoder> enc,
+static void encode_sdpa(_gd_backend *self,
+                        id<MTLComputeCommandEncoder> enc,
                         id<MTLComputePipelineState> pso,
                         _gd_executable *exe,
                         const _gd_node *node)
@@ -1348,19 +1378,32 @@ static void encode_sdpa(id<MTLComputeCommandEncoder> enc,
      * valid placeholder buffer when absent. */
     int bias_input = node->attrs.has_bias ? node->inputs[3] : node->inputs[0];
     gd_metal_sdpa_params p;
-    int grid = 0;
 
     fill_sdpa_params(&p, q, k, bias, node);
-    grid = p.B * p.Hq * p.Tq;
-    [enc setComputePipelineState:pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
     [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:3];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
-    if (grid > 0) {
-        dispatch_1d(enc, pso, (NSUInteger)grid);
+
+    if (p.Dh <= GD_METAL_SDPA_DHT) {
+        /* Tiled: one threadgroup per (b, hq, query-block) of GD_METAL_SDPA_BQ. */
+        int n_qb = (p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
+        NSUInteger groups = (NSUInteger)(p.B * p.Hq * n_qb);
+        [enc setComputePipelineState:pso];
+        if (groups > 0) {
+            [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
+        }
+    } else {
+        /* Fallback to the per-(b,hq,i) reference kernel for large head_dim. */
+        id<MTLComputePipelineState> ref = pipeline_named(state_of(self), "gd_sdpa");
+        int grid = p.B * p.Hq * p.Tq;
+        [enc setComputePipelineState:ref];
+        if (grid > 0) {
+            dispatch_1d(enc, ref, (NSUInteger)grid);
+        }
     }
 }
 
@@ -1369,6 +1412,8 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
                                  id<MTLComputeCommandEncoder> enc,
                                  id<MTLComputePipelineState> dq_pso,
                                  id<MTLComputePipelineState> dkv_pso,
+                                 id<MTLComputePipelineState> stats_pso,
+                                 id<MTLBuffer> stats_buf,
                                  _gd_executable *exe,
                                  const _gd_node *node)
 {
@@ -1380,16 +1425,39 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
                                      : NULL;
     int bias_input = node->attrs.has_bias ? node->inputs[4] : node->inputs[1];
     gd_metal_sdpa_params p;
-    int dq_grid = 0;
-    int dkv_grid = 0;
+    int q_groups = 0;
+    int kv_groups = 0;
 
-    if (dkv_pso == nil) {
-        return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd_dkv pipeline missing");
+    if (dkv_pso == nil || stats_pso == nil || stats_buf == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd pipeline/scratch missing");
     }
     fill_sdpa_params(&p, q, k, bias, node);
-    dq_grid = p.B * p.Hq * p.Tq;
-    dkv_grid = p.B * p.Hkv * p.Tk;
+    /* The tiled backward keeps per-thread q/k/v/dO/acc rows in registers, capped
+     * at GD_METAL_SDPA_DHT. Fail loud for larger head_dim (CPU_REF is the
+     * correctness fallback) rather than overrun the register arrays. */
+    if (p.Dh > GD_METAL_SDPA_DHT) {
+        return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd supports head_dim <= 64");
+    }
+    /* Threadgroups: query blocks for stats/dq, key blocks for dk/dv; both use
+     * GD_METAL_SDPA_BQ threads per group. */
+    q_groups = p.B * p.Hq * ((p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ);
+    kv_groups = p.B * p.Hkv * ((p.Tk + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ);
 
+    /* Pass 1: per-query softmax stats (m, l, D) into scratch. */
+    [enc setComputePipelineState:stats_pso];
+    [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0]; /* go */
+    [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1]; /* q */
+    [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2]; /* k */
+    [enc setBuffer:value_buffer(exe, node->inputs[3]) offset:0 atIndex:3]; /* v */
+    [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:4];      /* bias */
+    [enc setBuffer:stats_buf offset:0 atIndex:5];                          /* stats */
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    if (q_groups > 0) {
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)q_groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
+    }
+
+    /* Pass 2: dq (one pass over keys using stats). */
     [enc setComputePipelineState:dq_pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0]; /* go */
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1]; /* q */
@@ -1398,10 +1466,13 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
     [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:4];      /* bias */
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:5]; /* dq */
     [enc setBytes:&p length:sizeof(p) atIndex:6];
-    if (dq_grid > 0) {
-        dispatch_1d(enc, dq_pso, (NSUInteger)dq_grid);
+    [enc setBuffer:stats_buf offset:0 atIndex:7];                          /* stats */
+    if (q_groups > 0) {
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)q_groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
     }
 
+    /* Pass 3: dk/dv (one pass over queries per kv slot using stats). */
     [enc setComputePipelineState:dkv_pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0]; /* go */
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1]; /* q */
@@ -1411,8 +1482,10 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
     [enc setBuffer:value_buffer(exe, node->outputs[1]) offset:0 atIndex:5]; /* dk */
     [enc setBuffer:value_buffer(exe, node->outputs[2]) offset:0 atIndex:6]; /* dv */
     [enc setBytes:&p length:sizeof(p) atIndex:7];
-    if (dkv_grid > 0) {
-        dispatch_1d(enc, dkv_pso, (NSUInteger)dkv_grid);
+    [enc setBuffer:stats_buf offset:0 atIndex:8];                          /* stats */
+    if (kv_groups > 0) {
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
     }
     return GD_OK;
 }
@@ -1469,7 +1542,9 @@ static gd_status encode_node(_gd_backend *self,
                              _gd_executable *exe,
                              const _gd_node *node,
                              id<MTLComputePipelineState> pso,
-                             id<MTLComputePipelineState> pso2)
+                             id<MTLComputePipelineState> pso2,
+                             id<MTLComputePipelineState> pso3,
+                             id<MTLBuffer> scratch)
 {
     if (pso == nil) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op");
@@ -1556,10 +1631,10 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_ROPE_BWD:
         return encode_rope(enc, pso, exe, node, -1.0F);
     case _GD_OP_SDPA:
-        encode_sdpa(enc, pso, exe, node);
+        encode_sdpa(self, enc, pso, exe, node);
         return GD_OK;
     case _GD_OP_SDPA_BWD:
-        return encode_sdpa_bwd(self, enc, pso, pso2, exe, node);
+        return encode_sdpa_bwd(self, enc, pso, pso2, pso3, scratch, exe, node);
     case _GD_OP_RMS_NORM_BWD:
         encode_rms_norm_bwd(enc, pso, exe, node);
         return GD_OK;
@@ -1606,11 +1681,14 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             const _gd_node *node = &exe->graph->nodes[i];
             id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
             id<MTLComputePipelineState> pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
+            id<MTLComputePipelineState> pso3 = (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
+            id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
+                ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
             uint64_t op_start = _gd_profile_now_ns();
             @autoreleasepool {
                 id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                status = encode_node(self, enc, exe, node, pso, pso2);
+                status = encode_node(self, enc, exe, node, pso, pso2, pso3, scratch);
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;
@@ -1643,7 +1721,11 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
                 id<MTLComputePipelineState> pso2 =
                     (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
-                status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2);
+                id<MTLComputePipelineState> pso3 =
+                    (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
+                id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
+                    ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
+                status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2, pso3, scratch);
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;

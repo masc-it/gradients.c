@@ -549,8 +549,54 @@ CPU+Metal kernels and parity tests before the next phase.
   gradcheck of q/k/v with a partial-masking bias, plus CPU↔Metal forward+grad
   parity (`sdpa_bias`). This addresses the "no custom attention mask" gap; the
   block-sparse path (G4) remains the structured-sparsity complement.
-- [ ] **G3 — SDPA tiled (FlashAttention-style)**: Metal `GPU_FUSED` forward,
-  online softmax, parity vs reference; optional logsumexp output.
+- [x] **G3 — SDPA FlashAttention-2-style backward (Metal)**: the profiled
+  bottleneck was `sdpa_bwd`, not the forward. The reference dk/dv kernel
+  recomputed each query's softmax stats *inside the per-key loop*
+  (O(B·Hkv·Tk · Tq·Tk·Dh)). Replaced with the FA-2 structure: a stats pre-pass
+  computes per-query `(m, l, D=Σ_j p_ij·(dO_i·v_j))` once into a backend-owned
+  device scratch buffer (`B·Hq·Tq·3` floats, allocated at compile, freed with the
+  executable — allocation-free per run); `dq` and `dk/dv` then visit each
+  (query,key) pair a single time, giving optimal O(B·Hq·Tq·Tk·Dh). Three kernels
+  (`gd_sdpa_bwd_stats`, `gd_sdpa_bwd_dq`, `gd_sdpa_bwd_dkv`) under one IR node
+  (extends the P8 plan with `node_pso3` + `node_scratch`). Numbers (12.39M GPT,
+  T=64, 6 layers, `GD_PROFILE=trace`): `sdpa_bwd` 298.9 ms → 56.7 ms (5.3×);
+  end-to-end Metal train step 345 ms → **101 ms** (3.4×), 14 → **48 GFLOP/s**.
+  Parity: CPU↔Metal dq/dk/dv at 1e-4 and GPT train parity stay green (the
+  reference CPU kernel is unchanged oracle). The **forward** `gd_sdpa` is already
+  streaming/per-query (no T² score matrix, ~28 ms), so the classic tiled-forward
+  rung buys little here; threadgroup K/V staging and emitting the per-row
+  logsumexp `L` from the forward (to skip the backward stats pass) remain
+  optional future refinements.
+
+  **Update — FlashAttention threadgroup tiling (forward + backward).** Profiling
+  a realistic workload (B=4, T=256, 6 layers, 12.39M) showed attention back on
+  top because T² work grows with sequence length and the per-query/per-key
+  kernels re-read the other operand from device memory (one thread per (b,h,i)
+  or (b,h,j), no reuse). Added threadgroup-staged tiling, the standard
+  FlashAttention shape:
+  - **Forward `gd_sdpa_tiled`**: one threadgroup per (b, hq, query-block of
+    `GD_METAL_SDPA_BQ`=64); K/V key tiles (`GD_METAL_SDPA_BK`=16) are staged into
+    threadgroup memory once per block and reused by every query; softmax is a
+    single online streaming pass (running max/denom/acc with rescale). Capped to
+    `head_dim <= GD_METAL_SDPA_DHT`=64 (per-thread q/acc rows in registers); the
+    host falls back to the reference `gd_sdpa` kernel for larger Dh.
+  - **Backward**: the same staging applied to all three kernels — `stats`/`dq`
+    stage K/V across a query block; `dkv` stages Q/dO and the per-query stats
+    `(m,l,D)` across a key block (each thread owns one kv slot, conflict-free
+    register accumulation). `stats` also folded to a single online pass.
+  Numbers (B=4, T=256, 6 layers, `GD_PROFILE=trace`): forward `sdpa` 264.9 ms ->
+  48.4 ms (5.5x); backward `sdpa_bwd` 847.8 ms -> 127.8 ms (6.6x). End-to-end
+  Metal train step **1370 ms -> 500 ms (2.74x)**, **60 -> 164 GFLOP/s**,
+  748 -> **2055 tokens/s**. Attention (176 ms) is no longer dominant — GEMM
+  (matmul 148.6 + linear 57.6 = 206 ms) is now the top cost.
+  Learnings: (1) the win is device-memory traffic reduction (BQ× fewer K/V or
+  Q/dO reads), not arithmetic — throughput jumped 2.7× with identical FLOPs;
+  (2) the per-thread register-array cap (`DHT`=64) is the practical limit of the
+  register-resident-accumulator approach; >64 needs Dh-specialized kernels or
+  threadgroup-resident accumulators (future); (3) online softmax matches the
+  two-pass reference within 1e-4 — parity held across all SDPA tests and GPT
+  train parity. Tiled forward + backward both validated CPU↔Metal at 1e-4 and
+  ASan-clean.
 - [ ] **G4 — Block-sparse SDPA**: `block_mask` value + host pattern builders
   (causal, sliding-window, custom); kernel visits allowed blocks; parity vs
   dense-masked reference. (Forward-first; sparse backward deferred.)

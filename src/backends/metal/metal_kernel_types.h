@@ -13,6 +13,14 @@
  * the host dispatches matching threadgroup dimensions. */
 #define GD_METAL_GEMM_TILE 16
 
+/* FlashAttention-style tiled SDPA forward: query-block (threads per group), key
+ * tile (staged in threadgroup memory), and the max head_dim the tiled kernel
+ * supports. The host falls back to the reference SDPA kernel when
+ * head_dim > GD_METAL_SDPA_DHT. Shared so host dispatch matches the kernel. */
+#define GD_METAL_SDPA_BQ 64
+#define GD_METAL_SDPA_BK 16
+#define GD_METAL_SDPA_DHT 64
+
 /* Elementwise binary ops (add/mul) with NumPy-style right-aligned broadcasting.
  * `out_sizes` describes the contiguous output; `a_sizes`/`b_sizes` describe each
  * input's own shape so the shader can reproduce broadcast_offset() from the CPU

@@ -879,6 +879,50 @@ static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk, int causal, int
     return true;
 }
 
+/* Causal block-skip bounds (B1). These are threadgroup-uniform: they depend only
+ * on the block index, not the per-thread row, so every thread in the group runs
+ * the same number of staging iterations and barriers stay aligned. The
+ * per-element gd_sdpa_allowed() predicate still runs inside visited blocks, so
+ * partial (diagonal) blocks and the window mask remain exact. */
+
+/* For a query block covering [q0, q0+bq), the largest causal key index any query
+ * in the block may attend is min(q0+bq-1, Tq-1) + (Tk-Tq). Key blocks past that
+ * are fully masked; returns the exclusive key bound to cap the kb loop. */
+static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk, int causal)
+{
+    if (!causal) {
+        return Tk;
+    }
+    int qmax = q0 + bq - 1;
+    if (qmax > Tq - 1) {
+        qmax = Tq - 1;
+    }
+    int lim = qmax + (Tk - Tq) + 1; /* keys j < lim may be attended */
+    if (lim < 0) {
+        lim = 0;
+    }
+    if (lim > Tk) {
+        lim = Tk;
+    }
+    return lim;
+}
+
+/* Symmetric bound for the dk/dv kernel, which iterates query blocks per key
+ * block. Keys [k0, ..) can only be attended by queries i >= k0 - (Tk-Tq); query
+ * blocks fully below that are masked. Returns the qblk-aligned first query block
+ * to start the qb loop from. */
+static inline int gd_sdpa_qb_start(int k0, int qblk, int Tk, int Tq, int causal)
+{
+    if (!causal) {
+        return 0;
+    }
+    int qmin = k0 - (Tk - Tq);
+    if (qmin <= 0) {
+        return 0;
+    }
+    return (qmin / qblk) * qblk;
+}
+
 static inline float gd_sdpa_dot(device const float *a, device const float *b, int n)
 {
     float s = 0.0f;
@@ -901,6 +945,97 @@ static inline float gd_sdpa_bias_at(device const float *bias,
     int ib = (p.Tqb == 1) ? 0 : i;
     int jb = (p.Tkb == 1) ? 0 : j;
     return bias[((bb * p.Hb + hb) * p.Tqb + ib) * p.Tkb + jb];
+}
+
+/* FlashAttention-style tiled forward (G3). One threadgroup per (b, hq,
+ * query-block of GD_SDPA_BQ queries); K/V key tiles are staged into threadgroup
+ * memory once per block and reused by every query in the block, and softmax is
+ * computed online in a single streaming pass (running max/denom/accumulator with
+ * rescale). Capped to head_dim <= GD_SDPA_DHT; the host falls back to the
+ * reference kernel for larger Dh. */
+#define GD_SDPA_BQ GD_METAL_SDPA_BQ
+#define GD_SDPA_BK GD_METAL_SDPA_BK
+#define GD_SDPA_DHT GD_METAL_SDPA_DHT
+kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
+                          device const float *k              [[buffer(1)]],
+                          device const float *v              [[buffer(2)]],
+                          device const float *bias           [[buffer(3)]],
+                          device float *out                  [[buffer(4)]],
+                          constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                          uint tgid [[threadgroup_position_in_grid]],
+                          uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int qb = (int)tgid % n_qb;
+    int r = (int)tgid / n_qb; /* b*Hq + hq */
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        int tile = kb_end - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        /* Cooperatively stage this key tile (all threads participate). */
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    float s = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float mnew = (s > m) ? s : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(s - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        if (l > 0.0f) {
+            for (int c = 0; c < p.Dh; ++c) {
+                out[qbase + c] = acc[c] / l;
+            }
+        } else {
+            for (int c = 0; c < p.Dh; ++c) {
+                out[qbase + c] = 0.0f;
+            }
+        }
+    }
 }
 
 /* Forward: one thread per (b, hq, i); two-pass stable softmax, no score matrix. */
@@ -960,7 +1095,92 @@ kernel void gd_sdpa(device const float *q              [[buffer(0)]],
     }
 }
 
-/* Backward dq: one thread per (b, hq, i); recompute softmax stats then dq. */
+/* FlashAttention-2 style backward (G3). A stats pre-pass computes, per query,
+ * the softmax max `m`, denominator `l`, and `D = sum_j p_ij (dO_i . v_j)` once;
+ * dq and dk/dv then visit each (query,key) pair a single time using those
+ * stats, so the total work is O(B*Hq*Tq*Tk*Dh) instead of the reference
+ * O(B*Hkv*Tk * Tq*Tk) recompute. Stats layout: 3 floats per (b,hq,i):
+ * [m, l, D] at index ((b*Hq + hq)*Tq + i)*3. */
+kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
+                              device const float *q             [[buffer(1)]],
+                              device const float *k             [[buffer(2)]],
+                              device const float *v             [[buffer(3)]],
+                              device const float *bias          [[buffer(4)]],
+                              device float *stats               [[buffer(5)]],
+                              constant gd_metal_sdpa_params &p   [[buffer(6)]],
+                              uint tgid [[threadgroup_position_in_grid]],
+                              uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int qb = (int)tgid % n_qb;
+    int r = (int)tgid / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float goreg[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        goreg[c] = active ? go[qbase + c] : 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float raw = 0.0f;
+
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        int tile = kb_end - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    float s = 0.0f;
+                    float dp = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qreg[c] * ksh[jj * p.Dh + c];
+                        dp += goreg[c] * vsh[jj * p.Dh + c];
+                    }
+                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float mnew = (s > m) ? s : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(s - mnew);
+                    l = l * corr + e;
+                    raw = raw * corr + e * dp;
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        int sbase = ((b * p.Hq + hq) * p.Tq + i) * 3;
+        stats[sbase + 0] = m;
+        stats[sbase + 1] = l;
+        stats[sbase + 2] = (l > 0.0f) ? (raw / l) : 0.0f;
+    }
+}
+
+/* Backward dq: one threadgroup per (b, hq, query-block); K/V tiles staged and
+ * reused across the block; single pass over keys using stats. */
 kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
                            device const float *q             [[buffer(1)]],
                            device const float *k             [[buffer(2)]],
@@ -968,71 +1188,83 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
                            device const float *bias          [[buffer(4)]],
                            device float *dq                  [[buffer(5)]],
                            constant gd_metal_sdpa_params &p   [[buffer(6)]],
-                           uint gid                          [[thread_position_in_grid]])
+                           device const float *stats         [[buffer(7)]],
+                           uint tgid [[threadgroup_position_in_grid]],
+                           uint tid  [[thread_index_in_threadgroup]])
 {
-    int total = p.B * p.Hq * p.Tq;
-    if ((int)gid >= total) {
-        return;
-    }
-    int i = (int)gid % p.Tq;
-    int r = (int)gid / p.Tq;
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int qb = (int)tgid % n_qb;
+    int r = (int)tgid / n_qb;
     int hq = r % p.Hq;
     int b = r / p.Hq;
     int group = p.Hq / p.Hkv;
     int hkv = hq / group;
-    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
-    int gobase = qbase;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+    int sbase = active ? (((b * p.Hq + hq) * p.Tq + i) * 3) : 0;
+    float m = active ? stats[sbase + 0] : 0.0f;
+    float l = active ? stats[sbase + 1] : 0.0f;
+    float D = active ? stats[sbase + 2] : 0.0f;
 
-    float m = -INFINITY;
-    for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
-            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
-                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-            if (s > m) {
-                m = s;
-            }
-        }
-    }
-    float sum = 0.0f;
-    float dsum = 0.0f;
-    for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
-            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
-                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-            sum += exp(s - m);
-        }
-    }
-    for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
-            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
-                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-            float pj = exp(s - m) / sum;
-            dsum += pj * gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
-        }
-    }
+    float qreg[GD_SDPA_DHT];
+    float goreg[GD_SDPA_DHT];
+    float dqacc[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
-        dq[qbase + c] = 0.0f;
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        goreg[c] = active ? go[qbase + c] : 0.0f;
+        dqacc[c] = 0.0f;
     }
-    for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
-            float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
-                      + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-            float pj = exp(s - m) / sum;
-            float dp = gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
-            float ds = pj * (dp - dsum);
-            for (int c = 0; c < p.Dh; ++c) {
-                dq[qbase + c] += p.scale * ds * k[kbase + c];
+    bool run = active && l > 0.0f;
+
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        int tile = kb_end - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (run) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    float s = 0.0f;
+                    float dp = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qreg[c] * ksh[jj * p.Dh + c];
+                        dp += goreg[c] * vsh[jj * p.Dh + c];
+                    }
+                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float pj = exp(s - m) / l;
+                    float ds = pj * (dp - D);
+                    for (int c = 0; c < p.Dh; ++c) {
+                        dqacc[c] += p.scale * ds * ksh[jj * p.Dh + c];
+                    }
+                }
             }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        for (int c = 0; c < p.Dh; ++c) {
+            dq[qbase + c] = dqacc[c];
         }
     }
 }
 
-/* Backward dk/dv: one thread per (b, hkv, j); loop the query-head group and all
- * query positions, accumulating into this kv slot (no cross-thread conflict). */
+/* Backward dk/dv: one threadgroup per (b, hkv, key-block); Q/dO and per-query
+ * stats are staged into threadgroup memory and reused across the key block.
+ * Each thread owns one kv slot, so dk/dv accumulate conflict-free in registers. */
 kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
                             device const float *q             [[buffer(1)]],
                             device const float *k             [[buffer(2)]],
@@ -1041,70 +1273,93 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
                             device float *dk                  [[buffer(5)]],
                             device float *dv                  [[buffer(6)]],
                             constant gd_metal_sdpa_params &p   [[buffer(7)]],
-                            uint gid                          [[thread_position_in_grid]])
+                            device const float *stats         [[buffer(8)]],
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint tid  [[thread_index_in_threadgroup]])
 {
-    int total = p.B * p.Hkv * p.Tk;
-    if ((int)gid >= total) {
-        return;
-    }
-    int j = (int)gid % p.Tk;
-    int r = (int)gid / p.Tk;
+    threadgroup float qsh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float gsh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float msh[GD_SDPA_BK];
+    threadgroup float lsh[GD_SDPA_BK];
+    threadgroup float dsh[GD_SDPA_BK];
+
+    int n_kb = (p.Tk + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int kblk = (int)tgid % n_kb;
+    int r = (int)tgid / n_kb;
     int hkv = r % p.Hkv;
     int b = r / p.Hkv;
     int group = p.Hq / p.Hkv;
-    int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+    int j = kblk * GD_SDPA_BQ + (int)tid;
+    bool active = j < p.Tk;
+    int kbase = active ? (((b * p.Tk + j) * p.Hkv + hkv) * p.Dh) : 0;
 
+    float kreg[GD_SDPA_DHT];
+    float vreg[GD_SDPA_DHT];
+    float dkacc[GD_SDPA_DHT];
+    float dvacc[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
-        dk[kbase + c] = 0.0f;
-        dv[kbase + c] = 0.0f;
+        kreg[c] = active ? k[kbase + c] : 0.0f;
+        vreg[c] = active ? v[kbase + c] : 0.0f;
+        dkacc[c] = 0.0f;
+        dvacc[c] = 0.0f;
     }
+
+    int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_BQ, GD_SDPA_BK, p.Tk, p.Tq, p.causal);
     for (int g = 0; g < group; ++g) {
         int hq = hkv * group + g;
-        for (int i = 0; i < p.Tq; ++i) {
-            if (!gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
-                continue;
+        for (int qb = qb_start; qb < p.Tq; qb += GD_SDPA_BK) {
+            int tile = p.Tq - qb;
+            if (tile > GD_SDPA_BK) {
+                tile = GD_SDPA_BK;
             }
-            int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
-            int gobase = qbase;
-            float m = -INFINITY;
-            for (int jj = 0; jj < p.Tk; ++jj) {
-                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
-                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
-                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
-                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
-                    if (s > m) {
-                        m = s;
+            for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+                int ii = idx / p.Dh;
+                int c = idx % p.Dh;
+                int qb2 = ((b * p.Tq + (qb + ii)) * p.Hq + hq) * p.Dh;
+                qsh[ii * p.Dh + c] = q[qb2 + c];
+                gsh[ii * p.Dh + c] = go[qb2 + c];
+            }
+            for (int ii = (int)tid; ii < tile; ii += GD_SDPA_BQ) {
+                int sb = ((b * p.Hq + hq) * p.Tq + (qb + ii)) * 3;
+                msh[ii] = stats[sb + 0];
+                lsh[ii] = stats[sb + 1];
+                dsh[ii] = stats[sb + 2];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (active) {
+                for (int ii = 0; ii < tile; ++ii) {
+                    int i = qb + ii;
+                    if (!gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                        continue;
+                    }
+                    float l = lsh[ii];
+                    if (l <= 0.0f) {
+                        continue;
+                    }
+                    float mm = msh[ii];
+                    float D = dsh[ii];
+                    float s = 0.0f;
+                    float dp = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qsh[ii * p.Dh + c] * kreg[c];
+                        dp += gsh[ii * p.Dh + c] * vreg[c];
+                    }
+                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float pj = exp(s - mm) / l;
+                    float ds = pj * (dp - D);
+                    for (int c = 0; c < p.Dh; ++c) {
+                        dvacc[c] += pj * gsh[ii * p.Dh + c];
+                        dkacc[c] += p.scale * ds * qsh[ii * p.Dh + c];
                     }
                 }
             }
-            float sum = 0.0f;
-            float dsum = 0.0f;
-            for (int jj = 0; jj < p.Tk; ++jj) {
-                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
-                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
-                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
-                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
-                    sum += exp(s - m);
-                }
-            }
-            for (int jj = 0; jj < p.Tk; ++jj) {
-                if (gd_sdpa_allowed(i, jj, p.Tq, p.Tk, p.causal, p.window)) {
-                    int kb = ((b * p.Tk + jj) * p.Hkv + hkv) * p.Dh;
-                    float s = p.scale * gd_sdpa_dot(q + qbase, k + kb, p.Dh)
-                              + gd_sdpa_bias_at(bias, p, b, hq, i, jj);
-                    float pjj = exp(s - m) / sum;
-                    dsum += pjj * gd_sdpa_dot(go + gobase, v + kb, p.Dh);
-                }
-            }
-            float sj = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
-                       + gd_sdpa_bias_at(bias, p, b, hq, i, j);
-            float pj = exp(sj - m) / sum;
-            float dp = gd_sdpa_dot(go + gobase, v + kbase, p.Dh);
-            float ds = pj * (dp - dsum);
-            for (int c = 0; c < p.Dh; ++c) {
-                dv[kbase + c] += pj * go[gobase + c];
-                dk[kbase + c] += p.scale * ds * q[qbase + c];
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (active) {
+        for (int c = 0; c < p.Dh; ++c) {
+            dk[kbase + c] = dkacc[c];
+            dv[kbase + c] = dvacc[c];
         }
     }
 }

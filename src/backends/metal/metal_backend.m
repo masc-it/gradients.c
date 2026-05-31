@@ -218,7 +218,9 @@ struct _gd_executable {
     void **node_pso2;  /* secondary pipeline (e.g. sdpa_bwd dkv), or NULL */
     void **node_pso3;  /* tertiary pipeline (e.g. sdpa_bwd stats), or NULL */
     void **node_mps;   /* optional per-node MPS kernel object, retained, or NULL */
-    gd_storage **node_scratch; /* per-node device scratch (e.g. sdpa_bwd stats), or NULL */
+    size_t *node_scratch_bytes; /* per-node scratch need inside shared arena */
+    gd_storage *scratch_arena;  /* max-sized executable scratch, reused per node */
+    size_t scratch_arena_bytes;
     /* Fusion plan (GPU_FUSED, Option A): a node marked absorbed is encoded by its
      * group head, so execute skips it. Set by metal_plan_fusions at compile;
      * all-zero means no fusion (the identity plan). */
@@ -495,12 +497,8 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
     }
     free(exe->node_absorbed);
     free(exe->node_fused_src);
-    if (exe->node_scratch != NULL) {
-        for (i = 0; i < exe->n_plan; ++i) {
-            gd_storage_release(exe->node_scratch[i]);
-        }
-        free(exe->node_scratch);
-    }
+    free(exe->node_scratch_bytes);
+    gd_storage_release(exe->scratch_arena);
     free(exe);
 }
 
@@ -793,17 +791,19 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
     if (graph->n_nodes > 0) {
         GDMetalState *st = state_of(self);
         int j = 0;
+        size_t scratch_max_bytes = 0U;
 
         exe->node_pso = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso));
         exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
         exe->node_pso3 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso3));
         exe->node_mps = calloc((size_t)graph->n_nodes, sizeof(*exe->node_mps));
-        exe->node_scratch = calloc((size_t)graph->n_nodes, sizeof(*exe->node_scratch));
+        exe->node_scratch_bytes = calloc((size_t)graph->n_nodes,
+                                         sizeof(*exe->node_scratch_bytes));
         exe->node_absorbed = calloc((size_t)graph->n_nodes, sizeof(*exe->node_absorbed));
         exe->node_fused_src = calloc((size_t)graph->n_nodes, sizeof(*exe->node_fused_src));
         if (exe->node_pso == NULL || exe->node_pso2 == NULL || exe->node_pso3 == NULL ||
-            exe->node_mps == NULL || exe->node_scratch == NULL || exe->node_absorbed == NULL ||
-            exe->node_fused_src == NULL) {
+            exe->node_mps == NULL || exe->node_scratch_bytes == NULL ||
+            exe->node_absorbed == NULL || exe->node_fused_src == NULL) {
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
             goto fail;
         }
@@ -955,13 +955,10 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                 int row_blocks = (rows + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_rms_norm_wbwd_reduce");
                 if (row_blocks > 0 && last > 0) {
-                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
-                                             GD_MEM_UNIFIED,
-                                             (size_t)row_blocks * (size_t)last * sizeof(float),
-                                             sizeof(float)};
-                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
-                    if (status != GD_OK) {
-                        goto fail;
+                    exe->node_scratch_bytes[j] = (size_t)row_blocks * (size_t)last *
+                                                 sizeof(float);
+                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                        scratch_max_bytes = exe->node_scratch_bytes[j];
                     }
                 }
             } else if (op == _GD_OP_EMBEDDING_BWD) {
@@ -978,12 +975,9 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                 }
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_cross_entropy_reduce");
                 if (positions > 0) {
-                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
-                                             GD_MEM_UNIFIED,
-                                             (size_t)positions * sizeof(float), sizeof(float)};
-                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
-                    if (status != GD_OK) {
-                        goto fail;
+                    exe->node_scratch_bytes[j] = (size_t)positions * sizeof(float);
+                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                        scratch_max_bytes = exe->node_scratch_bytes[j];
                     }
                 }
             } else if (op == _GD_OP_SDPA) {
@@ -998,14 +992,11 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                 if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
                     int64_t npart = qd->sizes[0] * qd->sizes[2] * qd->sizes[1]
                                     * nsplit * (Dh + 2);
-                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
-                                             GD_MEM_UNIFIED,
-                                             (size_t)npart * sizeof(float), sizeof(float)};
                     exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_splitk");
                     exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_combine");
-                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
-                    if (status != GD_OK) {
-                        goto fail;
+                    exe->node_scratch_bytes[j] = (size_t)npart * sizeof(float);
+                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                        scratch_max_bytes = exe->node_scratch_bytes[j];
                     }
                 }
             } else if (op == _GD_OP_SDPA_BWD) {
@@ -1031,15 +1022,21 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                     } else {
                         nfloats = (int64_t)B * Hq * Tq * 3;
                     }
-                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
-                                             GD_MEM_UNIFIED,
-                                             (size_t)nfloats * sizeof(float), sizeof(float)};
-                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
-                    if (status != GD_OK) {
-                        goto fail;
+                    exe->node_scratch_bytes[j] = (size_t)nfloats * sizeof(float);
+                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                        scratch_max_bytes = exe->node_scratch_bytes[j];
                     }
                 }
             }
+        }
+        if (scratch_max_bytes > 0U) {
+            gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
+                                     scratch_max_bytes, sizeof(float)};
+            status = gd_storage_create(graph->ctx, &sdesc, &exe->scratch_arena);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            exe->scratch_arena_bytes = scratch_max_bytes;
         }
         metal_plan_fusions(self, graph, exe);
     }
@@ -2351,8 +2348,14 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
             pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
             id<MTLComputePipelineState> pso3 = (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
-            id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
-                ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
+            id<MTLBuffer> scratch = nil;
+            if (exe->node_scratch_bytes[i] > 0U) {
+                if (exe->scratch_arena == NULL ||
+                    exe->node_scratch_bytes[i] > exe->scratch_arena_bytes) {
+                    return _gd_error(GD_ERR_BACKEND, "metal scratch arena too small");
+                }
+                scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
+            }
             uint64_t op_start = _gd_profile_now_ns();
             @autoreleasepool {
                 id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
@@ -2404,8 +2407,15 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
                 id<MTLComputePipelineState> pso3 =
                     (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
-                id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
-                    ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
+                id<MTLBuffer> scratch = nil;
+                if (exe->node_scratch_bytes[i] > 0U) {
+                    if (exe->scratch_arena == NULL ||
+                        exe->node_scratch_bytes[i] > exe->scratch_arena_bytes) {
+                        [enc endEncoding];
+                        return _gd_error(GD_ERR_BACKEND, "metal scratch arena too small");
+                    }
+                    scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
+                }
                 if (exe->node_fused_src[i] >= 0) {
                     encode_fused_silu_mul(enc, pso2, exe, &exe->graph->nodes[i],
                                           &exe->graph->nodes[exe->node_fused_src[i]]);

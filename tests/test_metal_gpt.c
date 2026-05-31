@@ -483,14 +483,18 @@ static int build_sdpa_causal(gd_context *ctx, gd_tensor **inputs, int *n, gd_ten
  * paths; window=48 additionally checks that the per-element predicate still masks
  * correctly alongside the block skip. gd_graph_compare diffs every node value and
  * gradient across CPU and Metal, so no fixed-size copy buffer is involved. */
-static int test_sdpa_multiblock(gd_context *ctx, int window)
+static int test_sdpa_multiblock(gd_context *ctx, int T, int window)
 {
-    enum { MB_B = 2, MB_H = 2, MB_T = 130, MB_DH = 32, MB_N = MB_B * MB_H * MB_T * MB_DH };
-    static float qd[MB_N];
-    static float kd[MB_N];
-    static float vd[MB_N];
-    int64_t qs[4] = {MB_B, MB_H, MB_T, MB_DH};
-    int64_t flat[1] = {MB_N};
+    /* MB_TMAX sizes the buffers; T (<= MB_TMAX) selects the actual sequence so a
+     * single test covers both the single-pass+skip path (T small => 1 split) and
+     * the split-K path (T >= 2*GD_METAL_SDPA_SPLIT_MIN => multiple splits). */
+    enum { MB_B = 2, MB_H = 2, MB_TMAX = 600, MB_DH = 32, MB_NMAX = MB_B * MB_H * MB_TMAX * MB_DH };
+    static float qd[MB_NMAX];
+    static float kd[MB_NMAX];
+    static float vd[MB_NMAX];
+    int64_t qs[4] = {MB_B, MB_H, T, MB_DH};
+    int64_t flat[1] = {(int64_t)MB_B * MB_H * T * MB_DH};
+    int MB_N = MB_B * MB_H * T * MB_DH;
     gd_compare_options opts = {1e-4, 1e-4, false};
     gd_sdpa_config cfg = {0};
     gd_tensor *q = NULL, *k = NULL, *v = NULL, *y = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
@@ -554,8 +558,10 @@ int main(void)
     rc |= backward_parity(ctx, build_rope, "rope");
     rc |= backward_parity(ctx, build_sdpa, "sdpa");
     rc |= backward_parity(ctx, build_sdpa_causal, "sdpa_causal");
-    rc |= test_sdpa_multiblock(ctx, 0);  /* causal, multi-block */
-    rc |= test_sdpa_multiblock(ctx, 48); /* causal + sliding window */
+    rc |= test_sdpa_multiblock(ctx, 130, 0);  /* causal, single-pass + block-skip */
+    rc |= test_sdpa_multiblock(ctx, 130, 48); /* causal + sliding window */
+    rc |= test_sdpa_multiblock(ctx, 600, 0);  /* causal, split-K (3 splits) */
+    rc |= test_sdpa_multiblock(ctx, 600, 48); /* causal + window, split-K */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");
     rc |= backward_parity(ctx, build_gelu_tanh, "gelu_tanh");
     rc |= backward_parity(ctx, build_transpose, "transpose");

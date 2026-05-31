@@ -21,6 +21,18 @@
 #define GD_METAL_SDPA_BK 16
 #define GD_METAL_SDPA_DHT 64
 
+/* Split-K / flash-decoding for long-context forward SDPA. A causal kernel is
+ * critical-path bound: the heaviest query block must scan all Tk keys, and that
+ * one threadgroup saturates the GPU regardless of how many lighter blocks the
+ * causal block-skip removed. Split-K shortens that path by partitioning the key
+ * range across up to GD_METAL_SDPA_SPLIT_MAX threadgroups (each scans ~SPLIT_MIN
+ * keys), writing partial online-softmax state to scratch, then a cheap combine
+ * pass merges the splits. Splits are auto-selected from Tk: ceil(Tk/SPLIT_MIN)
+ * capped at SPLIT_MAX, so short sequences resolve to 1 split and stay on the
+ * existing single-pass kernel (no scratch, no regression). */
+#define GD_METAL_SDPA_SPLIT_MIN 256
+#define GD_METAL_SDPA_SPLIT_MAX 8
+
 /* Elementwise binary ops (add/mul) with NumPy-style right-aligned broadcasting.
  * `out_sizes` describes the contiguous output; `a_sizes`/`b_sizes` describe each
  * input's own shape so the shader can reproduce broadcast_offset() from the CPU
@@ -169,6 +181,8 @@ typedef struct gd_metal_sdpa_params {
     int Hb;
     int Tqb;
     int Tkb;
+    int n_splits;   /* split-K: number of key partitions (>=1) */
+    int split_len;  /* split-K: keys per partition (BK-aligned multiple) */
 } gd_metal_sdpa_params;
 
 /* Rotary embedding; one thread per (.., head) row over head_dim. sin_sign is

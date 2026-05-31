@@ -1038,6 +1038,148 @@ kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
     }
 }
 
+/* ---- Split-K (flash-decoding) forward SDPA ------------------------------- *
+ * Same tiled online-softmax body as gd_sdpa_tiled, but each threadgroup scans
+ * only key range [s*split_len, (s+1)*split_len) for split s, writing the partial
+ * state (acc[Dh], m, l) to scratch. This shortens the critical path of the
+ * heaviest query block from Tk to ~Tk/n_splits. gd_sdpa_combine merges the
+ * splits. Scratch layout per (b, hq, i, s): Dh acc floats, then m, then l;
+ * stride (Dh+2), index ((((b*Hq+hq)*Tq+i)*n_splits)+s)*(Dh+2). */
+kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
+                           device const float *k              [[buffer(1)]],
+                           device const float *v              [[buffer(2)]],
+                           device const float *bias           [[buffer(3)]],
+                           device float *partials             [[buffer(4)]],
+                           constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                           uint tgid [[threadgroup_position_in_grid]],
+                           uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int s = (int)tgid % p.n_splits;
+    int t2 = (int)tgid / p.n_splits;
+    int qb = t2 % n_qb;
+    int r = t2 / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int k_lo = s * p.split_len;
+    int k_hi = k_lo + p.split_len;
+    if (k_hi > kb_end) {
+        k_hi = kb_end;
+    }
+    for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        int tile = k_hi - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    float ss = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        ss += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    ss = p.scale * ss + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float mnew = (ss > m) ? ss : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(ss - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        for (int c = 0; c < p.Dh; ++c) {
+            partials[base + c] = acc[c];
+        }
+        partials[base + p.Dh] = m;
+        partials[base + p.Dh + 1] = l;
+    }
+}
+
+/* Combine split-K partials into the final attention output. One thread per
+ * (b, hq, i): online-merge the n_splits partial (acc, m, l) triples. */
+kernel void gd_sdpa_combine(device const float *partials       [[buffer(0)]],
+                            device float *out                  [[buffer(1)]],
+                            constant gd_metal_sdpa_params &p    [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq;
+    if ((int)gid >= total) {
+        return;
+    }
+    int i = (int)gid % p.Tq;
+    int r = (int)gid / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int s = 0; s < p.n_splits; ++s) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        float ms = partials[base + p.Dh];
+        float ls = partials[base + p.Dh + 1];
+        if (ls <= 0.0f) {
+            continue;
+        }
+        float mnew = (ms > m) ? ms : m;
+        float corr_o = exp(m - mnew);
+        float corr_s = exp(ms - mnew);
+        l = l * corr_o + ls * corr_s;
+        for (int c = 0; c < p.Dh; ++c) {
+            acc[c] = acc[c] * corr_o + partials[base + c] * corr_s;
+        }
+        m = mnew;
+    }
+    if (l > 0.0f) {
+        for (int c = 0; c < p.Dh; ++c) {
+            out[qbase + c] = acc[c] / l;
+        }
+    } else {
+        for (int c = 0; c < p.Dh; ++c) {
+            out[qbase + c] = 0.0f;
+        }
+    }
+}
+
 /* Forward: one thread per (b, hq, i); two-pass stable softmax, no score matrix. */
 kernel void gd_sdpa(device const float *q              [[buffer(0)]],
                     device const float *k              [[buffer(1)]],

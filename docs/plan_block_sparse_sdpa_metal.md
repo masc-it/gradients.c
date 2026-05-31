@@ -125,14 +125,22 @@ query-block skip matters most.
   T=256 / 1024. **Implemented and correct, but wall-time-neutral for causal
   self-attention — see §6.1 for the finding.** The infrastructure (uniform block
   bounds `gd_sdpa_kb_end` / `gd_sdpa_qb_start`) is the foundation B2/B1.5 build on.
-- [ ] **B1.5 — Split-K / flash-decoding (the actual causal wall-time lever).**
+- [x] **B1.5 — Split-K / flash-decoding forward (the causal wall-time lever).**
   See §6.1: block-skip removes only the *light* groups; the critical path (heavy
   blocks scanning the full key range) is unchanged and saturates the GPU. Split
   each query block's key range across several threadgroups, each computing a
-  partial online-softmax `(m, l, acc)` over a key slice, then a combine pass
-  merges them. Shortens the per-group critical path from `Tk` to `Tk/nsplit`.
-  Higher complexity (needs a merge step + scratch); closer to GPU_FUSED. This is
-  the prerequisite for any causal forward wall-time win on this hardware.
+  partial online-softmax `(m, l, acc)` over a key slice into scratch, then a
+  combine pass merges them. Shortens the per-group critical path from `Tk` to
+  `~Tk/nsplit`. **Implemented for the forward and validated — see §6.2.**
+  Backward split-K is the remaining 73% of attention cost, tracked as **B1.5b**.
+- [ ] **B1.5b — Split-K backward.** `sdpa_bwd` (stats + dq + dkv) is still the
+  dominant attention cost (~1333 ms at T=1024 vs ~378 ms forward). Same pattern:
+  `stats`/`dq` split the key range per query block (online-merge for `stats`,
+  plain partial-sum for `dq` since `(m,l,D)` are known); `dkv` splits the query
+  range per key block (partial-sum of dk/dv). Needs multi-scratch plumbing (more
+  than one partial buffer per node). Expected ~1.3× on backward / ~1.1× e2e at
+  T=1024 — deferred behind raising per-kernel throughput (see §6.2 learning),
+  which lifts forward *and* backward and is the deeper current ceiling.
 - [ ] B2 — **Sliding-window block-skip** (skip blocks above the diagonal *and*
   below the window). **Expected to win where B1 does not**: a window caps *every*
   query block's key scan to `w`, so it shortens the critical path itself (unlike
@@ -206,6 +214,41 @@ per-threadgroup occupancy (64 threads, large register arrays) is critical-path
 bound, so the optimization that matters is *shortening the longest single
 threadgroup's scan*, not *reducing aggregate work*.
 
+### 6.2 Finding — split-K reaches the throughput floor (forward)
+
+B1.5 forward split-K was implemented (`gd_sdpa_splitk` + `gd_sdpa_combine`,
+auto-selected `n_splits = clamp(ceil(Tk/256), 1, 8)`, BK-aligned key slices,
+partial `(acc, m, l)` in compile-allocated scratch, online-merge combine).
+Validated: `test_sdpa_multiblock` at T=600 (3 splits), causal and causal+window,
+CPU↔Metal parity at 1e-4 + ASan-clean; T=256 resolves to 1 split and stays on
+the single-pass tiled kernel (no scratch, no regression).
+
+```text
+forward sdpa gpu_ms (B=4, 6 layers, GD_PROFILE=trace):
+  T          B1 (no split)   B1.5 split-K
+  256        ~50  (S=1)      ~52   (S=1, unchanged)
+  1024       ~477 (S=1)      ~375  (S=4)    1.27x
+  1024 S=8 probe             ~375          (no further gain)
+```
+
+The key result: at S=4 the per-group critical path drops `1024 -> 256` keys and
+forward falls `477 -> 375 ms`; **raising splits to S=8 gives no further gain
+(375 ms)**. So split-K moved the forward off the critical-path wall (§6.1) and
+onto the **throughput floor** — time ≈ (causal-triangle work) / (kernel
+throughput). It is now bound by aggregate work ÷ ALU/occupancy, which the causal
+block-skip (B1) already minimizes (it caps each split at `kb_end`). To go below
+375 ms one must raise *per-kernel throughput* (vectorized/`simdgroup` dot
+products, higher occupancy), not split further — the same lever as the GEMM
+plan, and one that would lift the backward kernels too. Hence S=4
+(`SPLIT_MIN=256`) is chosen: fewer splits = less scratch/overhead at the same
+speed. End-to-end (T=1024): step `3708 -> 3561 ms`, `1110 -> 1150 tok/s` — modest
+because `sdpa_bwd` (~1333 ms, not yet split: B1.5b) now dominates attention.
+
+Learning: split-K is the right tool to escape the causal critical-path wall, but
+it converts a latency problem into a throughput problem; beyond the point where
+the critical path is no longer the bottleneck, the ceiling is ALU throughput /
+occupancy, shared with every other compute kernel.
+
 ---
 
 ## 7. Reporting rule
@@ -231,9 +274,14 @@ When marking a phase done, record:
 | G3 (dense tiled) | 1024 | 476 ms | 1324 ms | 3734 ms | 1104 | attention 60% |
 | B1 (causal skip) | 256 | 50 ms | 128 ms | 496 ms | 2068 | no change — critical-path bound (§6.1) |
 | B1 (causal skip) | 1024 | 477 ms | 1306 ms | 3708 ms | 1110 | no change — critical-path bound (§6.1) |
+| B1.5 split-K fwd | 256 | 52 ms | 128 ms | 496 ms | 2065 | S=1, unchanged (no regression) |
+| B1.5 split-K fwd | 1024 | 375 ms | 1333 ms | 3561 ms | 1150 | S=4; fwd 1.27×, now throughput-bound (§6.2) |
+| B1.5 split-K fwd | 2048 | 1377 ms | — | 11746 ms | 697 | S=8 |
 
-B1 is correct (parity green) and neutral on wall-time for causal; the wall-time
-levers are B2 (window) and B1.5 (split-K). (Fill as B1.5–B4 land.)
+B1 is correct (parity green) and neutral on wall-time for causal. B1.5 forward
+split-K lands the forward at its throughput floor (§6.2). Remaining levers:
+B1.5b (backward split-K, the dominant ~1333 ms), B2 (window), per-kernel
+throughput. (Fill as B1.5b–B4 land.)
 
 ---
 

@@ -92,7 +92,36 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv",
     "gd_sdpa_bwd_stats",
     "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
+    "gd_sdpa_splitk",  /* split-K forward (long context) */
+    "gd_sdpa_combine", /* split-K combine pass */
 };
+
+/* Split-K key partitioning for the forward SDPA, derived purely from Tk so the
+ * compile-time scratch size and the encode-time dispatch agree. Returns 1 (no
+ * split) for short sequences, keeping them on the single-pass tiled kernel. */
+static int sdpa_num_splits(int Tk)
+{
+    int s = (Tk + GD_METAL_SDPA_SPLIT_MIN - 1) / GD_METAL_SDPA_SPLIT_MIN;
+    if (s < 1) {
+        s = 1;
+    }
+    if (s > GD_METAL_SDPA_SPLIT_MAX) {
+        s = GD_METAL_SDPA_SPLIT_MAX;
+    }
+    return s;
+}
+
+/* Keys per split, rounded up to a GD_METAL_SDPA_BK multiple so each partition
+ * starts on a key-tile boundary. */
+static int sdpa_split_len(int Tk, int n_splits)
+{
+    int len = (Tk + n_splits - 1) / n_splits;
+    len = ((len + GD_METAL_SDPA_BK - 1) / GD_METAL_SDPA_BK) * GD_METAL_SDPA_BK;
+    if (len < GD_METAL_SDPA_BK) {
+        len = GD_METAL_SDPA_BK;
+    }
+    return len;
+}
 
 static gd_status metal_dtype_code(gd_dtype dtype, int *out)
 {
@@ -599,7 +628,29 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
-            if (op == _GD_OP_SDPA_BWD) {
+            if (op == _GD_OP_SDPA) {
+                /* Long-context forward uses split-K: scratch holds per-split
+                 * partial (acc[Dh], m, l) for each (b, hq, query). Only allocated
+                 * when the tiled path is eligible (Dh <= DHT) and >1 split. */
+                const gd_tensor_desc *qd = &graph->values[node->inputs[0]].desc;
+                const gd_tensor_desc *kd = &graph->values[node->inputs[1]].desc;
+                int Dh = (int)qd->sizes[3];
+                int Tk = (int)kd->sizes[1];
+                int nsplit = sdpa_num_splits(Tk);
+                if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
+                    int64_t npart = qd->sizes[0] * qd->sizes[2] * qd->sizes[1]
+                                    * nsplit * (Dh + 2);
+                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
+                                             GD_MEM_UNIFIED,
+                                             (size_t)npart * sizeof(float), sizeof(float)};
+                    exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_splitk");
+                    exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_combine");
+                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
+                    if (status != GD_OK) {
+                        goto fail;
+                    }
+                }
+            } else if (op == _GD_OP_SDPA_BWD) {
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_dkv");
                 exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_stats");
                 /* Per-query stats scratch [m, l, D] = B*Hq*Tq*3 floats. q is
@@ -1361,11 +1412,16 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Hb = bias_desc != NULL ? (int)bias_desc->sizes[1] : 1;
     p->Tqb = bias_desc != NULL ? (int)bias_desc->sizes[2] : 1;
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
+    p->n_splits = 1;
+    p->split_len = p->Tk;
 }
 
 static void encode_sdpa(_gd_backend *self,
                         id<MTLComputeCommandEncoder> enc,
                         id<MTLComputePipelineState> pso,
+                        id<MTLComputePipelineState> splitk_pso,
+                        id<MTLComputePipelineState> combine_pso,
+                        id<MTLBuffer> scratch,
                         _gd_executable *exe,
                         const _gd_node *node)
 {
@@ -1378,8 +1434,44 @@ static void encode_sdpa(_gd_backend *self,
      * valid placeholder buffer when absent. */
     int bias_input = node->attrs.has_bias ? node->inputs[3] : node->inputs[0];
     gd_metal_sdpa_params p;
+    int n_qb = 0;
 
     fill_sdpa_params(&p, q, k, bias, node);
+    n_qb = (p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
+
+    /* Split-K (flash-decoding) path for long context: partition the key range
+     * across threadgroups to shorten the heaviest query block's critical path,
+     * then merge partials. Eligible only when the scratch/pipelines were
+     * allocated at compile (Dh <= DHT and >1 split). */
+    if (p.Dh <= GD_METAL_SDPA_DHT && scratch != nil &&
+        splitk_pso != nil && combine_pso != nil) {
+        p.n_splits = sdpa_num_splits(p.Tk);
+        p.split_len = sdpa_split_len(p.Tk, p.n_splits);
+        /* Pass 1: per-split partial online-softmax into scratch. */
+        [enc setComputePipelineState:splitk_pso];
+        [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
+        [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+        [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
+        [enc setBuffer:value_buffer(exe, bias_input) offset:0 atIndex:3];
+        [enc setBuffer:scratch offset:0 atIndex:4];
+        [enc setBytes:&p length:sizeof(p) atIndex:5];
+        NSUInteger sgroups = (NSUInteger)(p.B * p.Hq * n_qb * p.n_splits);
+        if (sgroups > 0) {
+            [enc dispatchThreadgroups:MTLSizeMake(sgroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
+        }
+        /* Pass 2: combine the splits into the output. */
+        [enc setComputePipelineState:combine_pso];
+        [enc setBuffer:scratch offset:0 atIndex:0];
+        [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        int grid = p.B * p.Hq * p.Tq;
+        if (grid > 0) {
+            dispatch_1d(enc, combine_pso, (NSUInteger)grid);
+        }
+        return;
+    }
+
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
@@ -1389,7 +1481,6 @@ static void encode_sdpa(_gd_backend *self,
 
     if (p.Dh <= GD_METAL_SDPA_DHT) {
         /* Tiled: one threadgroup per (b, hq, query-block) of GD_METAL_SDPA_BQ. */
-        int n_qb = (p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
         NSUInteger groups = (NSUInteger)(p.B * p.Hq * n_qb);
         [enc setComputePipelineState:pso];
         if (groups > 0) {
@@ -1631,7 +1722,7 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_ROPE_BWD:
         return encode_rope(enc, pso, exe, node, -1.0F);
     case _GD_OP_SDPA:
-        encode_sdpa(self, enc, pso, exe, node);
+        encode_sdpa(self, enc, pso, pso2, pso3, scratch, exe, node);
         return GD_OK;
     case _GD_OP_SDPA_BWD:
         return encode_sdpa_bwd(self, enc, pso, pso2, pso3, scratch, exe, node);

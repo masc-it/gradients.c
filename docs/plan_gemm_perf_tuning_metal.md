@@ -368,10 +368,11 @@ Integrated MPS as an **opt-in** path (`GD_METAL_MPS=1`), not the default yet:
 - Adds `GDMPSGemmPlan` cached per executable node (MPS kernel + left/right/result
   matrix wrappers); no per-run descriptor/matrix allocation.
 - Handles `_GD_OP_LINEAR` when F32, contiguous, no bias.
-- Handles `_GD_OP_MATMUL` for the safe flattened-GEMM subset:
-  `trans_a=false`, RHS is 2D, F32 contiguous. This covers the LM head and many dx
-  matmuls. Batched dW matmuls (`trans_a=true`, both operands batched) remain on
-  the in-house tiled kernel for now.
+- Handles `_GD_OP_MATMUL` for two safe F32 contiguous subsets:
+  1. flattened left operand with 2D RHS (`trans_a=false`, RHS is 2D), covering the
+     LM head and many dx matmuls;
+  2. exact-batch matmuls where A/B/output leading dims match, including the GPT
+     dW family (`trans_a=true`, both operands batched).
 - MPS encodes directly on the command buffer, so the backend ends the active
   compute encoder, encodes MPS, then resumes a compute encoder. This preserves
   the existing single command-buffer ordering.
@@ -384,22 +385,28 @@ Clean release GPT bench (6L, M1 Pro):
 
 ```text
 B=4,T=256:
-  default (tiled)       step 286.5 ms, 3575 tok/s
-  MPS linear only       step 251.9 ms, 4066 tok/s
-  MPS linear+matmul     step 252.0 ms, 4064 tok/s
+  default (tiled)             step 286.5 ms, 3575 tok/s
+  MPS linear only             step 251.9 ms, 4066 tok/s
+  MPS linear+flat matmul      step 252.0 ms, 4064 tok/s
+  MPS + exact-batch matmul    step 234.5 ms, 4367 tok/s
 
 B=8,T=512:
-  default (tiled)       step 1514.4 ms, 2705 tok/s
-  MPS linear only       step 1459.3 ms, 2807 tok/s
-  MPS linear+matmul     step 1388.1 ms, 2951 tok/s
+  default (tiled)             step 1514.4 ms, 2705 tok/s
+  MPS linear only             step 1459.3 ms, 2807 tok/s
+  MPS linear+flat matmul      step 1388.1 ms, 2951 tok/s
+  MPS + exact-batch matmul    step 1303.3 ms, 3143 tok/s
 ```
 
-Trace deltas (`GD_PROFILE=trace`, B=8,T=512):
+Trace deltas (`GD_PROFILE=trace`, B=8,T=512, second run after MPS warmup):
 
 ```text
 linear:  ~105 ms -> ~60 ms
-matmul:  ~250 ms -> ~173 ms
+matmul:  ~250 ms -> ~110 ms
 ```
+
+T=256 trace is also noisy on first MPS run (driver/cache warmup), but stabilizes
+around `linear ~28 ms`, `matmul ~46 ms`. End-to-end release timing is the
+primary decision metric.
 
 Learning:
 - MPS is a real win on M1 Pro for F32 GEMM even though our custom simdgroup path
@@ -407,8 +414,11 @@ Learning:
   unavailable through basic MSL simdgroup experiments.
 - The encoder-model mismatch is manageable: close compute encoder around MPS and
   reopen; one IR node still maps to one backend op, so GPU_SAFE holds.
-- Remaining matmul headroom is mostly the batched dW shape family. Supporting MPS
-  batch descriptors (or changing autograd to flatten/reduce differently) is the
-  next GEMM-specific extension.
+- MPS batch descriptors are worth it: adding the exact-batch dW family improved
+  T=256 by another ~17 ms and T=512 by another ~85 ms vs the flat-only MPS path.
+- Remaining GEMM-specific headroom is mostly graph shape: dW currently computes a
+  per-batch `[B,M,N]` matmul then `reduce_to` sums over B. A fused/rephrased
+  weight-gradient GEMM over flattened `B*T` could avoid that intermediate, but it
+  crosses from plain GPU_SAFE kernel selection into graph/fusion work.
 - Keep env-gated until more shape coverage and CI soak; default path remains the
   portable in-house tiled kernel.

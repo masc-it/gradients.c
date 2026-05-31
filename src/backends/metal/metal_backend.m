@@ -823,54 +823,112 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                     a_desc->storage_offset_bytes == 0 && b_desc->storage_offset_bytes == 0 &&
                     out_desc->storage_offset_bytes == 0) {
                     bool ok = false;
+                    bool trans_left = false;
                     bool trans_right = node->attrs.trans_b ? true : false;
-                    int rows = 0;
-                    int cols = 0;
+                    int result_rows = 0;
+                    int result_cols = 0;
                     int inner = 0;
+                    NSUInteger batch = 1U;
+                    NSUInteger a_rows_desc = 0U;
+                    NSUInteger a_cols_desc = 0U;
+                    NSUInteger b_rows_desc = 0U;
+                    NSUInteger b_cols_desc = 0U;
+                    NSUInteger out_rows_desc = 0U;
+                    NSUInteger out_cols_desc = 0U;
                     if (op == _GD_OP_LINEAR && !node->attrs.has_bias) {
                         inner = (int)a_desc->sizes[a_desc->ndim - 1];
-                        cols = (int)out_desc->sizes[out_desc->ndim - 1];
-                        rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
+                        result_cols = (int)out_desc->sizes[out_desc->ndim - 1];
+                        result_rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
+                        a_rows_desc = (NSUInteger)result_rows;
+                        a_cols_desc = (NSUInteger)inner;
+                        b_rows_desc = (NSUInteger)b_desc->sizes[0];
+                        b_cols_desc = (NSUInteger)b_desc->sizes[1];
+                        out_rows_desc = (NSUInteger)result_rows;
+                        out_cols_desc = (NSUInteger)result_cols;
                         ok = true;
                     } else if (op == _GD_OP_MATMUL && !node->attrs.trans_a && b_desc->ndim == 2) {
-                        int a_cols = (int)a_desc->sizes[a_desc->ndim - 1];
-                        int b_rows = (int)b_desc->sizes[0];
-                        int b_cols = (int)b_desc->sizes[1];
-                        inner = a_cols;
-                        cols = trans_right ? b_rows : b_cols;
-                        rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
-                        ok = (out_desc->sizes[out_desc->ndim - 1] == cols);
+                        int a_cols_i = (int)a_desc->sizes[a_desc->ndim - 1];
+                        int b_rows_i = (int)b_desc->sizes[0];
+                        int b_cols_i = (int)b_desc->sizes[1];
+                        inner = a_cols_i;
+                        result_cols = trans_right ? b_rows_i : b_cols_i;
+                        result_rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
+                        a_rows_desc = (NSUInteger)result_rows;
+                        a_cols_desc = (NSUInteger)inner;
+                        b_rows_desc = (NSUInteger)b_rows_i;
+                        b_cols_desc = (NSUInteger)b_cols_i;
+                        out_rows_desc = (NSUInteger)result_rows;
+                        out_cols_desc = (NSUInteger)result_cols;
+                        ok = (out_desc->sizes[out_desc->ndim - 1] == result_cols);
+                    } else if (op == _GD_OP_MATMUL && out_desc->ndim >= 3 &&
+                               a_desc->ndim == out_desc->ndim &&
+                               b_desc->ndim == out_desc->ndim) {
+                        bool same_batch = true;
+                        int batch_ndim = out_desc->ndim - 2;
+                        int a_rows_i = (int)a_desc->sizes[a_desc->ndim - 2];
+                        int a_cols_i = (int)a_desc->sizes[a_desc->ndim - 1];
+                        int b_rows_i = (int)b_desc->sizes[b_desc->ndim - 2];
+                        int b_cols_i = (int)b_desc->sizes[b_desc->ndim - 1];
+                        int i_batch = 0;
+                        for (i_batch = 0; i_batch < batch_ndim; ++i_batch) {
+                            if (a_desc->sizes[i_batch] != out_desc->sizes[i_batch] ||
+                                b_desc->sizes[i_batch] != out_desc->sizes[i_batch]) {
+                                same_batch = false;
+                                break;
+                            }
+                            batch *= (NSUInteger)out_desc->sizes[i_batch];
+                        }
+                        trans_left = node->attrs.trans_a ? true : false;
+                        inner = trans_left ? a_rows_i : a_cols_i;
+                        result_rows = trans_left ? a_cols_i : a_rows_i;
+                        result_cols = trans_right ? b_rows_i : b_cols_i;
+                        a_rows_desc = (NSUInteger)a_rows_i;
+                        a_cols_desc = (NSUInteger)a_cols_i;
+                        b_rows_desc = (NSUInteger)b_rows_i;
+                        b_cols_desc = (NSUInteger)b_cols_i;
+                        out_rows_desc = (NSUInteger)out_desc->sizes[out_desc->ndim - 2];
+                        out_cols_desc = (NSUInteger)out_desc->sizes[out_desc->ndim - 1];
+                        ok = same_batch && inner == (trans_right ? b_cols_i : b_rows_i) &&
+                             out_desc->sizes[out_desc->ndim - 2] == result_rows &&
+                             out_desc->sizes[out_desc->ndim - 1] == result_cols;
                     }
-                    if (ok && rows > 0 && inner > 0 && cols > 0) {
-                        NSUInteger a_cols = (NSUInteger)inner;
-                        NSUInteger b_rows = (NSUInteger)b_desc->sizes[0];
-                        NSUInteger b_cols = (NSUInteger)b_desc->sizes[1];
-                        NSUInteger out_cols = (NSUInteger)cols;
+                    if (ok && result_rows > 0 && result_cols > 0 && inner > 0 && batch > 0U) {
+                        NSUInteger a_row_bytes = a_cols_desc * sizeof(float);
+                        NSUInteger b_row_bytes = b_cols_desc * sizeof(float);
+                        NSUInteger out_row_bytes = out_cols_desc * sizeof(float);
                         MPSMatrixDescriptor *ad = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:(NSUInteger)rows
-                                             columns:a_cols
-                                            rowBytes:a_cols * sizeof(float)
+                            matrixDescriptorWithRows:a_rows_desc
+                                             columns:a_cols_desc
+                                            matrices:batch
+                                            rowBytes:a_row_bytes
+                                         matrixBytes:a_rows_desc * a_row_bytes
                                             dataType:MPSDataTypeFloat32];
                         MPSMatrixDescriptor *bd = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:b_rows
-                                             columns:b_cols
-                                            rowBytes:b_cols * sizeof(float)
+                            matrixDescriptorWithRows:b_rows_desc
+                                             columns:b_cols_desc
+                                            matrices:batch
+                                            rowBytes:b_row_bytes
+                                         matrixBytes:b_rows_desc * b_row_bytes
                                             dataType:MPSDataTypeFloat32];
                         MPSMatrixDescriptor *od = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:(NSUInteger)rows
-                                             columns:out_cols
-                                            rowBytes:out_cols * sizeof(float)
+                            matrixDescriptorWithRows:out_rows_desc
+                                             columns:out_cols_desc
+                                            matrices:batch
+                                            rowBytes:out_row_bytes
+                                         matrixBytes:out_rows_desc * out_row_bytes
                                             dataType:MPSDataTypeFloat32];
                         GDMPSGemmPlan *plan = [GDMPSGemmPlan new];
                         plan.kernel = [[MPSMatrixMultiplication alloc]
                             initWithDevice:st.device
-                            transposeLeft:false
+                            transposeLeft:trans_left
                             transposeRight:trans_right
-                            resultRows:(NSUInteger)rows
-                            resultColumns:(NSUInteger)cols
+                            resultRows:(NSUInteger)result_rows
+                            resultColumns:(NSUInteger)result_cols
                             interiorColumns:(NSUInteger)inner
                             alpha:1.0
                             beta:0.0];
+                        plan.kernel.batchStart = 0U;
+                        plan.kernel.batchSize = batch;
                         plan.left = [[MPSMatrix alloc]
                             initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[0]].storage)
                                     offset:0

@@ -226,40 +226,47 @@ static gd_status make_i32(gd_context *ctx, int ndim, const int64_t *sizes, const
     return gd_tensor_copy_from_cpu(ctx, *out, data, (size_t)numel * sizeof(int32_t));
 }
 
-/* matmul parity: plain 2D, trans_b, and batched. */
+/* matmul parity: plain 2D, trans_b, batched, and batched trans_a. */
 static int test_metal_matmul_parity(gd_context *ctx)
 {
     int64_t s23[2] = {2, 3};
     int64_t s34[2] = {3, 4};
     int64_t s43[2] = {4, 3};
     int64_t a3[3] = {2, 2, 3};
+    int64_t at3[3] = {2, 3, 2};
     int64_t b3[3] = {2, 3, 4};
     float a[6] = {1, 2, 3, 4, 5, 6};
     float b[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     float bt[12] = {1, 5, 9, 2, 6, 10, 3, 7, 11, 4, 8, 12};
     float ab[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    float atb[12] = {1, 4, 2, 5, 3, 6, 7, 10, 8, 11, 9, 12};
     float bb[24] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
                     12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
-    gd_tensor *ta = NULL, *tb = NULL, *tbt = NULL, *tab = NULL, *tbb = NULL;
-    gd_tensor *mm = NULL, *mmt = NULL, *mmb = NULL;
+    gd_tensor *ta = NULL, *tb = NULL, *tbt = NULL, *tab = NULL, *tatb = NULL;
+    gd_tensor *tbb = NULL;
+    gd_tensor *mm = NULL, *mmt = NULL, *mmb = NULL, *mmbt = NULL;
     gd_graph *g = NULL;
     gd_matmul_desc td = {false, true, {GD_DTYPE_F32, GD_DTYPE_F32}};
+    gd_matmul_desc tad = {true, false, {GD_DTYPE_F32, GD_DTYPE_F32}};
     gd_compare_options opts = {1e-4, 1e-4, false};
 
     CHECK_OK(make_f32(ctx, 2, s23, a, &ta));
     CHECK_OK(make_f32(ctx, 2, s34, b, &tb));
     CHECK_OK(make_f32(ctx, 2, s43, bt, &tbt));
     CHECK_OK(make_f32(ctx, 3, a3, ab, &tab));
+    CHECK_OK(make_f32(ctx, 3, at3, atb, &tatb));
     CHECK_OK(make_f32(ctx, 3, b3, bb, &tbb));
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_matmul(ctx, ta, tb, &mm));         /* [2,3]@[3,4] */
+    CHECK_OK(gd_matmul(ctx, ta, tb, &mm));           /* [2,3]@[3,4] */
     CHECK_OK(gd_matmul_ex(ctx, &td, ta, tbt, &mmt)); /* [2,3]@[4,3]^T */
-    CHECK_OK(gd_matmul(ctx, tab, tbb, &mmb));       /* [2,2,3]@[2,3,4] */
+    CHECK_OK(gd_matmul(ctx, tab, tbb, &mmb));        /* [2,2,3]@[2,3,4] */
+    CHECK_OK(gd_matmul_ex(ctx, &tad, tatb, tbb, &mmbt)); /* [2,3,2]^T@[2,3,4] */
     CHECK_OK(gd_graph_end(ctx));
     gd_tensor_release(mm);
     gd_tensor_release(mmt);
     gd_tensor_release(mmb);
+    gd_tensor_release(mmbt);
 
     CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
 
@@ -268,6 +275,7 @@ static int test_metal_matmul_parity(gd_context *ctx)
     gd_tensor_release(tb);
     gd_tensor_release(tbt);
     gd_tensor_release(tab);
+    gd_tensor_release(tatb);
     gd_tensor_release(tbb);
     return 0;
 }

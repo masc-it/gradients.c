@@ -8,6 +8,7 @@
 #include "gradients/ops.h"
 #include "gradients/module.h"
 #include "gradients/optim.h"
+#include "gradients/tokenizer.h"
 #include "gradients/gradients.h"
 
 int main(void)

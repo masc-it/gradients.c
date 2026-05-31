@@ -13,6 +13,7 @@ INCLUDE_DIR := include
 SRC_DIR := src
 TEST_DIR := tests
 EXAMPLE_DIR := examples
+TOOL_DIR := tools
 DOCS_DIR := docs
 
 LIB_NAME := gradients
@@ -88,6 +89,8 @@ TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 
 EXAMPLE_SRC := $(shell find $(EXAMPLE_DIR) -type f -name '*.c' 2>/dev/null | sort)
 EXAMPLE_BINS := $(patsubst %.c,$(BUILD_DIR)/%,$(EXAMPLE_SRC))
+TOOL_SRC := $(shell find $(TOOL_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort)
+TOOL_BINS := $(patsubst %.c,$(BUILD_DIR)/%,$(TOOL_SRC))
 
 MLP_SRC := $(EXAMPLE_DIR)/mlp/mlp.c
 MLP_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/mlp/mlp
@@ -95,7 +98,7 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples docs-check clean list
+.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check clean list
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -107,6 +110,7 @@ help:
 	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
 	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
+	@printf '%s\n' '  make tools       build command-line tools'
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
 	@printf '%s\n' '  make list        show discovered source/test/example files'
 	@printf '%s\n' '  make clean       remove build artifacts'
@@ -118,7 +122,7 @@ all: check
 build: $(LIB) $(METALLIB)
 	@printf '[build] ok (metal=%s)\n' '$(GD_ENABLE_METAL)'
 
-check: build docs-check test
+check: build docs-check test tools
 	@printf '[check] ok\n'
 
 test tests: build $(TEST_BINS)
@@ -174,6 +178,13 @@ else
 endif
 	@printf '[examples] ok\n'
 
+tools: build $(TOOL_BINS)
+ifeq ($(strip $(TOOL_BINS)),)
+	@printf '[tools] no tools found under %s/ yet\n' '$(TOOL_DIR)'
+else
+	@printf '[tools] built %s\n' '$(TOOL_BINS)'
+endif
+
 docs-check: build
 	@test -f $(DOCS_DIR)/design_spec.md
 	@test -f $(DOCS_DIR)/plan_mlp.md
@@ -185,9 +196,11 @@ list:
 	@printf 'SRC:\n%s\n' '$(SRC)'
 	@printf 'TEST_SRC:\n%s\n' '$(TEST_SRC)'
 	@printf 'EXAMPLE_SRC:\n%s\n' '$(EXAMPLE_SRC)'
+	@printf 'TOOL_SRC:\n%s\n' '$(TOOL_SRC)'
 	@printf 'OBJ:\n%s\n' '$(OBJ)'
 	@printf 'TEST_BINS:\n%s\n' '$(TEST_BINS)'
 	@printf 'EXAMPLE_BINS:\n%s\n' '$(EXAMPLE_BINS)'
+	@printf 'TOOL_BINS:\n%s\n' '$(TOOL_BINS)'
 
 clean:
 	@$(RM) $(BUILD_DIR)
@@ -224,6 +237,10 @@ $(BUILD_DIR)/$(TEST_DIR)/%: $(TEST_DIR)/%.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BUILD_DIR)/$(EXAMPLE_DIR)/%: $(EXAMPLE_DIR)/%.c $(LIB)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BUILD_DIR)/$(TOOL_DIR)/%: $(TOOL_DIR)/%.c $(LIB)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 

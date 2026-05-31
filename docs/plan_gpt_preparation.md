@@ -1,6 +1,6 @@
 # gradients.c — Text GPT Training Preparation
 
-Status: draft v0.1
+Status: in progress v0.2
 
 Goal: turn the existing text-only GPT core into a production-ready training and
 inference stack. Current model math is mostly present; missing pieces are the
@@ -41,7 +41,7 @@ Already available:
 
 Not enough for real GPT training:
 
-- [ ] tokenizer stack
+- [x] tokenizer stack
 - [ ] corpus preprocessing / packed token shards
 - [ ] production data loader
 - [ ] LR scheduler without graph rebuilds
@@ -125,8 +125,7 @@ gd_status gd_bpe_tokenizer_train(const char **input_paths,
 
 gd_status gd_bpe_tokenizer_save(gd_tokenizer *tok, const char *tokenizer_path);
 
-gd_status gd_bpe_tokenizer_load(gd_context *ctx,
-                                const char *tokenizer_path,
+gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
                                 const gd_tokenizer_config *cfg,
                                 gd_tokenizer **out);
 void gd_tokenizer_destroy(gd_tokenizer *tok);
@@ -142,6 +141,9 @@ gd_status gd_tokenizer_decode(gd_tokenizer *tok,
                               char **text_out);
 
 gd_status gd_tokenizer_id(gd_tokenizer *tok, const char *special, int32_t *id_out);
+int gd_tokenizer_vocab_size(const gd_tokenizer *tok);
+uint64_t gd_tokenizer_hash(const gd_tokenizer *tok);
+void gd_tokenizer_free(void *ptr);
 ```
 
 CLI tools:
@@ -159,6 +161,9 @@ gradients-train-bpe \
 
 gradients-tokenizer-info --tokenizer tokenizer.json
 gradients-tokenize --tokenizer tokenizer.json --input train.txt --output train.tokens
+
+# Build tools with:
+make tools
 ```
 
 ### 3.3 Implementation notes
@@ -184,10 +189,12 @@ Quality requirements:
 - Tokenizer training is deterministic: same corpus/config => same vocab ids and
   merge ranks.
 - Initial alphabet includes byte-level symbols plus reserved specials.
-- Special-token trie for exact longest-match before BPE.
+- Special-token exact longest-match parser before BPE.
 - Byte encoder/decoder table like GPT-2/tiktoken.
-- BPE trainer uses pair counts + heap/hash invalidation; avoid O(vocab * corpus)
-  rescans where possible.
+- BPE trainer uses pair counts in hash tables with deterministic full recount in
+  v1. Measured on `promessi_sposi.txt`: 8192-vocab training in ~11s and full
+  corpus encode in ~0.4s with O3 on local CPU. Upgrade to incremental
+  heap/invalidation only if corpus scale needs it.
 - Encode path follows tiktoken-style rank-ordered byte-pair merging with compact
   arrays and hash lookups.
 - BPE merge ranks in a fast hash table.
@@ -199,15 +206,17 @@ Quality requirements:
 
 ### 3.4 Tests
 
-- BPE trainer is deterministic for fixed corpus/config.
-- Save/load preserves vocab ids and merge ranks.
-- `<|im_start|>` and `<|im_end|>` each become one id.
-- `<|pad|>` is reserved and never produced from normal text.
-- Special tokens embedded in text are preserved.
-- `abc123def` encodes digits as three separate digit tokens.
-- No learned merge crosses digit-digit boundaries.
-- Decode round trip for UTF-8 strings.
-- Invalid special-token policy errors clearly.
+Implemented in `tests/test_tokenizer.c`:
+
+- [x] BPE trainer is deterministic for fixed corpus/config.
+- [x] Save/load preserves vocab ids and merge ranks.
+- [x] `<|im_start|>` and `<|im_end|>` each become one id.
+- [x] `<|pad|>` is reserved and never produced from normal text.
+- [x] Special tokens embedded in text are preserved.
+- [x] `abc123def` encodes digits as three separate digit tokens.
+- [x] No learned merge crosses digit-digit boundaries.
+- [x] Decode round trip for UTF-8 strings.
+- [x] Invalid special-token policy errors clearly.
 
 ---
 
@@ -870,13 +879,14 @@ Not required for first real training, but important later:
 ### P1 — BPE tokenizer
 
 - [x] Clone tiktoken reference under `data/tiktoken`.
-- [ ] Study/port tiktoken-style byte-pair encode mechanics into C.
-- [ ] Byte-level BPE trainer on our corpus.
-- [ ] Reproducible merge ordering, vocab-size config, min-frequency.
-- [ ] Byte-level BPE load/save/encode/decode.
-- [ ] Special token support with `<|pad|>`, `<|im_start|>`, `<|im_end|>`.
-- [ ] Digit splitting during train and encode.
-- [ ] Unit + perf tests.
+- [x] Study/port tiktoken-style byte-pair encode mechanics into C.
+- [x] Byte-level BPE trainer on our corpus.
+- [x] Reproducible merge ordering, vocab-size config, min-frequency.
+- [x] Byte-level BPE load/save/encode/decode.
+- [x] Special token support with `<|pad|>`, `<|im_start|>`, `<|im_end|>`.
+- [x] Digit splitting during train and encode.
+- [x] CLI tools: `gradients-train-bpe`, `gradients-tokenizer-info`, `gradients-tokenize`.
+- [x] Unit tests + real-corpus perf smoke.
 
 ### P2 — Dataset builder
 

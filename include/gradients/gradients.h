@@ -12,5 +12,6 @@
 #include "gradients/module.h"
 #include "gradients/nn.h"
 #include "gradients/optim.h"
+#include "gradients/tokenizer.h"
 
 #endif /* GRADIENTS_H */

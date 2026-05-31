@@ -2017,7 +2017,7 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
             NSUInteger dqpart_b = (NSUInteger)L.dq_part_off * sizeof(float);
             NSUInteger dkvpart_b = (NSUInteger)L.dkv_part_off * sizeof(float);
             int n_qb = (p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
-            int n_kb = (p.Tk + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
+            int n_kb = (p.Tk + GD_METAL_SDPA_DKV_KEYS - 1) / GD_METAL_SDPA_DKV_KEYS;
             NSUInteger qsplit_groups = (NSUInteger)(p.B * p.Hq * n_qb * nsplit);
             NSUInteger ksplit_groups = (NSUInteger)(p.B * p.Hkv * n_kb * nsplit);
             NSUInteger q_rows = (NSUInteger)(p.B * p.Hq * p.Tq);

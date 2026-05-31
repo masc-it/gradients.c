@@ -391,6 +391,50 @@ Negative dkv probe (reverted): split `dkv_split` into separate `dv_split` and
 for every pair; extra arithmetic dominates any occupancy/register relief. Keep
 combined dk/dv so q·k and dO·v are shared.
 
+### 6.7 Kernel-structure win — cooperative dK/dV split lanes (2026-05-31)
+
+The remaining `sdpa_bwd` hot subpass was `gd_sdpa_bwd_dkv_split`. The old kernel
+mapped one thread to one key row and kept full `k`, `v`, `dk`, and `dv` vectors in
+registers (`4*Dh`, 256 floats at Dh=64), then computed both dot products and both
+output vectors serially over channels. This shared `q·k` and `dO·v` correctly but
+left the kernel register-heavy and under-parallelized across head_dim.
+
+Reworked the split path only: a 64-thread group now maps to **8 keys × 8 channel
+lanes** (`GD_METAL_SDPA_DKV_KEYS=8`). Each lane owns `Dh/8` channels for one key.
+Per query tile, lanes compute partial `q·k` and `dO·v`, reduce the 8 lane partials
+through threadgroup memory, then each lane updates only its channel slice of
+`dk`/`dv`. The partial scratch layout and final `dkv_reduce` stay unchanged, so
+this is a pure kernel-structure change inside the existing `sdpa_bwd` op.
+
+Tuning on B=8,T=512,6L (`GD_METAL_MPS=1`, release step, best):
+
+```text
+keys/group  lanes/key  step best
+32          2          1297.7 ms
+16          4          1127.5 ms
+8           8          1089.9 ms
+4           16         1193.3 ms
+```
+
+Decision: `8×8` is the best point on M1 Pro. `32×2` leaves too much per-thread
+channel work/register pressure; `4×16` creates too many key threadgroups and more
+lane-reduction overhead.
+
+End-to-end release numbers (`GD_METAL_MPS=1`, 6L):
+
+```text
+B=4,T=256: 234.5 ms -> 181.6 ms best, 5639 tok/s
+B=8,T=512: 1328.6 ms -> ~1088-1113 ms best (stable reruns), ~3760 tok/s
+```
+
+The trace-mode `sdpa_bwd` number is less clean here because `GD_PROFILE=trace`
+runs one command buffer per node and overweights the increased dK/dV split group
+count. Non-trace release step is the decision metric; correctness is unchanged
+and validated with CPU_REF parity.
+
+Validation: default `make check` green, `GD_METAL_MPS=1 make check` green,
+`make docs-check` green, ASan `GD_METAL_MPS=1 test_metal_gpt` clean.
+
 ---
 
 ## 7. Reporting rule
@@ -427,6 +471,8 @@ When marking a phase done, record:
 | Split reduce parallel | 512 | 207.8 ms | 584.9 ms | 1619.9 ms | 2529 | B=8 user workload |
 | Fused stats+dq split | 256 | ~55 ms | 99.7 ms | 309.2 ms | 3311 | removes duplicate qk/dO·v scan for dq |
 | Fused stats+dq split | 512 | ~219 ms | 519.8 ms | 1596.1 ms | 2566 | B=8 user workload |
+| Coop dK/dV lanes + MPS | 256 | ~47 ms | ~88 ms | 181.6 ms | 5639 | 8 keys × 8 channel lanes; MPS GEMM enabled |
+| Coop dK/dV lanes + MPS | 512 | ~219 ms | ~522 ms trace* | ~1088-1113 ms | ~3760 | trace noisy; release step improves strongly |
 
 B1 is correct (parity green) and neutral on wall-time for causal. B1.5/B1.5b
 split-K land the forward and backward at their throughput floors (§6.2–§6.3):

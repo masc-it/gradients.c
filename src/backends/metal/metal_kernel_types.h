@@ -33,6 +33,9 @@
 #define GD_METAL_SDPA_BQ 64
 #define GD_METAL_SDPA_BK 16
 #define GD_METAL_SDPA_DHT 64
+/* dK/dV split kernel: one threadgroup handles this many keys, with the 64
+ * threads divided into key lanes over head_dim channels. */
+#define GD_METAL_SDPA_DKV_KEYS 8
 
 /* Split-K / flash-decoding for long-context forward SDPA. A causal kernel is
  * critical-path bound: the heaviest query block must scan all Tk keys, and that

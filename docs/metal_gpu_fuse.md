@@ -136,9 +136,10 @@ no-op on correctness and perf before any kernel exists.
 
 ## 5. Phases
 
-Agreed order (escalating risk, bank value early): **M1 → F2a → F2b**, after the
-already-landed F0/F1. M1 is orthogonal (model track) and can proceed in
-parallel; F2a de-risks the tiled GEMM+softmax kernel that F2b reuses.
+Agreed order was **M1 → F2a → F2b** after the landed F0/F1. **M1 was
+premise-checked and deferred** (marginal at d_model=320 — GEMMs already saturate;
+weight-concat doesn't cut DRAM input reads; see below), so the active order is
+**F2a → F2b**. F2a de-risks the tiled GEMM+softmax kernel that F2b reuses.
 
 - [x] F0 — **Fusion infrastructure (identity pass).** Landed the executable
   plumbing: `_gd_executable.node_absorbed` (per-node skip flag, calloc'd/freed),
@@ -162,15 +163,26 @@ parallel; F2a de-risks the tiled GEMM+softmax kernel that F2b reuses.
   (absorbed into `mul`), 6 fewer dispatches, step 408 ms unchanged (~0.4%). The
   value is the proven pipeline; the perf payoff is F2. Dropping `act` (recompute
   in a fused backward) is deferred — it needs a fused backward and buys little.
-- [ ] M1 — **Fused QKV + gate/up projection (model layout, not a lowering-pass
-  fusion).** Concatenate `Wq|Wk|Wv` and `Wgate|Wup` at construction so each
-  block's sibling projections that read the normed input become one larger,
-  more-efficient `gd_linear` + slices. Implemented in `nn.c` /
-  `gd_gpt_create` / `gd_gpt_forward`; **no Metal backend changes**. Biggest safe
-  training GEMM win; do first. Watch the interaction with F1: gate/up become
-  slices of one tensor, so confirm the `silu→mul` recognizer still matches
-  `silu(gate_slice)` (or teach legality to see through a metadata-only slice).
-  Cross-ref: GPT model plan (`plan_gpt.md`).
+- [~] M1 — **Fused QKV + gate/up projection.** *Premise-checked and deferred:
+  marginal at this model size.* Findings (T=256, 6L):
+  - Fwd projections (`linear`) = 36 ms total; the QKV+gate/up siblings are ~26 ms.
+    Projection backward (`matmul`, 84 of them) = the bulk, ~80 ms.
+  - Concatenating the sibling weights into one bigger-N GEMM **does not reduce the
+    dominant cost**: the reg-blocked GEMM reads its A-tile per (M-band, N-tile),
+    and different N-tiles are different threadgroups that each reload the same A
+    from DRAM — so a merged GEMM reads the input the *same* number of times. At
+    d_model=320 each QKV GEMM (`[1024,320]@[320,320]`, ~80 output tiles) already
+    **saturates** the GPU, so a larger merged GEMM gives no utilization gain.
+  - The only real saving is **dispatch count** (~18 fewer launches ≈ ~0.3 ms) —
+    negligible vs a 408 ms step.
+  - **Blocked path:** weight-concat would also need a new differentiable *slice*
+    op + a split-copy, because this codebase forbids strided graph values
+    (virtual tensors must be contiguous; `gd_tensor_slice` only views materialized
+    params and records no autograd). Likely net-negative here.
+  Conclusion: the fused-QKV win is **scale-dependent** — it pays off at larger
+  d_model (real GPT ≥768) and on tiny models where launch overhead dominates, not
+  at this bench's d=320 where GEMMs already saturate. Revisit when targeting a
+  larger model; not worth the slice-op + copy machinery now.
 - [ ] F2 — **`matmul`/`linear`→`cross_entropy`** (LM head). Investigated; scope is
   bigger than first framed (it is a cut-cross-entropy kernel). Key findings:
   - The logits claim "forward-only" is **false in training**: `logits` is

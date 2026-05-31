@@ -305,6 +305,29 @@ reduction overhead exceed the critical-path win), but S=2/S=4 is a better point
 for current T=256/T=512 training. Validation: `make check` green, GPT train
 parity green, ASan `test_metal_gpt` clean.
 
+### 6.5 Reduce parallelism — split-K partial reductions (2026-05-31)
+
+Once S=2/S=4 is active, the split-K reduction kernels became visible overhead.
+`gd_sdpa_bwd_dq_reduce` and `gd_sdpa_bwd_dkv_reduce` used one thread per
+query/key row and looped all `Dh=64` channels serially. Rewrote them to one
+thread per `(row, channel)`; each thread only reduces across splits and writes one
+channel (dkv writes both dk/dv for that channel). Same arithmetic/order across
+splits, just parallelizes the channel loop.
+
+```text
+B=4,T=256,6L, S=2:
+  before: sdpa 47.0 ms, sdpa_bwd 113.5 ms, step 328.4 ms, 3118 tok/s
+  after:  sdpa 47.6 ms, sdpa_bwd 111.9 ms, step 318.9 ms, 3211 tok/s
+
+B=8,T=512,6L, S=4:
+  before: sdpa 206.9 ms, sdpa_bwd 610.5 ms, step 1696.6 ms, 2414 tok/s
+  after:  sdpa 207.8 ms, sdpa_bwd 584.9 ms, step 1619.9 ms, 2529 tok/s
+```
+
+Learning: at the retuned split counts, reduction overhead matters — especially
+for `dkv_reduce`, which writes both dk and dv. This is still GPU_SAFE inside one
+IR node (`sdpa_bwd`), and keeps the split partial format unchanged.
+
 ---
 
 ## 7. Reporting rule
@@ -337,6 +360,8 @@ When marking a phase done, record:
 | B1.5b split-K bwd | 2048 | 1358 ms | 4127 ms | 11240 ms | 729 | S=8 |
 | Split retune | 256 | 47 ms | 113.5 ms | 328.4 ms | 3118 | S=2 (`SPLIT_MIN=128`), post-CE/O3 baseline |
 | Split retune | 512 | 206.9 ms | 610.5 ms | 1696.6 ms | 2414 | B=8 user workload, S=4 |
+| Split reduce parallel | 256 | 47.6 ms | 111.9 ms | 318.9 ms | 3211 | one thread per (row,channel) reduce |
+| Split reduce parallel | 512 | 207.8 ms | 584.9 ms | 1619.9 ms | 2529 | B=8 user workload |
 
 B1 is correct (parity green) and neutral on wall-time for causal. B1.5/B1.5b
 split-K land the forward and backward at their throughput floors (§6.2–§6.3):

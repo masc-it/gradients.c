@@ -1861,7 +1861,7 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
             [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
             [enc setBytes:&p length:sizeof(p) atIndex:2];
             if (q_rows > 0) {
-                dispatch_1d(enc, dqr_pso, q_rows);
+                dispatch_1d(enc, dqr_pso, q_rows * (NSUInteger)p.Dh);
             }
 
             /* dk/dv: per-split partial sums -> reduce. */
@@ -1883,7 +1883,7 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
             [enc setBuffer:value_buffer(exe, node->outputs[2]) offset:0 atIndex:2];
             [enc setBytes:&p length:sizeof(p) atIndex:3];
             if (kv_rows > 0) {
-                dispatch_1d(enc, dkr_pso, kv_rows);
+                dispatch_1d(enc, dkr_pso, kv_rows * (NSUInteger)p.Dh);
             }
             return GD_OK;
         }

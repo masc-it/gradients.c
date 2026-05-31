@@ -1053,7 +1053,10 @@ should be attention backward (`sdpa_bwd`), especially for the user workload wher
 `sdpa`+`sdpa_bwd` is ~50% of step. Immediate follow-up retuned attention split-K
 (`GD_METAL_SDPA_SPLIT_MIN 256 -> 128`): T=256 `sdpa_bwd 129.6 -> 113.5 ms`, step
 `361.3 -> 328.4 ms`; T=512 user workload `sdpa_bwd 642.6 -> 610.5 ms`, step
-`1731 -> 1697 ms` (tracked in `plan_block_sparse_sdpa_metal.md` §6.4).
+`1731 -> 1697 ms`. Then parallelized split-K `dq/dkv` reductions over channels:
+T=256 `sdpa_bwd 113.5 -> 111.9 ms`, step `328.4 -> 318.9 ms`; T=512 `sdpa_bwd
+610.5 -> 584.9 ms`, step `1697 -> 1620 ms` (tracked in
+`plan_block_sparse_sdpa_metal.md` §6.4–§6.5).
 
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)

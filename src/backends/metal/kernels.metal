@@ -1908,29 +1908,31 @@ kernel void gd_sdpa_bwd_dq_split(device const float *go             [[buffer(0)]
     }
 }
 
-/* Sum the per-split dq partials into dq. */
+/* Sum per-split dq partials. One thread owns one (row, channel) so the Dh loop
+ * is parallelized; the old one-thread-per-row version serialized all 64 channels
+ * and was visible once split-K moved work into partial reductions. */
 kernel void gd_sdpa_bwd_dq_reduce(device const float *part          [[buffer(0)]],
                                   device float *dq                  [[buffer(1)]],
                                   constant gd_metal_sdpa_params &p   [[buffer(2)]],
                                   uint gid [[thread_position_in_grid]])
 {
-    int total = p.B * p.Hq * p.Tq;
+    int total = p.B * p.Hq * p.Tq * p.Dh;
     if ((int)gid >= total) {
         return;
     }
-    int i = (int)gid % p.Tq;
-    int r = (int)gid / p.Tq;
+    int c = (int)gid % p.Dh;
+    int row = (int)gid / p.Dh;
+    int i = row % p.Tq;
+    int r = row / p.Tq;
     int hq = r % p.Hq;
     int b = r / p.Hq;
     int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
     int pbase = ((b * p.Hq + hq) * p.Tq + i) * p.n_splits * p.Dh;
-    for (int c = 0; c < p.Dh; ++c) {
-        float acc = 0.0f;
-        for (int s = 0; s < p.n_splits; ++s) {
-            acc += part[pbase + s * p.Dh + c];
-        }
-        dq[qbase + c] = acc;
+    float acc = 0.0f;
+    for (int s = 0; s < p.n_splits; ++s) {
+        acc += part[pbase + s * p.Dh + c];
     }
+    dq[qbase + c] = acc;
 }
 
 kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]],
@@ -2043,33 +2045,34 @@ kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]
     }
 }
 
-/* Sum the per-split dk/dv partials into dk, dv. */
+/* Sum per-split dk/dv partials. One thread owns one (row, channel), writing both
+ * dk and dv for that channel. */
 kernel void gd_sdpa_bwd_dkv_reduce(device const float *part         [[buffer(0)]],
                                    device float *dk                 [[buffer(1)]],
                                    device float *dv                 [[buffer(2)]],
                                    constant gd_metal_sdpa_params &p  [[buffer(3)]],
                                    uint gid [[thread_position_in_grid]])
 {
-    int total = p.B * p.Hkv * p.Tk;
+    int total = p.B * p.Hkv * p.Tk * p.Dh;
     if ((int)gid >= total) {
         return;
     }
-    int j = (int)gid % p.Tk;
-    int r = (int)gid / p.Tk;
+    int c = (int)gid % p.Dh;
+    int row = (int)gid / p.Dh;
+    int j = row % p.Tk;
+    int r = row / p.Tk;
     int hkv = r % p.Hkv;
     int b = r / p.Hkv;
     int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
     int pbase = ((b * p.Hkv + hkv) * p.Tk + j) * p.n_splits * 2 * p.Dh;
-    for (int c = 0; c < p.Dh; ++c) {
-        float adk = 0.0f;
-        float adv = 0.0f;
-        for (int s = 0; s < p.n_splits; ++s) {
-            adk += part[pbase + s * 2 * p.Dh + c];
-            adv += part[pbase + s * 2 * p.Dh + p.Dh + c];
-        }
-        dk[kbase + c] = adk;
-        dv[kbase + c] = adv;
+    float adk = 0.0f;
+    float adv = 0.0f;
+    for (int s = 0; s < p.n_splits; ++s) {
+        adk += part[pbase + s * 2 * p.Dh + c];
+        adv += part[pbase + s * 2 * p.Dh + p.Dh + c];
     }
+    dk[kbase + c] = adk;
+    dv[kbase + c] = adv;
 }
 
 /* Rotary position embedding; one thread per (.., head) row. Serves forward and

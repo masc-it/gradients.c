@@ -1279,14 +1279,32 @@ kernel void gd_embedding(device const float *table           [[buffer(0)]],
 
 /* ---- Scaled dot-product attention (reference, dense + causal, GQA) -------- */
 
-static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk, int causal, int window)
+static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk,
+                                   int causal, int window, int prefix_len)
 {
     int qpos = i + (Tk - Tq);
-    if (causal && j > qpos) {
-        return false;
+
+    if (causal) {
+        if (prefix_len > 0) {
+            if (qpos < prefix_len) {
+                if (j >= prefix_len) {
+                    return false;
+                }
+            } else if (j > qpos) {
+                return false;
+            }
+        } else if (j > qpos) {
+            return false;
+        }
     }
-    if (window > 0 && (qpos - j) >= window) {
-        return false;
+    if (window > 0) {
+        if (prefix_len > 0) {
+            if (qpos >= prefix_len && j >= prefix_len && (qpos - j) >= window) {
+                return false;
+            }
+        } else if ((qpos - j) >= window) {
+            return false;
+        }
     }
     return true;
 }
@@ -1300,7 +1318,8 @@ static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk, int causal, int
 /* For a query block covering [q0, q0+bq), the largest causal key index any query
  * in the block may attend is min(q0+bq-1, Tq-1) + (Tk-Tq). Key blocks past that
  * are fully masked; returns the exclusive key bound to cap the kb loop. */
-static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk, int causal)
+static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk,
+                                  int causal, int prefix_len)
 {
     if (!causal) {
         return Tk;
@@ -1309,7 +1328,11 @@ static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk, int causal)
     if (qmax > Tq - 1) {
         qmax = Tq - 1;
     }
-    int lim = qmax + (Tk - Tq) + 1; /* keys j < lim may be attended */
+    int qmaxpos = qmax + (Tk - Tq);
+    int lim = qmaxpos + 1; /* keys j < lim may be attended */
+    if (prefix_len > 0 && qmaxpos < prefix_len) {
+        lim = prefix_len;
+    }
     if (lim < 0) {
         lim = 0;
     }
@@ -1323,14 +1346,21 @@ static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk, int causal)
  * block. Keys [k0, ..) can only be attended by queries i >= k0 - (Tk-Tq); query
  * blocks fully below that are masked. Returns the qblk-aligned first query block
  * to start the qb loop from. */
-static inline int gd_sdpa_qb_start(int k0, int qblk, int Tk, int Tq, int causal)
+static inline int gd_sdpa_qb_start(int k0, int qblk, int Tk, int Tq,
+                                    int causal, int prefix_len)
 {
     if (!causal) {
+        return 0;
+    }
+    if (prefix_len > 0 && k0 < prefix_len) {
         return 0;
     }
     int qmin = k0 - (Tk - Tq);
     if (qmin <= 0) {
         return 0;
+    }
+    if (qmin > Tq) {
+        return Tq;
     }
     return (qmin / qblk) * qblk;
 }
@@ -1403,7 +1433,7 @@ kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
     float m = -INFINITY;
     float l = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
@@ -1421,7 +1451,7 @@ kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
         if (active) {
             for (int jj = 0; jj < tile; ++jj) {
                 int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                     float s = 0.0f;
                     for (int c = 0; c < p.Dh; ++c) {
                         s += qreg[c] * ksh[jj * p.Dh + c];
@@ -1494,7 +1524,7 @@ kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
     float m = -INFINITY;
     float l = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     int k_lo = s * p.split_len;
     int k_hi = k_lo + p.split_len;
     if (k_hi > kb_end) {
@@ -1516,7 +1546,7 @@ kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
         if (active) {
             for (int jj = 0; jj < tile; ++jj) {
                 int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                     float ss = 0.0f;
                     for (int c = 0; c < p.Dh; ++c) {
                         ss += qreg[c] * ksh[jj * p.Dh + c];
@@ -1619,7 +1649,7 @@ kernel void gd_sdpa(device const float *q              [[buffer(0)]],
 
     float m = -INFINITY;
     for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
             int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
             float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
                       + gd_sdpa_bias_at(bias, p, b, hq, i, j);
@@ -1633,7 +1663,7 @@ kernel void gd_sdpa(device const float *q              [[buffer(0)]],
     }
     float sum = 0.0f;
     for (int j = 0; j < p.Tk; ++j) {
-        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+        if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
             int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
             int vbase = kbase;
             float s = p.scale * gd_sdpa_dot(q + qbase, k + kbase, p.Dh)
@@ -1692,7 +1722,7 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
     float l = 0.0f;
     float raw = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
@@ -1709,7 +1739,7 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
         if (active) {
             for (int jj = 0; jj < tile; ++jj) {
                 int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                     float s = 0.0f;
                     float dp = 0.0f;
                     for (int c = 0; c < p.Dh; ++c) {
@@ -1777,7 +1807,7 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
     }
     bool run = active && l > 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
@@ -1794,7 +1824,7 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
         if (run) {
             for (int jj = 0; jj < tile; ++jj) {
                 int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                     float s = 0.0f;
                     float dp = 0.0f;
                     for (int c = 0; c < p.Dh; ++c) {
@@ -1861,7 +1891,7 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
         dvacc[c] = 0.0f;
     }
 
-    int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_BQ, GD_SDPA_BK, p.Tk, p.Tq, p.causal);
+    int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_BQ, GD_SDPA_BK, p.Tk, p.Tq, p.causal, p.prefix_len);
     for (int g = 0; g < group; ++g) {
         int hq = hkv * group + g;
         for (int qb = qb_start; qb < p.Tq; qb += GD_SDPA_BK) {
@@ -1886,7 +1916,7 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
             if (active) {
                 for (int ii = 0; ii < tile; ++ii) {
                     int i = qb + ii;
-                    if (!gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    if (!gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                         continue;
                     }
                     float l = lsh[ii];
@@ -1992,7 +2022,7 @@ kernel void gd_sdpa_bwd_stats_dq_split(device const float *go          [[buffer(
     float l = 0.0f;
     float raw = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal);
+    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     int slen = gd_sdpa_split_len(p.Tk, p.n_splits);
     int k_lo = sp * slen;
     int k_hi = k_lo + slen;
@@ -2015,7 +2045,7 @@ kernel void gd_sdpa_bwd_stats_dq_split(device const float *go          [[buffer(
         if (active) {
             for (int jj = 0; jj < tile; ++jj) {
                 int j = kb + jj;
-                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                if (gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                     float ss = 0.0f;
                     float dp = 0.0f;
                     for (int c = 0; c < p.Dh; ++c) {
@@ -2153,7 +2183,7 @@ kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]
     }
 
     int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_DKV_KEYS, GD_SDPA_BK,
-                                    p.Tk, p.Tq, p.causal);
+                                    p.Tk, p.Tq, p.causal, p.prefix_len);
     int slen = gd_sdpa_split_len(p.Tq, p.n_splits);
     int q_lo = s * slen;
     int q_hi = q_lo + slen;
@@ -2204,7 +2234,7 @@ kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]
                     int ob = ii * GD_SDPA_DKV_KEYS + local_key;
                     float pj = 0.0f;
                     float ds = 0.0f;
-                    if (active && gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window)) {
+                    if (active && gd_sdpa_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
                         float l = lsh[ii];
                         if (l > 0.0f) {
                             int rb = ob * GD_SDPA_DKV_LANES;

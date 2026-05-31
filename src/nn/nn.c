@@ -273,7 +273,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     int64_t kv4[4] = {B, T, Hkv, Dh};
     int64_t o3[3] = {B, T, Hq * Dh};
     gd_rope_config rope = {c->rope_theta, 0, false};
-    gd_sdpa_config sdpa = {0.0f, true, 0};
+    gd_sdpa_config sdpa = {0.0f, true, 0, 0};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
     gd_tensor *om = NULL, *op = NULL, *out = NULL;

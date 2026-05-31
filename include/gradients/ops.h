@@ -126,11 +126,16 @@ gd_status gd_rope(gd_context *ctx,
  * broadcast over [B, Hq, Tq, Tk] (any axis may be 1). This expresses padding
  * masks (0 / large-negative), ALiBi (per-head linear bias), and arbitrary
  * relative-position bias, and composes with the causal/window fast path. Bias
- * is treated as a constant (no gradient) in v1. */
+ * is treated as a constant (no gradient) in v1.
+ *
+ * `prefix_len` enables VLM prefix-causal attention when `causal=true`: query
+ * positions before prefix_len attend bidirectionally within the prefix only;
+ * later positions attend causally to prefix + prior/current suffix tokens. */
 typedef struct gd_sdpa_config {
-    float scale;        /* 0 => 1/sqrt(head_dim) */
+    float scale;          /* 0 => 1/sqrt(head_dim) */
     bool  causal;
     int   sliding_window; /* 0 => none */
+    int   prefix_len;     /* >0 with causal=true => prefix-causal */
 } gd_sdpa_config;
 gd_status gd_sdpa(gd_context *ctx,
                   gd_tensor *q,

@@ -633,6 +633,9 @@ gd_status gd_sdpa(gd_context *ctx,
     const gd_tensor_desc *dq = NULL;
     const gd_tensor_desc *dk = NULL;
     int head_dim = 0;
+    int causal = 0;
+    int sliding_window = 0;
+    int prefix_len = 0;
     int n_inputs = 3;
 
     if (q == NULL || k == NULL || v == NULL || out == NULL) {
@@ -659,16 +662,33 @@ gd_status gd_sdpa(gd_context *ctx,
         }
     }
     head_dim = (int)dq->sizes[3];
+    causal = (config != NULL && config->causal) ? 1 : 0;
+    sliding_window = (config != NULL && config->sliding_window > 0)
+                         ? config->sliding_window
+                         : 0;
+    prefix_len = (config != NULL) ? config->prefix_len : 0;
+    if (prefix_len < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "sdpa prefix_len must be non-negative");
+    }
+    if ((int64_t)prefix_len > dk->sizes[1]) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "sdpa prefix_len exceeds key sequence length");
+    }
+    if (prefix_len > 0 && !causal) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "sdpa prefix_len requires causal=true");
+    }
+    if (prefix_len > 0 && sliding_window > 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT,
+                         "sdpa prefix_len with sliding_window is not supported in v1");
+    }
     attrs.head_dim = head_dim;
     attrs.n_q_heads = (int)dq->sizes[2];
     attrs.n_kv_heads = (int)dk->sizes[2];
     attrs.attn_scale = (config != NULL && config->scale > 0.0F)
                            ? config->scale
                            : (float)(1.0 / sqrt((double)head_dim));
-    attrs.causal = (config != NULL && config->causal) ? 1 : 0;
-    attrs.sliding_window = (config != NULL && config->sliding_window > 0)
-                               ? config->sliding_window
-                               : 0;
+    attrs.causal = causal;
+    attrs.sliding_window = sliding_window;
+    attrs.prefix_len = prefix_len;
     attrs.has_bias = bias != NULL;
     inputs[0] = q;
     inputs[1] = k;

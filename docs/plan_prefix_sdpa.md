@@ -1,6 +1,6 @@
 # gradients.c — Prefix-Causal SDPA for VLM Attention
 
-Status: draft v0.1
+Status: implemented v1
 
 Goal: support VLM-style self-attention where a fixed prefix block (image tokens)
 attends bidirectionally within the prefix, while suffix tokens (text) attend

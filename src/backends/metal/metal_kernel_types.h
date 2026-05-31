@@ -216,6 +216,7 @@ typedef struct gd_metal_sdpa_params {
     float scale;
     int causal;
     int window;
+    int prefix_len;
     int has_bias;
     int Bb;   /* bias broadcast dims over [B, Hq, Tq, Tk] (each 1 or full) */
     int Hb;

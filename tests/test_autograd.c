@@ -326,6 +326,7 @@ typedef struct sdpa_in {
     gd_tensor *v;
     gd_tensor *bias; /* optional additive bias (constant; tests q/k/v grads) */
     bool causal;
+    int prefix_len;
 } sdpa_in;
 
 static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
@@ -338,6 +339,7 @@ static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_ou
     gd_status status = GD_OK;
 
     cfg.causal = s->causal;
+    cfg.prefix_len = s->prefix_len;
     status = gd_sdpa(ctx, s->q, s->k, s->v, s->bias, &cfg, &y);
     if (status != GD_OK) {
         return status;
@@ -726,6 +728,9 @@ int main(void)
         CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa") == 0);
         s.causal = true;
         CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_causal") == 0);
+        s.prefix_len = 2;
+        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_prefix") == 0);
+        s.prefix_len = 0;
         {
             /* additive bias broadcast over [B,Hq,Tq,Tk] = [1,1,3,3]; verifies
              * q/k/v grads are correct in the presence of a bias term. */

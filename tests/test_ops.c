@@ -232,6 +232,51 @@ static int test_matmul(gd_context *ctx)
     return 0;
 }
 
+static int test_sdpa_prefix_schema(gd_context *ctx)
+{
+    int64_t xs[4] = {1, 5, 1, 1};
+    gd_tensor *q = NULL;
+    gd_tensor *k = NULL;
+    gd_tensor *v = NULL;
+    gd_tensor *out = NULL;
+    gd_graph *g = NULL;
+    gd_sdpa_config cfg = {0};
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, xs, &q));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, xs, &k));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, xs, &v));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+
+    cfg.prefix_len = 2;
+    cfg.causal = false;
+    CHECK_STATUS(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out), GD_ERR_INVALID_ARGUMENT);
+    CHECK_TRUE(out == NULL);
+
+    cfg.causal = true;
+    cfg.sliding_window = 3;
+    CHECK_STATUS(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out), GD_ERR_INVALID_ARGUMENT);
+    CHECK_TRUE(out == NULL);
+
+    cfg.sliding_window = 0;
+    cfg.prefix_len = 6;
+    CHECK_STATUS(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out), GD_ERR_INVALID_ARGUMENT);
+    CHECK_TRUE(out == NULL);
+
+    cfg.prefix_len = 5;
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out));
+    CHECK_TRUE(check_shape(out, 4, xs) == 0);
+    gd_tensor_release(out);
+
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(q);
+    gd_tensor_release(k);
+    gd_tensor_release(v);
+    return 0;
+}
+
 static int test_linear(gd_context *ctx)
 {
     int64_t xs[2] = {2, 3};
@@ -421,8 +466,9 @@ int main(void)
 
     CHECK_OK(gd_context_create(&ctx));
     if (test_elementwise(ctx) != 0 || test_powlu_schema(ctx) != 0 ||
-        test_matmul(ctx) != 0 || test_linear(ctx) != 0 ||
-        test_reduce_softmax_ce_cast(ctx) != 0 || test_chain_dump(ctx) != 0) {
+        test_matmul(ctx) != 0 || test_sdpa_prefix_schema(ctx) != 0 ||
+        test_linear(ctx) != 0 || test_reduce_softmax_ce_cast(ctx) != 0 ||
+        test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

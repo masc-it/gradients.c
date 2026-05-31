@@ -789,14 +789,32 @@ gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
 
 #define GD_SDPA_MAX_HEAD_DIM 256
 
-static int sdpa_allowed(int64_t i, int64_t j, int64_t Tq, int64_t Tk, int causal, int window)
+static int sdpa_allowed(int64_t i, int64_t j, int64_t Tq, int64_t Tk,
+                        int causal, int window, int prefix_len)
 {
     int64_t qpos = i + (Tk - Tq);
-    if (causal && j > qpos) {
-        return 0;
+
+    if (causal) {
+        if (prefix_len > 0) {
+            if (qpos < prefix_len) {
+                if (j >= prefix_len) {
+                    return 0;
+                }
+            } else if (j > qpos) {
+                return 0;
+            }
+        } else if (j > qpos) {
+            return 0;
+        }
     }
-    if (window > 0 && (qpos - j) >= window) {
-        return 0;
+    if (window > 0) {
+        if (prefix_len > 0) {
+            if (qpos >= prefix_len && j >= prefix_len && (qpos - j) >= window) {
+                return 0;
+            }
+        } else if ((qpos - j) >= window) {
+            return 0;
+        }
     }
     return 1;
 }
@@ -835,7 +853,7 @@ gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
                          const gd_tensor_desc *k_desc, const float *k,
                          const gd_tensor_desc *v_desc, const float *v,
                          const gd_tensor_desc *bias_desc, const float *bias,
-                         float scale, int causal, int window)
+                         float scale, int causal, int window, int prefix_len)
 {
     int64_t B = q_desc->sizes[0];
     int64_t Tq = q_desc->sizes[1];
@@ -865,7 +883,7 @@ gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
                     acc[c] = 0.0;
                 }
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         double s = (double)scale * sdpa_dot(qr, kr, Dh)
                                    + sdpa_bias_at(bias_desc, bias, b, hq, i, j);
@@ -875,7 +893,7 @@ gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
                     }
                 }
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         const float *vr = v + (((b * Tk + j) * Hkv + hkv) * Dh);
                         double s = (double)scale * sdpa_dot(qr, kr, Dh)
@@ -902,7 +920,7 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                              const gd_tensor_desc *bias_desc, const float *bias,
                              const float *go,
                              float *dq, float *dk, float *dv,
-                             float scale, int causal, int window)
+                             float scale, int causal, int window, int prefix_len)
 {
     int64_t B = q_desc->sizes[0];
     int64_t Tq = q_desc->sizes[1];
@@ -937,7 +955,7 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                 double dsum = 0.0; /* D = sum_j p_j * dp_j */
 
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         double s = (double)scale * sdpa_dot(qr, kr, Dh)
                                    + sdpa_bias_at(bias_desc, bias, b, hq, i, j);
@@ -947,7 +965,7 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                     }
                 }
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         double s = (double)scale * sdpa_dot(qr, kr, Dh)
                                    + sdpa_bias_at(bias_desc, bias, b, hq, i, j);
@@ -955,7 +973,7 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                     }
                 }
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         const float *vr = v + (((b * Tk + j) * Hkv + hkv) * Dh);
                         double s = (double)scale * sdpa_dot(qr, kr, Dh)
@@ -965,7 +983,7 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                     }
                 }
                 for (j = 0; j < Tk; ++j) {
-                    if (sdpa_allowed(i, j, Tq, Tk, causal, window)) {
+                    if (sdpa_allowed(i, j, Tq, Tk, causal, window, prefix_len)) {
                         const float *kr = k + (((b * Tk + j) * Hkv + hkv) * Dh);
                         const float *vr = v + (((b * Tk + j) * Hkv + hkv) * Dh);
                         float *dkr = dk + (((b * Tk + j) * Hkv + hkv) * Dh);

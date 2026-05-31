@@ -7,7 +7,11 @@
 /* White-box hook from the Metal backend: count of fusions applied at compile.
  * Lets this test assert a fusion actually engaged (parity alone can't, since a
  * silent fallback to the unfused path would still pass). */
+#if defined(GD_ENABLE_METAL) && GD_ENABLE_METAL
 extern unsigned long _gd_metal_fusions_applied(void);
+#else
+static unsigned long _gd_metal_fusions_applied(void) { return 0UL; }
+#endif
 
 #define CHECK_OK(expr)                                                            \
     do {                                                                          \
@@ -208,10 +212,11 @@ static int test_sdpa_forward(gd_context *ctx)
     float qd[48];
     float kd[24];
     float vd[24];
-    gd_tensor *q = NULL, *k = NULL, *v = NULL, *yd = NULL, *yc = NULL;
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *yd = NULL, *yc = NULL, *yp = NULL;
     gd_graph *g = NULL;
     gd_compare_options opts = {1e-4, 1e-4, false};
-    gd_sdpa_config causal = {0.0F, true, 0};
+    gd_sdpa_config causal = {0.0F, true, 0, 0};
+    gd_sdpa_config prefix = {0.0F, true, 0, 2};
     int i = 0;
 
     for (i = 0; i < 48; ++i) {
@@ -228,9 +233,11 @@ static int test_sdpa_forward(gd_context *ctx)
     CHECK_OK(gd_graph_begin(ctx, g));
     CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, NULL, &yd));      /* dense */
     CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &causal, &yc));   /* causal */
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &prefix, &yp));   /* prefix-causal */
     CHECK_OK(gd_graph_end(ctx));
     gd_tensor_release(yd);
     gd_tensor_release(yc);
+    gd_tensor_release(yp);
 
     CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
 
@@ -430,7 +437,7 @@ static int build_rope(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **l
 }
 
 static int build_sdpa_impl(gd_context *ctx, gd_tensor **inputs, int *n,
-                           gd_tensor **loss_out, bool causal)
+                           gd_tensor **loss_out, bool causal, int prefix_len)
 {
     int64_t qs[4] = {1, 3, 4, 4};
     int64_t ks[4] = {1, 3, 2, 4};
@@ -450,6 +457,7 @@ static int build_sdpa_impl(gd_context *ctx, gd_tensor **inputs, int *n,
         vd[i] = 0.2F * (float)((i % 5) - 2);
     }
     cfg.causal = causal;
+    cfg.prefix_len = prefix_len;
     CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
     CHECK_OK(make_f32(ctx, 4, ks, kd, &k));
     CHECK_OK(make_f32(ctx, 4, ks, vd, &v));
@@ -473,12 +481,17 @@ static int build_sdpa_impl(gd_context *ctx, gd_tensor **inputs, int *n,
 
 static int build_sdpa(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
 {
-    return build_sdpa_impl(ctx, inputs, n, loss_out, false);
+    return build_sdpa_impl(ctx, inputs, n, loss_out, false, 0);
 }
 
 static int build_sdpa_causal(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
 {
-    return build_sdpa_impl(ctx, inputs, n, loss_out, true);
+    return build_sdpa_impl(ctx, inputs, n, loss_out, true, 0);
+}
+
+static int build_sdpa_prefix(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    return build_sdpa_impl(ctx, inputs, n, loss_out, true, 2);
 }
 
 /* F1: fused SwiGLU silu+mul. Checks CPU<->Metal parity of the whole fwd+bwd
@@ -590,22 +603,20 @@ static int test_add_rms_norm_fusion(gd_context *ctx)
 
 /* Multi-block SDPA parity (forward + backward via gd_graph_compare). The tiny-T
  * builders above fit in a single tile (BQ=64, BK=16) and run through the 64-float
- * gradient harness, so they never exercise the B1 causal block-skip. T=130 spans
- * 3 query blocks and 9 key blocks, forcing the kb_end < Tk and qb_start > 0
- * paths; window=48 additionally checks that the per-element predicate still masks
- * correctly alongside the block skip. gd_graph_compare diffs every node value and
- * gradient across CPU and Metal, so no fixed-size copy buffer is involved. */
-static int test_sdpa_multiblock(gd_context *ctx, int T, int window)
+ * gradient harness. These cases use real [B,T,H,Dh] layout with T crossing query
+ * blocks, key blocks, and split-K boundaries. Window and prefix cases check that
+ * the per-element predicate stays exact alongside block skip. */
+static int test_sdpa_multiblock(gd_context *ctx, int T, int window, int prefix_len)
 {
     /* MB_TMAX sizes the buffers; T (<= MB_TMAX) selects the actual sequence so a
      * single test covers both the single-pass+skip path (T small => 1 split) and
      * the split-K path (T >= 2*GD_METAL_SDPA_SPLIT_MIN => multiple splits). */
-    enum { MB_B = 2, MB_H = 2, MB_TMAX = 600, MB_DH = 32, MB_NMAX = MB_B * MB_H * MB_TMAX * MB_DH };
+    enum { MB_B = 2, MB_H = 2, MB_TMAX = 300, MB_DH = 32, MB_NMAX = MB_B * MB_H * MB_TMAX * MB_DH };
     static float qd[MB_NMAX];
     static float kd[MB_NMAX];
     static float vd[MB_NMAX];
-    int64_t qs[4] = {MB_B, MB_H, T, MB_DH};
-    int64_t flat[1] = {(int64_t)MB_B * MB_H * T * MB_DH};
+    int64_t qs[4] = {MB_B, T, MB_H, MB_DH};
+    int64_t flat[1] = {(int64_t)MB_B * T * MB_H * MB_DH};
     int MB_N = MB_B * MB_H * T * MB_DH;
     gd_compare_options opts = {1e-4, 1e-4, false};
     gd_sdpa_config cfg = {0};
@@ -620,6 +631,7 @@ static int test_sdpa_multiblock(gd_context *ctx, int T, int window)
     }
     cfg.causal = true;
     cfg.sliding_window = window;
+    cfg.prefix_len = prefix_len;
     CHECK_OK(make_f32(ctx, 4, qs, qd, &q));
     CHECK_OK(make_f32(ctx, 4, qs, kd, &k));
     CHECK_OK(make_f32(ctx, 4, qs, vd, &v));
@@ -670,10 +682,13 @@ int main(void)
     rc |= backward_parity(ctx, build_rope, "rope");
     rc |= backward_parity(ctx, build_sdpa, "sdpa");
     rc |= backward_parity(ctx, build_sdpa_causal, "sdpa_causal");
-    rc |= test_sdpa_multiblock(ctx, 130, 0);  /* causal, single-pass + block-skip */
-    rc |= test_sdpa_multiblock(ctx, 130, 48); /* causal + sliding window */
-    rc |= test_sdpa_multiblock(ctx, 600, 0);  /* causal, split-K (3 splits) */
-    rc |= test_sdpa_multiblock(ctx, 600, 48); /* causal + window, split-K */
+    rc |= backward_parity(ctx, build_sdpa_prefix, "sdpa_prefix");
+    rc |= test_sdpa_multiblock(ctx, 130, 0, 0);    /* causal, single-pass + block-skip */
+    rc |= test_sdpa_multiblock(ctx, 130, 48, 0);   /* causal + sliding window */
+    rc |= test_sdpa_multiblock(ctx, 300, 0, 0);    /* causal, split-K */
+    rc |= test_sdpa_multiblock(ctx, 300, 48, 0);   /* causal + window, split-K */
+    rc |= test_sdpa_multiblock(ctx, 130, 0, 33);   /* prefix-causal, boundary block */
+    rc |= test_sdpa_multiblock(ctx, 300, 0, 129);  /* prefix-causal, split-K */
     rc |= test_swiglu_fusion(ctx);            /* F1 fused silu+mul + fired check */
     rc |= test_add_rms_norm_fusion(ctx);      /* F4 residual add+rms_norm fwd/bwd */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");

@@ -113,14 +113,14 @@ gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
                          const gd_tensor_desc *k_desc, const float *k,
                          const gd_tensor_desc *v_desc, const float *v,
                          const gd_tensor_desc *bias_desc, const float *bias,
-                         float scale, int causal, int window);
+                         float scale, int causal, int window, int prefix_len);
 gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                              const gd_tensor_desc *k_desc, const float *k,
                              const gd_tensor_desc *v_desc, const float *v,
                              const gd_tensor_desc *bias_desc, const float *bias,
                              const float *go,
                              float *dq, float *dk, float *dv,
-                             float scale, int causal, int window);
+                             float scale, int causal, int window, int prefix_len);
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
                              float *dx,
                              const float *x,

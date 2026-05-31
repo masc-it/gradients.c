@@ -247,7 +247,7 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
                               in_desc[1], in_data[1], in_desc[2], in_data[2],
                               bias_desc, bias,
                               node->attrs.attn_scale, node->attrs.causal,
-                              node->attrs.sliding_window);
+                              node->attrs.sliding_window, node->attrs.prefix_len);
     }
     case _GD_OP_SDPA_BWD: {
         /* inputs: go, q, k, v[, bias] ; outputs: dq, dk, dv */
@@ -269,7 +269,7 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
                                   in_desc[3], in_data[3], bias_desc, bias, in_data[0],
                                   out_data, dk_data, dv_data,
                                   node->attrs.attn_scale, node->attrs.causal,
-                                  node->attrs.sliding_window);
+                                  node->attrs.sliding_window, node->attrs.prefix_len);
     }
     case _GD_OP_COPY:
         return _gd_cpu_k_copy(out_desc, out_data, in_desc[0], in_data[0]);

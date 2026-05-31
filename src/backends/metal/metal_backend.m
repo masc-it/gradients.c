@@ -2414,6 +2414,7 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->scale = node->attrs.attn_scale;
     p->causal = node->attrs.causal;
     p->window = node->attrs.sliding_window;
+    p->prefix_len = node->attrs.prefix_len;
     p->has_bias = node->attrs.has_bias ? 1 : 0;
     p->Bb = bias_desc != NULL ? (int)bias_desc->sizes[0] : 1;
     p->Hb = bias_desc != NULL ? (int)bias_desc->sizes[1] : 1;

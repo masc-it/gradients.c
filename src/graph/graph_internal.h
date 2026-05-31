@@ -87,6 +87,7 @@ typedef struct _gd_op_attrs {
     int head_dim;               /* SDPA */
     int causal;                 /* SDPA: causal masking */
     int sliding_window;         /* SDPA: window size (0 = none) */
+    int prefix_len;             /* SDPA: bidirectional prefix length for causal mask */
     gd_compute_policy compute;   /* MATMUL / LINEAR */
     float lr;                    /* ADAMW */
     float beta1;                 /* ADAMW */

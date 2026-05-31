@@ -42,7 +42,7 @@ Already available:
 Not enough for real GPT training:
 
 - [x] tokenizer stack
-- [ ] corpus preprocessing / packed token shards
+- [x] corpus preprocessing / packed token shards
 - [ ] production data loader
 - [ ] LR scheduler without graph rebuilds
 - [ ] global grad clipping
@@ -324,16 +324,17 @@ Use mmap-friendly binary shards.
 
 ```text
 *.gdtok
-header:
+header (64 bytes, little-endian):
   magic/version
   dtype: uint16 if vocab <= 65535 else uint32
   vocab_size
   block_len = 512
-  n_tokens
+  n_tokens = n_samples * block_len + 1
   n_samples
   tokenizer_hash
+  payload_offset
 payload:
-  packed token ids, contiguous
+  packed token ids, contiguous stream with one lookahead token
 ```
 
 Also write JSON sidecar:
@@ -346,7 +347,13 @@ Also write JSON sidecar:
   "vocab_size": 32000,
   "tokenizer_hash": "...",
   "source_files": [...],
-  "n_records": 0,
+  "split": "train|val",
+  "train_ratio": 0.9,
+  "val_ratio": 0.1,
+  "split_seed": 1234,
+  "n_records_total": 0,
+  "n_records_split": 0,
+  "n_tokens_total": 0,
   "n_tokens": 0,
   "n_samples": 0,
   "dropped_tail_tokens": 0
@@ -370,15 +377,19 @@ gradients-build-dataset \
   --special im_end='<|im_end|>'
 ```
 
-### 4.6 Tests
+### 4.6 API and tests
 
-- train/val split is deterministic for fixed seed.
-- train and val record ids are disjoint.
-- packed samples produce correct shifted targets.
-- tail dropping count is exact per split.
-- special token ids appear at record boundaries.
-- shard can be mmaped and read without copies.
-- tokenizer hash mismatch is detected.
+Implemented in `include/gradients/dataset.h`, `src/dataset/dataset.c`,
+`tools/gradients-build-dataset.c`, and `tests/test_dataset.c`.
+
+- [x] train/val split is deterministic for fixed seed.
+- [x] train and val record ids are disjoint.
+- [x] packed samples produce correct shifted targets via `n_tokens = n_samples * block_len + 1`.
+- [x] tail dropping count is exact per split.
+- [x] special token ids appear at record boundaries.
+- [x] shard header is mmap-friendly and read without parsing JSON.
+- [x] malformed formatted records are rejected.
+- [ ] tokenizer hash mismatch is detected by loader (P3).
 
 ---
 
@@ -890,12 +901,12 @@ Not required for first real training, but important later:
 
 ### P2 — Dataset builder
 
-- [ ] Validate `<|im_start|>...<|im_end|>` records.
-- [ ] Bootstrap-wrap plain-text corpus (`~/projects/dnn.c/docs/promessi_sposi.txt`).
-- [ ] Deterministic train/val split before packing.
-- [ ] Tokenize and pack 512-token blocks per split.
-- [ ] Drop incomplete/final no-lookahead tail per split.
-- [ ] Write mmap shards + metadata for train and val.
+- [x] Validate `<|im_start|>...<|im_end|>` records.
+- [x] Bootstrap-wrap plain-text corpus (`~/projects/dnn.c/docs/promessi_sposi.txt`).
+- [x] Deterministic train/val split before packing.
+- [x] Tokenize and pack 512-token blocks per split.
+- [x] Drop incomplete/final no-lookahead tail per split.
+- [x] Write mmap shards + metadata for train and val.
 
 ### P3 — Double-buffer dataloader
 
@@ -944,7 +955,7 @@ Not required for first real training, but important later:
 A first production-ready text GPT training run is accepted when:
 
 - [ ] tokenizer trains on real corpus and encodes it with special tokens and separate digits.
-- [ ] dataset builder creates separate train/val 512-token packed shards and reports dropped tail.
+- [x] dataset builder creates separate train/val 512-token packed shards and reports dropped tail.
 - [ ] loader double buffers and reports near-zero wait after warmup.
 - [ ] train graph uses mutable LR scheduler and global grad clipping.
 - [ ] checkpoint/resume reproduces deterministic training continuation.

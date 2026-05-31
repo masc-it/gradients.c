@@ -55,6 +55,7 @@ typedef struct gd_metal_ew_params {
     int numel;                         /* output element count */
     int a_ndim;
     int b_ndim;
+    int same_shape;                    /* a,b,out all same contiguous shape */
     int out_sizes[GD_METAL_MAX_DIMS];
     int a_sizes[GD_METAL_MAX_DIMS];
     int b_sizes[GD_METAL_MAX_DIMS];

@@ -1110,6 +1110,20 @@ clean. Learning: for long sequences, weight-gradient reductions need both row an
 channel parallelism; a single channel-tile grid underutilizes the GPU even if
 per-row `rms_inv` is cached.
 
+### 2026-05-31 binary equal-shape fast path
+
+`add`/`mul` still spent tens of ms in the generic broadcast kernel. Most GPT
+instances have identical contiguous input/output shapes, so the per-element
+right-aligned coordinate reconstruction and broadcast-offset math are pure
+waste. Added `same_shape` to `gd_metal_ew_params`; when set, `gd_add`/`gd_mul`
+use direct `out[i] = a[i] +/-/* b[i]` indexing and keep the generic path for
+broadcast cases.
+
+Numbers (B=8,T=512,6L trace): `add 28.9 -> 25.3 ms`, `mul 36.0 -> 27.6 ms`.
+End-to-end: T=512 step `1533 -> 1524 ms`, T=256 step `290.7 -> 287.2 ms`.
+Validation: `make check` green, GPT train parity green, ASan `test_metal_gpt`
+clean.
+
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)
 - `GD_PROFILE=trace ... make gpt-bench` per-op attribution before/after

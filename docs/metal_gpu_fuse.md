@@ -273,7 +273,8 @@ cutting T=512 `sdpa_bwd` `610.5 -> 584.9 ms` and user-workload step `1697 ->
 was switched from gather-by-vocab to zero+atomic scatter, cutting T=512
 `embedding_bwd` `48.7 -> 0.76 ms` and step `1596 -> 1548 ms`. `rms_norm_wbwd`
 then got row-block partial reductions, cutting T=512 `38.1 -> 9.0 ms` and step
-`1548 -> 1533 ms`.
+`1548 -> 1533 ms`. Binary `add`/`mul` got an equal-shape fast path, cutting T=512
+`add 28.9 -> 25.3 ms`, `mul 36.0 -> 27.6 ms`, step `1533 -> 1524 ms`.
 
 (Fill as F2+ land; use post-CE/tail-triage/split-retune clean-release baselines.)
 

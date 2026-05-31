@@ -979,8 +979,17 @@ static void build_ew_params(gd_metal_ew_params *p,
     for (i = 0; i < a_desc->ndim; ++i) {
         p->a_sizes[i] = (int)a_desc->sizes[i];
     }
+    p->same_shape = (a_desc->ndim == out_desc->ndim && b_desc->ndim == out_desc->ndim) ? 1 : 0;
+    for (i = 0; i < a_desc->ndim; ++i) {
+        if (a_desc->sizes[i] != out_desc->sizes[i]) {
+            p->same_shape = 0;
+        }
+    }
     for (i = 0; i < b_desc->ndim; ++i) {
         p->b_sizes[i] = (int)b_desc->sizes[i];
+        if (b_desc->sizes[i] != out_desc->sizes[i]) {
+            p->same_shape = 0;
+        }
     }
 }
 

@@ -33,6 +33,10 @@ static inline void gd_binary(device const float *a,
     if ((int)gid >= p.numel) {
         return;
     }
+    if (p.same_shape) {
+        out[gid] = (op == 0) ? (a[gid] + b[gid]) : (a[gid] * b[gid]);
+        return;
+    }
     int index[GD_METAL_MAX_DIMS];
     int lin = (int)gid;
     for (int i = p.ndim - 1; i >= 0; --i) {

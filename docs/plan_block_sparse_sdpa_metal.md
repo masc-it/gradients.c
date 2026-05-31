@@ -133,14 +133,13 @@ query-block skip matters most.
   combine pass merges them. Shortens the per-group critical path from `Tk` to
   `~Tk/nsplit`. **Implemented for the forward and validated — see §6.2.**
   Backward split-K is the remaining 73% of attention cost, tracked as **B1.5b**.
-- [ ] **B1.5b — Split-K backward.** `sdpa_bwd` (stats + dq + dkv) is still the
-  dominant attention cost (~1333 ms at T=1024 vs ~378 ms forward). Same pattern:
-  `stats`/`dq` split the key range per query block (online-merge for `stats`,
-  plain partial-sum for `dq` since `(m,l,D)` are known); `dkv` splits the query
-  range per key block (partial-sum of dk/dv). Needs multi-scratch plumbing (more
-  than one partial buffer per node). Expected ~1.3× on backward / ~1.1× e2e at
-  T=1024 — deferred behind raising per-kernel throughput (see §6.2 learning),
-  which lifts forward *and* backward and is the deeper current ceiling.
+- [x] **B1.5b — Split-K backward.** `sdpa_bwd` (stats + dq + dkv) was the
+  dominant attention cost (~1333 ms at T=1024 vs ~378 ms forward). Implemented as
+  six kernels: `stats`/`dq` split the key range per query block (online-merge for
+  `stats`, plain partial-sum for `dq` since `(m,l,D)` are known); `dkv` splits the
+  query range per key block (partial-sum of dk/dv). All partials live in one
+  scratch buffer carved into regions (`sdpa_bwd_scratch_layout`), bound at byte
+  offsets. **Validated and measured — see §6.3.**
 - [ ] B2 — **Sliding-window block-skip** (skip blocks above the diagonal *and*
   below the window). **Expected to win where B1 does not**: a window caps *every*
   query block's key scan to `w`, so it shortens the critical path itself (unlike
@@ -249,6 +248,34 @@ it converts a latency problem into a throughput problem; beyond the point where
 the critical path is no longer the bottleneck, the ceiling is ALU throughput /
 occupancy, shared with every other compute kernel.
 
+### 6.3 Finding — split-K backward (B1.5b)
+
+The three backward passes were split the same way (six kernels: `stats`/`dq`
+key-split + combine/reduce, `dkv` query-split + reduce; partials in one
+region-carved scratch). Validated: `test_sdpa_multiblock` at T=600 (3 splits)
+runs the full fwd+bwd graph through `gd_graph_compare`, so dq/dk/dv parity at
+1e-4 is checked on the split path; T=256 stays on the single-pass path (no
+regression); ASan-clean.
+
+```text
+sdpa_bwd gpu_ms (B=4, 6 layers, GD_PROFILE=trace):
+  T          before (B1.5)   B1.5b split-K
+  256        128  (S=1)      128   (S=1, unchanged)
+  1024       1333 (S=1)      1094  (S=4)   1.22x
+  2048       —               4127  (S=8)
+end-to-end step (real, B=4):
+  T=1024     3561 -> 3316 ms   tok/s 1150 -> 1235
+```
+
+Backward split-K gives ~1.22× — the same order as the forward's 1.27× and for the
+same reason: it lands each backward pass on its throughput floor (§6.2). With
+both forward and backward split, attention at T=1024 went `476+1333 = 1809 ms`
+(B1) -> `362+1094 = 1456 ms` (1.24×), and the end-to-end step `3708 -> 3316 ms`
+(1.12×), `1110 -> 1235 tok/s`, vs the original G3-dense baseline of 3734 ms /
+1104 tok/s. The remaining attention cost is now throughput-bound; further gains
+need per-kernel throughput work (vectorized/`simdgroup` dot products, higher
+occupancy), which is shared with the GEMM plan and lifts every compute kernel.
+
 ---
 
 ## 7. Reporting rule
@@ -276,12 +303,15 @@ When marking a phase done, record:
 | B1 (causal skip) | 1024 | 477 ms | 1306 ms | 3708 ms | 1110 | no change — critical-path bound (§6.1) |
 | B1.5 split-K fwd | 256 | 52 ms | 128 ms | 496 ms | 2065 | S=1, unchanged (no regression) |
 | B1.5 split-K fwd | 1024 | 375 ms | 1333 ms | 3561 ms | 1150 | S=4; fwd 1.27×, now throughput-bound (§6.2) |
-| B1.5 split-K fwd | 2048 | 1377 ms | — | 11746 ms | 697 | S=8 |
+| B1.5b split-K bwd | 256 | 52 ms | 128 ms | 496 ms | 2065 | S=1, unchanged (no regression) |
+| B1.5b split-K bwd | 1024 | 362 ms | 1094 ms | 3316 ms | 1235 | S=4; bwd 1.22× (§6.3) |
+| B1.5b split-K bwd | 2048 | 1358 ms | 4127 ms | 11240 ms | 729 | S=8 |
 
-B1 is correct (parity green) and neutral on wall-time for causal. B1.5 forward
-split-K lands the forward at its throughput floor (§6.2). Remaining levers:
-B1.5b (backward split-K, the dominant ~1333 ms), B2 (window), per-kernel
-throughput. (Fill as B1.5b–B4 land.)
+B1 is correct (parity green) and neutral on wall-time for causal. B1.5/B1.5b
+split-K land the forward and backward at their throughput floors (§6.2–§6.3):
+attention at T=1024 `1809 -> 1456 ms`, step `3708 -> 3316 ms`, `1110 -> 1235
+tok/s`. Remaining levers: B2 (window), per-kernel throughput (vectorized dot
+products), B3/B4 (block-sparse). (Fill as B2–B4 land.)
 
 ---
 

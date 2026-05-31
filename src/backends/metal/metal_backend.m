@@ -94,7 +94,41 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
     "gd_sdpa_splitk",  /* split-K forward (long context) */
     "gd_sdpa_combine", /* split-K combine pass */
+    "gd_sdpa_bwd_stats_split",
+    "gd_sdpa_bwd_stats_combine",
+    "gd_sdpa_bwd_dq_split",
+    "gd_sdpa_bwd_dq_reduce",
+    "gd_sdpa_bwd_dkv_split",
+    "gd_sdpa_bwd_dkv_reduce",
 };
+
+/* Backward split-K scratch is one buffer carved into four regions (float counts
+ * and offsets). When n_splits==1 only the stats region is used (the original
+ * single-pass path). Keep in sync with the kernel partial layouts. */
+typedef struct {
+    int64_t stats_off;      /* final (m,l,D): B*Hq*Tq*3 */
+    int64_t stats_part_off; /* per-split (m,l,raw): B*Hq*Tq*S*3 */
+    int64_t dq_part_off;    /* per-split dq: B*Hq*Tq*S*Dh */
+    int64_t dkv_part_off;   /* per-split dk,dv: B*Hkv*Tk*S*2*Dh */
+    int64_t total;          /* total floats */
+} sdpa_bwd_layout;
+
+static sdpa_bwd_layout sdpa_bwd_scratch_layout(int B, int Hq, int Hkv,
+                                               int Tq, int Tk, int Dh, int S)
+{
+    sdpa_bwd_layout o;
+    int64_t off = 0;
+    o.stats_off = off;
+    off += (int64_t)B * Hq * Tq * 3;
+    o.stats_part_off = off;
+    off += (int64_t)B * Hq * Tq * S * 3;
+    o.dq_part_off = off;
+    off += (int64_t)B * Hq * Tq * S * Dh;
+    o.dkv_part_off = off;
+    off += (int64_t)B * Hkv * Tk * S * 2 * Dh;
+    o.total = off;
+    return o;
+}
 
 /* Split-K key partitioning for the forward SDPA, derived purely from Tk so the
  * compile-time scratch size and the encode-time dispatch agree. Returns 1 (no
@@ -653,14 +687,29 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             } else if (op == _GD_OP_SDPA_BWD) {
                 exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_dkv");
                 exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_stats");
-                /* Per-query stats scratch [m, l, D] = B*Hq*Tq*3 floats. q is
-                 * input 1: [B, Tq, Hq, Dh]. */
+                /* Scratch holds the per-query stats [m, l, D] (B*Hq*Tq*3). For
+                 * long context the split-K path additionally carves per-split
+                 * partial regions out of the same buffer; size it accordingly.
+                 * q is input 1: [B, Tq, Hq, Dh]; k is input 2: [B, Tk, Hkv, Dh]. */
                 {
                     const gd_tensor_desc *qd = &graph->values[node->inputs[1]].desc;
-                    int64_t nstats = qd->sizes[0] * qd->sizes[2] * qd->sizes[1] * 3;
+                    const gd_tensor_desc *kd = &graph->values[node->inputs[2]].desc;
+                    int B = (int)qd->sizes[0];
+                    int Tq = (int)qd->sizes[1];
+                    int Hq = (int)qd->sizes[2];
+                    int Dh = (int)qd->sizes[3];
+                    int Tk = (int)kd->sizes[1];
+                    int Hkv = (int)kd->sizes[2];
+                    int nsplit = sdpa_num_splits(Tk > Tq ? Tk : Tq);
+                    int64_t nfloats;
+                    if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
+                        nfloats = sdpa_bwd_scratch_layout(B, Hq, Hkv, Tq, Tk, Dh, nsplit).total;
+                    } else {
+                        nfloats = (int64_t)B * Hq * Tq * 3;
+                    }
                     gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
                                              GD_MEM_UNIFIED,
-                                             (size_t)nstats * sizeof(float), sizeof(float)};
+                                             (size_t)nfloats * sizeof(float), sizeof(float)};
                     status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
                     if (status != GD_OK) {
                         goto fail;
@@ -1529,6 +1578,112 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
     if (p.Dh > GD_METAL_SDPA_DHT) {
         return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd supports head_dim <= 64");
     }
+
+    /* Long-context split-K backward: like the forward, each pass is critical-path
+     * bound on the heaviest block, so split the scanned dimension across
+     * threadgroups into per-split partials, then reduce. stats/dq split the key
+     * range (per query block); dkv splits the query range (per key block). */
+    {
+        int nsplit = sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
+        if (nsplit > 1) {
+            sdpa_bwd_layout L = sdpa_bwd_scratch_layout(p.B, p.Hq, p.Hkv, p.Tq, p.Tk,
+                                                        p.Dh, nsplit);
+            NSUInteger stat_b = (NSUInteger)L.stats_off * sizeof(float);
+            NSUInteger spart_b = (NSUInteger)L.stats_part_off * sizeof(float);
+            NSUInteger dqpart_b = (NSUInteger)L.dq_part_off * sizeof(float);
+            NSUInteger dkvpart_b = (NSUInteger)L.dkv_part_off * sizeof(float);
+            int n_qb = (p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
+            int n_kb = (p.Tk + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ;
+            NSUInteger qsplit_groups = (NSUInteger)(p.B * p.Hq * n_qb * nsplit);
+            NSUInteger ksplit_groups = (NSUInteger)(p.B * p.Hkv * n_kb * nsplit);
+            NSUInteger q_rows = (NSUInteger)(p.B * p.Hq * p.Tq);
+            NSUInteger kv_rows = (NSUInteger)(p.B * p.Hkv * p.Tk);
+            GDMetalState *st = state_of(self);
+            id<MTLComputePipelineState> ss_pso = pipeline_named(st, "gd_sdpa_bwd_stats_split");
+            id<MTLComputePipelineState> sc_pso = pipeline_named(st, "gd_sdpa_bwd_stats_combine");
+            id<MTLComputePipelineState> dqs_pso = pipeline_named(st, "gd_sdpa_bwd_dq_split");
+            id<MTLComputePipelineState> dqr_pso = pipeline_named(st, "gd_sdpa_bwd_dq_reduce");
+            id<MTLComputePipelineState> dks_pso = pipeline_named(st, "gd_sdpa_bwd_dkv_split");
+            id<MTLComputePipelineState> dkr_pso = pipeline_named(st, "gd_sdpa_bwd_dkv_reduce");
+            id<MTLBuffer> go_b = value_buffer(exe, node->inputs[0]);
+            id<MTLBuffer> q_b = value_buffer(exe, node->inputs[1]);
+            id<MTLBuffer> k_b = value_buffer(exe, node->inputs[2]);
+            id<MTLBuffer> v_b = value_buffer(exe, node->inputs[3]);
+            id<MTLBuffer> bias_b = value_buffer(exe, bias_input);
+            MTLSize tg = MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1);
+
+            if (ss_pso == nil || sc_pso == nil || dqs_pso == nil || dqr_pso == nil ||
+                dks_pso == nil || dkr_pso == nil) {
+                return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd split-K pipeline missing");
+            }
+            p.n_splits = nsplit;
+
+            /* stats: per-split partial (m,l,raw) -> merge to (m,l,D). */
+            [enc setComputePipelineState:ss_pso];
+            [enc setBuffer:go_b offset:0 atIndex:0];
+            [enc setBuffer:q_b offset:0 atIndex:1];
+            [enc setBuffer:k_b offset:0 atIndex:2];
+            [enc setBuffer:v_b offset:0 atIndex:3];
+            [enc setBuffer:bias_b offset:0 atIndex:4];
+            [enc setBuffer:stats_buf offset:spart_b atIndex:5];
+            [enc setBytes:&p length:sizeof(p) atIndex:6];
+            if (qsplit_groups > 0) {
+                [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1) threadsPerThreadgroup:tg];
+            }
+            [enc setComputePipelineState:sc_pso];
+            [enc setBuffer:stats_buf offset:spart_b atIndex:0];
+            [enc setBuffer:stats_buf offset:stat_b atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            if (q_rows > 0) {
+                dispatch_1d(enc, sc_pso, q_rows);
+            }
+
+            /* dq: per-split partial sums -> reduce. */
+            [enc setComputePipelineState:dqs_pso];
+            [enc setBuffer:go_b offset:0 atIndex:0];
+            [enc setBuffer:q_b offset:0 atIndex:1];
+            [enc setBuffer:k_b offset:0 atIndex:2];
+            [enc setBuffer:v_b offset:0 atIndex:3];
+            [enc setBuffer:bias_b offset:0 atIndex:4];
+            [enc setBuffer:stats_buf offset:dqpart_b atIndex:5];
+            [enc setBytes:&p length:sizeof(p) atIndex:6];
+            [enc setBuffer:stats_buf offset:stat_b atIndex:7];
+            if (qsplit_groups > 0) {
+                [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1) threadsPerThreadgroup:tg];
+            }
+            [enc setComputePipelineState:dqr_pso];
+            [enc setBuffer:stats_buf offset:dqpart_b atIndex:0];
+            [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            if (q_rows > 0) {
+                dispatch_1d(enc, dqr_pso, q_rows);
+            }
+
+            /* dk/dv: per-split partial sums -> reduce. */
+            [enc setComputePipelineState:dks_pso];
+            [enc setBuffer:go_b offset:0 atIndex:0];
+            [enc setBuffer:q_b offset:0 atIndex:1];
+            [enc setBuffer:k_b offset:0 atIndex:2];
+            [enc setBuffer:v_b offset:0 atIndex:3];
+            [enc setBuffer:bias_b offset:0 atIndex:4];
+            [enc setBuffer:stats_buf offset:dkvpart_b atIndex:5];
+            [enc setBytes:&p length:sizeof(p) atIndex:6];
+            [enc setBuffer:stats_buf offset:stat_b atIndex:7];
+            if (ksplit_groups > 0) {
+                [enc dispatchThreadgroups:MTLSizeMake(ksplit_groups, 1, 1) threadsPerThreadgroup:tg];
+            }
+            [enc setComputePipelineState:dkr_pso];
+            [enc setBuffer:stats_buf offset:dkvpart_b atIndex:0];
+            [enc setBuffer:value_buffer(exe, node->outputs[1]) offset:0 atIndex:1];
+            [enc setBuffer:value_buffer(exe, node->outputs[2]) offset:0 atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            if (kv_rows > 0) {
+                dispatch_1d(enc, dkr_pso, kv_rows);
+            }
+            return GD_OK;
+        }
+    }
+
     /* Threadgroups: query blocks for stats/dq, key blocks for dk/dv; both use
      * GD_METAL_SDPA_BQ threads per group. */
     q_groups = p.B * p.Hq * ((p.Tq + GD_METAL_SDPA_BQ - 1) / GD_METAL_SDPA_BQ);

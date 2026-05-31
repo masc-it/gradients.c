@@ -111,6 +111,9 @@ typedef struct gd_metal_value {
     gd_tensor *external;   /* borrowed leaf source, NULL for produced values */
     size_t leaf_offset;    /* byte offset of the leaf data inside its source storage */
     bool external_alias;   /* true when storage directly aliases a Metal external leaf */
+    bool needs_writeback;  /* CPU-backed external value is mutated by this executable */
+    bool has_staged;
+    uint64_t staged_version;
 } gd_metal_value;
 
 struct _gd_executable {
@@ -213,7 +216,7 @@ static gd_status writeback_externals(_gd_backend *self, _gd_executable *exe)
         size_t nbytes = 0U;
         gd_status status = GD_OK;
 
-        if (v->external == NULL || v->external_alias) {
+        if (v->external == NULL || v->external_alias || !v->needs_writeback) {
             continue;
         }
         dst = gd_tensor_storage(v->external);
@@ -349,6 +352,43 @@ static bool can_alias_copy_value(const gd_graph *graph, const _gd_node *node)
     return in_bytes == out_bytes;
 }
 
+static bool node_mutates_input(const _gd_node *node, int input_index)
+{
+    switch (node->op) {
+    case _GD_OP_STEP_INC:
+        return input_index == 0;
+    case _GD_OP_ADAMW_STEP:
+        return input_index == 0 || input_index == 2 || input_index == 3;
+    default:
+        return false;
+    }
+}
+
+static void mark_external_writebacks(_gd_executable *exe)
+{
+    int i = 0;
+
+    for (i = 0; i < exe->graph->n_nodes; ++i) {
+        const _gd_node *node = &exe->graph->nodes[i];
+        int j = 0;
+
+        for (j = 0; j < node->n_outputs; ++j) {
+            int value_id = node->outputs[j];
+            if (value_id >= 0 && value_id < exe->n_values &&
+                exe->values[value_id].external != NULL && !exe->values[value_id].external_alias) {
+                exe->values[value_id].needs_writeback = true;
+            }
+        }
+        for (j = 0; j < node->n_inputs; ++j) {
+            int value_id = node->inputs[j];
+            if (node_mutates_input(node, j) && value_id >= 0 && value_id < exe->n_values &&
+                exe->values[value_id].external != NULL && !exe->values[value_id].external_alias) {
+                exe->values[value_id].needs_writeback = true;
+            }
+        }
+    }
+}
+
 static void refresh_external_flags(_gd_executable *exe)
 {
     int i = 0;
@@ -358,8 +398,9 @@ static void refresh_external_flags(_gd_executable *exe)
     for (i = 0; i < exe->n_values; ++i) {
         if (exe->values[i].external != NULL && !exe->values[i].external_alias) {
             exe->needs_stage = true;
+        }
+        if (exe->values[i].needs_writeback) {
             exe->needs_writeback = true;
-            return;
         }
     }
 }
@@ -457,6 +498,7 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
     if (status != GD_OK) {
         goto fail;
     }
+    mark_external_writebacks(exe);
     refresh_external_flags(exe);
 
     *out = exe;
@@ -471,6 +513,25 @@ fail:
 
 /* Copies each external-leaf's host bytes into its Metal buffer. Must run before
  * the command buffer is committed (coherency). */
+static bool metal_needs_stage_now(const _gd_executable *exe)
+{
+    int i = 0;
+
+    for (i = 0; i < exe->n_values; ++i) {
+        const gd_metal_value *v = &exe->values[i];
+        gd_storage *src = NULL;
+
+        if (v->external == NULL || v->external_alias) {
+            continue;
+        }
+        src = gd_tensor_storage(v->external);
+        if (src == NULL || !v->has_staged || v->staged_version != _gd_storage_version(src)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
 {
     int i = 0;
@@ -493,6 +554,9 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
             return _gd_error(GD_ERR_INVALID_STATE, "metal leaf input has no storage");
         }
         nbytes = gd_storage_nbytes(v->storage);
+        if (v->has_staged && v->staged_version == _gd_storage_version(src)) {
+            continue;
+        }
         bytes += nbytes;
         count += 1U;
         status = gd_storage_data_cpu(v->storage, &dst);
@@ -503,6 +567,8 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
         if (status != GD_OK) {
             return status;
         }
+        v->staged_version = _gd_storage_version(src);
+        v->has_staged = true;
     }
     if (start != 0U) {
         _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_STAGE_LEAVES,
@@ -1397,10 +1463,10 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
     gd_status status = GD_OK;
     int i = 0;
 
-    /* If CPU-backed leaves must be staged, any prior command buffer using the
-     * shadow buffers must complete before the CPU mutates them (Metal coherency).
-     * Fully device-resident graphs can queue runs on the serial command queue. */
-    if (exe->needs_stage) {
+    /* If CPU-backed leaves changed, any prior command buffer using their shadow
+     * buffers must complete before the CPU mutates those buffers (Metal coherency).
+     * If nothing changed, the next command buffer can be queued immediately. */
+    if (exe->needs_stage && metal_needs_stage_now(exe)) {
         status = metal_synchronize(self);
         if (status != GD_OK) {
             return status;

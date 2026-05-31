@@ -77,6 +77,19 @@ static int test_metal_add_direct(gd_context *ctx)
         CHECK_TRUE(close_to(out[i], a[i] + b[i]));
     }
 
+    /* Reusing a compiled Metal graph must restage CPU-backed leaves when their
+     * host storage changes. This catches stale shadow-buffer bugs in dirty
+     * staging. */
+    for (i = 0; i < 6; ++i) {
+        a[i] = (float)(100 + i);
+    }
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, ta, a, sizeof(a)));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tc, out, sizeof(out)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(close_to(out[i], a[i] + b[i]));
+    }
+
     gd_tensor_release(tc);
     CHECK_OK(gd_graph_destroy(g));
     gd_tensor_release(ta);

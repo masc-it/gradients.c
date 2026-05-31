@@ -139,7 +139,7 @@ layout/fusion, but each task must improve or clarify GPU_SAFE independently.
 - [x] P2 — Honest benchmark/release build target
 - [x] P3 — Device-resident parameters and optimizer state
 - [ ] P4 — Lazy writeback: download only on explicit CPU read/sync need
-- [ ] P5 — Dirty-tracked staging: upload only changed host leaves
+- [x] P5 — Dirty-tracked staging: upload only changed host leaves
 - [x] P6 — Async run boundary: remove unconditional post-run wait where safe
 - [x] P7 — Zero-copy reshape/copy aliasing for metadata-only copies
 - [ ] P8 — Precomputed Metal executable encode plan
@@ -548,7 +548,7 @@ _To fill when done: numbers, choices, learnings, validation._
 
 ## P5 — Dirty-tracked staging: upload only changed host leaves
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Intent
 Stop uploading all external leaves before every Metal run.
@@ -581,7 +581,42 @@ Rules:
 - Profile reports staged leaf count/bytes near zero after warmup except changed inputs.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Completed for CPU-backed Metal shadow buffers.
+
+Numbers:
+- Device-resident GPT path remains at `stage_leaves items=0 bytes=0`, as in P3.
+- `GD_PROFILE=summary GD_PROFILE_BACKEND=metal ./build/tests/test_metal` reports
+  small staged footprint across the Metal test suite: `stage_leaves count=16
+  items=53 bytes=1348 ms≈0.007`, with repeated CPU-backed graph reuse covered by
+  a test update.
+
+Choices:
+- Added a per-storage version counter that increments on successful
+  `gd_storage_copy_from_cpu` (host/API writes).
+- Metal executable values remember `staged_version`; CPU-backed leaves are
+  uploaded only when their source storage version changed or they have never
+  been staged.
+- Metal now identifies CPU-backed external values that actually need writeback:
+  node outputs bound with `emit_to`, plus known in-place mutators
+  (`step_inc`, `adamw_step` param/m/v). Read-only CPU leaves are no longer
+  written back just because they are external.
+- If no CPU leaf changed, Metal skips pre-run synchronization and queues the next
+  command buffer, preserving Metal's command-buffer coherency rule because no CPU
+  mutation of shadow buffers occurs.
+
+Learnings:
+- Dirty staging matters mainly for CPU-backed graphs and mixed debug workflows;
+  the optimized GPT path is now fully device-resident, so it naturally stages
+  nothing per step.
+- Precise writeback targeting is required before version-based staging is useful;
+  writing back read-only leaves would bump their versions and force useless
+  re-uploads.
+
+Validation:
+- Added `test_metal_add_direct` coverage for reusing a compiled Metal graph after
+  changing a CPU-backed input tensor; output reflects the new host data.
+- `GD_PROFILE=summary GD_PROFILE_BACKEND=metal ./build/tests/test_metal`
+- `make check`
 
 ---
 

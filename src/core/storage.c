@@ -13,6 +13,7 @@ struct gd_storage {
     gd_storage_desc desc;
     _gd_backend *backend;
     void *handle;
+    uint64_t version; /* increments when host/API writes replace storage bytes */
 };
 
 static void *storage_host_ptr(const gd_storage *storage)
@@ -160,6 +161,9 @@ gd_status gd_storage_copy_from_cpu(gd_context *ctx,
         uint64_t start = _gd_profile_enabled(ctx) ? _gd_profile_now_ns() : 0U;
         gd_status status = dst->backend->vt->upload(dst->backend, dst->handle, dst_offset,
                                                     src, nbytes);
+        if (status == GD_OK) {
+            dst->version += 1U;
+        }
         if (start != 0U) {
             _gd_profile_record_upload(ctx, dst->backend, _gd_profile_now_ns() - start, nbytes);
         }
@@ -227,6 +231,11 @@ const void *_gd_storage_data(const gd_storage *storage)
 size_t _gd_storage_nbytes(const gd_storage *storage)
 {
     return storage == NULL ? 0U : storage->desc.nbytes;
+}
+
+uint64_t _gd_storage_version(const gd_storage *storage)
+{
+    return storage == NULL ? 0U : storage->version;
 }
 
 const gd_storage_desc *_gd_storage_desc(const gd_storage *storage)

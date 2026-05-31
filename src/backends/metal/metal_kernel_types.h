@@ -26,17 +26,6 @@
 #define GD_METAL_GEMM_TM 4
 #define GD_METAL_GEMM_TN 4
 
-/* simdgroup_matrix (matrix-unit) GEMM. One threadgroup computes a 64x64 output
- * block with 4 simdgroups in a 2x2 grid; each simdgroup owns a 32x32 sub-block
- * as a 4x4 array of 8x8 accumulator fragments. K is streamed in 8-deep tiles
- * staged in threadgroup memory (transpose normalized during the copy), results
- * stored to a threadgroup tile then bounds-copied out. Threads per group = 128
- * (4 simdgroups x 32 lanes). Requires Apple GPU family 7+ (M1+). */
-#define GD_METAL_GEMM_SIMD_BM 64
-#define GD_METAL_GEMM_SIMD_BN 64
-#define GD_METAL_GEMM_SIMD_BK 8
-#define GD_METAL_GEMM_SIMD_THREADS 128
-
 /* FlashAttention-style tiled SDPA forward: query-block (threads per group), key
  * tile (staged in threadgroup memory), and the max head_dim the tiled kernel
  * supports. The host falls back to the reference SDPA kernel when

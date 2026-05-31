@@ -228,7 +228,9 @@ When marking a phase done, record in this doc:
 | baseline | B=4 T=256 step | scalar tiled | ~164 (step) | GEMM ~206ms of ~500ms (~41%) |
 | T1 | B=4 T=256 step | 64×64 reg-blocked | ~201 (step) | matmul 148->81ms, linear 57->38ms; 2065->2511 tok/s |
 | T1 | B=4 T=1024 step | 64×64 reg-blocked | ~136 (step) | matmul 558->248ms (2.25×), linear 196->102ms (1.92×) |
-| T3 | B=4 T=256 matmul | simdgroup_matrix (fp32) | — | 408ms vs 82ms reg-blocked — 3–5× slower, gated off (§8.1) |
+| T3 | 2048³ square | fp32 reg-blocked | ~1250 | ideal-case ceiling of shipping kernel |
+| T3 | 2048³ square | fp32 simdgroup | ~283 | 4–5× slower (§8.1) |
+| T3 | 2048³ square | bf16 simdgroup | ~100 | slowest — no native bf16 matrix accel on M1 (§8.1); removed |
 
 (Fill as T2/T4 land.)
 
@@ -277,43 +279,45 @@ Learnings / choices:
 
 ---
 
-## 8.1 T3 finding — simdgroup_matrix is not competitive for fp32
+## 8.1 T3 finding — simdgroup_matrix loses to register blocking on M1 Pro (fp32 *and* bf16)
 
-Implemented `gd_matmul_simd` / `gd_linear_simd`: 64×64 block per threadgroup, 4
-simdgroups (2×2) each owning a 4×4 grid of 8×8 `simdgroup_float8x8` accumulator
-fragments, K streamed in 8-deep tiles (transpose/batch normalized during
-staging). Parity-correct (CPU↔Metal 1e-4, GPT train), but measured **3–5× slower
-than the register-blocked kernel** on M-series:
+Implemented `gd_matmul_simd` / `gd_linear_simd` (64×64 block, 4 simdgroups 2×2,
+4×4 grid of 8×8 fragments) and integrated them parity-correctly. In the model
+bench they ran 3–5× slower than register-blocked; a standalone square-GEMM probe
+(`gemm_bf16.metal` + `gemm_bench.m`) with retuned `BK=32` made the verdict
+decisive on **M1 Pro**:
 
 ```text
-matmul gpu_ms (B=4, 6 layers, GD_PROFILE=trace):
-  T       reg-blocked (T1)   simdgroup (T3)
-  256     82                 ~408
-  1024    248                ~1870
+GFLOP/s, square GEMM (ideal, all-interior):
+  size            1024    2048    4096
+  fp32 reg-blocked ~1220   ~1250   ~1290   <- shipping kernel (~25% of ~5 TFLOP/s peak)
+  fp32 simdgroup    ~235    ~283    ~298   <- 4-5x slower
+  bf16 simdgroup    ~105    ~100     ~91   <- slowest of all
 ```
 
-Iteration ruled out the obvious host-side culprits:
-- **Output staging**: tried (a) full 64×64 threadgroup tile, (b) per-simdgroup
-  8×8 staged copy, (c) direct device `simdgroup_store` for interior blocks. All
-  ~the same (~408 ms at T=256) → the store is **not** the bottleneck.
-- **Occupancy**: the direct-store path uses only As/Bs (~4 KB threadgroup), so
-  occupancy is high, yet no improvement.
+Findings:
+- The register-blocked `float4` kernel hits ~1.25 TFLOP/s and **dominates**.
+- `simdgroup_matrix` is 4–5× slower even retuned. Store strategy was ruled out
+  (full tile / per-frag staged / direct device store all equal) — the
+  `simdgroup_multiply_accumulate` itself is the limiter.
+- **bf16 simdgroup is *slower* than fp32 simdgroup**, which strongly indicates
+  **M1 Pro has no native bf16 matrix-unit acceleration** (the bf16 MMA is
+  emulated). So bf16 does not redeem the matrix path on this hardware.
 
-That leaves the `simdgroup_multiply_accumulate` itself: on Apple GPUs the matrix
-units are built for fp16/bf16, and **fp32 matrix-multiply runs at a fraction of
-the fp32 vector-ALU rate**. The register-blocked `float4` kernel already saturates
-fp32 FMA throughput, so the matrix path cannot win in fp32.
+Decision: **removed** `gd_matmul_simd` / `gd_linear_simd`, the `GD_METAL_GEMM_SIMD`
+gate, and the dispatch plumbing. They added maintenance surface for zero (or
+negative) value on the target GPU; the implementation and the bench live in git
+history. The shipping fp32 GEMM is the register-blocked kernel (T1).
 
-Decision: keep the kernels behind `GD_METAL_GEMM_SIMD=1` (opt-in, default off so
-there is no regression) as a validated foundation for a future mixed-precision
-(fp16/bf16) path — that is where `simdgroup_matrix` pays off. The shipping fp32
-GEMM remains the register-blocked kernel (T1).
-
-Learning: `simdgroup_matrix` is a precision-gated optimization, not a free GEMM
-speedup. Revisit T3 only alongside an fp16/bf16 compute path; for fp32 the
-remaining headroom is in the register-blocked kernel (bigger micro-tiles, deeper
-K-unroll) or Option B (MPS, which internally selects precision-appropriate
-kernels).
+Learnings:
+- On Apple M1-class GPUs a well-vectorized `float4` register-blocked kernel beats
+  `simdgroup_matrix` for fp32 by a wide margin; the matrix path is not a free win.
+- The bf16 matrix-unit GEMM speedup (the main premise for adopting bf16) **does
+  not exist on M1 Pro**. bf16's durable benefit here is *memory bandwidth*
+  (attention + the elementwise tail), which is hardware-independent and needs no
+  matrix units — not GEMM acceleration. Revisit matrix-unit GEMM only on M3/M4,
+  which improved low-precision matrix throughput; otherwise prefer Option B (MPS)
+  if a faster GEMM is needed.
 
 ## 9. Risks
 

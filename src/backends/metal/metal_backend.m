@@ -102,6 +102,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
+    "gd_cross_entropy_reduce",
 };
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
@@ -784,7 +785,27 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
-            if (op == _GD_OP_SDPA) {
+            if (op == _GD_OP_CROSS_ENTROPY) {
+                const gd_tensor_desc *logits = &graph->values[node->inputs[0]].desc;
+                int dim = node->attrs.dim;
+                int64_t positions = 0;
+                if (dim < 0) {
+                    dim += logits->ndim;
+                }
+                if (dim >= 0 && dim < logits->ndim && logits->sizes[dim] > 0) {
+                    positions = desc_numel(logits) / logits->sizes[dim];
+                }
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_cross_entropy_reduce");
+                if (positions > 0) {
+                    gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index},
+                                             GD_MEM_UNIFIED,
+                                             (size_t)positions * sizeof(float), sizeof(float)};
+                    status = gd_storage_create(graph->ctx, &sdesc, &exe->node_scratch[j]);
+                    if (status != GD_OK) {
+                        goto fail;
+                    }
+                }
+            } else if (op == _GD_OP_SDPA) {
                 /* Long-context forward uses split-K: scratch holds per-split
                  * partial (acc[Dh], m, l) for each (b, hq, query). Only allocated
                  * when the tiled path is eligible (Dh <= DHT) and >1 split. */
@@ -1245,6 +1266,8 @@ static void encode_rms_norm(id<MTLComputeCommandEncoder> enc,
 
 static gd_status encode_cross_entropy(id<MTLComputeCommandEncoder> enc,
                                       id<MTLComputePipelineState> pso,
+                                      id<MTLComputePipelineState> reduce_pso,
+                                      id<MTLBuffer> scratch,
                                       _gd_executable *exe,
                                       const _gd_node *node)
 {
@@ -1259,23 +1282,44 @@ static gd_status encode_cross_entropy(id<MTLComputeCommandEncoder> enc,
     split_around_dim(logits, node->attrs.dim, &p.outer, &dummy, &p.inner);
     p.classes = (int)logits->sizes[node->attrs.dim];
     p.positions = p.outer * p.inner;
+    if (reduce_pso == nil || scratch == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal cross_entropy scratch/pipeline missing");
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
-    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBuffer:scratch offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    /* Single threadgroup reduction over positions (see gd_cross_entropy). The
-     * kernel's threadgroup `partial` array is sized GD_CE_TG, so clamp here. */
     {
         NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-        if (tg > 256) {
-            tg = 256;
+        NSUInteger w = 256;
+        if (tg < w) {
+            w = 1;
+            while ((w << 1) <= tg) {
+                w <<= 1;
+            }
         }
-        if (tg == 0) {
-            tg = 1;
+        if (p.positions > 0) {
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.positions, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+        }
+    }
+
+    [enc setComputePipelineState:reduce_pso];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    {
+        NSUInteger tg = reduce_pso.maxTotalThreadsPerThreadgroup;
+        NSUInteger w = 256;
+        if (tg < w) {
+            w = 1;
+            while ((w << 1) <= tg) {
+                w <<= 1;
+            }
         }
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
     }
     return GD_OK;
 }
@@ -1364,8 +1408,19 @@ static gd_status encode_cross_entropy_bwd(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[2]) offset:0 atIndex:2];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
+    /* One threadgroup per position; threads cooperate over the class dim (see
+     * gd_cross_entropy_bwd). Power-of-two threadgroup width for the reductions. */
     if (p.outer * p.inner > 0) {
-        dispatch_1d(enc, pso, (NSUInteger)(p.outer * p.inner));
+        NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+        NSUInteger w = 256;
+        if (tg < w) {
+            w = 1;
+            while ((w << 1) <= tg) {
+                w <<= 1;
+            }
+        }
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(p.outer * p.inner), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
     }
     return GD_OK;
 }
@@ -1986,7 +2041,7 @@ static gd_status encode_node(_gd_backend *self,
         encode_rms_norm(enc, pso, exe, node);
         return GD_OK;
     case _GD_OP_CROSS_ENTROPY:
-        return encode_cross_entropy(enc, pso, exe, node);
+        return encode_cross_entropy(enc, pso, pso2, scratch, exe, node);
     case _GD_OP_RELU_BWD:
     case _GD_OP_SILU_BWD:
         encode_unary_bwd(enc, pso, exe, node);

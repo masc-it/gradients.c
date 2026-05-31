@@ -985,6 +985,41 @@ Deferred (not hot on current workloads, tracked as their own phases):
   reference recompute and belongs to the deferred FlashAttention-2 backward
   (plan_gpt G3+), not this GPU_SAFE batch.
 
+### 2026-05-31 revisit: CE occupancy fix (GPU_SAFE)
+
+The first CE upgrade removed the worst single-thread cliff but left two GPT-scale
+occupancy problems:
+- `cross_entropy` forward was still **one threadgroup total** (≤256 threads)
+  looping over all positions and classes.
+- `cross_entropy_bwd` was **one thread per token**, each serially scanning
+  `V=8000` three times (max, sum, write). The measured 32 ms was mostly serial
+  softmax work, not the `dlogits` write bandwidth.
+
+Implemented safer kernel parallelism before attempting cut-CE fusion:
+- `gd_cross_entropy_bwd`: one threadgroup per position; threads cooperate over
+  classes for row max/sum reductions, then each thread writes a strided class
+  slice. Same math, one op/dispatch, CPU_REF remains oracle.
+- `gd_cross_entropy`: pass 1 one threadgroup per position writes per-position
+  losses to per-node scratch; pass 2 (`gd_cross_entropy_reduce`) reduces scratch
+  to the scalar mean. Same op semantics, still GPU_SAFE at the IR level.
+
+Numbers (M1 Pro, GPT bench, B=4,T=256,6L, fresh metallib + rebuilt bench):
+```text
+before CE revisit (post F1): cross_entropy 17.5 ms, cross_entropy_bwd ~32 ms,
+                             step ~408 ms, ~2509 tok/s
+after bwd only:              cross_entropy 17.5 ms, cross_entropy_bwd 1.56 ms,
+                             step 376.6 ms, 2719 tok/s
+after fwd+bwd:               cross_entropy 0.54 ms, cross_entropy_bwd 1.39 ms,
+                             step 358.7 ms, 2855 tok/s
+```
+User workload (B=8,T=512,6L): best step **1905 ms -> 1693 ms**, tokens/s
+**2150 -> 2420** (~12.6% faster).
+
+Validation: `make check` green, GPT train parity green, `test_metal_gpt` ASan
+clean. Learning: the CE tail was under-parallelization/occupancy, not primarily
+materialization bandwidth; this makes cut-cross-entropy fusion lower priority
+until profiling shows CE is still hot after the safe kernel fix.
+
 Validation:
 - `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)
 - `GD_PROFILE=trace ... make gpt-bench` per-op attribution before/after

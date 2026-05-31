@@ -138,8 +138,11 @@ no-op on correctness and perf before any kernel exists.
 
 Agreed order was **M1 → F2a → F2b** after the landed F0/F1. **M1 was
 premise-checked and deferred** (marginal at d_model=320 — GEMMs already saturate;
-weight-concat doesn't cut DRAM input reads; see below), so the active order is
-**F2a → F2b**. F2a de-risks the tiled GEMM+softmax kernel that F2b reuses.
+weight-concat doesn't cut DRAM input reads; see below). **F2 was then
+re-prioritized** after the CE GPU_SAFE occupancy fix made CE cheap
+(`cross_entropy` 0.54 ms, `cross_entropy_bwd` 1.39 ms at T=256). Active next
+fusion work should be chosen from a fresh post-CE profile, not the stale CE-tail
+assumption.
 
 - [x] F0 — **Fusion infrastructure (identity pass).** Landed the executable
   plumbing: `_gd_executable.node_absorbed` (per-node skip flag, calloc'd/freed),
@@ -184,17 +187,23 @@ weight-concat doesn't cut DRAM input reads; see below), so the active order is
   at this bench's d=320 where GEMMs already saturate. Revisit when targeting a
   larger model; not worth the slice-op + copy machinery now.
 - [ ] F2 — **`matmul`/`linear`→`cross_entropy`** (LM head). Investigated; scope is
-  bigger than first framed (it is a cut-cross-entropy kernel). Key findings:
+  bigger than first framed (it is a cut-cross-entropy kernel). **2026-05-31
+  update:** the CE tail turned out to be mostly under-parallelized GPU_SAFE
+  kernels, not logits/`dlogits` materialization bandwidth. A CE occupancy fix
+  landed in the foundations track (`cross_entropy` 17.5 -> 0.54 ms,
+  `cross_entropy_bwd` ~32 -> 1.39 ms; T=256 step 408 -> 358.7 ms). Therefore
+  F2 is lower priority until a fresh profile shows CE still hot. Key findings:
   - The logits claim "forward-only" is **false in training**: `logits` is
     consumed by both `cross_entropy` (fwd) **and** `cross_entropy_bwd` (which
     recomputes softmax). So a forward-only fusion is illegal in a training graph
     (the legality gate refuses; it would only fire for eval/inference graphs).
-  - The real training win is eliminating **`dlogits[N,V]`** in the backward
-    (~32 ms at T=256; ~131 MB / much larger at T=512,B=8). That needs the head
-    grad matmuls (`d_normed = dlogits@wte`, `d_wte = dlogits^T@normed`) to
-    **recompute `dlogits` in-tile** from materialized `logits` + per-row softmax
-    stats — i.e. a cut-cross-entropy backward. `d_wte` is the hard part
-    (cross-token reduction; can't drop `dlogits` without a tiled recompute GEMM).
+  - Before the CE occupancy fix, `cross_entropy_bwd` looked like a ~32 ms
+    `dlogits[N,V]` materialization problem. After parallelizing row softmax, it is
+    ~1.4 ms. The materialization itself is **not** the dominant cost at this
+    size; cut-CE should only be revisited after fresh profiles justify it. If it
+    is revisited, the head grad matmuls (`d_normed = dlogits@wte`,
+    `d_wte = dlogits^T@normed`) must recompute `dlogits` in-tile from logits +
+    softmax stats; `d_wte` remains the hard cross-token reduction.
   - A naive row-oriented fused forward (one threadgroup/row, GEMV + online
     softmax) would **regress** the forward, because it discards the efficient
     tiled reg-blocked GEMM. A non-regressing fused forward must itself be tiled.
@@ -241,9 +250,12 @@ fusion fired).
 | Phase | T | tail ms | dispatches | step (real) | tokens/s | Notes |
 |---|---:|---:|---:|---:|---:|---|
 | baseline | 256 | ~180 | ~500 | 408 ms | 2510 | post GEMM+attention work |
-| baseline | 1024 | ~190 | ~500 | 2965 ms | 1381 | |
+| F1 SwiGLU | 256 | ~178 | -6 | 408 ms | 2509 | perf-neutral; fusion infra proven |
+| GPU_SAFE CE revisit | 256 | CE 49.5 -> 1.9 | +1 dispatch | 358.7 ms | 2855 | outside fusion; CE occupancy fix |
+| GPU_SAFE CE revisit | 512 | n/a | +1 dispatch | 1693 ms | 2420 | B=8 user workload; best step |
+| baseline | 1024 | ~190 | ~500 | 2965 ms | 1381 | pre-CE revisit |
 
-(Fill as F0–F4 land.)
+(Fill as F2+ land; refresh baselines after GPU_SAFE CE revisit.)
 
 ---
 

@@ -599,36 +599,71 @@ kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
  * threadgroup reduction produces the mean. Targets are int32; class index is
  * assumed valid (matches a validated graph). */
 #define GD_CE_TG 256
+/* Pass 1: one threadgroup per position, threads cooperate over classes and
+ * write an unnormalized per-position loss. Pass 2 reduces losses to the scalar
+ * mean (gd_cross_entropy_reduce). */
 kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
                              device const int *targets       [[buffer(1)]],
-                             device float *out               [[buffer(2)]],
+                             device float *losses            [[buffer(2)]],
                              constant gd_metal_ce_params &p   [[buffer(3)]],
+                             uint gid  [[threadgroup_position_in_grid]],
                              uint tid  [[thread_index_in_threadgroup]],
                              uint tgsz [[threads_per_threadgroup]])
 {
+    threadgroup float red[GD_CE_TG];
+    int total = p.outer * p.inner;
+    int pos = (int)gid;
+    if (pos >= total) {
+        return;
+    }
+    int o = pos / p.inner;
+    int in = pos % p.inner;
+    int target = targets[pos];
+
+    float lmax = -INFINITY;
+    for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
+        lmax = max(lmax, logits[(o * p.classes + c) * p.inner + in]);
+    }
+    red[tid] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsz / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maxv = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float lsum = 0.0f;
+    for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
+        lsum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
+    }
+    red[tid] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsz / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float logit_t = logits[(o * p.classes + target) * p.inner + in];
+        losses[pos] = -(logit_t - maxv - log(red[0]));
+    }
+}
+
+kernel void gd_cross_entropy_reduce(device const float *losses           [[buffer(0)]],
+                                    device float *out                    [[buffer(1)]],
+                                    constant gd_metal_ce_params &p        [[buffer(2)]],
+                                    uint tid  [[thread_index_in_threadgroup]],
+                                    uint tgsz [[threads_per_threadgroup]])
+{
     threadgroup float partial[GD_CE_TG];
     float local = 0.0f;
-    int total = p.outer * p.inner;
-
-    for (int pos = (int)tid; pos < total; pos += (int)tgsz) {
-        int o = pos / p.inner;
-        int in = pos % p.inner;
-        int target = targets[pos];
-        float maxv = -INFINITY;
-        for (int c = 0; c < p.classes; ++c) {
-            float v = logits[(o * p.classes + c) * p.inner + in];
-            if (v > maxv) {
-                maxv = v;
-            }
-        }
-        float sum = 0.0f;
-        for (int c = 0; c < p.classes; ++c) {
-            sum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
-        }
-        float logit_t = logits[(o * p.classes + target) * p.inner + in];
-        local += -(logit_t - maxv - log(sum));
+    for (int pos = (int)tid; pos < p.positions; pos += (int)tgsz) {
+        local += losses[pos];
     }
-
     partial[tid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tgsz / 2; stride > 0; stride >>= 1) {
@@ -714,35 +749,62 @@ kernel void gd_sum_bwd(device const float *go              [[buffer(0)]],
     }
 }
 
-/* dlogits = (go_scalar/positions) * (softmax - onehot); one thread per position. */
+/* dlogits = (go_scalar/positions) * (softmax - onehot).
+ * One threadgroup per position; the GD_CE_TG threads cooperate over the class
+ * dimension (two threadgroup reductions: row max, then sum-exp), then each
+ * thread writes its slice of `dlogits`. Replaces the prior one-thread-per-token
+ * scan, which serialized the V-length softmax on a single thread and left the
+ * GPU badly under-occupied. Math is identical (fp32). */
 kernel void gd_cross_entropy_bwd(device const float *logits     [[buffer(0)]],
                                  device const int *targets      [[buffer(1)]],
                                  device const float *go_scalar  [[buffer(2)]],
                                  device float *dlogits          [[buffer(3)]],
                                  constant gd_metal_ce_params &p  [[buffer(4)]],
-                                 uint gid                       [[thread_position_in_grid]])
+                                 uint gid  [[threadgroup_position_in_grid]],
+                                 uint tid  [[thread_index_in_threadgroup]],
+                                 uint tgsz [[threads_per_threadgroup]])
 {
+    threadgroup float red[GD_CE_TG];
     int total = p.outer * p.inner;
-    if ((int)gid >= total) {
+    int pos = (int)gid;
+    if (pos >= total) {
         return;
     }
-    int o = (int)gid / p.inner;
-    int in = (int)gid % p.inner;
-    int pos = o * p.inner + in;
+    int o = pos / p.inner;
+    int in = pos % p.inner;
     int target = targets[pos];
     float scale = go_scalar[0] / (float)p.positions;
-    float maxv = -INFINITY;
-    for (int c = 0; c < p.classes; ++c) {
-        float v = logits[(o * p.classes + c) * p.inner + in];
-        if (v > maxv) {
-            maxv = v;
+
+    float lmax = -INFINITY;
+    for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
+        lmax = max(lmax, logits[(o * p.classes + c) * p.inner + in]);
+    }
+    red[tid] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsz / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float sum = 0.0f;
-    for (int c = 0; c < p.classes; ++c) {
-        sum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
+    float maxv = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float lsum = 0.0f;
+    for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
+        lsum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
     }
-    for (int c = 0; c < p.classes; ++c) {
+    red[tid] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsz / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum = red[0];
+
+    for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
         float pc = exp(logits[(o * p.classes + c) * p.inner + in] - maxv) / sum;
         float onehot = (c == target) ? 1.0f : 0.0f;
         dlogits[(o * p.classes + c) * p.inner + in] = scale * (pc - onehot);

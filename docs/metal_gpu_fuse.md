@@ -135,10 +135,16 @@ no-op on correctness and perf before any kernel exists.
 
 ## 5. Phases
 
-- [ ] F0 — **Fusion infrastructure** (§4 items 1–4, 6, 8–9) as an identity pass:
-  consumers map, legality predicate scaffold, `node_absorbed`/`node_fused_kind`
-  in the executable, step-aware `execute`, and the parity + fusion-fired test
-  harness. No patterns yet → must not change any result or timing.
+- [x] F0 — **Fusion infrastructure (identity pass).** Landed the executable
+  plumbing: `_gd_executable.node_absorbed` (per-node skip flag, calloc'd/freed),
+  the `metal_plan_fusions(self, graph, exe)` hook called at end of `compile`
+  (no patterns yet → leaves `node_absorbed` all-zero), and the skip check
+  (`if (node_absorbed[i]) continue;`) in **both** execute paths (normal and the
+  `GD_PROFILE=trace` per-node path). Validated: `make check` green, ASan-clean,
+  T=256 step 408 ms / 2499 tok/s unchanged — a true no-op, as required.
+  Deferred to the first pattern (F1): the consumers map, the legality predicate,
+  `node_fused_kind` + the fused-encode dispatch branch, and the fusion-fired
+  assertion (nothing to observe until a pattern exists).
 - [ ] F1 — **First kernel: SwiGLU `silu`+`mul`** (infra shakedown, small kernel).
   `act=silu(gate)` is single-consumer (`mul`); fuse forward into one kernel
   `hh = silu(gate)·up`. Backward needs `silu(gate)` and `up` → **recompute

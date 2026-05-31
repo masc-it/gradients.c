@@ -198,6 +198,10 @@ struct _gd_executable {
     void **node_pso2;  /* secondary pipeline (e.g. sdpa_bwd dkv), or NULL */
     void **node_pso3;  /* tertiary pipeline (e.g. sdpa_bwd stats), or NULL */
     gd_storage **node_scratch; /* per-node device scratch (e.g. sdpa_bwd stats), or NULL */
+    /* Fusion plan (GPU_FUSED, Option A): a node marked absorbed is encoded by its
+     * group head, so execute skips it. Set by metal_plan_fusions at compile;
+     * all-zero means no fusion (the identity plan). */
+    uint8_t *node_absorbed;
 };
 
 /* ---- Helpers ------------------------------------------------------------- */
@@ -449,6 +453,7 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe->node_pso);
     free(exe->node_pso2);
     free(exe->node_pso3);
+    free(exe->node_absorbed);
     if (exe->node_scratch != NULL) {
         for (i = 0; i < exe->n_plan; ++i) {
             gd_storage_release(exe->node_scratch[i]);
@@ -575,6 +580,22 @@ static gd_status alias_copy_values(_gd_executable *exe)
     return GD_OK;
 }
 
+/* Fusion planner (GPU_FUSED, Option A). Recognizes fusible node groups in the
+ * (op-granular, shared) IR and marks absorbed nodes so `execute` skips them,
+ * binding each group head to a fused kernel. CPU_REF still runs the unfused
+ * nodes as the oracle; parity holds at group boundaries.
+ *
+ * Phase F0 ships this hook with NO patterns: node_absorbed stays all-zero, so
+ * the executable runs every node exactly as the unfused plan (identity pass).
+ * Patterns are added incrementally; see docs/metal_gpu_fuse.md. */
+static void metal_plan_fusions(_gd_backend *self, const gd_graph *graph,
+                               _gd_executable *exe)
+{
+    (void)self;
+    (void)graph;
+    (void)exe;
+}
+
 static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable **out)
 {
     gd_status status = GD_OK;
@@ -653,8 +674,9 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
         exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
         exe->node_pso3 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso3));
         exe->node_scratch = calloc((size_t)graph->n_nodes, sizeof(*exe->node_scratch));
+        exe->node_absorbed = calloc((size_t)graph->n_nodes, sizeof(*exe->node_absorbed));
         if (exe->node_pso == NULL || exe->node_pso2 == NULL || exe->node_pso3 == NULL ||
-            exe->node_scratch == NULL) {
+            exe->node_scratch == NULL || exe->node_absorbed == NULL) {
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
             goto fail;
         }
@@ -717,6 +739,7 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                 }
             }
         }
+        metal_plan_fusions(self, graph, exe);
     }
 
     *out = exe;
@@ -1926,8 +1949,13 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
         }
         for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
             const _gd_node *node = &exe->graph->nodes[i];
-            id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
-            id<MTLComputePipelineState> pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
+            id<MTLComputePipelineState> pso;
+            id<MTLComputePipelineState> pso2;
+            if (exe->node_absorbed[i]) {
+                continue; /* encoded by its fusion group head */
+            }
+            pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
+            pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
             id<MTLComputePipelineState> pso3 = (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
             id<MTLBuffer> scratch = exe->node_scratch[i] != NULL
                 ? (__bridge id<MTLBuffer>)_gd_storage_handle(exe->node_scratch[i]) : nil;
@@ -1964,8 +1992,11 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
-                id<MTLComputePipelineState> pso =
-                    (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
+                id<MTLComputePipelineState> pso;
+                if (exe->node_absorbed[i]) {
+                    continue; /* encoded by its fusion group head */
+                }
+                pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
                 id<MTLComputePipelineState> pso2 =
                     (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
                 id<MTLComputePipelineState> pso3 =

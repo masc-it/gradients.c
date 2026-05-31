@@ -57,6 +57,13 @@ typedef struct _gd_backend_vtable {
 
     /* Ordering (P4). */
     gd_status (*synchronize)(_gd_backend *self);
+
+    /* Lazy writeback (P4): flush any pending device->host writeback associated
+     * with `cookie` (an opaque backend handle, e.g. a compiled executable),
+     * making the affected host-visible storages current. Invoked by the core
+     * when a host read hits a storage the backend marked pending. Nullable for
+     * backends that never defer writeback (e.g. CPU_REF). */
+    gd_status (*flush_pending)(_gd_backend *self, void *cookie);
 } _gd_backend_vtable;
 
 struct _gd_backend {

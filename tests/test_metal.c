@@ -642,6 +642,63 @@ static int test_metal_adamw(gd_context *ctx)
     return 0;
 }
 
+/* P4 lazy writeback: a CPU-backed param updated in place on Metal across many
+ * runs with NO intermediate reads must equal the reference, and the single
+ * read-back at the end must observe all updates (deferred writeback flushed on
+ * read). Pre-P4 this path waited + wrote back every step. */
+static int test_metal_lazy_writeback(gd_context *ctx)
+{
+    float pinit[3] = {1.0F, -2.0F, 0.5F};
+    float g[3] = {0.25F, 0.5F, -0.75F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *graph = NULL;
+    float ref_p[3], ref_m[3] = {0, 0, 0}, ref_v[3] = {0, 0, 0};
+    float got[3];
+    const int steps = 25;
+    int step = 0, i = 0;
+    int64_t s3[1] = {3};
+
+    cfg.lr = 0.05F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.0F;
+    memcpy(ref_p, pinit, sizeof(pinit));
+
+    CHECK_OK(make_f32(ctx, 1, s3, pinit, &param));
+    CHECK_OK(gd_tensor_set_requires_grad(param, true));
+    CHECK_OK(gd_adamw_create(ctx, &param, 1, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, METAL));
+
+    /* No reads between steps: writeback must be deferred yet not lost. */
+    for (step = 1; step <= steps; ++step) {
+        CHECK_OK(gd_graph_run(graph));
+        ref_adamw(ref_p, ref_m, ref_v, g, 3, step, cfg.lr, cfg.beta1, cfg.beta2, cfg.eps,
+                  cfg.weight_decay);
+    }
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, got, sizeof(got)));
+    for (i = 0; i < 3; ++i) {
+        CHECK_TRUE(close_to(got[i], ref_p[i]));
+    }
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(param);
+    return 0;
+}
+
 /* Fallback policy at dispatch: assert_finite has no Metal kernel (debug op). */
 static int test_metal_fallback(gd_context *ctx)
 {
@@ -706,6 +763,7 @@ int main(void)
     rc |= test_metal_cross_entropy_parity(ctx);
     rc |= test_metal_backward_parity(ctx);
     rc |= test_metal_adamw(ctx);
+    rc |= test_metal_lazy_writeback(ctx);
     rc |= test_metal_fallback(ctx);
 
     gd_context_destroy(ctx);

@@ -14,7 +14,53 @@ struct gd_storage {
     _gd_backend *backend;
     void *handle;
     uint64_t version; /* increments when host/API writes replace storage bytes */
+    /* Lazy writeback (P4): when another backend has computed newer bytes for this
+     * host storage but has not yet copied them back, it registers itself here.
+     * Host reads resolve the pending flush first. */
+    _gd_backend *pending_backend;
+    void *pending_cookie;
 };
+
+/* Resolve any deferred device->host writeback before a host read. The backend
+ * flush is responsible for copying current bytes into this storage and clearing
+ * its pending marker (and those of sibling storages it covers). */
+static gd_status storage_resolve_pending(gd_storage *storage)
+{
+    _gd_backend *backend = NULL;
+    void *cookie = NULL;
+
+    if (storage == NULL || storage->pending_backend == NULL) {
+        return GD_OK;
+    }
+    backend = storage->pending_backend;
+    cookie = storage->pending_cookie;
+    /* Clear before invoking so a re-entrant read during flush does not recurse;
+     * the backend clears all covered storages too. */
+    storage->pending_backend = NULL;
+    storage->pending_cookie = NULL;
+    if (backend->vt->flush_pending == NULL) {
+        return GD_OK;
+    }
+    return backend->vt->flush_pending(backend, cookie);
+}
+
+void _gd_storage_set_pending_flush(gd_storage *storage, _gd_backend *backend, void *cookie)
+{
+    if (storage == NULL) {
+        return;
+    }
+    storage->pending_backend = backend;
+    storage->pending_cookie = cookie;
+}
+
+void _gd_storage_clear_pending_flush(gd_storage *storage)
+{
+    if (storage == NULL) {
+        return;
+    }
+    storage->pending_backend = NULL;
+    storage->pending_cookie = NULL;
+}
 
 static void *storage_host_ptr(const gd_storage *storage)
 {
@@ -133,6 +179,12 @@ gd_status gd_storage_data_cpu(gd_storage *storage, void **out)
     if (!storage_is_host_accessible(storage)) {
         return _gd_error(GD_ERR_UNSUPPORTED, "storage is not CPU accessible");
     }
+    {
+        gd_status pending = storage_resolve_pending(storage);
+        if (pending != GD_OK) {
+            return pending;
+        }
+    }
     ptr = storage_host_ptr(storage);
     if (ptr == NULL) {
         return _gd_error(GD_ERR_INVALID_STATE, "storage has no host pointer");
@@ -157,6 +209,9 @@ gd_status gd_storage_copy_from_cpu(gd_context *ctx,
     if (dst->backend->vt->upload == NULL) {
         return _gd_error(GD_ERR_UNSUPPORTED, "backend does not implement host upload");
     }
+    /* A host write replaces these bytes, so any deferred device writeback for
+     * this storage is now stale. */
+    _gd_storage_clear_pending_flush(dst);
     {
         uint64_t start = _gd_profile_enabled(ctx) ? _gd_profile_now_ns() : 0U;
         gd_status status = dst->backend->vt->upload(dst->backend, dst->handle, dst_offset,
@@ -185,6 +240,12 @@ gd_status gd_storage_copy_to_cpu(gd_context *ctx,
     }
     if (src->backend->vt->download == NULL) {
         return _gd_error(GD_ERR_UNSUPPORTED, "backend does not implement host download");
+    }
+    {
+        gd_status pending = storage_resolve_pending(src);
+        if (pending != GD_OK) {
+            return pending;
+        }
     }
     {
         uint64_t start = _gd_profile_enabled(ctx) ? _gd_profile_now_ns() : 0U;

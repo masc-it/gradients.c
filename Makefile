@@ -78,7 +78,12 @@ MOBJ := $(patsubst %.m,$(BUILD_DIR)/%.o,$(MSRC))
 OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC)) $(MOBJ)
 DEP := $(OBJ:.o=.d)
 
-TEST_SRC := $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort)
+# gpt_bench is a profiling harness, not a correctness test: exclude it from the
+# auto-discovered test runner (build/run via `make gpt-bench`).
+GPT_BENCH_SRC := $(TEST_DIR)/gpt_bench.c
+GPT_BENCH_BIN := $(BUILD_DIR)/$(TEST_DIR)/gpt_bench
+TEST_SRC := $(filter-out $(GPT_BENCH_SRC),\
+             $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort))
 TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 
 EXAMPLE_SRC := $(shell find $(EXAMPLE_DIR) -type f -name '*.c' 2>/dev/null | sort)
@@ -90,7 +95,7 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt bench-gpt examples docs-check clean list
+.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples docs-check clean list
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -99,7 +104,8 @@ help:
 	@printf '%s\n' '  make check       build, run docs checks, then run tests'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
-	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT benchmark'
+	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
+	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
 	@printf '%s\n' '  make list        show discovered source/test/example files'
@@ -147,6 +153,14 @@ endif
 
 bench-gpt:
 	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' gpt
+
+# Release-built GPT profiling harness. Honors GD_DEVICE and GD_BENCH_* env knobs.
+gpt-bench:
+	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' _gpt_bench_run
+
+_gpt_bench_run: build $(GPT_BENCH_BIN)
+	@printf '[gpt-bench] run %s (GD_DEVICE=%s)\n' '$(GPT_BENCH_BIN)' '$(GD_DEVICE)'
+	@GRADIENTS_METALLIB=$(BUILD_DIR)/gradients.metallib $(GPT_BENCH_BIN)
 
 examples: build $(EXAMPLE_BINS)
 ifeq ($(strip $(EXAMPLE_BINS)),)

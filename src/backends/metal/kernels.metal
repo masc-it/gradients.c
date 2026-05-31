@@ -207,6 +207,121 @@ kernel void gd_linear(device const float *x               [[buffer(0)]],
     out[r * p.out_features + o] = acc;
 }
 
+/* Tiled batched matmul. One threadgroup computes a GD_METAL_GEMM_TILE square
+ * output block for a single batch (grid z = batch index). K is streamed in tiles
+ * through threadgroup memory, so each A/B element is read from device memory
+ * once per tile instead of once per output element. Reproduces the naive
+ * kernel's batch-broadcast and transpose addressing, so it is a drop-in for all
+ * shapes the reference kernel accepted. */
+kernel void gd_matmul_tiled(device const float *a              [[buffer(0)]],
+                            device const float *b              [[buffer(1)]],
+                            device float *out                  [[buffer(2)]],
+                            constant gd_metal_matmul_params &p  [[buffer(3)]],
+                            uint3 tgpos [[threadgroup_position_in_grid]],
+                            uint3 lid   [[thread_position_in_threadgroup]])
+{
+    threadgroup float As[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+    threadgroup float Bs[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+
+    int col = (int)(tgpos.x * GD_METAL_GEMM_TILE + lid.x);
+    int row = (int)(tgpos.y * GD_METAL_GEMM_TILE + lid.y);
+    int batch_lin = (int)tgpos.z;
+
+    int bidx[GD_METAL_MAX_DIMS];
+    int tmp = batch_lin;
+    for (int i = p.batch_ndim - 1; i >= 0; --i) {
+        bidx[i] = tmp % p.out_batch_sizes[i];
+        tmp /= p.out_batch_sizes[i];
+    }
+    int a_base = 0, a_bstride = 1;
+    for (int i = p.a_batch_ndim - 1; i >= 0; --i) {
+        int out_pos = p.batch_ndim - (p.a_batch_ndim - i);
+        int coord = (p.a_batch_sizes[i] == 1) ? 0 : bidx[out_pos];
+        a_base += coord * a_bstride * p.a_mat;
+        a_bstride *= p.a_batch_sizes[i];
+    }
+    int b_base = 0, b_bstride = 1;
+    for (int i = p.b_batch_ndim - 1; i >= 0; --i) {
+        int out_pos = p.batch_ndim - (p.b_batch_ndim - i);
+        int coord = (p.b_batch_sizes[i] == 1) ? 0 : bidx[out_pos];
+        b_base += coord * b_bstride * p.b_mat;
+        b_bstride *= p.b_batch_sizes[i];
+    }
+
+    float acc = 0.0f;
+    int n_tiles = (p.k + GD_METAL_GEMM_TILE - 1) / GD_METAL_GEMM_TILE;
+    for (int t = 0; t < n_tiles; ++t) {
+        int a_k = t * GD_METAL_GEMM_TILE + (int)lid.x;
+        int b_k = t * GD_METAL_GEMM_TILE + (int)lid.y;
+
+        if (row < p.m && a_k < p.k) {
+            int a_off = p.trans_a ? (a_k * p.a_cols + row) : (row * p.a_cols + a_k);
+            As[lid.y][lid.x] = a[a_base + a_off];
+        } else {
+            As[lid.y][lid.x] = 0.0f;
+        }
+        if (col < p.n && b_k < p.k) {
+            int b_off = p.trans_b ? (col * p.b_cols + b_k) : (b_k * p.b_cols + col);
+            Bs[lid.y][lid.x] = b[b_base + b_off];
+        } else {
+            Bs[lid.y][lid.x] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = 0; i < GD_METAL_GEMM_TILE; ++i) {
+            acc += As[lid.y][i] * Bs[i][lid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < p.m && col < p.n) {
+        out[batch_lin * p.out_mat + row * p.n + col] = acc;
+    }
+}
+
+/* Tiled linear: out[r,o] = bias[o] + sum_k x[r,k] * w[...]. Same tiling as the
+ * matmul kernel (M=rows, N=out_features, K=in_features), with the weight layout
+ * selected by trans_w and an optional bias add on store. */
+kernel void gd_linear_tiled(device const float *x               [[buffer(0)]],
+                            device const float *w               [[buffer(1)]],
+                            device const float *bias            [[buffer(2)]],
+                            device float *out                   [[buffer(3)]],
+                            constant gd_metal_linear_params &p   [[buffer(4)]],
+                            uint3 tgpos [[threadgroup_position_in_grid]],
+                            uint3 lid   [[thread_position_in_threadgroup]])
+{
+    threadgroup float Xs[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+    threadgroup float Ws[GD_METAL_GEMM_TILE][GD_METAL_GEMM_TILE];
+
+    int o = (int)(tgpos.x * GD_METAL_GEMM_TILE + lid.x);
+    int r = (int)(tgpos.y * GD_METAL_GEMM_TILE + lid.y);
+
+    float acc = 0.0f;
+    int n_tiles = (p.in_features + GD_METAL_GEMM_TILE - 1) / GD_METAL_GEMM_TILE;
+    for (int t = 0; t < n_tiles; ++t) {
+        int x_k = t * GD_METAL_GEMM_TILE + (int)lid.x;
+        int w_k = t * GD_METAL_GEMM_TILE + (int)lid.y;
+
+        if (r < p.rows && x_k < p.in_features) {
+            Xs[lid.y][lid.x] = x[r * p.in_features + x_k];
+        } else {
+            Xs[lid.y][lid.x] = 0.0f;
+        }
+        if (o < p.out_features && w_k < p.in_features) {
+            int w_off = p.trans_w ? (o * p.in_features + w_k) : (w_k * p.out_features + o);
+            Ws[lid.y][lid.x] = w[w_off];
+        } else {
+            Ws[lid.y][lid.x] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = 0; i < GD_METAL_GEMM_TILE; ++i) {
+            acc += Xs[lid.y][i] * Ws[i][lid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r < p.rows && o < p.out_features) {
+        out[r * p.out_features + o] = (p.has_bias ? bias[o] : 0.0f) + acc;
+    }
+}
+
 /* ---- Reductions ---------------------------------------------------------- */
 
 /* sum/mean over one dim; one thread per output position reduces the d axis. */
@@ -262,114 +377,182 @@ kernel void gd_softmax(device const float *x               [[buffer(0)]],
     }
 }
 
-/* RMSNorm over the last dim; one thread per row. */
+/* Threadgroup size for the RMSNorm-family reductions. Power of two so the
+ * tree reduction is exact; sized to fit the shared partial arrays. */
+#define GD_RMS_TG 256
+
+/* RMSNorm over the last dim; one threadgroup per row, threads cooperatively
+ * reduce sum(x^2) then write the normalized row. */
 kernel void gd_rms_norm(device const float *x               [[buffer(0)]],
                         device const float *weight          [[buffer(1)]],
                         device float *out                   [[buffer(2)]],
                         constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
-                        uint gid                            [[thread_position_in_grid]])
+                        uint tgid  [[threadgroup_position_in_grid]],
+                        uint tid    [[thread_index_in_threadgroup]],
+                        uint tgsz   [[threads_per_threadgroup]])
 {
-    if ((int)gid >= p.rows) {
+    int r = (int)tgid;
+    if (r >= p.rows) {
         return;
     }
-    int r = (int)gid;
-    float sumsq = 0.0f;
-    for (int c = 0; c < p.last; ++c) {
-        float v = x[r * p.last + c];
-        sumsq += v * v;
+    threadgroup float part[GD_RMS_TG];
+    int base = r * p.last;
+    float local = 0.0f;
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
+        float v = x[base + c];
+        local += v * v;
     }
-    float inv = 1.0f / sqrt(sumsq / (float)p.last + p.eps);
-    for (int c = 0; c < p.last; ++c) {
-        out[r * p.last + c] = x[r * p.last + c] * inv * weight[c];
+    part[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsz / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            part[tid] += part[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sqrt(part[0] / (float)p.last + p.eps);
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
+        out[base + c] = x[base + c] * inv * weight[c];
     }
 }
 
-/* RMSNorm backward dx; one thread per row. */
+/* RMSNorm backward dx; one threadgroup per row. Threads cooperatively reduce
+ * both sum(x^2) (for the rms) and A = sum_c go*weight*x in a single pass, then
+ * write dx. */
 kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
                             device const float *weight          [[buffer(1)]],
                             device const float *go              [[buffer(2)]],
                             device float *dx                    [[buffer(3)]],
                             constant gd_metal_rmsnorm_params &p  [[buffer(4)]],
-                            uint gid                            [[thread_position_in_grid]])
+                            uint tgid  [[threadgroup_position_in_grid]],
+                            uint tid    [[thread_index_in_threadgroup]],
+                            uint tgsz   [[threads_per_threadgroup]])
 {
-    if ((int)gid >= p.rows) {
+    int r = (int)tgid;
+    if (r >= p.rows) {
         return;
     }
-    int r = (int)gid;
+    threadgroup float pss[GD_RMS_TG];
+    threadgroup float pa[GD_RMS_TG];
     int base = r * p.last;
-    float sumsq = 0.0f;
-    for (int c = 0; c < p.last; ++c) {
+    float lss = 0.0f;
+    float la = 0.0f;
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
         float v = x[base + c];
-        sumsq += v * v;
+        lss += v * v;
+        la += go[base + c] * weight[c] * v;
     }
-    float inv = 1.0f / sqrt(sumsq / (float)p.last + p.eps);
+    pss[tid] = lss;
+    pa[tid] = la;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsz / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            pss[tid] += pss[tid + stride];
+            pa[tid] += pa[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sqrt(pss[0] / (float)p.last + p.eps);
     float inv3 = inv * inv * inv;
-    float A = 0.0f;
-    for (int c = 0; c < p.last; ++c) {
-        A += go[base + c] * weight[c] * x[base + c];
-    }
-    for (int c = 0; c < p.last; ++c) {
+    float A = pa[0];
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
         dx[base + c] = inv * go[base + c] * weight[c] - x[base + c] * inv3 * A / (float)p.last;
     }
 }
 
-/* RMSNorm backward dweight; one thread per channel, reducing over rows. */
+/* RMSNorm backward dweight = sum_r go[r,c] * x[r,c] * rms_inv[r]. One threadgroup
+ * per channel-tile; the per-row rms_inv is computed cooperatively once per row
+ * tile and cached in threadgroup memory, instead of being recomputed for every
+ * channel (the previous one-thread-per-channel kernel recomputed it `last`
+ * times, which dominated GPT's backward). */
 kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
                              device const float *go              [[buffer(1)]],
                              device float *dweight               [[buffer(2)]],
                              constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
-                             uint gid                            [[thread_position_in_grid]])
+                             uint tgid  [[threadgroup_position_in_grid]],
+                             uint tid    [[thread_index_in_threadgroup]],
+                             uint tgsz   [[threads_per_threadgroup]])
 {
-    if ((int)gid >= p.last) {
-        return;
-    }
-    int c = (int)gid;
+    threadgroup float inv_sh[GD_RMS_TG];
+    int c = (int)(tgid * tgsz + tid);
     float acc = 0.0f;
-    for (int r = 0; r < p.rows; ++r) {
-        int base = r * p.last;
-        float sumsq = 0.0f;
-        for (int cc = 0; cc < p.last; ++cc) {
-            float v = x[base + cc];
-            sumsq += v * v;
+
+    for (int rb = 0; rb < p.rows; rb += GD_RMS_TG) {
+        int tile = p.rows - rb;
+        if (tile > GD_RMS_TG) {
+            tile = GD_RMS_TG;
         }
-        float inv = 1.0f / sqrt(sumsq / (float)p.last + p.eps);
-        acc += go[base + c] * x[base + c] * inv;
+        /* Cooperatively compute rms_inv for the rows in this tile (one row per
+         * thread for tid < tile). */
+        if ((int)tid < tile) {
+            int rbase = (rb + (int)tid) * p.last;
+            float ss = 0.0f;
+            for (int cc = 0; cc < p.last; ++cc) {
+                float v = x[rbase + cc];
+                ss += v * v;
+            }
+            inv_sh[tid] = 1.0f / sqrt(ss / (float)p.last + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (c < p.last) {
+            for (int i = 0; i < tile; ++i) {
+                int rbase = (rb + i) * p.last;
+                acc += go[rbase + c] * x[rbase + c] * inv_sh[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    dweight[c] = acc;
+    if (c < p.last) {
+        dweight[c] = acc;
+    }
 }
 
-/* Mean cross-entropy to a single scalar; naive single-thread reduction (v1).
- * Targets are int32; class index assumed valid (matches a validated graph). */
+/* Mean cross-entropy to a single scalar. One threadgroup: each thread sums the
+ * per-position negative log-likelihood for a strided subset of positions, then a
+ * threadgroup reduction produces the mean. Targets are int32; class index is
+ * assumed valid (matches a validated graph). */
+#define GD_CE_TG 256
 kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
                              device const int *targets       [[buffer(1)]],
                              device float *out               [[buffer(2)]],
                              constant gd_metal_ce_params &p   [[buffer(3)]],
-                             uint gid                        [[thread_position_in_grid]])
+                             uint tid  [[thread_index_in_threadgroup]],
+                             uint tgsz [[threads_per_threadgroup]])
 {
-    if ((int)gid != 0) {
-        return;
-    }
-    float loss = 0.0f;
-    for (int o = 0; o < p.outer; ++o) {
-        for (int in = 0; in < p.inner; ++in) {
-            int pos = o * p.inner + in;
-            int target = targets[pos];
-            float maxv = -INFINITY;
-            for (int c = 0; c < p.classes; ++c) {
-                float v = logits[(o * p.classes + c) * p.inner + in];
-                if (v > maxv) {
-                    maxv = v;
-                }
+    threadgroup float partial[GD_CE_TG];
+    float local = 0.0f;
+    int total = p.outer * p.inner;
+
+    for (int pos = (int)tid; pos < total; pos += (int)tgsz) {
+        int o = pos / p.inner;
+        int in = pos % p.inner;
+        int target = targets[pos];
+        float maxv = -INFINITY;
+        for (int c = 0; c < p.classes; ++c) {
+            float v = logits[(o * p.classes + c) * p.inner + in];
+            if (v > maxv) {
+                maxv = v;
             }
-            float sum = 0.0f;
-            for (int c = 0; c < p.classes; ++c) {
-                sum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
-            }
-            float logit_t = logits[(o * p.classes + target) * p.inner + in];
-            loss += -(logit_t - maxv - log(sum));
         }
+        float sum = 0.0f;
+        for (int c = 0; c < p.classes; ++c) {
+            sum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
+        }
+        float logit_t = logits[(o * p.classes + target) * p.inner + in];
+        local += -(logit_t - maxv - log(sum));
     }
-    out[0] = loss / (float)p.positions;
+
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsz / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[0] = partial[0] / (float)p.positions;
+    }
 }
 
 /* ---- Backward kernels ---------------------------------------------------- */
@@ -479,29 +662,70 @@ kernel void gd_cross_entropy_bwd(device const float *logits     [[buffer(0)]],
     }
 }
 
-/* Sum `go` down into `out` (target shape) following broadcast rules. Naive
- * single-thread scatter-add (matches the CPU accumulation order). */
+/* Sum `go` down into `out` (target shape) following right-aligned broadcast
+ * rules. One thread owns one target element and sums only the `go` positions
+ * that broadcast to it (iterating the reduced dims), so the total work is
+ * O(go_numel) split across target_numel threads instead of a single serial
+ * scan. Both tensors are contiguous. */
 kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
                          device float *out                     [[buffer(1)]],
                          constant gd_metal_reduce_to_params &p  [[buffer(2)]],
                          uint gid                              [[thread_position_in_grid]])
 {
-    if ((int)gid != 0) {
+    int t = (int)gid;
+    if (t >= p.target_numel) {
         return;
     }
-    for (int i = 0; i < p.target_numel; ++i) {
-        out[i] = 0.0f;
-    }
-    for (int i = 0; i < p.go_numel; ++i) {
-        int idx[GD_METAL_MAX_DIMS];
-        int lin = i;
-        for (int k = p.go_ndim - 1; k >= 0; --k) {
-            idx[k] = lin % p.go_sizes[k];
-            lin /= p.go_sizes[k];
+
+    /* Target coordinates (contiguous target). */
+    int tcoord[GD_METAL_MAX_DIMS];
+    int lin = t;
+    for (int k = p.target_ndim - 1; k >= 0; --k) {
+        tcoord[k] = (p.target_sizes[k] > 0) ? (lin % p.target_sizes[k]) : 0;
+        if (p.target_sizes[k] > 0) {
+            lin /= p.target_sizes[k];
         }
-        int off = gd_broadcast_offset(idx, p.go_ndim, p.target_sizes, p.target_ndim);
-        out[off] += go[i];
     }
+
+    /* Contiguous strides for go. */
+    int go_stride[GD_METAL_MAX_DIMS];
+    int s = 1;
+    for (int i = p.go_ndim - 1; i >= 0; --i) {
+        go_stride[i] = s;
+        s *= p.go_sizes[i];
+    }
+
+    /* Partition go dims into fixed (matched to a target coord) and reduced
+     * (extra leading dim, or target dim of size 1 that go broadcasts over). */
+    int reduce_dims[GD_METAL_MAX_DIMS];
+    int n_reduce = 0;
+    int reduce_count = 1;
+    int base = 0;
+    for (int i = 0; i < p.go_ndim; ++i) {
+        int out_pos = p.target_ndim - (p.go_ndim - i);
+        bool reduced = (out_pos < 0) ||
+                       (p.target_sizes[out_pos] == 1 && p.go_sizes[i] > 1);
+        if (reduced) {
+            reduce_dims[n_reduce++] = i;
+            reduce_count *= p.go_sizes[i];
+        } else {
+            int coord = (out_pos < 0 || p.go_sizes[i] == 1) ? 0 : tcoord[out_pos];
+            base += coord * go_stride[i];
+        }
+    }
+
+    float acc = 0.0f;
+    for (int r = 0; r < reduce_count; ++r) {
+        int rem = r;
+        int goff = base;
+        for (int j = n_reduce - 1; j >= 0; --j) {
+            int dim = reduce_dims[j];
+            goff += (rem % p.go_sizes[dim]) * go_stride[dim];
+            rem /= p.go_sizes[dim];
+        }
+        acc += go[goff];
+    }
+    out[t] = acc;
 }
 
 /* ---- Optimizer ----------------------------------------------------------- */
@@ -917,23 +1141,26 @@ kernel void gd_rope(device const float *x                 [[buffer(0)]],
     }
 }
 
-/* Scatter-add backward; naive single-thread (zero then accumulate by id). */
+/* Scatter-add backward. One thread owns one dtable element (v, c) and sums the
+ * gradient rows whose id == v, avoiding atomics and the serial scan. Work per
+ * thread is O(n_ids); total O(vocab*dim*n_ids) spread across vocab*dim threads. */
 kernel void gd_embedding_bwd(device const float *go               [[buffer(0)]],
                              device const int *ids                [[buffer(1)]],
                              device float *dtable                 [[buffer(2)]],
                              constant gd_metal_embedding_params &p [[buffer(3)]],
                              uint gid                            [[thread_position_in_grid]])
 {
-    if ((int)gid != 0) {
+    int idx = (int)gid;
+    if (idx >= p.vocab * p.dim) {
         return;
     }
-    for (int i = 0; i < p.vocab * p.dim; ++i) {
-        dtable[i] = 0.0f;
-    }
+    int v = idx / p.dim;
+    int c = idx % p.dim;
+    float acc = 0.0f;
     for (int row = 0; row < p.n; ++row) {
-        int id = ids[row];
-        for (int c = 0; c < p.dim; ++c) {
-            dtable[id * p.dim + c] += go[row * p.dim + c];
+        if (ids[row] == v) {
+            acc += go[row * p.dim + c];
         }
     }
+    dtable[idx] = acc;
 }

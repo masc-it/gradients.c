@@ -9,6 +9,10 @@
 
 #define GD_METAL_MAX_DIMS 8
 
+/* Threadgroup tile size for the tiled GEMM kernels (matmul/linear). Shared so
+ * the host dispatches matching threadgroup dimensions. */
+#define GD_METAL_GEMM_TILE 16
+
 /* Elementwise binary ops (add/mul) with NumPy-style right-aligned broadcasting.
  * `out_sizes` describes the contiguous output; `a_sizes`/`b_sizes` describe each
  * input's own shape so the shader can reproduce broadcast_offset() from the CPU

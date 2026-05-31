@@ -39,7 +39,10 @@ _gd_backend *_gd_context_backend(const gd_context *ctx, gd_device device);
 gd_status _gd_context_register_backend(gd_context *ctx, const _gd_backend_vtable *vt);
 
 bool _gd_profile_enabled(const gd_context *ctx);
+bool _gd_profile_trace_enabled(const gd_context *ctx);
 uint64_t _gd_profile_now_ns(void);
+void _gd_profile_record_op_time(gd_context *ctx, const _gd_backend *backend,
+                                int op, uint64_t elapsed_ns);
 void _gd_profile_record_compile(gd_context *ctx, const _gd_backend *backend,
                                 uint64_t elapsed_ns, const _gd_node *nodes, int n_nodes);
 void _gd_profile_record_run(gd_context *ctx, const _gd_backend *backend,

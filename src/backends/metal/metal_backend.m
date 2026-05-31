@@ -35,8 +35,10 @@
 @property (strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipelinesByName;
 /* Last committed command buffer, or nil once synchronized. */
 @property (strong) id<MTLCommandBuffer> inFlight;
-/* Executable whose external leaves need write-back at synchronize (C pointer). */
-@property (nonatomic) void *inFlightExe;
+/* Executables with deferred CPU-backed external write-back, pending until the
+ * next synchronize/flush (P4 lazy writeback). Holds boxed _gd_executable*
+ * pointers; deduped. Empty for fully device-resident graphs. */
+@property (strong) NSMutableArray<NSValue *> *pendingExes;
 @end
 
 @implementation GDMetalState
@@ -56,8 +58,8 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_SILU, "gd_silu"},
     {_GD_OP_COPY, "gd_copy"},
     {_GD_OP_CAST, "gd_cast"},
-    {_GD_OP_MATMUL, "gd_matmul"},
-    {_GD_OP_LINEAR, "gd_linear"},
+    {_GD_OP_MATMUL, "gd_matmul_tiled"},
+    {_GD_OP_LINEAR, "gd_linear_tiled"},
     {_GD_OP_SUM, "gd_reduce"},
     {_GD_OP_MEAN, "gd_reduce"},
     {_GD_OP_SOFTMAX, "gd_softmax"},
@@ -122,6 +124,13 @@ struct _gd_executable {
     gd_metal_value *values;
     bool needs_stage;
     bool needs_writeback;
+    /* Per-node compiled encode plan (P8): pipeline state(s) resolved once at
+     * compile so the per-run encode loop does no dictionary lookups. Stored as
+     * unretained __bridge pointers; the owning GDMetalState retains the
+     * pipelines for the context lifetime, which outlives every executable. */
+    int n_plan;
+    void **node_pso;   /* primary pipeline per node id, or NULL */
+    void **node_pso2;  /* secondary pipeline (e.g. sdpa_bwd dkv), or NULL */
 };
 
 /* ---- Helpers ------------------------------------------------------------- */
@@ -242,14 +251,62 @@ static gd_status writeback_externals(_gd_backend *self, _gd_executable *exe)
     return GD_OK;
 }
 
+/* Writes back every executable with deferred CPU-backed external mutations and
+ * clears the pending set. Called after the in-flight command buffer completes. */
+static gd_status flush_pending_writebacks(_gd_backend *self)
+{
+    GDMetalState *st = state_of(self);
+    gd_status status = GD_OK;
+
+    if (st.pendingExes.count == 0) {
+        return GD_OK;
+    }
+    for (NSValue *boxed in st.pendingExes) {
+        _gd_executable *exe = (_gd_executable *)boxed.pointerValue;
+        gd_status s = writeback_externals(self, exe);
+        if (s != GD_OK && status == GD_OK) {
+            status = s;
+        }
+    }
+    [st.pendingExes removeAllObjects];
+    return status;
+}
+
+/* Registers an executable's CPU-backed mutated externals for deferred writeback.
+ * The host storages are marked pending so a later read resolves the flush; the
+ * executable is added to the pending set (deduped) for the next synchronize. */
+static void register_pending_writeback(_gd_backend *self, _gd_executable *exe)
+{
+    GDMetalState *st = state_of(self);
+    NSValue *boxed = [NSValue valueWithPointer:exe];
+    int i = 0;
+
+    if (![st.pendingExes containsObject:boxed]) {
+        [st.pendingExes addObject:boxed];
+    }
+    for (i = 0; i < exe->n_values; ++i) {
+        gd_metal_value *v = &exe->values[i];
+        gd_storage *dst = NULL;
+
+        if (v->external == NULL || v->external_alias || !v->needs_writeback) {
+            continue;
+        }
+        dst = gd_tensor_storage(v->external);
+        if (dst != NULL) {
+            _gd_storage_set_pending_flush(dst, self, exe);
+        }
+    }
+}
+
 static gd_status metal_synchronize(_gd_backend *self)
 {
     GDMetalState *st = state_of(self);
     id<MTLCommandBuffer> cmd = st.inFlight;
-    _gd_executable *exe = (_gd_executable *)st.inFlightExe;
 
     if (cmd == nil) {
-        return GD_OK;
+        /* No GPU work in flight, but a prior sync may have left writebacks queued
+         * (it never happens today, but keep the set authoritative). */
+        return flush_pending_writebacks(self);
     }
     {
         uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
@@ -260,17 +317,24 @@ static gd_status metal_synchronize(_gd_backend *self)
         }
     }
     st.inFlight = nil;
-    st.inFlightExe = NULL;
     if (cmd.status == MTLCommandBufferStatusError) {
         const char *reason = cmd.error != nil
                                  ? cmd.error.localizedDescription.UTF8String
                                  : "command buffer failed";
+        [st.pendingExes removeAllObjects];
         return _gd_error(GD_ERR_BACKEND, reason);
     }
-    if (exe != NULL) {
-        return writeback_externals(self, exe);
-    }
-    return GD_OK;
+    return flush_pending_writebacks(self);
+}
+
+/* P4 flush hook: a host read hit a storage this backend marked pending. The
+ * command buffer is serial, so syncing the latest in-flight buffer completes all
+ * earlier ones; we then write back every pending executable. `cookie` is
+ * advisory (the registering executable); we flush the whole pending set. */
+static gd_status metal_flush_pending(_gd_backend *self, void *cookie)
+{
+    (void)cookie;
+    return metal_synchronize(self);
 }
 
 static gd_status metal_upload(_gd_backend *self, void *dst_handle, size_t dst_off,
@@ -314,6 +378,9 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
         }
         free(exe->values);
     }
+    /* node_pso/node_pso2 hold unretained __bridge pointers; just free the arrays. */
+    free(exe->node_pso);
+    free(exe->node_pso2);
     free(exe);
 }
 
@@ -501,6 +568,28 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
     mark_external_writebacks(exe);
     refresh_external_flags(exe);
 
+    /* Resolve each node's pipeline once (P8): the per-run encode loop then does
+     * no NSDictionary lookups. sdpa_bwd needs a second pipeline (dkv). */
+    exe->n_plan = graph->n_nodes;
+    if (graph->n_nodes > 0) {
+        GDMetalState *st = state_of(self);
+        int j = 0;
+
+        exe->node_pso = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso));
+        exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
+        if (exe->node_pso == NULL || exe->node_pso2 == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
+            goto fail;
+        }
+        for (j = 0; j < graph->n_nodes; ++j) {
+            _gd_op_kind op = graph->nodes[j].op;
+            exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
+            if (op == _GD_OP_SDPA_BWD) {
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_sdpa_bwd_dkv");
+            }
+        }
+    }
+
     *out = exe;
     return GD_OK;
 
@@ -621,29 +710,32 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
-static void dispatch_2d(id<MTLComputeCommandEncoder> enc,
-                        id<MTLComputePipelineState> pso,
-                        NSUInteger w,
-                        NSUInteger h)
+/* Tiled GEMM dispatch: one threadgroup per GD_METAL_GEMM_TILE-square output
+ * block, with the K-tiling loop inside the kernel. Uses fixed-size threadgroups
+ * (required for the threadgroup-memory tiles) and rounds the grid up. */
+static void dispatch_gemm_tiles(id<MTLComputeCommandEncoder> enc,
+                                NSUInteger cols,
+                                NSUInteger rows,
+                                NSUInteger batch)
 {
-    NSUInteger tw = pso.threadExecutionWidth;
-    NSUInteger th = 1;
+    NSUInteger tile = GD_METAL_GEMM_TILE;
+    NSUInteger gx = (cols + tile - 1) / tile;
+    NSUInteger gy = (rows + tile - 1) / tile;
 
-    if (tw > w) {
-        tw = w;
-    }
-    if (tw == 0) {
-        tw = 1;
-    }
-    th = pso.maxTotalThreadsPerThreadgroup / tw;
-    if (th > h) {
-        th = h;
-    }
-    if (th == 0) {
-        th = 1;
-    }
-    [enc dispatchThreads:MTLSizeMake(w, h, 1)
-        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(gx, gy, batch)
+        threadsPerThreadgroup:MTLSizeMake(tile, tile, 1)];
+}
+
+/* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in
+ * kernels.metal (power of two for the tree reduction). */
+#define GD_METAL_RMS_TG 256
+
+/* Dispatches `groups` threadgroups of GD_METAL_RMS_TG threads (one threadgroup
+ * per reduced row, or per channel tile). */
+static void dispatch_reduce_groups(id<MTLComputeCommandEncoder> enc, NSUInteger groups)
+{
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(GD_METAL_RMS_TG, 1, 1)];
 }
 
 static void encode_binary(id<MTLComputeCommandEncoder> enc,
@@ -765,8 +857,8 @@ static void encode_matmul(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    if (p.n > 0 && batch_total * p.m > 0) {
-        dispatch_2d(enc, pso, (NSUInteger)p.n, (NSUInteger)(batch_total * p.m));
+    if (p.n > 0 && p.m > 0 && batch_total > 0) {
+        dispatch_gemm_tiles(enc, (NSUInteger)p.n, (NSUInteger)p.m, (NSUInteger)batch_total);
     }
 }
 
@@ -794,7 +886,7 @@ static void encode_linear(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     if (p.out_features > 0 && p.rows > 0) {
-        dispatch_2d(enc, pso, (NSUInteger)p.out_features, (NSUInteger)p.rows);
+        dispatch_gemm_tiles(enc, (NSUInteger)p.out_features, (NSUInteger)p.rows, 1);
     }
 }
 
@@ -868,7 +960,7 @@ static void encode_rms_norm(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
     if (p.rows > 0) {
-        dispatch_1d(enc, pso, (NSUInteger)p.rows);
+        dispatch_reduce_groups(enc, (NSUInteger)p.rows);
     }
 }
 
@@ -893,7 +985,19 @@ static gd_status encode_cross_entropy(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    dispatch_1d(enc, pso, 1);
+    /* Single threadgroup reduction over positions (see gd_cross_entropy). The
+     * kernel's threadgroup `partial` array is sized GD_CE_TG, so clamp here. */
+    {
+        NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+        if (tg > 256) {
+            tg = 256;
+        }
+        if (tg == 0) {
+            tg = 1;
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    }
     return GD_OK;
 }
 
@@ -1013,7 +1117,9 @@ static void encode_reduce_to(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch_1d(enc, pso, 1);
+    if (p.target_numel > 0) {
+        dispatch_1d(enc, pso, (NSUInteger)p.target_numel);
+    }
 }
 
 /* step_inc: in-place ++ on a scalar buffer (no produced value). */
@@ -1164,7 +1270,13 @@ static gd_status encode_embedding_bwd(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    dispatch_1d(enc, pso, 1);
+    /* One thread per dtable element (vocab*dim). */
+    {
+        int total = p.vocab * p.dim;
+        if (total > 0) {
+            dispatch_1d(enc, pso, (NSUInteger)total);
+        }
+    }
     return GD_OK;
 }
 
@@ -1256,6 +1368,7 @@ static void encode_sdpa(id<MTLComputeCommandEncoder> enc,
 static gd_status encode_sdpa_bwd(_gd_backend *self,
                                  id<MTLComputeCommandEncoder> enc,
                                  id<MTLComputePipelineState> dq_pso,
+                                 id<MTLComputePipelineState> dkv_pso,
                                  _gd_executable *exe,
                                  const _gd_node *node)
 {
@@ -1266,7 +1379,6 @@ static gd_status encode_sdpa_bwd(_gd_backend *self,
                                      ? &exe->graph->values[node->inputs[4]].desc
                                      : NULL;
     int bias_input = node->attrs.has_bias ? node->inputs[4] : node->inputs[1];
-    id<MTLComputePipelineState> dkv_pso = pipeline_named(state_of(self), "gd_sdpa_bwd_dkv");
     gd_metal_sdpa_params p;
     int dq_grid = 0;
     int dkv_grid = 0;
@@ -1324,7 +1436,7 @@ static void encode_rms_norm_bwd(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     if (p.rows > 0) {
-        dispatch_1d(enc, pso, (NSUInteger)p.rows);
+        dispatch_reduce_groups(enc, (NSUInteger)p.rows);
     }
 }
 
@@ -1346,17 +1458,19 @@ static void encode_rms_norm_wbwd(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
     if (p.last > 0) {
-        dispatch_1d(enc, pso, (NSUInteger)p.last);
+        /* One threadgroup per channel tile of GD_METAL_RMS_TG channels. */
+        NSUInteger groups = ((NSUInteger)p.last + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
+        dispatch_reduce_groups(enc, groups);
     }
 }
 
 static gd_status encode_node(_gd_backend *self,
                              id<MTLComputeCommandEncoder> enc,
                              _gd_executable *exe,
-                             const _gd_node *node)
+                             const _gd_node *node,
+                             id<MTLComputePipelineState> pso,
+                             id<MTLComputePipelineState> pso2)
 {
-    id<MTLComputePipelineState> pso = pipeline_for(state_of(self), node->op);
-
     if (pso == nil) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op");
     }
@@ -1445,7 +1559,7 @@ static gd_status encode_node(_gd_backend *self,
         encode_sdpa(enc, pso, exe, node);
         return GD_OK;
     case _GD_OP_SDPA_BWD:
-        return encode_sdpa_bwd(self, enc, pso, exe, node);
+        return encode_sdpa_bwd(self, enc, pso, pso2, exe, node);
     case _GD_OP_RMS_NORM_BWD:
         encode_rms_norm_bwd(enc, pso, exe, node);
         return GD_OK;
@@ -1480,6 +1594,44 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                                  0U, 0U, 0U);
     }
 
+    /* Trace mode: encode one node per command buffer and wait on each, so the
+     * host-measured time is attributed to that op kind. Serializing like this is
+     * far slower than normal execution and is for profiling only. */
+    if (_gd_profile_trace_enabled(self->ctx)) {
+        status = metal_synchronize(self);
+        if (status != GD_OK) {
+            return status;
+        }
+        for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
+            const _gd_node *node = &exe->graph->nodes[i];
+            id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
+            id<MTLComputePipelineState> pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
+            uint64_t op_start = _gd_profile_now_ns();
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                status = encode_node(self, enc, exe, node, pso, pso2);
+                if (status != GD_OK) {
+                    [enc endEncoding];
+                    return status;
+                }
+                [enc endEncoding];
+                [cmd commit];
+                [cmd waitUntilCompleted];
+                if (cmd.status == MTLCommandBufferStatusError) {
+                    return _gd_error(GD_ERR_BACKEND, "metal trace command buffer failed");
+                }
+            }
+            _gd_profile_record_op_time(self->ctx, self, (int)node->op,
+                                       _gd_profile_now_ns() - op_start);
+        }
+        st.inFlight = nil;
+        if (exe->needs_writeback) {
+            return writeback_externals(self, exe);
+        }
+        return GD_OK;
+    }
+
     {
         uint64_t encode_start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
         @autoreleasepool {
@@ -1487,7 +1639,11 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
-                status = encode_node(self, enc, exe, &exe->graph->nodes[i]);
+                id<MTLComputePipelineState> pso =
+                    (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
+                id<MTLComputePipelineState> pso2 =
+                    (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
+                status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2);
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;
@@ -1496,7 +1652,6 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             [enc endEncoding];
             [cmd commit];
             st.inFlight = cmd;
-            st.inFlightExe = exe;
         }
         if (encode_start != 0U) {
             uint64_t count = 0U;
@@ -1509,10 +1664,12 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
         }
     }
     if (exe->needs_writeback) {
-        /* CPU-backed external mutations must remain visible to plain CPU tensor
-         * reads after gd_graph_run. Device-resident graphs defer waiting until
-         * gd_synchronize or a blocking download. */
-        return metal_synchronize(self);
+        /* P4: defer the wait + device->host writeback. The mutated CPU-backed
+         * leaves are marked pending; a host read (gd_tensor_copy_to_cpu,
+         * gd_storage_data_cpu) or gd_synchronize triggers the flush. P5's
+         * skip-unchanged staging keeps the shadow buffers authoritative across
+         * runs, so deferring does not lose in-place updates. */
+        register_pending_writeback(self, exe);
     }
     return GD_OK;
 }
@@ -1593,6 +1750,7 @@ static gd_status metal_init(_gd_backend *self, gd_context *ctx, int device_index
         st.pipelines = [NSMutableDictionary dictionary];
         st.pipelinesByName = [NSMutableDictionary dictionary];
         st.inFlight = nil;
+        st.pendingExes = [NSMutableArray array];
 
         for (k = 0; k < sizeof(g_metal_kernels) / sizeof(g_metal_kernels[0]); ++k) {
             NSString *name = [NSString stringWithUTF8String:g_metal_kernels[k].fn];
@@ -1638,6 +1796,7 @@ static void metal_shutdown(_gd_backend *self)
     if (self->impl != NULL) {
         GDMetalState *st = (__bridge_transfer GDMetalState *)self->impl; /* ARC releases */
         st.inFlight = nil;
+        [st.pendingExes removeAllObjects];
         self->impl = NULL;
     }
 }
@@ -1659,6 +1818,7 @@ static const _gd_backend_vtable metal_backend_vtable = {
     .value_storage = metal_value_storage,
     .supports_node = metal_supports_node,
     .synchronize = metal_synchronize,
+    .flush_pending = metal_flush_pending,
 };
 
 gd_status _gd_metal_backend_register(gd_context *ctx)

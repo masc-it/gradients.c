@@ -138,15 +138,16 @@ layout/fusion, but each task must improve or clarify GPU_SAFE independently.
 - [x] P1 — Metal profiling counters and per-op timing/cost report
 - [x] P2 — Honest benchmark/release build target
 - [x] P3 — Device-resident parameters and optimizer state
-- [ ] P4 — Lazy writeback: download only on explicit CPU read/sync need
+- [x] P4 — Lazy writeback: download only on explicit CPU read/sync need (CPU-backed path; device-resident already lazy)
 - [x] P5 — Dirty-tracked staging: upload only changed host leaves
 - [x] P6 — Async run boundary: remove unconditional post-run wait where safe
 - [x] P7 — Zero-copy reshape/copy aliasing for metadata-only copies
-- [ ] P8 — Precomputed Metal executable encode plan
-- [ ] P9 — GPU_SAFE kernel upgrades batch 1: reductions/norm/CE/reduce_to
-- [ ] P10 — GPU_SAFE kernel upgrades batch 2: matmul/linear
+- [x] P8 — Precomputed Metal executable encode plan (pipeline resolution cached; full ICB deferred)
+- [x] P9 — GPU_SAFE kernel upgrades batch 1: reductions/norm/CE/reduce_to (hot offenders; per-row polish + sdpa_bwd deferred)
+- [x] P10 — GPU_SAFE kernel upgrades batch 2: matmul/linear
 - [ ] P11 — Optional MPS-backed matmul/linear path
 - [ ] P12 — GPT example/device ergonomics and regression benchmark
+- [x] P13 — GPU_SAFE kernel upgrades batch 3: per-row threadgroup reductions (RMSNorm family)
 
 ---
 
@@ -506,7 +507,7 @@ Validation:
 
 ## P4 — Lazy writeback: download only on explicit CPU read/sync need
 
-- [ ] Phase complete
+- [x] Phase complete
 
 ### Intent
 Remove unconditional `writeback_externals()` after every Metal graph run.
@@ -542,7 +543,76 @@ copy APIs already promise CPU-visible bytes when they return.
 - Profile shows writeback cost removed or sharply reduced.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Scope: the **device-resident** path was already lazy after P3/P6 (params/state
+are Metal storage; reads go through `metal_download` -> `synchronize`). The
+remaining work was the **CPU-backed Metal path**, where a param/grad lives in the
+Metal *shadow* buffer but the user reads the leaf's *CPU* storage, which has no
+link to the executable. P4 adds the missing read->flush bridge so that path can
+run async too.
+
+Mechanism (lazy writeback markers):
+- `gd_storage` gains an optional pending-flush marker `(pending_backend,
+  pending_cookie)`. A backend that computed newer bytes but deferred the copy
+  registers itself; the next host read resolves it.
+- New backend vtable hook `flush_pending(self, cookie)` (nullable; CPU_REF leaves
+  it NULL).
+- `gd_storage_copy_to_cpu` and `gd_storage_data_cpu` call
+  `storage_resolve_pending()` before reading; `gd_storage_copy_from_cpu` clears
+  the marker (a host write supersedes a deferred device write).
+- Metal: `metal_execute_range` no longer waits+writes-back at the end of a
+  CPU-backed run. It marks each mutated CPU-backed leaf pending and adds the
+  executable to a pending set. `metal_flush_pending` / `gd_synchronize` /
+  `metal_executable_free` drain the set: wait the (serial) in-flight command
+  buffer once, then `writeback_externals` for every pending executable.
+- Correctness rests on P5: "skip staging unchanged host leaves" keeps the shadow
+  buffers authoritative across runs, so deferring writeback never lets a later
+  run re-stage stale CPU bytes over GPU-updated params.
+
+Numbers (CPU-backed params, Metal graph, 100 train steps, read loss once at end;
+`GD_PROFILE=summary`):
+
+```text
+before P4 (eager): metal_wait ~100, writeback_externals ~100 (one per run)
+after  P4 (lazy):  metal_wait = 1, writeback_externals = 1,
+                   stage_leaves items = 85 total (only the first run stages)
+                   run_ms ~112 over 100 runs (~1.12 ms/run, async return)
+final loss read once = 0.00302 (matches per-step-read reference)
+```
+
+The CPU-backed path is now as async as the device-resident path: per-run
+wait+writeback collapsed from O(steps) to 1 (at the read).
+
+Semantics decision: chose **option 1** — `gd_synchronize` (and any blocking
+read) flushes pending writeback, but `gd_graph_run` does not. Public copy APIs
+still guarantee CPU-visible bytes when they return, because they resolve pending
+first.
+
+Choices / safety:
+- Pending markers are unretained backend+cookie pointers; the only producer
+  (Metal) drains and clears them in `synchronize`/`flush_pending`, and
+  `metal_executable_free` synchronizes before freeing, so a cookie can never
+  dangle past its executable.
+- A pending *set* of executables (not a single one) handles consecutive async
+  runs and multiple graphs without losing any writeback (serial queue => one
+  wait completes all).
+- `writeback_externals` copies shadow->CPU via `gd_storage_copy_from_cpu`, which
+  also clears the leaf's pending marker, keeping markers and the pending set
+  consistent.
+
+Learnings:
+- The subtle hazard was re-staging: without P5, a deferred-writeback run followed
+  by another run would upload stale CPU params over the GPU's in-place update.
+  P5's version-gated staging is precisely what makes P4 safe — the two features
+  are co-dependent for the CPU-backed path.
+- Device-residency (P3) remains the recommended path; P4 mainly closes the gap
+  for mixed CPU-param / Metal-compute and debug workflows.
+
+Validation:
+- `make check` — including `test_metal_gpt_train` (CPU params + Metal graph,
+  multi-step, reads params after) and a new `test_metal_lazy_writeback` (25
+  in-place AdamW steps on Metal with no intermediate reads, single read-back
+  matches the double-precision reference).
+- `GD_PROFILE=summary` wait/writeback/stage counts before vs after.
 
 ---
 
@@ -750,7 +820,7 @@ Validation:
 
 ## P8 — Precomputed Metal executable encode plan
 
-- [ ] Phase complete
+- [x] Phase complete (pipeline resolution cached at compile; full prerecord/ICB deferred)
 
 ### Intent
 Reduce CPU overhead in the encode loop while keeping one dispatch per node.
@@ -787,13 +857,57 @@ At execute time:
 - Code remains maintainable; complex ops may keep custom encoder with cached params.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Measured the host encode cost first to scope the work honestly:
+
+```text
+6-layer 12.39M, T=64 (per run): encode ~0.26 ms vs GPU step ~345 ms
+tiny 19.6K, T=16  (per run):     encode ~0.10 ms vs GPU step ~3.3 ms (metal_wait ~3.5 ms)
+```
+
+Host encode is a tiny fraction even on the tiny high-iteration model, so this is
+a host-side micro-opt / architecture cleanup, not a wall-time lever on current
+workloads.
+
+Implemented: per-node pipeline resolution is now done **once at
+`metal_compile`** (stored on the executable as unretained `__bridge` pointers in
+`node_pso` / `node_pso2`; the `GDMetalState` retains the pipelines for the
+context lifetime). The per-run encode loop (and the trace loop) pass the cached
+PSOs to `encode_node`, so the hot path no longer does an `NSDictionary` lookup
+(NSNumber boxing + hash) per node per run. `sdpa_bwd`'s second pipeline
+(`gd_sdpa_bwd_dkv`) is cached in `node_pso2`.
+
+Numbers: encode/run for the 6-layer model went ~0.26 ms -> ~0.24-0.31 ms (within
+run-to-run noise). End-to-end step unchanged (GPU-bound).
+
+Choices:
+- Cached only pipeline state, not a full prerecorded dispatch/param plan. The
+  remaining encode cost is the unavoidable `setBuffer`/`setBytes`/`dispatchThreads`
+  Obj-C calls, which a params/dispatch cache would not remove; the existing
+  per-op encoders stay (the spec explicitly allows complex ops to keep custom
+  encoders).
+- Plan pointers are unretained `__bridge` (no refcount churn) because pipeline
+  lifetime strictly outlives executables; the arrays are freed in
+  `metal_executable_free`.
+
+Learnings:
+- The per-node dictionary lookup was a minor slice of encode; the ObjC encoding
+  calls dominate. Eliminating those needs **indirect command buffers (ICB)** to
+  prerecord the whole dispatch sequence once and re-execute it, which is a much
+  larger change and only pays off if a workload becomes host-encode-bound (e.g.
+  many tiny kernels with async submission and no per-iter sync). Deferred until
+  measurements justify it.
+- For current GPT workloads the bottleneck is GPU execution (`sdpa_bwd`), not
+  host encode, so further host-side work is not warranted now.
+
+Validation:
+- `make check` (all parity + GPT train parity green)
+- `GD_PROFILE=summary` encode timings before/after on 6-layer and tiny configs
 
 ---
 
 ## P9 — GPU_SAFE kernel upgrades batch 1: reductions/norm/CE/reduce_to
 
-- [ ] Phase complete
+- [x] Phase complete (hot offenders; per-row reduction polish + sdpa_bwd deferred)
 
 ### Intent
 Improve obvious slow scalar/reference kernels while keeping one kernel per op.
@@ -814,7 +928,67 @@ Improve obvious slow scalar/reference kernels while keeping one kernel per op.
 - Any numerical tolerance change documented here.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Data-driven via a new per-op GPU-time attribution path (see below). On a 1-layer
+4.2M model at T=64 (`GD_PROFILE=trace`, one command buffer per node, host-timed),
+the single-thread kernels dominated a training step at **3940 ms total**:
+
+```text
+reduce_to     3593.4 ms   (single thread!)
+embedding_bwd  142.3 ms   (single thread: zero 2.56M + scatter)
+cross_entropy  100.7 ms   (single thread scalar reduction)
+sdpa_bwd        49.8 ms
+... everything else < 10 ms (matmul 9.1, etc.)
+```
+
+Fixed the three single-thread offenders:
+- **`reduce_to`**: rewritten to one thread per *target* element that sums only
+  the `go` positions broadcasting to it (iterating the reduced dims via strides).
+  Total work O(go_numel) across `target_numel` threads instead of one serial
+  scan. `3593 ms -> ~4 ms`.
+- **`embedding_bwd`**: one thread per `dtable` element `(v,c)` sums gradient rows
+  whose id == v. No atomics, no serial zero+scatter. `142 ms -> ~1.4 ms`.
+- **`cross_entropy`**: single threadgroup, each thread accumulates a strided set
+  of positions, then a threadgroup reduction yields the mean. `100 ms -> ~3.4 ms`.
+
+After these, the 1-layer trace step is **121 ms** (32x), and the real workload
+(full 12.39M params, 6 layers, T=64, non-trace train step) dropped from
+**~11,400 ms/iter to ~372 ms/iter (~30x)** — Metal is now faster than the CPU
+reference (~2,660 ms/iter) instead of 4.3x slower.
+
+Profiler addition (part of P1, landed here because it was needed to localize the
+cost): `GD_PROFILE=trace` makes the Metal backend encode one command buffer per
+node and wait on each, accumulating host-measured time per op kind. The summary
+then prints `op=<name> count=N gpu_ms=...`. This serial mode is for profiling
+only; normal execution batches all nodes into one command buffer.
+
+Choices:
+- Per-target `reduce_to` iterates reduced dims only (O(go_numel) total), not the
+  O(target*go) per-target full scan that an earlier naive attempt used.
+- `embedding_bwd` uses the scatter-free "gather by id" formulation to stay
+  deterministic and atomic-free; cost grows with n_ids but is fully parallel.
+- `cross_entropy` threadgroup is capped at 256 (`GD_CE_TG`) to match the
+  threadgroup `partial[]` array; positions are handled grid-stride within the
+  single group.
+
+Learnings:
+- A single-thread GPU kernel is ~50-100x slower than the same loop on a CPU core,
+  so any `gid != 0` kernel is a latent cliff. Trace attribution turned an opaque
+  "11s, GPU slower than CPU" into a one-line diagnosis.
+- The tied-embedding LM head produces a `[B,V,d] -> [V,d]` grad reduction; with
+  `V=8000, d=320` that single-thread `reduce_to` alone was 91% of the step.
+
+Deferred (not hot on current workloads, tracked as their own phases):
+- Per-row threadgroup reductions for `sum`/`mean`/`softmax`/`rms_norm*`
+  (`rms_norm_wbwd` is now the largest of these at ~9 ms; acceptable for now).
+  **Tracked as P13.**
+- `sdpa_bwd` is now the largest single op (~55 ms in trace); it is the O(T^2)
+  reference recompute and belongs to the deferred FlashAttention-2 backward
+  (plan_gpt G3+), not this GPU_SAFE batch.
+
+Validation:
+- `make check` (all CPU<->Metal parity + GPT train parity green at 1e-4)
+- `GD_PROFILE=trace ... make gpt-bench` per-op attribution before/after
+- 12.39M GPT train step: ~11.4 s -> ~0.372 s/iter on Metal
 
 ---
 
@@ -843,7 +1017,52 @@ This is correct but poor on Apple GPUs.
 - Document tile sizes, Apple GPU observations, and fallback conditions.
 
 ### Completion notes
-_To fill when done: numbers, choices, learnings, validation._
+Completed.
+
+Standalone GEMM microbenchmark (512x512x512, F32, 50 iters, release):
+
+```text
+naive  gd_matmul        metal  ~1.589 ms/iter  ~169 GFLOP/s
+tiled  gd_matmul_tiled  metal  ~0.929 ms/iter  ~289 GFLOP/s   (~1.7x)
+cpu_ref                  cpu    ~466.6 ms/iter  ~0.6 GFLOP/s
+```
+
+Tiny GPT (`GD_DEVICE=metal make bench-gpt`) wall time: `~12.58s` (P3/P6) ->
+`~12.42s` with tiled kernels. The toy config (M,N,K <= 64, T=16) is dispatch and
+command-buffer-wait bound, so tiled GEMM barely moves it; the win shows on real
+GEMM sizes as above.
+
+Choices:
+- Added `gd_matmul_tiled` and `gd_linear_tiled` using `GD_METAL_GEMM_TILE` (16)
+  threadgroup-memory tiles, streaming K in tiles so each operand element is read
+  from device memory once per tile instead of once per output element.
+- `gd_matmul_tiled` reproduces the reference kernel's batch-broadcast and
+  transpose addressing (grid z = batch index), so it is a drop-in for every shape
+  the naive kernel accepted; the naive kernels are retained in the metallib but
+  no longer routed.
+- `gd_linear_tiled` folds bias add into the store and selects the weight layout
+  by `trans_w`.
+- Added `dispatch_gemm_tiles` using fixed-size threadgroups (required for
+  threadgroup-memory tiles) with grid rounded up; removed the now-unused
+  `dispatch_2d` helper.
+- Tile size 16 chosen as a safe default (256 threads/group, well under Apple
+  `maxTotalThreadsPerThreadgroup`); SIMD-group matrix intrinsics deferred.
+
+Learnings:
+- Threadgroup tiling gives ~1.7x on a mid GEMM at 16x16 tiles with no SIMD-group
+  matmul; larger tiles / `simdgroup_matrix` would push further but add
+  complexity and per-GPU tuning.
+- Accumulation order changes (tile-summed) vs CPU double accumulation; parity
+  still holds at 1e-4 for all existing tests including GPT train parity.
+- For the tiny-GPT regression workload, kernel throughput is not the bottleneck;
+  command-buffer wait dominates. A larger benchmark config (P12 knobs) is needed
+  to show end-to-end model speedups from kernel work.
+
+Validation:
+- `./build/tests/test_metal` (matmul/linear parity incl. trans_b, batched)
+- `./build/tests/test_metal_gpt`, `test_metal_gpt_train`, `test_metal_mlp`
+- `make check`
+- GEMM microbenchmark above (naive vs tiled, parity-equivalent results).
 
 ---
 
@@ -920,6 +1139,101 @@ _To fill when done: numbers, choices, learnings, validation._
 
 ---
 
+## P13 — GPU_SAFE kernel upgrades batch 3: per-row threadgroup reductions
+
+- [x] Phase complete (RMSNorm family; standalone softmax/sum/mean not exercised by GPT)
+
+### Intent
+Finish the GPU_SAFE kernel parallelization started in P9 for the remaining
+reduction-style kernels that still use one-thread-per-row (or fewer) and leave
+most GPU lanes idle. These were not hot on the current 12.39M / T=64 workload
+(so P9 shipped without them), but they become the next ceiling as the hot
+offenders are gone and as rows/seq grow.
+
+Still GPU_SAFE: one IR node -> one kernel -> one dispatch, same math; only the
+intra-kernel thread strategy changes (threadgroup memory + barrier reductions).
+No fusion, no layout planning. (Confirmed: per-row threadgroup reduction is the
+same category as the P9 `cross_entropy` reduction and the P10 tiled GEMM.)
+
+### Targets
+Current per-op trace cost on the 1-layer 4.2M / T=64 step (post-P9) for context;
+re-profile on a larger row/seq config before optimizing:
+- `rms_norm_wbwd` (~9 ms, largest remaining reduction): reduces over rows per
+  channel and recomputes the per-row RMS inside the loop. Parallelize the
+  per-row RMS and the cross-row accumulation.
+- `rms_norm` / `rms_norm_bwd`: threadgroup reduction over the last dim instead of
+  one thread per row, for large `d_model`.
+- `softmax`: threadgroup row reduction for max/sum (one thread per
+  `(outer,inner)` today).
+- `sum` / `mean` (`gd_reduce`): threadgroup reduction over the reduced axis for
+  large reduced dims.
+
+### Approach
+- One threadgroup per row (or per reduced slice); threads cooperatively load and
+  reduce via threadgroup memory + `threadgroup_barrier`, matching the
+  `gd_cross_entropy` pattern landed in P9.
+- Cap threadgroup size by `maxTotalThreadsPerThreadgroup` and size the shared
+  array to that cap.
+- Keep the existing one-thread-per-row kernels as the correctness reference for
+  parity diffing during development.
+
+### Acceptance
+- Per-op CPU<->Metal parity holds at 1e-4 (document any reduction-order tolerance).
+- GPT train parity stays green.
+- `GD_PROFILE=trace` shows reduced `gpu_ms` for each upgraded op on a config with
+  large rows / sequence (e.g. bigger `d_model`, longer `T`).
+
+### Out of scope
+- `sdpa_bwd` (O(T^2) reference recompute, ~55 ms in trace): tracked as the
+  deferred FlashAttention-2 backward in `plan_gpt.md` G3+, not a per-row
+  reduction; it is a different (fused/tiled) rewrite, not GPU_SAFE batch work.
+
+### Completion notes
+Grounded on a fresh 6-layer trace baseline (12.39M params, T=64) taken before this
+phase. That confirmed `sdpa_bwd` dominates (298.9 ms of a 506 ms trace step) and
+is G3/out-of-scope; the largest GPU_SAFE op was `rms_norm_wbwd` (29.5 ms). GPT
+never emits standalone `softmax`/`sum`/`mean` (softmax is internal to SDPA), so
+those were left as-is.
+
+Fixed the RMSNorm family (one IR node -> one kernel -> one dispatch preserved):
+- **`rms_norm`**: one threadgroup per row; threads cooperatively reduce sum(x^2)
+  via threadgroup memory, then write the normalized row. `5.4 -> 3.4 ms`.
+- **`rms_norm_bwd`**: one threadgroup per row; single-pass cooperative reduction
+  of both sum(x^2) and `A = sum_c go*weight*x`, then write dx. `5.5 -> 3.0 ms`.
+- **`rms_norm_wbwd`**: root cause was recomputing each row's RMS *per channel*
+  (`last`x redundant). New kernel uses one threadgroup per channel tile and
+  computes the per-row rms_inv cooperatively **once per row tile**, cached in
+  threadgroup memory, then each channel thread sums over rows. `29.5 -> 3.6 ms`
+  (~8x).
+
+Whole-step effect (6-layer, T=64): trace step `506 -> 480 ms`; real non-trace
+train step `~372 -> ~345 ms`. The remaining time is almost entirely `sdpa_bwd`
+(~302 ms in trace, ~87%); every non-SDPA op is now < 4 ms.
+
+Choices:
+- Shared threadgroup size `GD_RMS_TG = 256` (kernels) / `GD_METAL_RMS_TG = 256`
+  (host), power of two for an exact tree reduction.
+- `rms_norm`/`rms_norm_bwd` dispatch one threadgroup per row; `rms_norm_wbwd`
+  dispatches `ceil(last / 256)` threadgroups (one per channel tile) and tiles the
+  row dimension by 256 so threadgroup memory is bounded regardless of rows.
+- 1D `threadgroup_position_in_grid` declared as scalar `uint` (MSL rejects mixing
+  a `uint3` grid attribute with scalar `threads_per_threadgroup`).
+
+Learnings:
+- The dominant `rms_norm_wbwd` cost was redundant work, not under-parallelism:
+  caching rms_inv per row tile removed an O(last) redundancy factor and gave the
+  8x even though the kernel still only spans a couple of threadgroups.
+- With P9+P13 done, the GPU_SAFE backend has no remaining single-thread or
+  redundant-reduction cliffs on the GPT workload; the next real lever is SDPA
+  (G3), which is explicitly outside GPU_SAFE.
+
+Validation:
+- `make check` (CPU<->Metal parity for rms_norm fwd/bwd/wbwd + GPT train parity,
+  all at 1e-4; overfit sanity green)
+- `GD_PROFILE=trace ... GD_BENCH_LAYERS=6` per-op attribution before/after
+
+---
+
 ## Suggested first sprint
 
 Do these first; they should give highest signal and biggest immediate win:
@@ -951,6 +1265,11 @@ Fill this table as phases land.
 | P2 | release `-O2` | `make bench-gpt` | ~0.78s | ~1.3 | CPU warm build |
 | P2 | release `-O2` | `GD_DEVICE=metal make bench-gpt` | ~13.09s | ~21.8 | before P3/P6 |
 | P3+P6 | release `-O2` | `GD_DEVICE=metal make bench-gpt` | ~12.58s | ~21.0 | device-resident leaves, async run boundary |
+| P10 | release `-O2` | `GD_DEVICE=metal make bench-gpt` | ~12.42s | ~20.7 | tiled GEMM (tiny GPT still wait-bound) |
+| P10 | release `-O2` | metal 512³ GEMM microbench | ~0.93ms/iter | — | ~289 GFLOP/s vs ~169 naive |
+| P9 | release `-O2` | metal 12.39M GPT train, T=64 (gpt-bench) | ~0.372s/iter | — | ~30x vs pre-P9 ~11.4s; CPU ref ~2.66s |
+| P13 | release `-O2` | metal 12.39M GPT train, T=64 (gpt-bench) | ~0.345s/iter | — | RMSNorm family parallelized; rest now bounded by sdpa_bwd (G3) |
+| P4 | release `-O2` | CPU-backed params, Metal graph, 100 steps, 1 read | — | ~1.12 ms/run | wait/writeback per-run O(steps)->1; CPU-backed path now async |
 
 ---
 

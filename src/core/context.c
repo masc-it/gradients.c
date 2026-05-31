@@ -322,8 +322,13 @@ static void profile_print_summary_backend(FILE *file, const gd_profile_backend_s
         if (op->count == 0U) {
             continue;
         }
-        (void)fprintf(file, "[gd_profile]   op=%s count=%" PRIu64 "\n",
-                      _gd_op_kind_name((_gd_op_kind)i), op->count);
+        if (op->ns > 0U) {
+            (void)fprintf(file, "[gd_profile]   op=%s count=%" PRIu64 " gpu_ms=%.3f\n",
+                          _gd_op_kind_name((_gd_op_kind)i), op->count, ns_to_ms(op->ns));
+        } else {
+            (void)fprintf(file, "[gd_profile]   op=%s count=%" PRIu64 "\n",
+                          _gd_op_kind_name((_gd_op_kind)i), op->count);
+        }
     }
 }
 
@@ -713,6 +718,26 @@ gd_status _gd_context_set_active_graph(gd_context *ctx, gd_graph *graph)
 bool _gd_profile_enabled(const gd_context *ctx)
 {
     return ctx != NULL && ctx->profile_mode != GD_PROFILE_OFF;
+}
+
+bool _gd_profile_trace_enabled(const gd_context *ctx)
+{
+    return ctx != NULL && ctx->profile_mode == GD_PROFILE_TRACE;
+}
+
+void _gd_profile_record_op_time(gd_context *ctx, const _gd_backend *backend,
+                                int op, uint64_t elapsed_ns)
+{
+    gd_profile_backend_stats *stats = NULL;
+
+    if (!_gd_profile_enabled(ctx) || op < 0 || op >= GD_PROFILE_OP_COUNT) {
+        return;
+    }
+    stats = profile_stats(ctx, backend);
+    if (stats == NULL) {
+        return;
+    }
+    stats->ops[op].ns += elapsed_ns;
 }
 
 uint64_t _gd_profile_now_ns(void)

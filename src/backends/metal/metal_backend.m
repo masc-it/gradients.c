@@ -13,6 +13,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <limits.h>
 #include <string.h>
@@ -40,9 +41,21 @@
  * next synchronize/flush (P4 lazy writeback). Holds boxed _gd_executable*
  * pointers; deduped. Empty for fully device-resident graphs. */
 @property (strong) NSMutableArray<NSValue *> *pendingExes;
+/* Opt-in MPSMatrixMultiplication path (`GD_METAL_MPS=1`). */
+@property BOOL useMPS;
 @end
 
 @implementation GDMetalState
+@end
+
+@interface GDMPSGemmPlan : NSObject
+@property (strong) MPSMatrixMultiplication *kernel;
+@property (strong) MPSMatrix *left;
+@property (strong) MPSMatrix *right;
+@property (strong) MPSMatrix *result;
+@end
+
+@implementation GDMPSGemmPlan
 @end
 
 /* op kind -> kernel function name in kernels.metal. Extend per phase. */
@@ -204,6 +217,7 @@ struct _gd_executable {
     void **node_pso;   /* primary pipeline per node id, or NULL */
     void **node_pso2;  /* secondary pipeline (e.g. sdpa_bwd dkv), or NULL */
     void **node_pso3;  /* tertiary pipeline (e.g. sdpa_bwd stats), or NULL */
+    void **node_mps;   /* optional per-node MPS kernel object, retained, or NULL */
     gd_storage **node_scratch; /* per-node device scratch (e.g. sdpa_bwd stats), or NULL */
     /* Fusion plan (GPU_FUSED, Option A): a node marked absorbed is encoded by its
      * group head, so execute skips it. Set by metal_plan_fusions at compile;
@@ -471,6 +485,14 @@ static void metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe->node_pso);
     free(exe->node_pso2);
     free(exe->node_pso3);
+    if (exe->node_mps != NULL) {
+        for (i = 0; i < exe->n_plan; ++i) {
+            if (exe->node_mps[i] != NULL) {
+                CFRelease(exe->node_mps[i]);
+            }
+        }
+        free(exe->node_mps);
+    }
     free(exe->node_absorbed);
     free(exe->node_fused_src);
     if (exe->node_scratch != NULL) {
@@ -775,11 +797,12 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
         exe->node_pso = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso));
         exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
         exe->node_pso3 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso3));
+        exe->node_mps = calloc((size_t)graph->n_nodes, sizeof(*exe->node_mps));
         exe->node_scratch = calloc((size_t)graph->n_nodes, sizeof(*exe->node_scratch));
         exe->node_absorbed = calloc((size_t)graph->n_nodes, sizeof(*exe->node_absorbed));
         exe->node_fused_src = calloc((size_t)graph->n_nodes, sizeof(*exe->node_fused_src));
         if (exe->node_pso == NULL || exe->node_pso2 == NULL || exe->node_pso3 == NULL ||
-            exe->node_scratch == NULL || exe->node_absorbed == NULL ||
+            exe->node_mps == NULL || exe->node_scratch == NULL || exe->node_absorbed == NULL ||
             exe->node_fused_src == NULL) {
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal encode plan");
             goto fail;
@@ -789,6 +812,84 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
+            if (st.useMPS && (op == _GD_OP_LINEAR || op == _GD_OP_MATMUL)) {
+                const gd_tensor_desc *a_desc = &graph->values[node->inputs[0]].desc;
+                const gd_tensor_desc *b_desc = &graph->values[node->inputs[1]].desc;
+                const gd_tensor_desc *out_desc = &graph->values[node->outputs[0]].desc;
+                if (a_desc->dtype == GD_DTYPE_F32 && b_desc->dtype == GD_DTYPE_F32 &&
+                    out_desc->dtype == GD_DTYPE_F32 && a_desc->layout == GD_LAYOUT_CONTIGUOUS &&
+                    b_desc->layout == GD_LAYOUT_CONTIGUOUS &&
+                    out_desc->layout == GD_LAYOUT_CONTIGUOUS &&
+                    a_desc->storage_offset_bytes == 0 && b_desc->storage_offset_bytes == 0 &&
+                    out_desc->storage_offset_bytes == 0) {
+                    bool ok = false;
+                    bool trans_right = node->attrs.trans_b ? true : false;
+                    int rows = 0;
+                    int cols = 0;
+                    int inner = 0;
+                    if (op == _GD_OP_LINEAR && !node->attrs.has_bias) {
+                        inner = (int)a_desc->sizes[a_desc->ndim - 1];
+                        cols = (int)out_desc->sizes[out_desc->ndim - 1];
+                        rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
+                        ok = true;
+                    } else if (op == _GD_OP_MATMUL && !node->attrs.trans_a && b_desc->ndim == 2) {
+                        int a_cols = (int)a_desc->sizes[a_desc->ndim - 1];
+                        int b_rows = (int)b_desc->sizes[0];
+                        int b_cols = (int)b_desc->sizes[1];
+                        inner = a_cols;
+                        cols = trans_right ? b_rows : b_cols;
+                        rows = inner > 0 ? (int)(desc_numel(a_desc) / inner) : 0;
+                        ok = (out_desc->sizes[out_desc->ndim - 1] == cols);
+                    }
+                    if (ok && rows > 0 && inner > 0 && cols > 0) {
+                        NSUInteger a_cols = (NSUInteger)inner;
+                        NSUInteger b_rows = (NSUInteger)b_desc->sizes[0];
+                        NSUInteger b_cols = (NSUInteger)b_desc->sizes[1];
+                        NSUInteger out_cols = (NSUInteger)cols;
+                        MPSMatrixDescriptor *ad = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:(NSUInteger)rows
+                                             columns:a_cols
+                                            rowBytes:a_cols * sizeof(float)
+                                            dataType:MPSDataTypeFloat32];
+                        MPSMatrixDescriptor *bd = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:b_rows
+                                             columns:b_cols
+                                            rowBytes:b_cols * sizeof(float)
+                                            dataType:MPSDataTypeFloat32];
+                        MPSMatrixDescriptor *od = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:(NSUInteger)rows
+                                             columns:out_cols
+                                            rowBytes:out_cols * sizeof(float)
+                                            dataType:MPSDataTypeFloat32];
+                        GDMPSGemmPlan *plan = [GDMPSGemmPlan new];
+                        plan.kernel = [[MPSMatrixMultiplication alloc]
+                            initWithDevice:st.device
+                            transposeLeft:false
+                            transposeRight:trans_right
+                            resultRows:(NSUInteger)rows
+                            resultColumns:(NSUInteger)cols
+                            interiorColumns:(NSUInteger)inner
+                            alpha:1.0
+                            beta:0.0];
+                        plan.left = [[MPSMatrix alloc]
+                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[0]].storage)
+                                    offset:0
+                                descriptor:ad];
+                        plan.right = [[MPSMatrix alloc]
+                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[1]].storage)
+                                    offset:0
+                                descriptor:bd];
+                        plan.result = [[MPSMatrix alloc]
+                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->outputs[0]].storage)
+                                    offset:0
+                                descriptor:od];
+                        if (plan.kernel != nil && plan.left != nil && plan.right != nil &&
+                            plan.result != nil) {
+                            exe->node_mps[j] = (void *)CFBridgingRetain(plan);
+                        }
+                    }
+                }
+            }
             if (op == _GD_OP_RMS_NORM_WBWD) {
                 const gd_tensor_desc *x_desc = &graph->values[node->inputs[0]].desc;
                 int last = (int)x_desc->sizes[x_desc->ndim - 1];
@@ -1215,6 +1316,27 @@ static void encode_linear(id<MTLComputeCommandEncoder> enc,
     if (p.out_features > 0 && p.rows > 0) {
         dispatch_gemm_tiles(enc, (NSUInteger)p.out_features, (NSUInteger)p.rows, 1);
     }
+}
+
+static gd_status encode_mps_gemm(id<MTLCommandBuffer> cmd,
+                                 id<MTLComputeCommandEncoder> *enc,
+                                 GDMPSGemmPlan *plan)
+{
+    if (cmd == nil || enc == NULL || *enc == nil || plan == nil || plan.kernel == nil ||
+        plan.left == nil || plan.right == nil || plan.result == nil) {
+        return _gd_error(GD_ERR_BACKEND, "invalid MPS GEMM encode");
+    }
+    [*enc endEncoding];
+    *enc = nil;
+    [plan.kernel encodeToCommandBuffer:cmd
+                            leftMatrix:plan.left
+                           rightMatrix:plan.right
+                          resultMatrix:plan.result];
+    *enc = [cmd computeCommandEncoder];
+    if (*enc == nil) {
+        return _gd_error(GD_ERR_BACKEND, "failed to resume compute encoder after MPS GEMM");
+    }
+    return GD_OK;
 }
 
 /* Splits a tensor around `dim` into [outer, d, inner] extents. */
@@ -2180,6 +2302,10 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                 if (exe->node_fused_src[i] >= 0) {
                     encode_fused_silu_mul(enc, pso2, exe, node,
                                           &exe->graph->nodes[exe->node_fused_src[i]]);
+                } else if (exe->node_mps[i] != NULL &&
+                           (node->op == _GD_OP_LINEAR || node->op == _GD_OP_MATMUL)) {
+                    status = encode_mps_gemm(cmd, &enc,
+                                             (__bridge GDMPSGemmPlan *)exe->node_mps[i]);
                 } else {
                     status = encode_node(self, enc, exe, node, pso, pso2, pso3, scratch);
                 }
@@ -2225,6 +2351,11 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                 if (exe->node_fused_src[i] >= 0) {
                     encode_fused_silu_mul(enc, pso2, exe, &exe->graph->nodes[i],
                                           &exe->graph->nodes[exe->node_fused_src[i]]);
+                } else if (exe->node_mps[i] != NULL &&
+                           (exe->graph->nodes[i].op == _GD_OP_LINEAR ||
+                            exe->graph->nodes[i].op == _GD_OP_MATMUL)) {
+                    status = encode_mps_gemm(cmd, &enc,
+                                             (__bridge GDMPSGemmPlan *)exe->node_mps[i]);
                 } else {
                     status = encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2, pso3, scratch);
                 }
@@ -2292,6 +2423,16 @@ static bool metal_supports_node(_gd_backend *self, const _gd_node *node)
 
 /* ---- Init / shutdown / registration -------------------------------------- */
 
+static bool env_flag_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    if (v == NULL || v[0] == '\0') {
+        return false;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+           strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
+}
+
 static NSString *resolve_metallib_path(void)
 {
     const char *env = getenv("GRADIENTS_METALLIB");
@@ -2335,6 +2476,7 @@ static gd_status metal_init(_gd_backend *self, gd_context *ctx, int device_index
         st.pipelinesByName = [NSMutableDictionary dictionary];
         st.inFlight = nil;
         st.pendingExes = [NSMutableArray array];
+        st.useMPS = env_flag_enabled("GD_METAL_MPS") ? YES : NO;
 
         for (k = 0; k < sizeof(g_metal_kernels) / sizeof(g_metal_kernels[0]); ++k) {
             NSString *name = [NSString stringWithUTF8String:g_metal_kernels[k].fn];

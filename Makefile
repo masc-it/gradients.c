@@ -58,7 +58,7 @@ METAL_SHADERS := $(shell find $(METAL_DIR) -type f -name '*.metal' 2>/dev/null |
 # Let C/Obj-C sources conditionally compile the Metal registration path.
 CPPFLAGS += -DGD_ENABLE_METAL=1
 OBJCFLAGS := $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c
-LDLIBS += -framework Metal -framework Foundation -framework QuartzCore
+LDLIBS += -framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore
 # The .metal shader compiler ships with full Xcode, not the Command Line Tools.
 # Compile shaders only when it is present; the Obj-C path still builds without it.
 METAL_TOOL := $(shell xcrun --find metal 2>/dev/null)

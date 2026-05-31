@@ -196,12 +196,16 @@ us how much headroom A is chasing.
   (`float4` accumulators + `float4` inner reads), `BK=8` K-tiles staged in
   threadgroup memory. Handles all shapes (bounds-checked) + transpose/batch, so
   it is a drop-in for the old kernels.
-- [ ] T2 — Option B spike: `MPSMatrixMultiplication` behind `GD_METAL_MPS=1`,
-  buffer aliasing + transpose/batch mapping, microbench vs C, decide keep/drop.
+- [x] T2 — Option B spike: `MPSMatrixMultiplication` behind `GD_METAL_MPS=1`.
+  Kept as an opt-in fast path; see §10. It caches MPS kernels/matrix wrappers in
+  the executable plan, closes/reopens the compute encoder around MPS encodes, and
+  falls back to the in-house tiled kernels for unsupported shapes.
 - [x] T3 — Option A: `simdgroup_matrix` kernel — **attempted, parity-correct, but
   slower for fp32; gated off behind `GD_METAL_GEMM_SIMD=1`.** See §8.1.
-- [ ] T4 — Selection + (optional) per-(shape,dtype) autotune cache; wire fast
-  path into the P8 compile plan; document final shape→kernel policy.
+- [~] T4 — Selection + (optional) per-(shape,dtype) autotune cache; wire fast
+  path into the P8 compile plan; document final shape→kernel policy. Partially
+  done for MPS: compile-time plan stores per-node `GDMPSGemmPlan`; selection is
+  env-gated (`GD_METAL_MPS=1`) with shape fallback.
 
 Each phase: land with parity + numbers; do not regress the canonical workload.
 
@@ -342,3 +346,69 @@ Learnings:
   complexity. Mitigation: one fallback (scalar tiled) is always correct; fast
   paths are strictly opt-in by shape at compile.
 ```
+
+## 10. T2 finding — MPSMatrixMultiplication wins on M1 Pro
+
+External microbench (`/tmp/mps_matrix_vs_gradients.m`, tight row-major F32) showed
+MPSMatrixMultiplication at ~2.8–3.4× the in-house `gd_linear_tiled` throughput on
+GPT projection shapes:
+
+```text
+B4T256 q/k/v/out      778  -> 2686 GF/s  3.45x
+B4T256 gate/up       1099  -> 3260 GF/s  2.96x
+B4T256 lm_head       1142  -> 3377 GF/s  2.96x
+B8T512 q/k/v/out     1120  -> 3115 GF/s  2.78x
+B8T512 gate/up       1134  -> 3393 GF/s  2.99x
+B8T512 lm_head       1162  -> 3446 GF/s  2.97x
+square 2048          1145  -> 3465 GF/s  3.03x
+```
+
+Integrated MPS as an **opt-in** path (`GD_METAL_MPS=1`), not the default yet:
+- Links `MetalPerformanceShaders` in Metal builds.
+- Adds `GDMPSGemmPlan` cached per executable node (MPS kernel + left/right/result
+  matrix wrappers); no per-run descriptor/matrix allocation.
+- Handles `_GD_OP_LINEAR` when F32, contiguous, no bias.
+- Handles `_GD_OP_MATMUL` for the safe flattened-GEMM subset:
+  `trans_a=false`, RHS is 2D, F32 contiguous. This covers the LM head and many dx
+  matmuls. Batched dW matmuls (`trans_a=true`, both operands batched) remain on
+  the in-house tiled kernel for now.
+- MPS encodes directly on the command buffer, so the backend ends the active
+  compute encoder, encodes MPS, then resumes a compute encoder. This preserves
+  the existing single command-buffer ordering.
+- Unsupported shapes silently fall back to `gd_matmul_tiled` / `gd_linear_tiled`.
+
+Validation: default `make check` green; `GD_METAL_MPS=1 make check` green;
+`GD_METAL_MPS=1` ASan `test_metal_gpt` green.
+
+Clean release GPT bench (6L, M1 Pro):
+
+```text
+B=4,T=256:
+  default (tiled)       step 286.5 ms, 3575 tok/s
+  MPS linear only       step 251.9 ms, 4066 tok/s
+  MPS linear+matmul     step 252.0 ms, 4064 tok/s
+
+B=8,T=512:
+  default (tiled)       step 1514.4 ms, 2705 tok/s
+  MPS linear only       step 1459.3 ms, 2807 tok/s
+  MPS linear+matmul     step 1388.1 ms, 2951 tok/s
+```
+
+Trace deltas (`GD_PROFILE=trace`, B=8,T=512):
+
+```text
+linear:  ~105 ms -> ~60 ms
+matmul:  ~250 ms -> ~173 ms
+```
+
+Learning:
+- MPS is a real win on M1 Pro for F32 GEMM even though our custom simdgroup path
+  was slower. Apple's tuned path likely uses private scheduling / memory movement
+  unavailable through basic MSL simdgroup experiments.
+- The encoder-model mismatch is manageable: close compute encoder around MPS and
+  reopen; one IR node still maps to one backend op, so GPU_SAFE holds.
+- Remaining matmul headroom is mostly the batched dW shape family. Supporting MPS
+  batch descriptors (or changing autograd to flatten/reduce differently) is the
+  next GEMM-specific extension.
+- Keep env-gated until more shape coverage and CI soak; default path remains the
+  portable in-house tiled kernel.

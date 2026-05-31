@@ -100,7 +100,17 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dq_reduce",
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_reduce",
+    "gd_matmul_simd",  /* matrix-unit GEMM (large shapes) */
+    "gd_linear_simd",
 };
+
+/* Use the simdgroup_matrix GEMM when the block is large enough to amortize its
+ * threadgroup-store + bounds-copy overhead; otherwise the register-blocked
+ * kernel wins on small/skinny shapes. */
+static bool gemm_use_simd(int m, int n, int k)
+{
+    return m >= 64 && n >= 64 && k >= 32;
+}
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
  * and offsets). When n_splits==1 only the stats region is used (the original
@@ -648,6 +658,11 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
     if (graph->n_nodes > 0) {
         GDMetalState *st = state_of(self);
         int j = 0;
+        /* simdgroup_matrix GEMM is opt-in: on Apple GPUs the matrix units favor
+         * fp16/bf16, so for fp32 it does not beat the register-blocked kernel
+         * (it regressed ~3x in measurement, see plan_gemm_perf_tuning_metal.md
+         * §8.1). Kept behind GD_METAL_GEMM_SIMD=1 for future mixed-precision work. */
+        bool simd_gemm = getenv("GD_METAL_GEMM_SIMD") != NULL;
 
         exe->node_pso = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso));
         exe->node_pso2 = calloc((size_t)graph->n_nodes, sizeof(*exe->node_pso2));
@@ -662,7 +677,11 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             const _gd_node *node = &graph->nodes[j];
             _gd_op_kind op = node->op;
             exe->node_pso[j] = (__bridge void *)pipeline_for(st, op);
-            if (op == _GD_OP_SDPA) {
+            if (op == _GD_OP_MATMUL && simd_gemm) {
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_matmul_simd");
+            } else if (op == _GD_OP_LINEAR && simd_gemm) {
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_linear_simd");
+            } else if (op == _GD_OP_SDPA) {
                 /* Long-context forward uses split-K: scratch holds per-split
                  * partial (acc[Dh], m, l) for each (b, hq, query). Only allocated
                  * when the tiled path is eligible (Dh <= DHT) and >1 split. */
@@ -856,6 +875,19 @@ static void dispatch_gemm_tiles(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
 }
 
+/* simdgroup_matrix GEMM: 64x64 block per threadgroup, 128 threads (4 simdgroups). */
+static void dispatch_gemm_simd(id<MTLComputeCommandEncoder> enc,
+                               NSUInteger cols,
+                               NSUInteger rows,
+                               NSUInteger batch)
+{
+    NSUInteger gx = (cols + GD_METAL_GEMM_SIMD_BN - 1) / GD_METAL_GEMM_SIMD_BN;
+    NSUInteger gy = (rows + GD_METAL_GEMM_SIMD_BM - 1) / GD_METAL_GEMM_SIMD_BM;
+
+    [enc dispatchThreadgroups:MTLSizeMake(gx, gy, batch)
+        threadsPerThreadgroup:MTLSizeMake(GD_METAL_GEMM_SIMD_THREADS, 1, 1)];
+}
+
 /* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in
  * kernels.metal (power of two for the tree reduction). */
 #define GD_METAL_RMS_TG 256
@@ -943,6 +975,7 @@ static gd_status encode_cast(id<MTLComputeCommandEncoder> enc,
 
 static void encode_matmul(id<MTLComputeCommandEncoder> enc,
                           id<MTLComputePipelineState> pso,
+                          id<MTLComputePipelineState> simd_pso,
                           _gd_executable *exe,
                           const _gd_node *node)
 {
@@ -982,18 +1015,24 @@ static void encode_matmul(id<MTLComputeCommandEncoder> enc,
         p.b_batch_sizes[i] = (int)b_desc->sizes[i];
     }
 
-    [enc setComputePipelineState:pso];
+    bool use_simd = simd_pso != nil && gemm_use_simd(p.m, p.n, p.k);
+    [enc setComputePipelineState:use_simd ? simd_pso : pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
     if (p.n > 0 && p.m > 0 && batch_total > 0) {
-        dispatch_gemm_tiles(enc, (NSUInteger)p.n, (NSUInteger)p.m, (NSUInteger)batch_total);
+        if (use_simd) {
+            dispatch_gemm_simd(enc, (NSUInteger)p.n, (NSUInteger)p.m, (NSUInteger)batch_total);
+        } else {
+            dispatch_gemm_tiles(enc, (NSUInteger)p.n, (NSUInteger)p.m, (NSUInteger)batch_total);
+        }
     }
 }
 
 static void encode_linear(id<MTLComputeCommandEncoder> enc,
                           id<MTLComputePipelineState> pso,
+                          id<MTLComputePipelineState> simd_pso,
                           _gd_executable *exe,
                           const _gd_node *node)
 {
@@ -1008,7 +1047,8 @@ static void encode_linear(id<MTLComputeCommandEncoder> enc,
     p.trans_w = node->attrs.trans_b ? 1 : 0;
     p.has_bias = node->attrs.has_bias ? 1 : 0;
 
-    [enc setComputePipelineState:pso];
+    bool use_simd = simd_pso != nil && gemm_use_simd(p.rows, p.out_features, p.in_features);
+    [enc setComputePipelineState:use_simd ? simd_pso : pso];
     [enc setBuffer:value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
     /* bias is always bound (placeholder when absent; the kernel guards reads). */
@@ -1016,7 +1056,11 @@ static void encode_linear(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     if (p.out_features > 0 && p.rows > 0) {
-        dispatch_gemm_tiles(enc, (NSUInteger)p.out_features, (NSUInteger)p.rows, 1);
+        if (use_simd) {
+            dispatch_gemm_simd(enc, (NSUInteger)p.out_features, (NSUInteger)p.rows, 1);
+        } else {
+            dispatch_gemm_tiles(enc, (NSUInteger)p.out_features, (NSUInteger)p.rows, 1);
+        }
     }
 }
 
@@ -1821,10 +1865,10 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_CAST:
         return encode_cast(enc, pso, exe, node);
     case _GD_OP_MATMUL:
-        encode_matmul(enc, pso, exe, node);
+        encode_matmul(enc, pso, pso2, exe, node);
         return GD_OK;
     case _GD_OP_LINEAR:
-        encode_linear(enc, pso, exe, node);
+        encode_linear(enc, pso, pso2, exe, node);
         return GD_OK;
     case _GD_OP_SUM:
     case _GD_OP_MEAN:

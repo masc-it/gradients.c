@@ -198,9 +198,8 @@ us how much headroom A is chasing.
   it is a drop-in for the old kernels.
 - [ ] T2 — Option B spike: `MPSMatrixMultiplication` behind `GD_METAL_MPS=1`,
   buffer aliasing + transpose/batch mapping, microbench vs C, decide keep/drop.
-- [ ] T3 — Option A: `simdgroup_matrix` kernel for the qualifying square-ish
-  shapes, shape-guarded fast path with C as fallback, on-device tile autotune,
-  parity-gated. The headline ceiling.
+- [x] T3 — Option A: `simdgroup_matrix` kernel — **attempted, parity-correct, but
+  slower for fp32; gated off behind `GD_METAL_GEMM_SIMD=1`.** See §8.1.
 - [ ] T4 — Selection + (optional) per-(shape,dtype) autotune cache; wire fast
   path into the P8 compile plan; document final shape→kernel policy.
 
@@ -229,8 +228,9 @@ When marking a phase done, record in this doc:
 | baseline | B=4 T=256 step | scalar tiled | ~164 (step) | GEMM ~206ms of ~500ms (~41%) |
 | T1 | B=4 T=256 step | 64×64 reg-blocked | ~201 (step) | matmul 148->81ms, linear 57->38ms; 2065->2511 tok/s |
 | T1 | B=4 T=1024 step | 64×64 reg-blocked | ~136 (step) | matmul 558->248ms (2.25×), linear 196->102ms (1.92×) |
+| T3 | B=4 T=256 matmul | simdgroup_matrix (fp32) | — | 408ms vs 82ms reg-blocked — 3–5× slower, gated off (§8.1) |
 
-(Fill as T2–T4 land.)
+(Fill as T2/T4 land.)
 
 ## 8. T1 findings — register-blocked / float4 GEMM
 
@@ -276,6 +276,44 @@ Learnings / choices:
   `simdgroup_matrix`) is the remaining GEMM ceiling.
 
 ---
+
+## 8.1 T3 finding — simdgroup_matrix is not competitive for fp32
+
+Implemented `gd_matmul_simd` / `gd_linear_simd`: 64×64 block per threadgroup, 4
+simdgroups (2×2) each owning a 4×4 grid of 8×8 `simdgroup_float8x8` accumulator
+fragments, K streamed in 8-deep tiles (transpose/batch normalized during
+staging). Parity-correct (CPU↔Metal 1e-4, GPT train), but measured **3–5× slower
+than the register-blocked kernel** on M-series:
+
+```text
+matmul gpu_ms (B=4, 6 layers, GD_PROFILE=trace):
+  T       reg-blocked (T1)   simdgroup (T3)
+  256     82                 ~408
+  1024    248                ~1870
+```
+
+Iteration ruled out the obvious host-side culprits:
+- **Output staging**: tried (a) full 64×64 threadgroup tile, (b) per-simdgroup
+  8×8 staged copy, (c) direct device `simdgroup_store` for interior blocks. All
+  ~the same (~408 ms at T=256) → the store is **not** the bottleneck.
+- **Occupancy**: the direct-store path uses only As/Bs (~4 KB threadgroup), so
+  occupancy is high, yet no improvement.
+
+That leaves the `simdgroup_multiply_accumulate` itself: on Apple GPUs the matrix
+units are built for fp16/bf16, and **fp32 matrix-multiply runs at a fraction of
+the fp32 vector-ALU rate**. The register-blocked `float4` kernel already saturates
+fp32 FMA throughput, so the matrix path cannot win in fp32.
+
+Decision: keep the kernels behind `GD_METAL_GEMM_SIMD=1` (opt-in, default off so
+there is no regression) as a validated foundation for a future mixed-precision
+(fp16/bf16) path — that is where `simdgroup_matrix` pays off. The shipping fp32
+GEMM remains the register-blocked kernel (T1).
+
+Learning: `simdgroup_matrix` is a precision-gated optimization, not a free GEMM
+speedup. Revisit T3 only alongside an fp16/bf16 compute path; for fp32 the
+remaining headroom is in the register-blocked kernel (bigger micro-tiles, deeper
+K-unroll) or Option B (MPS, which internally selects precision-appropriate
+kernels).
 
 ## 9. Risks
 

@@ -529,6 +529,65 @@ static int test_swiglu_fusion(gd_context *ctx)
     return 0;
 }
 
+/* F4: add -> rms_norm forward plus rms_norm_bwd -> gradient add backward. The
+ * extra z=sum+y consumer gives the residual stream an outside grad, forcing the
+ * backward accumulation ADD that the fused bwd kernel absorbs. */
+static int test_add_rms_norm_fusion(gd_context *ctx)
+{
+    enum { AR_ROWS = 4, AR_LAST = 320, AR_N = AR_ROWS * AR_LAST };
+    float a_d[AR_N];
+    float b_d[AR_N];
+    float w_d[AR_LAST];
+    int64_t s2[2] = {AR_ROWS, AR_LAST};
+    int64_t ws[1] = {AR_LAST};
+    int64_t flat[1] = {AR_N};
+    gd_compare_options opts = {1e-4, 1e-4, false};
+    gd_tensor *a = NULL, *b = NULL, *w = NULL, *sum = NULL, *y = NULL;
+    gd_tensor *z = NULL, *fl = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    unsigned long n0 = 0, n1 = 0;
+    int i = 0;
+
+    for (i = 0; i < AR_N; ++i) {
+        a_d[i] = 0.03F * (float)((i % 17) - 8);
+        b_d[i] = 0.02F * (float)((i % 13) - 6);
+    }
+    for (i = 0; i < AR_LAST; ++i) {
+        w_d[i] = 0.8F + 0.001F * (float)(i % 23);
+    }
+    CHECK_OK(make_f32(ctx, 2, s2, a_d, &a));
+    CHECK_OK(make_f32(ctx, 2, s2, b_d, &b));
+    CHECK_OK(make_f32(ctx, 1, ws, w_d, &w));
+    CHECK_OK(gd_tensor_set_requires_grad(a, true));
+    CHECK_OK(gd_tensor_set_requires_grad(b, true));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_add(ctx, a, b, &sum));
+    CHECK_OK(gd_rms_norm(ctx, sum, w, 1e-5F, &y));
+    CHECK_OK(gd_add(ctx, sum, y, &z));
+    CHECK_OK(gd_tensor_reshape(z, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(sum);
+    gd_tensor_release(y);
+    gd_tensor_release(z);
+    gd_tensor_release(fl);
+    gd_tensor_release(loss);
+
+    n0 = _gd_metal_fusions_applied();
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+    n1 = _gd_metal_fusions_applied();
+    CHECK_TRUE(n1 >= n0 + 2); /* fwd add+rms_norm and bwd rms_norm_bwd+add */
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(a);
+    gd_tensor_release(b);
+    gd_tensor_release(w);
+    return 0;
+}
+
 /* Multi-block SDPA parity (forward + backward via gd_graph_compare). The tiny-T
  * builders above fit in a single tile (BQ=64, BK=16) and run through the 64-float
  * gradient harness, so they never exercise the B1 causal block-skip. T=130 spans
@@ -616,6 +675,7 @@ int main(void)
     rc |= test_sdpa_multiblock(ctx, 600, 0);  /* causal, split-K (3 splits) */
     rc |= test_sdpa_multiblock(ctx, 600, 48); /* causal + window, split-K */
     rc |= test_swiglu_fusion(ctx);            /* F1 fused silu+mul + fired check */
+    rc |= test_add_rms_norm_fusion(ctx);      /* F4 residual add+rms_norm fwd/bwd */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");
     rc |= backward_parity(ctx, build_gelu_tanh, "gelu_tanh");
     rc |= backward_parity(ctx, build_transpose, "transpose");

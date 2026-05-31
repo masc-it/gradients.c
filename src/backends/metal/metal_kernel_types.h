@@ -53,6 +53,11 @@
 #define GD_METAL_SDPA_SPLIT_MIN 128
 #define GD_METAL_SDPA_SPLIT_MAX 8
 
+/* Fused add+rms_norm kernels cache one normalized row in threadgroup memory to
+ * avoid materializing/reloading the residual-add output inside the norm. Keep
+ * conservative; shapes above this limit fall back to unfused RMS kernels. */
+#define GD_METAL_FUSED_RMS_MAX 2048
+
 /* Elementwise binary ops (add/mul) with NumPy-style right-aligned broadcasting.
  * `out_sizes` describes the contiguous output; `a_sizes`/`b_sizes` describe each
  * input's own shape so the shader can reproduce broadcast_offset() from the CPU

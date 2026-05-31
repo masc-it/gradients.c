@@ -113,6 +113,8 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
+    "gd_add_rms_norm", /* F4: residual add + RMSNorm forward */
+    "gd_rms_norm_bwd_add", /* F4: RMSNorm backward + residual grad add */
     "gd_cross_entropy_reduce",
     "gd_lmce_fwd_chunk",
     "gd_lmce_loss_rows",
@@ -182,29 +184,28 @@ static int sdpa_split_len(int Tk, int n_splits)
 
 typedef struct lmce_scratch_layout {
     size_t logits_off;
-    size_t m_off;
-    size_t l_off;
     size_t target_logit_off;
     size_t losses_off;
     size_t total;
 } lmce_scratch_layout;
 
-static lmce_scratch_layout lmce_scratch_layout_for(int rows, int chunk)
+static lmce_scratch_layout lmce_fwd_scratch_layout_for(int rows, int chunk)
 {
     lmce_scratch_layout L;
     size_t off = 0U;
     L.logits_off = off;
     off += (size_t)rows * (size_t)chunk * sizeof(float);
-    L.m_off = off;
-    off += (size_t)rows * sizeof(float);
-    L.l_off = off;
-    off += (size_t)rows * sizeof(float);
     L.target_logit_off = off;
     off += (size_t)rows * sizeof(float);
     L.losses_off = off;
     off += (size_t)rows * sizeof(float);
     L.total = off;
     return L;
+}
+
+static size_t lmce_bwd_scratch_bytes_for(int rows, int chunk)
+{
+    return (size_t)rows * (size_t)chunk * sizeof(float);
 }
 
 static gd_status metal_dtype_code(gd_dtype dtype, int *out)
@@ -293,6 +294,20 @@ static int64_t desc_numel(const gd_tensor_desc *desc)
         n *= desc->sizes[i];
     }
     return n;
+}
+
+static bool desc_same_shape_metal(const gd_tensor_desc *a, const gd_tensor_desc *b)
+{
+    int i = 0;
+    if (a->ndim != b->ndim) {
+        return false;
+    }
+    for (i = 0; i < a->ndim; ++i) {
+        if (a->sizes[i] != b->sizes[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ---- Storage + transfers ------------------------------------------------- */
@@ -735,6 +750,121 @@ static bool try_fuse_silu_mul(GDMetalState *st, const gd_graph *graph,
     return true;
 }
 
+/* F4 forward: add(a,b) -> rms_norm(sum, weight). RMSNorm (head) absorbs ADD
+ * and writes both sum (the residual stream boundary) and normalized output. */
+static bool try_fuse_add_rms_norm(GDMetalState *st, const gd_graph *graph,
+                                  _gd_executable *exe, int head_idx)
+{
+    const _gd_node *head = &graph->nodes[head_idx];
+    int sum_id = 0;
+    int add_idx = 0;
+    const _gd_node *add = NULL;
+    const gd_tensor_desc *sum_d = NULL;
+    const gd_tensor_desc *a_d = NULL;
+    const gd_tensor_desc *b_d = NULL;
+    int last = 0;
+
+    if (head->op != _GD_OP_RMS_NORM || head->n_inputs != 2 || head->n_outputs != 1) {
+        return false;
+    }
+    sum_id = head->inputs[0];
+    if (sum_id < 0 || sum_id >= exe->n_values) {
+        return false;
+    }
+    add_idx = graph->values[sum_id].producer_node_id;
+    if (add_idx < 0 || add_idx >= graph->n_nodes || exe->node_absorbed[add_idx]) {
+        return false;
+    }
+    add = &graph->nodes[add_idx];
+    if (add->op != _GD_OP_ADD || add->n_inputs != 2 || add->n_outputs != 1 ||
+        add->outputs[0] != sum_id) {
+        return false;
+    }
+    if (value_min_consumer(graph, sum_id) < head_idx) {
+        return false;
+    }
+    sum_d = &graph->values[sum_id].desc;
+    a_d = &graph->values[add->inputs[0]].desc;
+    b_d = &graph->values[add->inputs[1]].desc;
+    if (sum_d->dtype != GD_DTYPE_F32 || a_d->dtype != GD_DTYPE_F32 || b_d->dtype != GD_DTYPE_F32 ||
+        !desc_same_shape_metal(sum_d, a_d) || !desc_same_shape_metal(sum_d, b_d)) {
+        return false;
+    }
+    last = (int)sum_d->sizes[sum_d->ndim - 1];
+    if (last <= 0 || last > GD_METAL_FUSED_RMS_MAX) {
+        return false;
+    }
+    exe->node_pso2[head_idx] = (__bridge void *)pipeline_named(st, "gd_add_rms_norm");
+    if (exe->node_pso2[head_idx] == NULL) {
+        return false;
+    }
+    exe->node_fused_src[head_idx] = add_idx;
+    exe->node_absorbed[add_idx] = 1;
+    g_metal_fusions_applied++;
+    return true;
+}
+
+/* F4 backward: rms_norm_bwd(x,w,go) -> add(dx, dS_out). ADD (head) absorbs the
+ * RMS dx kernel, materializes dx for parity, and writes accumulated dS. */
+static bool try_fuse_rms_norm_bwd_add(GDMetalState *st, const gd_graph *graph,
+                                      _gd_executable *exe, int head_idx)
+{
+    const _gd_node *head = &graph->nodes[head_idx];
+    int dx_id = -1;
+    int src_idx = -1;
+    const _gd_node *src = NULL;
+    const gd_tensor_desc *out_d = NULL;
+    const gd_tensor_desc *dx_d = NULL;
+    const gd_tensor_desc *ds_d = NULL;
+    int src_slot = -1;
+    int ds_slot = -1;
+    int last = 0;
+
+    if (head->op != _GD_OP_ADD || head->n_inputs != 2 || head->n_outputs != 1) {
+        return false;
+    }
+    for (src_slot = 0; src_slot < 2; ++src_slot) {
+        int v = head->inputs[src_slot];
+        int p = (v >= 0 && v < graph->n_values) ? graph->values[v].producer_node_id : -1;
+        if (p >= 0 && p < graph->n_nodes && !exe->node_absorbed[p] &&
+            graph->nodes[p].op == _GD_OP_RMS_NORM_BWD) {
+            dx_id = v;
+            src_idx = p;
+            ds_slot = 1 - src_slot;
+            break;
+        }
+    }
+    if (src_idx < 0) {
+        return false;
+    }
+    src = &graph->nodes[src_idx];
+    if (src->n_inputs != 3 || src->n_outputs != 1 || src->outputs[0] != dx_id) {
+        return false;
+    }
+    if (value_min_consumer(graph, dx_id) < head_idx) {
+        return false;
+    }
+    out_d = &graph->values[head->outputs[0]].desc;
+    dx_d = &graph->values[dx_id].desc;
+    ds_d = &graph->values[head->inputs[ds_slot]].desc;
+    if (out_d->dtype != GD_DTYPE_F32 || dx_d->dtype != GD_DTYPE_F32 || ds_d->dtype != GD_DTYPE_F32 ||
+        !desc_same_shape_metal(out_d, dx_d) || !desc_same_shape_metal(out_d, ds_d)) {
+        return false;
+    }
+    last = (int)dx_d->sizes[dx_d->ndim - 1];
+    if (last <= 0 || last > GD_METAL_FUSED_RMS_MAX) {
+        return false;
+    }
+    exe->node_pso2[head_idx] = (__bridge void *)pipeline_named(st, "gd_rms_norm_bwd_add");
+    if (exe->node_pso2[head_idx] == NULL) {
+        return false;
+    }
+    exe->node_fused_src[head_idx] = src_idx;
+    exe->node_absorbed[src_idx] = 1;
+    g_metal_fusions_applied++;
+    return true;
+}
+
 static void metal_plan_fusions(_gd_backend *self, const gd_graph *graph,
                                _gd_executable *exe)
 {
@@ -744,7 +874,13 @@ static void metal_plan_fusions(_gd_backend *self, const gd_graph *graph,
         if (exe->node_absorbed[i]) {
             continue;
         }
-        (void)try_fuse_silu_mul(st, graph, exe, i);
+        if (try_fuse_silu_mul(st, graph, exe, i)) {
+            continue;
+        }
+        if (try_fuse_add_rms_norm(st, graph, exe, i)) {
+            continue;
+        }
+        (void)try_fuse_rms_norm_bwd_add(st, graph, exe, i);
     }
 }
 
@@ -1019,7 +1155,11 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                 int rows = D > 0 ? (int)(desc_numel(x_desc) / D) : 0;
                 int chunk = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
                 if (rows > 0 && chunk > 0) {
-                    exe->node_scratch_bytes[j] = lmce_scratch_layout_for(rows, chunk).total;
+                    if (op == _GD_OP_LM_CROSS_ENTROPY) {
+                        exe->node_scratch_bytes[j] = lmce_fwd_scratch_layout_for(rows, chunk).total;
+                    } else {
+                        exe->node_scratch_bytes[j] = lmce_bwd_scratch_bytes_for(rows, chunk);
+                    }
                     if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
                         scratch_max_bytes = exe->node_scratch_bytes[j];
                     }
@@ -1306,6 +1446,80 @@ static void encode_fused_silu_mul(id<MTLComputeCommandEncoder> enc,
     if (numel > 0) {
         dispatch_1d(enc, pso, (NSUInteger)numel);
     }
+}
+
+static void encode_fused_add_rms_norm(id<MTLComputeCommandEncoder> enc,
+                                      id<MTLComputePipelineState> pso,
+                                      _gd_executable *exe,
+                                      const _gd_node *head,
+                                      const _gd_node *add)
+{
+    const gd_tensor_desc *desc = &exe->graph->values[head->outputs[0]].desc;
+    gd_metal_rmsnorm_params p;
+
+    p.last = (int)desc->sizes[desc->ndim - 1];
+    p.rows = p.last > 0 ? (int)(desc_numel(desc) / p.last) : 0;
+    p.eps = head->attrs.eps;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, add->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, add->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, head->inputs[1]) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, add->outputs[0]) offset:0 atIndex:3];
+    [enc setBuffer:value_buffer(exe, head->outputs[0]) offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    if (p.rows > 0) {
+        dispatch_reduce_groups(enc, (NSUInteger)p.rows);
+    }
+}
+
+static void encode_fused_rms_norm_bwd_add(id<MTLComputeCommandEncoder> enc,
+                                          id<MTLComputePipelineState> pso,
+                                          _gd_executable *exe,
+                                          const _gd_node *head,
+                                          const _gd_node *src)
+{
+    const gd_tensor_desc *desc = &exe->graph->values[head->outputs[0]].desc;
+    int ds_input = head->inputs[0] == src->outputs[0] ? head->inputs[1] : head->inputs[0];
+    gd_metal_rmsnorm_params p;
+
+    p.last = (int)desc->sizes[desc->ndim - 1];
+    p.rows = p.last > 0 ? (int)(desc_numel(desc) / p.last) : 0;
+    p.eps = src->attrs.eps;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:value_buffer(exe, src->inputs[0]) offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, src->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:value_buffer(exe, src->inputs[2]) offset:0 atIndex:2];
+    [enc setBuffer:value_buffer(exe, ds_input) offset:0 atIndex:3];
+    [enc setBuffer:value_buffer(exe, src->outputs[0]) offset:0 atIndex:4];
+    [enc setBuffer:value_buffer(exe, head->outputs[0]) offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    if (p.rows > 0) {
+        dispatch_reduce_groups(enc, (NSUInteger)p.rows);
+    }
+}
+
+static gd_status encode_fused_head(id<MTLComputeCommandEncoder> enc,
+                                   id<MTLComputePipelineState> pso,
+                                   _gd_executable *exe,
+                                   const _gd_node *head,
+                                   const _gd_node *src)
+{
+    if (pso == nil || head == NULL || src == NULL) {
+        return _gd_error(GD_ERR_BACKEND, "invalid fused metal encode");
+    }
+    if (head->op == _GD_OP_MUL && src->op == _GD_OP_SILU) {
+        encode_fused_silu_mul(enc, pso, exe, head, src);
+        return GD_OK;
+    }
+    if (head->op == _GD_OP_RMS_NORM && src->op == _GD_OP_ADD) {
+        encode_fused_add_rms_norm(enc, pso, exe, head, src);
+        return GD_OK;
+    }
+    if (head->op == _GD_OP_ADD && src->op == _GD_OP_RMS_NORM_BWD) {
+        encode_fused_rms_norm_bwd_add(enc, pso, exe, head, src);
+        return GD_OK;
+    }
+    return _gd_error(GD_ERR_BACKEND, "unknown fused metal encode");
 }
 
 static gd_status encode_cast(id<MTLComputeCommandEncoder> enc,
@@ -1739,11 +1953,13 @@ static gd_status encode_lm_cross_entropy(_gd_backend *self,
     int V = (int)w_desc->sizes[0];
     int rows = D > 0 ? (int)(desc_numel(x_desc) / D) : 0;
     int chunk_max = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
-    lmce_scratch_layout L = lmce_scratch_layout_for(rows, chunk_max);
+    lmce_scratch_layout L = lmce_fwd_scratch_layout_for(rows, chunk_max);
     id<MTLBuffer> x_b = value_buffer(exe, node->inputs[0]);
     id<MTLBuffer> w_b = value_buffer(exe, node->inputs[1]);
     id<MTLBuffer> t_b = value_buffer(exe, node->inputs[2]);
     id<MTLBuffer> out_b = value_buffer(exe, node->outputs[0]);
+    id<MTLBuffer> m_b = nil;
+    id<MTLBuffer> l_b = nil;
     id<MTLComputePipelineState> fwd_pso = pipeline_named(st, "gd_lmce_fwd_chunk");
     id<MTLComputePipelineState> loss_pso = pipeline_named(st, "gd_lmce_loss_rows");
     id<MTLComputePipelineState> reduce_pso = pipeline_named(st, "gd_cross_entropy_reduce");
@@ -1754,6 +1970,11 @@ static gd_status encode_lm_cross_entropy(_gd_backend *self,
     if (targets->dtype != GD_DTYPE_I32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy needs I32 targets");
     }
+    if (node->n_outputs != 3) {
+        return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy expects stats outputs");
+    }
+    m_b = value_buffer(exe, node->outputs[1]);
+    l_b = value_buffer(exe, node->outputs[2]);
     if (scratch == nil || fwd_pso == nil || loss_pso == nil || reduce_pso == nil ||
         rows <= 0 || D <= 0 || V <= 0) {
         return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy plan missing");
@@ -1781,8 +2002,8 @@ static gd_status encode_lm_cross_entropy(_gd_backend *self,
         [*enc setComputePipelineState:fwd_pso];
         [*enc setBuffer:scratch offset:L.logits_off atIndex:0];
         [*enc setBuffer:t_b offset:0 atIndex:1];
-        [*enc setBuffer:scratch offset:L.m_off atIndex:2];
-        [*enc setBuffer:scratch offset:L.l_off atIndex:3];
+        [*enc setBuffer:m_b offset:0 atIndex:2];
+        [*enc setBuffer:l_b offset:0 atIndex:3];
         [*enc setBuffer:scratch offset:L.target_logit_off atIndex:4];
         [*enc setBytes:&p length:sizeof(p) atIndex:5];
         dispatch_1d(*enc, fwd_pso, (NSUInteger)rows);
@@ -1792,8 +2013,8 @@ static gd_status encode_lm_cross_entropy(_gd_backend *self,
         gd_metal_lmce_params p = {rows, D, V, 0, chunk_max, 0};
         gd_metal_ce_params rp = {1, 1, V, rows};
         [*enc setComputePipelineState:loss_pso];
-        [*enc setBuffer:scratch offset:L.m_off atIndex:0];
-        [*enc setBuffer:scratch offset:L.l_off atIndex:1];
+        [*enc setBuffer:m_b offset:0 atIndex:0];
+        [*enc setBuffer:l_b offset:0 atIndex:1];
         [*enc setBuffer:scratch offset:L.target_logit_off atIndex:2];
         [*enc setBuffer:scratch offset:L.losses_off atIndex:3];
         [*enc setBytes:&p length:sizeof(p) atIndex:4];
@@ -1824,14 +2045,15 @@ static gd_status encode_lm_cross_entropy_bwd(_gd_backend *self,
     int V = (int)w_desc->sizes[0];
     int rows = D > 0 ? (int)(desc_numel(x_desc) / D) : 0;
     int chunk_max = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
-    lmce_scratch_layout L = lmce_scratch_layout_for(rows, chunk_max);
+    lmce_scratch_layout L = {0};
     id<MTLBuffer> x_b = value_buffer(exe, node->inputs[0]);
     id<MTLBuffer> w_b = value_buffer(exe, node->inputs[1]);
     id<MTLBuffer> t_b = value_buffer(exe, node->inputs[2]);
     id<MTLBuffer> go_b = value_buffer(exe, node->inputs[3]);
+    id<MTLBuffer> m_b = nil;
+    id<MTLBuffer> l_b = nil;
     id<MTLBuffer> dx_b = value_buffer(exe, node->outputs[0]);
     id<MTLBuffer> dw_b = value_buffer(exe, node->outputs[1]);
-    id<MTLComputePipelineState> fwd_pso = pipeline_named(st, "gd_lmce_fwd_chunk");
     id<MTLComputePipelineState> dlogits_pso = pipeline_named(st, "gd_lmce_dlogits_chunk");
 
     if (!st.useMPS) {
@@ -1840,38 +2062,13 @@ static gd_status encode_lm_cross_entropy_bwd(_gd_backend *self,
     if (targets->dtype != GD_DTYPE_I32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd needs I32 targets");
     }
-    if (scratch == nil || fwd_pso == nil || dlogits_pso == nil || rows <= 0 ||
-        D <= 0 || V <= 0) {
-        return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd plan missing");
+    if (node->n_inputs != 6) {
+        return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd expects stats inputs");
     }
-
-    for (int c0 = 0; c0 < V; c0 += chunk_max) {
-        int csz = V - c0;
-        if (csz > chunk_max) {
-            csz = chunk_max;
-        }
-        MPSMatrix *xm = mps_matrix(x_b, 0, (NSUInteger)rows, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *wm = mps_matrix(w_b, (NSUInteger)c0 * (NSUInteger)D * sizeof(float),
-                                   (NSUInteger)csz, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *lm = mps_matrix(scratch, L.logits_off, (NSUInteger)rows,
-                                   (NSUInteger)csz, (NSUInteger)csz * sizeof(float));
-        gd_status status = encode_mps_mm(cmd, enc, st.device, xm, wm, lm,
-                                         false, true, (NSUInteger)rows,
-                                         (NSUInteger)csz, (NSUInteger)D, 0.0);
-        if (status != GD_OK) {
-            return status;
-        }
-        gd_metal_lmce_params p = {rows, D, V, c0, csz, c0 == 0 ? 1 : 0};
-        [*enc setComputePipelineState:fwd_pso];
-        [*enc setBuffer:scratch offset:L.logits_off atIndex:0];
-        [*enc setBuffer:t_b offset:0 atIndex:1];
-        [*enc setBuffer:scratch offset:L.m_off atIndex:2];
-        [*enc setBuffer:scratch offset:L.l_off atIndex:3];
-        [*enc setBuffer:scratch offset:L.target_logit_off atIndex:4];
-        [*enc setBytes:&p length:sizeof(p) atIndex:5];
-        dispatch_1d(*enc, fwd_pso, (NSUInteger)rows);
+    m_b = value_buffer(exe, node->inputs[4]);
+    l_b = value_buffer(exe, node->inputs[5]);
+    if (scratch == nil || dlogits_pso == nil || rows <= 0 || D <= 0 || V <= 0) {
+        return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd plan missing");
     }
 
     for (int c0 = 0; c0 < V; c0 += chunk_max) {
@@ -1897,8 +2094,8 @@ static gd_status encode_lm_cross_entropy_bwd(_gd_backend *self,
         [*enc setBuffer:scratch offset:L.logits_off atIndex:0];
         [*enc setBuffer:t_b offset:0 atIndex:1];
         [*enc setBuffer:go_b offset:0 atIndex:2];
-        [*enc setBuffer:scratch offset:L.m_off atIndex:3];
-        [*enc setBuffer:scratch offset:L.l_off atIndex:4];
+        [*enc setBuffer:m_b offset:0 atIndex:3];
+        [*enc setBuffer:l_b offset:0 atIndex:4];
         [*enc setBytes:&p length:sizeof(p) atIndex:5];
         dispatch_1d(*enc, dlogits_pso, (NSUInteger)rows * (NSUInteger)csz);
 
@@ -2655,8 +2852,8 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                 id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                 if (exe->node_fused_src[i] >= 0) {
-                    encode_fused_silu_mul(enc, pso2, exe, node,
-                                          &exe->graph->nodes[exe->node_fused_src[i]]);
+                    status = encode_fused_head(enc, pso2, exe, node,
+                                               &exe->graph->nodes[exe->node_fused_src[i]]);
                 } else if (node->op == _GD_OP_LM_CROSS_ENTROPY) {
                     status = encode_lm_cross_entropy(self, cmd, &enc, scratch, exe, node);
                 } else if (node->op == _GD_OP_LM_CROSS_ENTROPY_BWD) {
@@ -2715,8 +2912,8 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
                 }
                 if (exe->node_fused_src[i] >= 0) {
-                    encode_fused_silu_mul(enc, pso2, exe, &exe->graph->nodes[i],
-                                          &exe->graph->nodes[exe->node_fused_src[i]]);
+                    status = encode_fused_head(enc, pso2, exe, &exe->graph->nodes[i],
+                                               &exe->graph->nodes[exe->node_fused_src[i]]);
                 } else if (exe->graph->nodes[i].op == _GD_OP_LM_CROSS_ENTROPY) {
                     status = encode_lm_cross_entropy(self, cmd, &enc, scratch, exe,
                                                      &exe->graph->nodes[i]);

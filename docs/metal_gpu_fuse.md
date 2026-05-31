@@ -209,13 +209,19 @@ assumption.
   MPS overhead outweighs logits allocation savings. Metal v1 requires
   `GD_METAL_MPS=1` and benchmark opt-in `GD_BENCH_FUSED_LMCE=1`; consider
   planner/default only under memory pressure or larger vocab.
-- [ ] F2a — improve fused LMCE speed with lower-overhead kernels or a runtime
-  chunk-size knob. Current chunk-size sweep at T512/B8 showed 512..8000 all near
-  1150 ms, so dispatch/recompute overhead dominates more than chunk size.
-- [ ] F2b — planner/default policy: choose fused LMCE only when logits are not
+- [x] F2a — save forward LMCE row stats and reuse them in backward. This removes
+  the backward stats recompute pass and shrinks backward scratch to `[N,C]`.
+- [ ] F2b — improve fused LMCE speed further with lower-overhead kernels or a
+  runtime chunk-size knob. Current chunk-size sweep at T512/B8 showed 512..8000
+  all near 1150 ms before saved-stats, so dispatch/recompute overhead dominates
+  more than chunk size.
+- [ ] F2c — planner/default policy: choose fused LMCE only when logits are not
   otherwise consumed and memory pressure or vocab size makes it net-positive.
 - [ ] F3 — *(later, if warranted)* RoPE folded into SDPA q/k staging.
-- [ ] F4 — *(later, partial)* residual `add` + `rms_norm` reload-merge.
+- [x] F4 — **residual `add` + `rms_norm` fwd/bwd reload-merge.** Landed as two conservative Metal peepholes:
+  - Forward: `add(a,b) -> rms_norm(sum, weight)` is encoded by `gd_add_rms_norm`, with the RMSNorm node as head. It writes both boundary values (`sum` for the residual stream and normalized output) while keeping the row sum in threadgroup memory for the norm, so no separate add dispatch and no add-output reload inside RMSNorm. Equal-shape F32 only; `last_dim <= GD_METAL_FUSED_RMS_MAX` (2048); otherwise silent unfused fallback.
+  - Backward: `rms_norm_bwd(x,w,go) -> add(dx, dS_out)` is encoded by `gd_rms_norm_bwd_add`, with the ADD as head. It materializes raw `dx` for graph parity / outside consumers and writes accumulated residual grad `dx + dS_out`, matching the Liger fused-add-RMSNorm backward structure while preserving current IR.
+  Validated by `test_add_rms_norm_fusion`: CPU↔Metal parity at 1e-4 over fwd+bwd, plus white-box fired assertion requiring both fusions. `make test` green. Release smoke (`gpt_bench`, Metal, B=1,T=128,d=256,6L) best 79.38 ms / 1612 tok/s; needs canonical B=4,T=256 and T=1024 profile for final perf table.
 
 Each phase: parity (`gd_graph_compare` boundaries, 1e-4) + GPT train parity +
 ASan + fusion-fired assertion; report before/after `GD_PROFILE=trace` per-op/step
@@ -251,6 +257,7 @@ fusion fired).
 | F1 SwiGLU | 256 | ~178 | -6 | 408 ms | 2509 | perf-neutral; fusion infra proven |
 | GPU_SAFE CE revisit + O3 bench | 256 | CE 49.5 -> 2.0 | +1 dispatch | 361.3 ms | 2834 | clean release profile; CE occupancy fix |
 | GPU_SAFE CE revisit + O3 bench | 512 | CE ~6.6 | +1 dispatch | 1731.4 ms | 2366 | B=8 user workload; clean release best |
+| F4 add+rms smoke | 128 | TBD | -add/rms_bwd-add dispatches | 79.38 ms | 1612 | B=1,d=256,6L release smoke only; canonical profile still needed |
 | baseline | 1024 | ~190 | ~500 | 2965 ms | 1381 | pre-CE revisit |
 
 Post-CE clean release profile (B=4,T=256): `sdpa_bwd` 129.6 ms, `matmul`

@@ -269,7 +269,7 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
   - [x] avoid computing dW as F16 then widening; that loses training precision.
 - [ ] Op-specific backward dtype fixes:
   - [ ] RMSNorm backward: dx F16 allowed, dweight F32.
-  - [ ] embedding backward: dweight F32.
+  - [x] embedding backward: dweight F32.
   - [ ] lmCE backward: hidden grad F16 allowed, weight grad F32.
   - [ ] SDPA backward: dq F16 allowed, dk/dv F16 for activations; param-facing grads F32 through projections.
   - [ ] activations: preserve incoming grad dtype unless leaf accumulation requires F32.
@@ -279,6 +279,7 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
   - [x] broadcast grad accumulation casts/reduces correctly.
   - [x] matmul weight grad dtype is F32 under F16 training.
   - [ ] no accidental F16 leaf grad in GPT.
+  - [x] embedding weight grad dtype is F32 under F16 training.
 
 ## Phase 6: AdamW master params
 
@@ -349,7 +350,7 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
 - [ ] RMSNorm backward typed F16/F32 as defined.
 - [ ] activation backward typed F16.
 - [ ] RoPE backward typed F16.
-- [ ] embedding backward accumulates F32 weight grad.
+- [x] embedding backward accumulates F32 weight grad.
 - [ ] SDPA backward typed F16:
   - [ ] full causal path.
   - [ ] sliding-window path.

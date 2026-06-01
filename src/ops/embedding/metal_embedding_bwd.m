@@ -10,6 +10,10 @@ static gd_status embedding_bwd_support(const _gd_metal_plan_ctx *ctx)
     if (ctx->graph->values[ctx->node->inputs[1]].desc.dtype != GD_DTYPE_I32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal embedding_bwd needs I32 ids in v1");
     }
+    if (ctx->graph->values[ctx->node->inputs[0]].desc.dtype != GD_DTYPE_F32 ||
+        ctx->graph->values[ctx->node->outputs[0]].desc.dtype != GD_DTYPE_F32) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal embedding_bwd needs F32 grad/output");
+    }
     return GD_OK;
 }
 

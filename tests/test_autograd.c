@@ -671,6 +671,62 @@ static int test_f16_linear_leaf_grads(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_embedding_leaf_grad(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t ts[2] = {3, 2};
+    int64_t ids_s[1] = {2};
+    uint16_t table_data[6] = {0x3c00U, 0x4000U, 0x4200U,
+                              0x4400U, 0x4500U, 0x4600U};
+    int32_t ids_data[2] = {0, 2};
+    float gt[6] = {0};
+    gd_tensor_desc desc;
+    gd_tensor *table = NULL;
+    gd_tensor *ids = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *yf = NULL;
+    gd_tensor *m0 = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, ts, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &table));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, table, table_data, sizeof(table_data)));
+    CHECK_OK(gd_tensor_set_requires_grad(table, true));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, ids_s, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &ids));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, ids, ids_data, sizeof(ids_data)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_embedding(ctx, table, ids, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
+    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_grad(table, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gt, sizeof(gt)));
+    CHECK_TRUE(fabsf(gt[0] - 0.25F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gt[1] - 0.25F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gt[2]) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gt[3]) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gt[4] - 0.25F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gt[5] - 0.25F) <= 1.0e-6F);
+    gd_tensor_release(loss);
+    gd_tensor_release(m0);
+    gd_tensor_release(yf);
+    gd_tensor_release(y);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(ids);
+    gd_tensor_release(table);
+    return 0;
+}
+
 static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
                                  const float *data, gd_tensor **out)
 {
@@ -712,6 +768,7 @@ int main(void)
     CHECK_OK(gd_context_create(&ctx));
     CHECK_TRUE(test_f16_cast_leaf_grad(ctx) == 0);
     CHECK_TRUE(test_f16_linear_leaf_grads(ctx) == 0);
+    CHECK_TRUE(test_f16_embedding_leaf_grad(ctx) == 0);
 
     {
         two_in t = {0};

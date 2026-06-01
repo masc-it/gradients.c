@@ -1178,11 +1178,11 @@ Current codebase inventory used to ground this plan:
 
 ### 24.10 Public headers and link coverage
 
-- [ ] Add public symbol link test that references every function declared in `include/gradients/*.h`.
-- [ ] Confirm current public headers with implementations: `ops.h`, `tokenizer.h`, `dataset.h`, `dataloader.h`, `optim.h`, `nn.h`, etc.
-- [ ] Decide whether to split `include/gradients/ops.h` into `include/gradients/ops/<op>.h` plus generated umbrella.
-- [ ] If splitting public op headers, generate umbrella under `build/generated/include/gradients/ops.h` or keep stable manual umbrella until install story exists.
-- [ ] Validate header compile and public symbol link test in `make test`.
+- [x] Add public symbol link test that references every function declared in `include/gradients/*.h`.
+- [x] Confirm current public headers with implementations: `ops.h`, `tokenizer.h`, `dataset.h`, `dataloader.h`, `optim.h`, `nn.h`, etc.
+- [x] Decide whether to split `include/gradients/ops.h` into `include/gradients/ops/<op>.h` plus generated umbrella.
+- [x] Keep stable manual `include/gradients/ops.h` umbrella until install story exists.
+- [x] Validate header compile and public symbol link test in `make test`.
 
 ### 24.11 Split remaining non-op oversized files
 

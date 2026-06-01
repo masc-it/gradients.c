@@ -2,6 +2,37 @@
 
 #include <limits.h>
 
+static gd_status copy_support(const _gd_metal_plan_ctx *ctx)
+{
+    gd_status status = GD_OK;
+    const gd_tensor_desc *in_desc = NULL;
+    const gd_tensor_desc *out_desc = NULL;
+
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal copy support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'copy'");
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    in_desc = &ctx->graph->values[ctx->node->inputs[0]].desc;
+    out_desc = &ctx->graph->values[ctx->node->outputs[0]].desc;
+    if (in_desc->dtype != out_desc->dtype) {
+        return _gd_error(GD_ERR_DTYPE, "metal copy requires matching dtypes");
+    }
+    if (gd_dtype_sizeof(out_desc->dtype) == 0U) {
+        return _gd_error(GD_ERR_DTYPE, "metal copy requires a fixed-size dtype");
+    }
+    return GD_OK;
+}
+
 static gd_status copy_encode(_gd_metal_encode_ctx *ctx)
 {
     const _gd_node *node = ctx->node;
@@ -44,5 +75,6 @@ static gd_status copy_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_copy = {
     .kind = _GD_OP_COPY,
     .name = "copy",
+    .support = copy_support,
     .encode = copy_encode,
 };

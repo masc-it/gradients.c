@@ -14,9 +14,16 @@ const _gd_metal_op *_gd_metal_op_for(_gd_op_kind kind)
     return NULL;
 }
 
+static bool metal_dtype_is_non_f32_float(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F16 || dtype == GD_DTYPE_BF16 ||
+           dtype == GD_DTYPE_FP8_E4M3 || dtype == GD_DTYPE_FP8_E5M2;
+}
+
 gd_status _gd_metal_support_default(const _gd_metal_plan_ctx *ctx)
 {
     gd_status status = GD_OK;
+    int i = 0;
 
     if (ctx == NULL || ctx->node == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal support ctx is NULL");
@@ -31,6 +38,28 @@ gd_status _gd_metal_support_default(const _gd_metal_plan_ctx *ctx)
         (void)snprintf(msg, sizeof(msg), "metal has no kernel for op '%s'",
                        _gd_op_kind_name(ctx->node->op));
         return _gd_error(GD_ERR_UNSUPPORTED, msg);
+    }
+    if (ctx->graph != NULL) {
+        for (i = 0; i < ctx->node->n_inputs; ++i) {
+            gd_dtype dtype = ctx->graph->values[ctx->node->inputs[i]].desc.dtype;
+            if (metal_dtype_is_non_f32_float(dtype)) {
+                char msg[128];
+                (void)snprintf(msg, sizeof(msg),
+                               "metal op '%s' supports F32 floating tensors only in v1",
+                               _gd_op_kind_name(ctx->node->op));
+                return _gd_error(GD_ERR_UNSUPPORTED, msg);
+            }
+        }
+        for (i = 0; i < ctx->node->n_outputs; ++i) {
+            gd_dtype dtype = ctx->graph->values[ctx->node->outputs[i]].desc.dtype;
+            if (metal_dtype_is_non_f32_float(dtype)) {
+                char msg[128];
+                (void)snprintf(msg, sizeof(msg),
+                               "metal op '%s' supports F32 floating tensors only in v1",
+                               _gd_op_kind_name(ctx->node->op));
+                return _gd_error(GD_ERR_UNSUPPORTED, msg);
+            }
+        }
     }
     return GD_OK;
 }

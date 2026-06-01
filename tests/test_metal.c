@@ -219,6 +219,31 @@ static int test_metal_cast_parity(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_unsupported_reject(gd_context *ctx)
+{
+    int64_t s2[1] = {2};
+    float data[2] = {1.0F, 2.0F};
+    gd_tensor *x = NULL;
+    gd_tensor *xh = NULL;
+    gd_tensor *sum = NULL;
+    gd_graph *g = NULL;
+    gd_status status = GD_OK;
+
+    CHECK_OK(make_f32(ctx, 1, s2, data, &x));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_add(ctx, xh, xh, &sum));
+    CHECK_OK(gd_graph_end(ctx));
+    status = gd_graph_compile(g, METAL);
+    CHECK_TRUE(status == GD_ERR_UNSUPPORTED);
+    gd_tensor_release(sum);
+    gd_tensor_release(xh);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(x);
+    return 0;
+}
+
 static gd_status make_i32(gd_context *ctx, int ndim, const int64_t *sizes, const int32_t *data,
                           gd_tensor **out)
 {
@@ -1024,6 +1049,7 @@ int main(void)
     rc |= test_metal_add_parity(ctx);
     rc |= test_metal_unary_parity(ctx);
     rc |= test_metal_cast_parity(ctx);
+    rc |= test_metal_f16_unsupported_reject(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);
     rc |= test_metal_reduce_parity(ctx);

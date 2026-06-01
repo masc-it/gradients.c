@@ -2,11 +2,22 @@
 
 static gd_status cast_support(const _gd_metal_plan_ctx *ctx)
 {
-    gd_status status = _gd_metal_support_default(ctx);
+    gd_status status = GD_OK;
     int dtype_code = 0;
 
-    if (status != GD_OK || ctx->graph == NULL) {
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal cast support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
+    if (status != GD_OK) {
         return status;
+    }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'cast'");
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
     }
     status = _gd_metal_dtype_code(ctx->graph->values[ctx->node->inputs[0]].desc.dtype,
                                   &dtype_code);

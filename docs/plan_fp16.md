@@ -394,22 +394,23 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
 
 ## Phase 10: rollout gates
 
-- [ ] Correctness gate:
-  - [ ] `make test GD_ENABLE_METAL=0` passes.
-  - [ ] `make test GD_ENABLE_METAL=1` passes.
-  - [ ] F16-specific CPU tests pass.
-  - [ ] F16-specific Metal tests pass.
-  - [ ] no hidden fallback in F16 GPT supported graph.
-- [ ] Numerical gate:
-  - [ ] F16 inference loss/logits match F32 within documented tolerance.
-  - [ ] F16+AMP toy MLP loss decreases.
-  - [ ] F16+AMP toy GPT loss decreases.
-  - [ ] Grad dtype assertions pass for all GPT params.
+- [x] Correctness gate:
+  - [x] `make test GD_ENABLE_METAL=0` passes.
+  - [x] `make test GD_ENABLE_METAL=1` passes.
+  - [x] F16-specific CPU tests pass.
+  - [x] F16-specific Metal tests pass.
+  - [x] no hidden fallback in F16 GPT supported graph.
+- [x] Numerical gate:
+  - [x] F16 inference loss/logits match F32 within documented tolerance.
+  - [x] F16+AMP toy MLP loss decreases.
+  - [x] F16+AMP toy GPT loss decreases.
+  - [x] Grad dtype assertions pass for all GPT params.
 - [ ] Performance gate:
   - [ ] standalone F16 GEMM faster than F32 for GPT-relevant shapes.
   - [ ] F16 inference faster than F32 on target GPT shapes.
   - [ ] F16+AMP training faster than F32 after AMP overhead.
-  - [ ] if speedup < 1.25x on target training shape, keep FP16 experimental.
+  - [x] if speedup < 1.25x on target training shape, keep FP16 experimental.
+  - latest 8.34M `B=1 T=128` train sample: F32 Metal best 74.3 ms, F16+AMP best 76.2 ms; keep experimental.
 - [ ] Production gate:
   - [ ] clear public docs and examples.
   - [ ] scaler state checkpointable once checkpointing exists.

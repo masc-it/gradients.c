@@ -24,7 +24,7 @@ static gd_status lm_cross_entropy_meta(const gd_tensor_desc *const *inputs,
     if (status != GD_OK) {
         return status;
     }
-    status = gd_tensor_desc_contiguous(inputs[0]->dtype, inputs[0]->device,
+    status = gd_tensor_desc_contiguous(GD_DTYPE_F32, inputs[0]->device,
                                        inputs[2]->ndim, inputs[2]->sizes, &outputs[1]);
     if (status != GD_OK) {
         return status;

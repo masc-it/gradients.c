@@ -429,7 +429,7 @@ gd_status _gd_meta_cross_entropy(const gd_tensor_desc *logits,
     }
 
     *norm_dim_out = norm_dim;
-    return gd_tensor_desc_contiguous(logits->dtype, logits->device, 0, NULL, out);
+    return gd_tensor_desc_contiguous(GD_DTYPE_F32, logits->device, 0, NULL, out);
 }
 
 gd_status _gd_meta_lm_cross_entropy(const gd_tensor_desc *hidden,
@@ -478,7 +478,7 @@ gd_status _gd_meta_lm_cross_entropy(const gd_tensor_desc *hidden,
             return _gd_error(GD_ERR_SHAPE, "lm_cross_entropy targets shape mismatch");
         }
     }
-    return gd_tensor_desc_contiguous(hidden->dtype, hidden->device, 0, NULL, out);
+    return gd_tensor_desc_contiguous(GD_DTYPE_F32, hidden->device, 0, NULL, out);
 }
 
 gd_status _gd_meta_cast(const gd_tensor_desc *x, gd_dtype dtype, gd_tensor_desc *out)

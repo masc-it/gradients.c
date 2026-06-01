@@ -349,6 +349,8 @@ static int test_reduce_softmax_ce_cast(gd_context *ctx)
     gd_tensor *targets = NULL;
     gd_tensor *targets_f = NULL;
     gd_tensor *targets_bad = NULL;
+    gd_tensor *xh = NULL;
+    gd_tensor *wh = NULL;
     gd_tensor *out = NULL;
     gd_graph *g = NULL;
 
@@ -385,8 +387,26 @@ static int test_reduce_softmax_ce_cast(gd_context *ctx)
 
     CHECK_OK(gd_lm_cross_entropy(ctx, x, w_lm, targets, &out));
     CHECK_TRUE(gd_tensor_ndim(out) == 0);
+    CHECK_TRUE(gd_tensor_dtype(out) == GD_DTYPE_F32);
     gd_tensor_release(out);
     out = NULL;
+
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_cast(ctx, w_lm, GD_DTYPE_F16, &wh));
+    CHECK_OK(gd_cross_entropy(ctx, xh, targets, 1, &out));
+    CHECK_TRUE(gd_tensor_ndim(out) == 0);
+    CHECK_TRUE(gd_tensor_dtype(out) == GD_DTYPE_F32);
+    gd_tensor_release(out);
+    out = NULL;
+    CHECK_OK(gd_lm_cross_entropy(ctx, xh, wh, targets, &out));
+    CHECK_TRUE(gd_tensor_ndim(out) == 0);
+    CHECK_TRUE(gd_tensor_dtype(out) == GD_DTYPE_F32);
+    gd_tensor_release(out);
+    out = NULL;
+    gd_tensor_release(xh);
+    xh = NULL;
+    gd_tensor_release(wh);
+    wh = NULL;
 
     CHECK_STATUS(gd_lm_cross_entropy(ctx, x, w_bad, targets, &out), GD_ERR_SHAPE);
     CHECK_TRUE(out == NULL);
@@ -416,6 +436,8 @@ static int test_reduce_softmax_ce_cast(gd_context *ctx)
     gd_tensor_release(targets);
     gd_tensor_release(targets_f);
     gd_tensor_release(targets_bad);
+    gd_tensor_release(xh);
+    gd_tensor_release(wh);
     return 0;
 }
 

@@ -247,6 +247,164 @@ static int test_lr_scheduler_write(gd_context *ctx)
     return 0;
 }
 
+static int test_clip_grad_norm(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    float p1_init[2] = {1.0F, 2.0F};
+    float p2_init[3] = {3.0F, 4.0F, 5.0F};
+    float p3_init[1] = {6.0F};
+    float g1[2] = {3.0F, 4.0F};
+    float g2[3] = {0.0F, 12.0F, -5.0F};
+    float small1[2] = {1.0F, 2.0F};
+    float small2[3] = {0.0F, 0.0F, 0.0F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *params_for_opt[2];
+    gd_tensor *params_for_clip[3];
+    gd_tensor *p1 = NULL;
+    gd_tensor *p2 = NULL;
+    gd_tensor *p3 = NULL;
+    gd_tensor *grad = NULL;
+    gd_tensor *norm = NULL;
+    gd_graph *graph = NULL;
+    float got1[2];
+    float got2[3];
+    float got3[1];
+    float got_norm = 0.0F;
+    float expect_norm = sqrtf(194.0F);
+    float scale = 7.0F / (expect_norm + 1e-6F);
+    int i = 0;
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.0F;
+
+    CHECK_OK(make_param(ctx, 2, p1_init, &p1));
+    CHECK_OK(make_param(ctx, 3, p2_init, &p2));
+    CHECK_OK(make_param(ctx, 1, p3_init, &p3));
+    params_for_opt[0] = p1;
+    params_for_opt[1] = p2;
+    CHECK_OK(gd_adamw_create(ctx, params_for_opt, 2, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g1, sizeof(g1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g2, sizeof(g2)));
+
+    params_for_clip[0] = p1;
+    params_for_clip[1] = p2;
+    params_for_clip[2] = p3; /* missing grad -> zero grad slot */
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_clip_grad_norm(ctx, params_for_clip, 3, 7.0F, &norm));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, norm, &got_norm, sizeof(got_norm)));
+    CHECK_TRUE(close_to(got_norm, expect_norm));
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got1, sizeof(got1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got2, sizeof(got2)));
+    CHECK_OK(gd_tensor_grad(p3, &grad));
+    CHECK_TRUE(grad != NULL);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got3, sizeof(got3)));
+    for (i = 0; i < 2; ++i) {
+        CHECK_TRUE(close_to(got1[i], g1[i] * scale));
+    }
+    for (i = 0; i < 3; ++i) {
+        CHECK_TRUE(close_to(got2[i], g2[i] * scale));
+    }
+    CHECK_TRUE(close_to(got3[0], 0.0F));
+
+    gd_tensor_release(norm);
+    norm = NULL;
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    graph = NULL;
+
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, small1, sizeof(small1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, small2, sizeof(small2)));
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_clip_grad_norm(ctx, params_for_clip, 3, 10.0F, &norm));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, norm, &got_norm, sizeof(got_norm)));
+    CHECK_TRUE(close_to(got_norm, sqrtf(5.0F)));
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got1, sizeof(got1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got2, sizeof(got2)));
+    for (i = 0; i < 2; ++i) {
+        CHECK_TRUE(close_to(got1[i], small1[i]));
+    }
+    for (i = 0; i < 3; ++i) {
+        CHECK_TRUE(close_to(got2[i], small2[i]));
+    }
+    gd_tensor_release(norm);
+    norm = NULL;
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(p3);
+    gd_tensor_release(p2);
+    gd_tensor_release(p1);
+    return 0;
+}
+
+static int test_clip_before_adamw(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    float pinit[1] = {1.0F};
+    float g[1] = {10.0F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_tensor *params[1];
+    gd_graph *graph = NULL;
+    float got = 0.0F;
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.1F;
+    cfg.beta2 = 0.1F;
+    cfg.eps = 1.0F;
+    cfg.weight_decay = 0.0F;
+
+    CHECK_OK(make_param(ctx, 1, pinit, &param));
+    params[0] = param;
+    CHECK_OK(gd_adamw_create(ctx, params, 1, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_clip_grad_norm(ctx, params, 1, 2.0F, NULL));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.93333334F));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 2.0F));
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(param);
+    return 0;
+}
+
 static int test_tied_single_update(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -311,6 +469,8 @@ int main(void)
         test_adamw_steps(ctx) != 0 ||
         test_adamw_lr_tensor(ctx) != 0 ||
         test_lr_scheduler_write(ctx) != 0 ||
+        test_clip_grad_norm(ctx) != 0 ||
+        test_clip_before_adamw(ctx) != 0 ||
         test_tied_single_update(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;

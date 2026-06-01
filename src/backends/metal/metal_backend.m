@@ -88,6 +88,7 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_MEAN_BWD, "gd_sum_bwd"},
     {_GD_OP_CROSS_ENTROPY_BWD, "gd_cross_entropy_bwd"},
     {_GD_OP_REDUCE_TO, "gd_reduce_to"},
+    {_GD_OP_CLIP_GRAD_NORM, "gd_clip_norm_partial"},
     {_GD_OP_STEP_INC, "gd_step_inc"},
     {_GD_OP_ADAMW_STEP, "gd_adamw"},
     {_GD_OP_GELU, "gd_gelu"},
@@ -287,6 +288,8 @@ static id<MTLComputePipelineState> pipeline_named(GDMetalState *st, const char *
 {
     return st.pipelinesByName[[NSString stringWithUTF8String:name]];
 }
+
+#define GD_METAL_CLIP_NORM_TG 256
 
 static int64_t desc_numel(const gd_tensor_desc *desc)
 {
@@ -589,6 +592,8 @@ static bool node_mutates_input(const _gd_node *node, int input_index)
     switch (node->op) {
     case _GD_OP_STEP_INC:
         return input_index == 0;
+    case _GD_OP_CLIP_GRAD_NORM:
+        return true;
     case _GD_OP_ADAMW_STEP:
         return input_index == 0 || input_index == 2 || input_index == 3;
     default:
@@ -1116,7 +1121,26 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
                     }
                 }
             }
-            if (op == _GD_OP_RMS_NORM_WBWD) {
+            if (op == _GD_OP_CLIP_GRAD_NORM) {
+                int in_i = 0;
+                int64_t total_groups = 0;
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_clip_norm_finalize");
+                exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_clip_norm_scale");
+                for (in_i = 0; in_i < node->n_inputs; ++in_i) {
+                    const gd_tensor_desc *gd = &graph->values[node->inputs[in_i]].desc;
+                    int64_t numel = desc_numel(gd);
+                    total_groups += (numel + GD_METAL_CLIP_NORM_TG - 1) /
+                                    GD_METAL_CLIP_NORM_TG;
+                }
+                if (total_groups <= 0) {
+                    status = _gd_error(GD_ERR_SHAPE, "clip_grad_norm has no elements");
+                    goto fail;
+                }
+                exe->node_scratch_bytes[j] = (size_t)(total_groups + 1) * sizeof(float);
+                if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                    scratch_max_bytes = exe->node_scratch_bytes[j];
+                }
+            } else if (op == _GD_OP_RMS_NORM_WBWD) {
                 const gd_tensor_desc *x_desc = &graph->values[node->inputs[0]].desc;
                 int last = (int)x_desc->sizes[x_desc->ndim - 1];
                 int rows = last > 0 ? (int)(desc_numel(x_desc) / last) : 0;
@@ -2208,6 +2232,85 @@ static void encode_step_inc(id<MTLComputeCommandEncoder> enc,
     dispatch_1d(enc, pso, 1);
 }
 
+static gd_status encode_clip_grad_norm(id<MTLComputeCommandEncoder> enc,
+                                      id<MTLComputePipelineState> partial_pso,
+                                      id<MTLComputePipelineState> finalize_pso,
+                                      id<MTLComputePipelineState> scale_pso,
+                                      id<MTLBuffer> scratch,
+                                      _gd_executable *exe,
+                                      const _gd_node *node)
+{
+    gd_metal_clip_norm_params p;
+    int i = 0;
+    int scratch_offset = 0;
+    int total_groups = 0;
+
+    if (partial_pso == nil || finalize_pso == nil || scale_pso == nil || scratch == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal clip_grad_norm pipeline/scratch missing");
+    }
+    if (node->n_inputs <= 0 || node->n_outputs != 1) {
+        return _gd_error(GD_ERR_INTERNAL, "clip_grad_norm expects inputs and one output");
+    }
+    for (i = 0; i < node->n_inputs; ++i) {
+        const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
+        int64_t numel64 = desc_numel(desc);
+        int groups = (int)((numel64 + GD_METAL_CLIP_NORM_TG - 1) / GD_METAL_CLIP_NORM_TG);
+        if (numel64 > INT_MAX || groups <= 0) {
+            return _gd_error(GD_ERR_SHAPE, "clip_grad_norm input too large");
+        }
+        total_groups += groups;
+    }
+    if (total_groups <= 0) {
+        return _gd_error(GD_ERR_SHAPE, "clip_grad_norm has no elements");
+    }
+
+    for (i = 0; i < node->n_inputs; ++i) {
+        const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
+        int64_t numel64 = desc_numel(desc);
+        int groups = (int)((numel64 + GD_METAL_CLIP_NORM_TG - 1) / GD_METAL_CLIP_NORM_TG);
+        memset(&p, 0, sizeof(p));
+        p.numel = (int)numel64;
+        p.scratch_offset = scratch_offset;
+        p.total_groups = total_groups;
+        p.scale_index = total_groups;
+        p.max_norm = node->attrs.scale;
+        p.eps = node->attrs.eps;
+        [enc setComputePipelineState:partial_pso];
+        [enc setBuffer:value_buffer(exe, node->inputs[i]) offset:0 atIndex:0];
+        [enc setBuffer:scratch offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_CLIP_NORM_TG, 1, 1)];
+        scratch_offset += groups;
+    }
+
+    memset(&p, 0, sizeof(p));
+    p.total_groups = total_groups;
+    p.scale_index = total_groups;
+    p.max_norm = node->attrs.scale;
+    p.eps = node->attrs.eps;
+    [enc setComputePipelineState:finalize_pso];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch_1d(enc, finalize_pso, 1);
+
+    for (i = 0; i < node->n_inputs; ++i) {
+        const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
+        int64_t numel64 = desc_numel(desc);
+        memset(&p, 0, sizeof(p));
+        p.numel = (int)numel64;
+        p.total_groups = total_groups;
+        p.scale_index = total_groups;
+        [enc setComputePipelineState:scale_pso];
+        [enc setBuffer:value_buffer(exe, node->inputs[i]) offset:0 atIndex:0];
+        [enc setBuffer:scratch offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch_1d(enc, scale_pso, (NSUInteger)numel64);
+    }
+    return GD_OK;
+}
+
 /* adamw: in-place update of (param, m, v) using grad and step. */
 static void encode_adamw(id<MTLComputeCommandEncoder> enc,
                          id<MTLComputePipelineState> pso,
@@ -2817,6 +2920,8 @@ static gd_status encode_node(_gd_backend *self,
     case _GD_OP_REDUCE_TO:
         encode_reduce_to(enc, pso, exe, node);
         return GD_OK;
+    case _GD_OP_CLIP_GRAD_NORM:
+        return encode_clip_grad_norm(enc, pso, pso2, pso3, scratch, exe, node);
     case _GD_OP_STEP_INC:
         encode_step_inc(enc, pso, exe, node);
         return GD_OK;

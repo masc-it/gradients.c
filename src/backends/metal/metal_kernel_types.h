@@ -175,6 +175,15 @@ typedef struct gd_metal_reduce_to_params {
     int go_sizes[GD_METAL_MAX_DIMS];
 } gd_metal_reduce_to_params;
 
+typedef struct gd_metal_clip_norm_params {
+    int numel;
+    int scratch_offset;
+    int total_groups;
+    int scale_index;
+    float max_norm;
+    float eps;
+} gd_metal_clip_norm_params;
+
 typedef struct gd_metal_adamw_params {
     int numel;
     int use_lr_tensor;

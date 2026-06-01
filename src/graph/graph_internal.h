@@ -8,7 +8,7 @@
 #include "gradients/graph.h"
 #include "gradients/tensor.h"
 
-#define _GD_OP_MAX_INPUTS 8
+#define _GD_OP_MAX_INPUTS 256
 
 typedef enum _gd_graph_state {
     _GD_GRAPH_EMPTY = 0,
@@ -42,6 +42,7 @@ typedef enum _gd_op_kind {
     _GD_OP_BACKWARD,
     _GD_OP_ZERO_GRAD,
     _GD_OP_OPTIMIZER_STEP,
+    _GD_OP_CLIP_GRAD_NORM,
     _GD_OP_ASSERT_FINITE,
     _GD_OP_ASSERT_CLOSE,
     /* Internal backward/support ops (not part of the public op set). */
@@ -66,7 +67,7 @@ typedef enum _gd_op_kind {
 } _gd_op_kind;
 
 typedef struct _gd_op_attrs {
-    float scale;                 /* SCALE */
+    float scale;                 /* SCALE / CLIP_GRAD_NORM max_norm */
     int dim;                     /* SUM / MEAN / SOFTMAX / CROSS_ENTROPY class dim */
     bool keepdim;                /* SUM / MEAN */
     bool trans_a;                /* MATMUL */

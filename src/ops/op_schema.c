@@ -699,3 +699,92 @@ gd_status gd_sdpa(gd_context *ctx,
     }
     return _gd_graph_emit(graph, _GD_OP_SDPA, inputs, n_inputs, &attrs, &desc, out);
 }
+
+gd_status gd_clip_grad_norm(gd_context *ctx,
+                            gd_tensor **params,
+                            int n_params,
+                            float max_norm,
+                            gd_tensor **norm_out)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *grads[_GD_OP_MAX_INPUTS];
+    gd_tensor_desc norm_desc;
+    gd_device device = {GD_DEVICE_CPU, 0};
+    _gd_op_attrs attrs = {0};
+    gd_tensor *norm = NULL;
+    int i = 0;
+
+    if (ctx == NULL || params == NULL || n_params <= 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_clip_grad_norm argument is invalid");
+    }
+    if (n_params > _GD_OP_MAX_INPUTS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_clip_grad_norm too many parameters");
+    }
+    if (!isfinite(max_norm) || max_norm <= 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT,
+                         "clip_grad_norm max_norm must be finite and positive");
+    }
+    if (norm_out != NULL) {
+        *norm_out = NULL;
+    }
+    status = require_active_graph(ctx, &graph);
+    if (status != GD_OK) {
+        return status;
+    }
+    for (i = 0; i < n_params; ++i) {
+        gd_tensor *grad = NULL;
+        int missing_grad = 0;
+        if (params[i] == NULL) {
+            return _gd_error(GD_ERR_INVALID_ARGUMENT, "clip_grad_norm parameter is NULL");
+        }
+        if (!gd_tensor_requires_grad(params[i])) {
+            return _gd_error(GD_ERR_INVALID_STATE,
+                             "clip_grad_norm parameter must require grad");
+        }
+        status = gd_tensor_grad(params[i], &grad);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (grad == NULL) {
+            missing_grad = 1;
+            status = _gd_tensor_ensure_grad(ctx, params[i], &grad);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+        if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_DTYPE, "clip_grad_norm requires F32 gradients");
+        }
+        if (i == 0) {
+            device = gd_tensor_device(grad);
+        } else if (!gd_device_equal(device, gd_tensor_device(grad))) {
+            return _gd_error(GD_ERR_DEVICE, "clip_grad_norm gradients must share device");
+        }
+        if (missing_grad != 0) {
+            status = _gd_tensor_zero(grad);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+        grads[i] = grad;
+    }
+
+    status = gd_tensor_desc_contiguous(GD_DTYPE_F32, device, 0, NULL, &norm_desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    attrs.scale = max_norm;
+    attrs.eps = 1e-6F;
+    status = _gd_graph_emit(graph, _GD_OP_CLIP_GRAD_NORM, grads, n_params,
+                            &attrs, &norm_desc, &norm);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (norm_out != NULL) {
+        *norm_out = norm;
+    } else {
+        gd_tensor_release(norm);
+    }
+    return GD_OK;
+}

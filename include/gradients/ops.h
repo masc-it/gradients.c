@@ -148,6 +148,12 @@ gd_status gd_sdpa(gd_context *ctx,
 gd_status gd_backward(gd_context *ctx, gd_tensor *loss);
 gd_status gd_zero_grad(gd_context *ctx, gd_tensor **params, int n_params);
 
+gd_status gd_clip_grad_norm(gd_context *ctx,
+                            gd_tensor **params,
+                            int n_params,
+                            float max_norm,
+                            gd_tensor **norm_out);
+
 #ifdef __cplusplus
 }
 #endif

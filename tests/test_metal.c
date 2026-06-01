@@ -701,6 +701,78 @@ static int test_metal_backward_parity(gd_context *ctx, int mps_enabled)
     return 0;
 }
 
+static int test_metal_clip_grad_norm(gd_context *ctx)
+{
+    float p1_init[2] = {1.0F, 2.0F};
+    float p2_init[3] = {3.0F, 4.0F, 5.0F};
+    float g1[2] = {3.0F, 4.0F};
+    float g2[3] = {0.0F, 12.0F, -5.0F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *p1 = NULL;
+    gd_tensor *p2 = NULL;
+    gd_tensor *params[2];
+    gd_tensor *grad = NULL;
+    gd_tensor *norm = NULL;
+    gd_graph *graph = NULL;
+    float got1[2];
+    float got2[3];
+    float got_norm = 0.0F;
+    float expect_norm = sqrtf(194.0F);
+    float scale = 7.0F / (expect_norm + 1e-6F);
+    int64_t s2[1] = {2};
+    int64_t s3[1] = {3};
+    int i = 0;
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.0F;
+
+    CHECK_OK(make_f32(ctx, 1, s2, p1_init, &p1));
+    CHECK_OK(make_f32(ctx, 1, s3, p2_init, &p2));
+    CHECK_OK(gd_tensor_set_requires_grad(p1, true));
+    CHECK_OK(gd_tensor_set_requires_grad(p2, true));
+    params[0] = p1;
+    params[1] = p2;
+    CHECK_OK(gd_adamw_create(ctx, params, 2, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g1, sizeof(g1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g2, sizeof(g2)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_clip_grad_norm(ctx, params, 2, 7.0F, &norm));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, METAL));
+    CHECK_OK(gd_graph_run(graph));
+
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, norm, &got_norm, sizeof(got_norm)));
+    CHECK_TRUE(close_to(got_norm, expect_norm));
+    CHECK_OK(gd_tensor_grad(p1, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got1, sizeof(got1)));
+    CHECK_OK(gd_tensor_grad(p2, &grad));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, got2, sizeof(got2)));
+    for (i = 0; i < 2; ++i) {
+        CHECK_TRUE(close_to(got1[i], g1[i] * scale));
+    }
+    for (i = 0; i < 3; ++i) {
+        CHECK_TRUE(close_to(got2[i], g2[i] * scale));
+    }
+
+    gd_tensor_release(norm);
+    norm = NULL;
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(p2);
+    gd_tensor_release(p1);
+    return 0;
+}
+
 /* AdamW reference (double precision), matching the CPU_REF kernel. */
 static void ref_adamw(float *p, float *m, float *v, const float *g, int n, int t,
                       float lr, float b1, float b2, float eps, float wd)
@@ -955,6 +1027,7 @@ int main(void)
         rc |= test_metal_lm_cross_entropy_parity(ctx);
     }
     rc |= test_metal_backward_parity(ctx, mps_enabled);
+    rc |= test_metal_clip_grad_norm(ctx);
     rc |= test_metal_adamw(ctx);
     rc |= test_metal_adamw_lr_tensor(ctx);
     rc |= test_metal_lazy_writeback(ctx);

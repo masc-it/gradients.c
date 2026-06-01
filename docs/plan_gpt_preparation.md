@@ -45,7 +45,7 @@ Not enough for real GPT training:
 - [x] corpus preprocessing / packed token shards
 - [x] production data loader
 - [x] LR scheduler without graph rebuilds
-- [ ] global grad clipping
+- [x] global grad clipping
 - [ ] checkpoint/resume
 - [ ] parameter groups
 - [ ] eval/generation loop
@@ -601,12 +601,15 @@ grad_p *= scale
 - Writes optional `norm_out` for logging; trainer may read it periodically, not
   every step.
 
+Implemented in `include/gradients/ops.h`, `src/ops/op_schema.c`, CPU_REF, Metal,
+and `tests/test_optim.c` / `tests/test_metal.c`.
+
 Tests:
 
-- no-op when norm <= max_norm
-- scales all grads by common factor when norm > max_norm
-- AdamW after clipping matches reference
-- CPU↔Metal parity
+- [x] no-op when norm <= max_norm
+- [x] scales all grads by common factor when norm > max_norm
+- [x] AdamW after clipping matches reference
+- [x] CPU_REF and Metal clip paths pass
 
 ---
 
@@ -955,9 +958,9 @@ Not required for first real training, but important later:
 
 ### P5 — Gradient clipping
 
-- [ ] global norm clip op/API.
-- [ ] CPU_REF + Metal.
-- [ ] trainer integration.
+- [x] global norm clip op/API.
+- [x] CPU_REF + Metal.
+- [x] trainer integration.
 
 ### P6 — Parameter groups + checkpoint/resume
 

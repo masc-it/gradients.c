@@ -77,6 +77,8 @@ const char *_gd_op_kind_name(_gd_op_kind op)
         return "zero_grad";
     case _GD_OP_OPTIMIZER_STEP:
         return "optimizer_step";
+    case _GD_OP_CLIP_GRAD_NORM:
+        return "clip_grad_norm";
     case _GD_OP_ASSERT_FINITE:
         return "assert_finite";
     case _GD_OP_ASSERT_CLOSE:

@@ -351,6 +351,25 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
             return status;
         }
         return _gd_cpu_k_step_inc(in_data[0]);
+    case _GD_OP_CLIP_GRAD_NORM:
+        if (node->n_inputs <= 0 || node->n_outputs != 1) {
+            return _gd_error(GD_ERR_INTERNAL, "clip_grad_norm expects inputs and one output");
+        }
+        status = require_f32(out_desc);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (out_desc->ndim != 0) {
+            return _gd_error(GD_ERR_SHAPE, "clip_grad_norm output must be scalar");
+        }
+        for (i = 0; i < node->n_inputs; ++i) {
+            status = require_f32(in_desc[i]);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+        return _gd_cpu_k_clip_grad_norm(in_desc, (float **)in_data, node->n_inputs,
+                                        node->attrs.scale, node->attrs.eps, out_data);
     case _GD_OP_ADAMW_STEP:
         status = require_f32(in_desc[0]);
         if (status != GD_OK) {

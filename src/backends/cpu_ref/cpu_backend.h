@@ -172,6 +172,12 @@ gd_status _gd_cpu_k_assert_close(const gd_tensor_desc *a_desc,
                                  float atol,
                                  float rtol);
 gd_status _gd_cpu_k_step_inc(float *step);
+gd_status _gd_cpu_k_clip_grad_norm(const gd_tensor_desc * const *grad_descs,
+                                   float **grads,
+                                   int n_grads,
+                                   float max_norm,
+                                   float eps,
+                                   float *norm_out);
 gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
                           float *param,
                           const float *grad,

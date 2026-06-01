@@ -76,9 +76,12 @@ static bool node_mutates_input(const _gd_node *node, int input_index)
         return input_index == 0;
     case _GD_OP_CLIP_GRAD_NORM:
         return true;
+    case _GD_OP_AMP_CLIP_GRAD_NORM:
+        return input_index >= 1;
     case _GD_OP_ADAMW_STEP:
-    case _GD_OP_ADAMW_STEP_AMP:
         return input_index == 0 || input_index == 2 || input_index == 3;
+    case _GD_OP_ADAMW_STEP_AMP:
+        return input_index == 0 || input_index == 2 || input_index == 3 || input_index == 6;
     case _GD_OP_AMP_UNSCALE_GRAD:
         return input_index == 0 || input_index == 2;
     case _GD_OP_AMP_STEP_INC:

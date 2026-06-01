@@ -508,6 +508,58 @@ kernel void gd_sdpa_bwd_stats_dq_combine(device const float *stats_part [[buffer
         stats[sb + 2] = D;
     }
 }
+
+kernel void gd_sdpa_bwd_stats_dq_combine_f16(device const float *stats_part [[buffer(0)]],
+                                             device const float *dq_part    [[buffer(1)]],
+                                             device float *stats            [[buffer(2)]],
+                                             device half *dq                [[buffer(3)]],
+                                             constant gd_metal_sdpa_params &p [[buffer(4)]],
+                                             uint gid [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq * p.Dh;
+    if ((int)gid >= total) {
+        return;
+    }
+    int c = (int)gid % p.Dh;
+    int row = (int)gid / p.Dh;
+    int i = row % p.Tq;
+    int r = row / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float raw = 0.0f;
+    float acc = 0.0f;
+    float ksum = 0.0f;
+    for (int sp = 0; sp < p.n_splits; ++sp) {
+        int sbase = (row * p.n_splits + sp) * 3;
+        float ls = stats_part[sbase + 1];
+        if (ls <= 0.0f) {
+            continue;
+        }
+        float ms = stats_part[sbase + 0];
+        float mnew = (ms > m) ? ms : m;
+        float corr_o = exp(m - mnew);
+        float corr_s = exp(ms - mnew);
+        int vbase = (row * p.n_splits + sp) * 2 * p.Dh;
+        l = l * corr_o + ls * corr_s;
+        raw = raw * corr_o + stats_part[sbase + 2] * corr_s;
+        acc = acc * corr_o + dq_part[vbase + c] * corr_s;
+        ksum = ksum * corr_o + dq_part[vbase + p.Dh + c] * corr_s;
+        m = mnew;
+    }
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float D = raw * inv_l;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+    dq[qbase + c] = (half)(p.scale * (acc * inv_l - D * ksum * inv_l));
+    if (c == 0) {
+        int sb = ((b * p.Hq + hq) * p.Tq + i) * 3;
+        stats[sb + 0] = m;
+        stats[sb + 1] = l;
+        stats[sb + 2] = D;
+    }
+}
 kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]],
                                   device const float *q             [[buffer(1)]],
                                   device const float *k             [[buffer(2)]],
@@ -677,4 +729,32 @@ kernel void gd_sdpa_bwd_dkv_reduce(device const float *part         [[buffer(0)]
     }
     dk[kbase + c] = adk;
     dv[kbase + c] = adv;
+}
+
+kernel void gd_sdpa_bwd_dkv_reduce_f16(device const float *part         [[buffer(0)]],
+                                       device half *dk                  [[buffer(1)]],
+                                       device half *dv                  [[buffer(2)]],
+                                       constant gd_metal_sdpa_params &p  [[buffer(3)]],
+                                       uint gid [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hkv * p.Tk * p.Dh;
+    if ((int)gid >= total) {
+        return;
+    }
+    int c = (int)gid % p.Dh;
+    int row = (int)gid / p.Dh;
+    int j = row % p.Tk;
+    int r = row / p.Tk;
+    int hkv = r % p.Hkv;
+    int b = r / p.Hkv;
+    int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+    int pbase = ((b * p.Hkv + hkv) * p.Tk + j) * p.n_splits * 2 * p.Dh;
+    float adk = 0.0f;
+    float adv = 0.0f;
+    for (int s = 0; s < p.n_splits; ++s) {
+        adk += part[pbase + s * 2 * p.Dh + c];
+        adv += part[pbase + s * 2 * p.Dh + p.Dh + c];
+    }
+    dk[kbase + c] = (half)adk;
+    dv[kbase + c] = (half)adv;
 }

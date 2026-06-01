@@ -213,6 +213,7 @@ typedef struct gd_metal_adamw_params {
     float beta2;
     float eps;
     float weight_decay;
+    int refresh_dtype;  /* -1 disables optional F32 master -> param refresh */
 } gd_metal_adamw_params;
 
 typedef struct gd_metal_amp_params {

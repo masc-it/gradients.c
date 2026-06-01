@@ -501,6 +501,7 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
     gd_tensor *scale = NULL;
     gd_tensor *found_inf = NULL;
     _gd_op_attrs attrs = {0};
+    bool fused_clip = false;
     int i = 0;
 
     if (ctx == NULL || optimizer == NULL) {
@@ -522,23 +523,26 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
     }
     scale = _gd_amp_scaler_scale_tensor(scaler);
     found_inf = _gd_amp_scaler_found_inf_tensor(scaler);
-    for (i = 0; i < optimizer->n_slots; ++i) {
-        gd_tensor *grad = NULL;
-        gd_tensor *inputs[3];
+    fused_clip = max_norm > 0.0F && optimizer->n_slots <= _GD_OP_MAX_INPUTS - 2;
+    if (!fused_clip) {
+        for (i = 0; i < optimizer->n_slots; ++i) {
+            gd_tensor *grad = NULL;
+            gd_tensor *inputs[3];
 
-        status = _gd_tensor_ensure_grad(ctx, optimizer->slots[i].param, &grad);
-        if (status != GD_OK) {
-            return status;
-        }
-        if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
-            return _gd_error(GD_ERR_DTYPE, "adamw AMP requires F32 gradients");
-        }
-        inputs[0] = grad;
-        inputs[1] = scale;
-        inputs[2] = found_inf;
-        status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_UNSCALE_GRAD, inputs, 3, NULL);
-        if (status != GD_OK) {
-            return status;
+            status = _gd_tensor_ensure_grad(ctx, optimizer->slots[i].param, &grad);
+            if (status != GD_OK) {
+                return status;
+            }
+            if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
+                return _gd_error(GD_ERR_DTYPE, "adamw AMP requires F32 gradients");
+            }
+            inputs[0] = grad;
+            inputs[1] = scale;
+            inputs[2] = found_inf;
+            status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_UNSCALE_GRAD, inputs, 3, NULL);
+            if (status != GD_OK) {
+                return status;
+            }
         }
     }
 
@@ -555,7 +559,10 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
         for (i = 0; i < optimizer->n_slots; ++i) {
             params[i] = optimizer->slots[i].param;
         }
-        status = gd_clip_grad_norm(ctx, params, optimizer->n_slots, max_norm, norm_out);
+        status = fused_clip ? _gd_amp_clip_grad_norm(ctx, params, optimizer->n_slots,
+                                                     scale, found_inf, max_norm, norm_out)
+                            : gd_clip_grad_norm(ctx, params, optimizer->n_slots,
+                                                max_norm, norm_out);
         free(params);
         if (status != GD_OK) {
             return status;
@@ -578,7 +585,8 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
         adamw_slot *slot = &optimizer->slots[i];
         gd_tensor *grad = NULL;
         gd_tensor *update_param = slot->master != NULL ? slot->master : slot->param;
-        gd_tensor *inputs[6];
+        gd_tensor *inputs[7];
+        int n_inputs = slot->master != NULL ? 7 : 6;
 
         status = _gd_tensor_ensure_grad(ctx, slot->param, &grad);
         if (status != GD_OK) {
@@ -592,17 +600,13 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
         inputs[3] = slot->v;
         inputs[4] = optimizer->step;
         inputs[5] = found_inf;
-        status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP_AMP, inputs, 6, &attrs);
+        if (slot->master != NULL) {
+            inputs[6] = slot->param;
+        }
+        status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP_AMP,
+                                        inputs, n_inputs, &attrs);
         if (status != GD_OK) {
             return status;
-        }
-        if (slot->master != NULL) {
-            gd_tensor *refresh_inputs[3] = {slot->param, slot->master, found_inf};
-            status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_REFRESH_PARAM,
-                                            refresh_inputs, 3, NULL);
-            if (status != GD_OK) {
-                return status;
-            }
         }
     }
     return GD_OK;

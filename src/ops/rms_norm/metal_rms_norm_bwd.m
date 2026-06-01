@@ -37,6 +37,12 @@ static gd_status rms_norm_bwd_encode(_gd_metal_encode_ctx *ctx)
     if (_gd_metal_dtype_code(desc->dtype, &p.dtype) != GD_OK) {
         return _gd_error(GD_ERR_DTYPE, "metal rms_norm_bwd dtype unsupported");
     }
+    if (desc->dtype == GD_DTYPE_F16) {
+        pso = _gd_metal_pipeline_named(ctx->state, "gd_rms_norm_bwd_f16");
+        if (pso == nil) {
+            return _gd_error(GD_ERR_BACKEND, "metal rms_norm_bwd F16 pipeline missing");
+        }
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

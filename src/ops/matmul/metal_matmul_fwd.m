@@ -16,6 +16,17 @@ static bool matmul_node_uses_f16(const _gd_metal_plan_ctx *ctx)
            out_desc->dtype == GD_DTYPE_F16;
 }
 
+static bool matmul_node_mixed_f16_f32(const _gd_node *node,
+                                      const gd_tensor_desc *a_desc,
+                                      const gd_tensor_desc *b_desc,
+                                      const gd_tensor_desc *out_desc)
+{
+    return a_desc->dtype == GD_DTYPE_F16 && b_desc->dtype == GD_DTYPE_F16 &&
+           out_desc->dtype == GD_DTYPE_F32 &&
+           node->attrs.compute.compute_dtype == GD_DTYPE_F32 &&
+           node->attrs.compute.accum_dtype == GD_DTYPE_INVALID;
+}
+
 static gd_status matmul_support(const _gd_metal_plan_ctx *ctx)
 {
     gd_status status = GD_OK;
@@ -45,10 +56,13 @@ static gd_status matmul_support(const _gd_metal_plan_ctx *ctx)
         !matmul_dtype_supported(out_desc->dtype)) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal matmul supports F32/F16 only");
     }
-    if (a_desc->dtype != b_desc->dtype || b_desc->dtype != out_desc->dtype) {
+    if ((a_desc->dtype != b_desc->dtype || b_desc->dtype != out_desc->dtype) &&
+        !matmul_node_mixed_f16_f32(node, a_desc, b_desc, out_desc)) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal matmul requires matching input/output dtypes");
     }
-    if (out_desc->dtype == GD_DTYPE_F16 && (ctx->state == nil || !ctx->state.useMPS)) {
+    if ((out_desc->dtype == GD_DTYPE_F16 ||
+         matmul_node_mixed_f16_f32(node, a_desc, b_desc, out_desc)) &&
+        (ctx->state == nil || !ctx->state.useMPS)) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal F16 matmul needs GD_METAL_MPS=1");
     }
     return GD_OK;

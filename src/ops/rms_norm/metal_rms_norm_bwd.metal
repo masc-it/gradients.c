@@ -46,6 +46,52 @@ kernel void gd_rms_norm_bwd(device const uchar *x               [[buffer(0)]],
                        inv * g * w - xv * inv3 * A / (float)p.last);
     }
 }
+
+kernel void gd_rms_norm_bwd_f16(device const half *x              [[buffer(0)]],
+                                device const half *weight         [[buffer(1)]],
+                                device const half *go             [[buffer(2)]],
+                                device half *dx                   [[buffer(3)]],
+                                constant gd_metal_rmsnorm_params &p [[buffer(4)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint tid  [[thread_index_in_threadgroup]],
+                                uint tgsz [[threads_per_threadgroup]])
+{
+    int r = (int)tgid;
+    if (r >= p.rows) {
+        return;
+    }
+    threadgroup float pss[GD_RMS_TG];
+    threadgroup float pa[GD_RMS_TG];
+    int base = r * p.last;
+    float lss = 0.0f;
+    float la = 0.0f;
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
+        float v = (float)x[base + c];
+        float g = (float)go[base + c];
+        float w = (float)weight[c];
+        lss += v * v;
+        la += g * w * v;
+    }
+    pss[tid] = lss;
+    pa[tid] = la;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsz / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            pss[tid] += pss[tid + stride];
+            pa[tid] += pa[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sqrt(pss[0] / (float)p.last + p.eps);
+    float inv3 = inv * inv * inv;
+    float A = pa[0];
+    for (int c = (int)tid; c < p.last; c += (int)tgsz) {
+        float g = (float)go[base + c];
+        float w = (float)weight[c];
+        float xv = (float)x[base + c];
+        dx[base + c] = (half)(inv * g * w - xv * inv3 * A / (float)p.last);
+    }
+}
 kernel void gd_rms_norm_bwd_add(device const float *x               [[buffer(0)]],
                                 device const float *weight          [[buffer(1)]],
                                 device const float *go              [[buffer(2)]],

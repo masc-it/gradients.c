@@ -8,6 +8,7 @@ kernel void gd_adamw_amp(device float *param                 [[buffer(0)]],
                          device const atomic_uint *found_inf [[buffer(5)]],
                          constant gd_metal_adamw_params &p   [[buffer(6)]],
                          device const float *lr_tensor       [[buffer(7)]],
+                         device uchar *refresh               [[buffer(8)]],
                          uint gid                            [[thread_position_in_grid]])
 {
     if ((int)gid >= p.numel || atomic_load_explicit(found_inf, memory_order_relaxed) != 0u) {
@@ -29,4 +30,7 @@ kernel void gd_adamw_amp(device float *param                 [[buffer(0)]],
     pp -= lr * p.weight_decay * pp;
     pp -= lr * mhat / (sqrt(vhat) + p.eps);
     param[gid] = pp;
+    if (p.refresh_dtype >= 0) {
+        gd_store_float(refresh, p.refresh_dtype, gid, pp);
+    }
 }

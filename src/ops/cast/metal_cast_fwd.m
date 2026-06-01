@@ -40,6 +40,7 @@ static gd_status cast_encode(_gd_metal_encode_ctx *ctx)
     int64_t numel = _gd_metal_desc_numel(out_desc);
     gd_metal_cast_params params;
     gd_status status = GD_OK;
+    bool use_x4 = false;
 
     params.numel = (int)numel;
     status = _gd_metal_dtype_code(in_desc->dtype, &params.src_dtype);
@@ -50,12 +51,26 @@ static gd_status cast_encode(_gd_metal_encode_ctx *ctx)
     if (status != GD_OK) {
         return status;
     }
+    if (in_desc->dtype == GD_DTYPE_F16 && out_desc->dtype == GD_DTYPE_F32) {
+        pso = _gd_metal_pipeline_named(ctx->state, "gd_cast_f16_to_f32_x4");
+        if (pso == nil) {
+            return _gd_error(GD_ERR_BACKEND, "metal cast F16->F32 pipeline missing");
+        }
+        use_x4 = true;
+    } else if (in_desc->dtype == GD_DTYPE_F32 && out_desc->dtype == GD_DTYPE_F16) {
+        pso = _gd_metal_pipeline_named(ctx->state, "gd_cast_f32_to_f16_x4");
+        if (pso == nil) {
+            return _gd_error(GD_ERR_BACKEND, "metal cast F32->F16 pipeline missing");
+        }
+        use_x4 = true;
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
     [enc setBytes:&params length:sizeof(params) atIndex:2];
     if (numel > 0) {
-        _gd_metal_dispatch_1d(enc, pso, (NSUInteger)numel);
+        NSUInteger work_items = use_x4 ? (NSUInteger)((numel + 3) / 4) : (NSUInteger)numel;
+        _gd_metal_dispatch_1d(enc, pso, work_items);
     }
     return GD_OK;
 }

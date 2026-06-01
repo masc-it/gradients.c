@@ -411,6 +411,9 @@ int main(void)
         }
     }
     CHECK(gd_graph_end(ctx));
+    if (getenv("GD_BENCH_DUMP") != NULL) {
+        CHECK(gd_graph_dump(g, GD_DUMP_TEXT, getenv("GD_BENCH_DUMP")));
+    }
     printf("  compiling graph...\n");
     CHECK(gd_graph_compile(g, target));
 

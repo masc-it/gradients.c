@@ -7,6 +7,8 @@
 
 #include "../core/internal.h"
 #include "../core/tensor_internal.h"
+#include "../graph/graph_internal.h"
+#include "../ops/op_impl.h"
 #include "amp_internal.h"
 
 struct gd_amp_scaler {
@@ -152,6 +154,56 @@ gd_status gd_amp_scaler_scale_loss(gd_context *ctx,
     return gd_mul(ctx, loss, scaler->scale, scaled_loss);
 }
 
+gd_status _gd_amp_clip_grad_norm(gd_context *ctx,
+                                 gd_tensor **params,
+                                 int n_params,
+                                 gd_tensor *scale,
+                                 gd_tensor *found_inf,
+                                 float max_norm,
+                                 gd_tensor **norm_out)
+{
+    gd_status status = GD_OK;
+    gd_tensor *inputs[_GD_OP_MAX_INPUTS];
+    gd_tensor *norm = NULL;
+    _gd_op_attrs attrs = {0};
+    int i = 0;
+
+    if (ctx == NULL || params == NULL || scale == NULL || found_inf == NULL ||
+        n_params <= 0 || n_params > _GD_OP_MAX_INPUTS - 2) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT,
+                         "amp_clip_grad_norm argument is invalid");
+    }
+    inputs[0] = scale;
+    inputs[1] = found_inf;
+    for (i = 0; i < n_params; ++i) {
+        gd_tensor *grad = NULL;
+        status = gd_tensor_grad(params[i], &grad);
+        if (status != GD_OK) { return status; }
+        if (grad == NULL) {
+            status = _gd_tensor_ensure_grad(ctx, params[i], &grad);
+            if (status != GD_OK) { return status; }
+            status = _gd_tensor_zero(grad);
+            if (status != GD_OK) { return status; }
+        }
+        if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_DTYPE,
+                             "amp_clip_grad_norm requires F32 gradients");
+        }
+        inputs[i + 2] = grad;
+    }
+    attrs.scale = max_norm;
+    attrs.eps = 1e-6F;
+    status = _gd_emit_checked(ctx, _GD_OP_AMP_CLIP_GRAD_NORM, inputs, n_params + 2,
+                              &attrs, &norm, 1);
+    if (status != GD_OK) { return status; }
+    if (norm_out != NULL) {
+        *norm_out = norm;
+    } else {
+        gd_tensor_release(norm);
+    }
+    return GD_OK;
+}
+
 gd_status gd_amp_scaler_found_inf(gd_context *ctx,
                                   gd_amp_scaler *scaler,
                                   bool *found_inf_out)
@@ -178,12 +230,15 @@ gd_status gd_amp_scaler_update(gd_context *ctx,
                                bool *stepped_out)
 {
     bool found = false;
+    bool scale_changed = false;
     int zero = 0;
+    float old_scale = 0.0F;
     gd_status status = gd_amp_scaler_found_inf(ctx, scaler, &found);
 
     if (status != GD_OK) {
         return status;
     }
+    old_scale = scaler->current_scale;
     if (found) {
         scaler->current_scale *= scaler->config.backoff_factor;
         if (scaler->current_scale < scaler->config.min_scale) {
@@ -200,9 +255,12 @@ gd_status gd_amp_scaler_update(gd_context *ctx,
             scaler->growth_tracker = 0;
         }
     }
-    status = gd_tensor_copy_from_cpu(ctx, scaler->scale, &scaler->current_scale,
-                                     sizeof(scaler->current_scale));
-    if (status == GD_OK) {
+    scale_changed = scaler->current_scale != old_scale;
+    if (scale_changed) {
+        status = gd_tensor_copy_from_cpu(ctx, scaler->scale, &scaler->current_scale,
+                                         sizeof(scaler->current_scale));
+    }
+    if (status == GD_OK && found) {
         status = gd_tensor_copy_from_cpu(ctx, scaler->found_inf, &zero, sizeof(zero));
     }
     if (status != GD_OK) {

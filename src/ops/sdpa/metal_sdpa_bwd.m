@@ -57,6 +57,7 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
                                      : NULL;
     int bias_input = node->attrs.has_bias ? node->inputs[4] : node->inputs[1];
     gd_metal_sdpa_params p;
+    bool f16 = q->dtype == GD_DTYPE_F16;
     int q_groups = 0;
     int kv_groups = 0;
 
@@ -76,7 +77,9 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
      * threadgroups into per-split partials, then reduce. stats/dq split the key
      * range (per query block); dkv splits the query range (per key block). */
     {
-        int nsplit = q->dtype == GD_DTYPE_F16 ? 1 : _gd_metal_sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
+        bool f16_window_split = f16 && sdpa_is_causal_no_bias(&p) && p.window > 0;
+        int nsplit = (f16 && !f16_window_split) ? 1 :
+            _gd_metal_sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
         if (nsplit > 1) {
             gd_metal_sdpa_bwd_layout L = _gd_metal_sdpa_bwd_scratch_layout(p.B, p.Hq, p.Hkv, p.Tq, p.Tk,
                                                         p.Dh, nsplit);
@@ -92,19 +95,19 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             NSUInteger kv_rows = (NSUInteger)(p.B * p.Hkv * p.Tk);
             GDMetalState *st = ctx->state;
             id<MTLComputePipelineState> sdq_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split");
-            id<MTLComputePipelineState> sdqc_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_combine");
+            id<MTLComputePipelineState> sdqc_pso = _gd_metal_pipeline_named(st, f16 ? "gd_sdpa_bwd_stats_dq_combine_f16" : "gd_sdpa_bwd_stats_dq_combine");
             id<MTLComputePipelineState> dks_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split");
-            id<MTLComputePipelineState> dkr_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_reduce");
+            id<MTLComputePipelineState> dkr_pso = _gd_metal_pipeline_named(st, f16 ? "gd_sdpa_bwd_dkv_reduce_f16" : "gd_sdpa_bwd_dkv_reduce");
             bool sdq_lane_split = false;
             NSUInteger sdq_threads = GD_METAL_SDPA_BQ;
             if (sdpa_is_causal_no_bias(&p)) {
                 if (p.window > 0) {
                     id<MTLComputePipelineState> fast_sdq_window =
                         _gd_metal_pipeline_named(st,
-                                                 "gd_sdpa_bwd_stats_dq_split_causal_window_lane8");
+                                                 f16 ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_f16" : "gd_sdpa_bwd_stats_dq_split_causal_window_lane8");
                     id<MTLComputePipelineState> fast_dks_window =
                         _gd_metal_pipeline_named(st,
-                                                 "gd_sdpa_bwd_dkv_split_causal_window_k16");
+                                                 f16 ? "gd_sdpa_bwd_dkv_split_causal_window_k16_f16" : "gd_sdpa_bwd_dkv_split_causal_window_k16");
                     if (fast_sdq_window != nil) {
                         sdq_pso = fast_sdq_window;
                         sdq_lane_split = true;
@@ -278,7 +281,12 @@ static gd_status sdpa_bwd_plan(_gd_metal_plan_ctx *ctx)
         int Dh = (int)qd->sizes[3];
         int Tk = (int)kd->sizes[1];
         int Hkv = (int)kd->sizes[2];
-        int nsplit = qd->dtype == GD_DTYPE_F16 ? 1 : _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
+        bool f16_window_split = qd->dtype == GD_DTYPE_F16 && ctx->node->attrs.causal &&
+                                ctx->node->attrs.prefix_len == 0 &&
+                                !ctx->node->attrs.has_bias &&
+                                ctx->node->attrs.sliding_window > 0;
+        int nsplit = (qd->dtype == GD_DTYPE_F16 && !f16_window_split) ? 1 :
+            _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
         int64_t nfloats = Dh <= GD_METAL_SDPA_DHT && nsplit > 1
                               ? _gd_metal_sdpa_bwd_scratch_layout(B, Hq, Hkv, Tq, Tk, Dh, nsplit).total
                               : (int64_t)B * Hq * Tq * 3;

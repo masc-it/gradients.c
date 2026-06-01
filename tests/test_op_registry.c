@@ -30,6 +30,7 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_ADAMW_STEP, "adamw_step"},
     {_GD_OP_ADAMW_STEP_AMP, "adamw_step_amp"},
     {_GD_OP_ADD, "add"},
+    {_GD_OP_AMP_CLIP_GRAD_NORM, "amp_clip_grad_norm"},
     {_GD_OP_AMP_REFRESH_PARAM, "amp_refresh_param"},
     {_GD_OP_AMP_STEP_INC, "amp_step_inc"},
     {_GD_OP_AMP_UNSCALE_GRAD, "amp_unscale_grad"},

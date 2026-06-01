@@ -19,6 +19,7 @@ static gd_status adamw_step_encode(_gd_metal_encode_ctx *ctx)
     p.beta2 = node->attrs.beta2;
     p.eps = node->attrs.eps;
     p.weight_decay = node->attrs.weight_decay;
+    p.refresh_dtype = -1;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

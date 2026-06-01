@@ -23,7 +23,15 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
         const gd_tensor_desc *a_desc = &graph->values[node->inputs[0]].desc;
         const gd_tensor_desc *b_desc = &graph->values[node->inputs[1]].desc;
         const gd_tensor_desc *out_desc = &graph->values[node->outputs[0]].desc;
-        if (a_desc->dtype == b_desc->dtype && b_desc->dtype == out_desc->dtype &&
+        bool same_dtype = a_desc->dtype == b_desc->dtype && b_desc->dtype == out_desc->dtype;
+        bool mixed_f16_f32 = a_desc->dtype == GD_DTYPE_F16 &&
+                             b_desc->dtype == GD_DTYPE_F16 &&
+                             out_desc->dtype == GD_DTYPE_F32 &&
+                             node->attrs.compute.compute_dtype == GD_DTYPE_F32 &&
+                             node->attrs.compute.accum_dtype == GD_DTYPE_INVALID;
+        if ((same_dtype || mixed_f16_f32) &&
+            mps_gemm_dtype_supported(a_desc->dtype) &&
+            mps_gemm_dtype_supported(b_desc->dtype) &&
             mps_gemm_dtype_supported(out_desc->dtype) &&
             a_desc->layout == GD_LAYOUT_CONTIGUOUS && b_desc->layout == GD_LAYOUT_CONTIGUOUS &&
             out_desc->layout == GD_LAYOUT_CONTIGUOUS &&
@@ -100,32 +108,36 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
                      out_desc->sizes[out_desc->ndim - 1] == result_cols;
             }
             if (ok && result_rows > 0 && result_cols > 0 && inner > 0 && batch > 0U) {
-                NSUInteger elem_size = (NSUInteger)gd_dtype_sizeof(out_desc->dtype);
-                MPSDataType dtype = mps_gemm_dtype(out_desc->dtype);
-                NSUInteger a_row_bytes = a_cols_desc * elem_size;
-                NSUInteger b_row_bytes = b_cols_desc * elem_size;
-                NSUInteger out_row_bytes = out_cols_desc * elem_size;
+                NSUInteger a_elem_size = (NSUInteger)gd_dtype_sizeof(a_desc->dtype);
+                NSUInteger b_elem_size = (NSUInteger)gd_dtype_sizeof(b_desc->dtype);
+                NSUInteger out_elem_size = (NSUInteger)gd_dtype_sizeof(out_desc->dtype);
+                MPSDataType a_dtype = mps_gemm_dtype(a_desc->dtype);
+                MPSDataType b_dtype = mps_gemm_dtype(b_desc->dtype);
+                MPSDataType out_dtype = mps_gemm_dtype(out_desc->dtype);
+                NSUInteger a_row_bytes = a_cols_desc * a_elem_size;
+                NSUInteger b_row_bytes = b_cols_desc * b_elem_size;
+                NSUInteger out_row_bytes = out_cols_desc * out_elem_size;
                 MPSMatrixDescriptor *ad = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:a_rows_desc
                                      columns:a_cols_desc
                                     matrices:batch
                                     rowBytes:a_row_bytes
                                  matrixBytes:a_rows_desc * a_row_bytes
-                                    dataType:dtype];
+                                    dataType:a_dtype];
                 MPSMatrixDescriptor *bd = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:b_rows_desc
                                      columns:b_cols_desc
                                     matrices:batch
                                     rowBytes:b_row_bytes
                                  matrixBytes:b_rows_desc * b_row_bytes
-                                    dataType:dtype];
+                                    dataType:b_dtype];
                 MPSMatrixDescriptor *od = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:out_rows_desc
                                      columns:out_cols_desc
                                     matrices:batch
                                     rowBytes:out_row_bytes
                                  matrixBytes:out_rows_desc * out_row_bytes
-                                    dataType:dtype];
+                                    dataType:out_dtype];
                 GDMPSGemmPlan *plan = [GDMPSGemmPlan new];
                 plan.kernel = [[MPSMatrixMultiplication alloc]
                     initWithDevice:st.device

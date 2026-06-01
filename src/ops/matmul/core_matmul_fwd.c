@@ -19,8 +19,18 @@ static gd_status matmul_meta(const gd_tensor_desc *const *inputs,
     if (status != GD_OK) {
         return status;
     }
-    return _gd_meta_matmul(inputs[0], inputs[1], attrs->trans_a, attrs->trans_b,
-                           &outputs[0]);
+    status = _gd_meta_matmul(inputs[0], inputs[1], attrs->trans_a, attrs->trans_b,
+                             &outputs[0]);
+    if (status != GD_OK) {
+        return status;
+    }
+    /* Internal AMP grad sentinel: F16 inputs, F32 output, no input upcast nodes. */
+    if (inputs[0]->dtype == GD_DTYPE_F16 && inputs[1]->dtype == GD_DTYPE_F16 &&
+        attrs->compute.compute_dtype == GD_DTYPE_F32 &&
+        attrs->compute.accum_dtype == GD_DTYPE_INVALID) {
+        outputs[0].dtype = GD_DTYPE_F32;
+    }
+    return GD_OK;
 }
 
 const _gd_op_def _gd_opdef_matmul = {

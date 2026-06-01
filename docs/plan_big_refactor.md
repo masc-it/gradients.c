@@ -1203,14 +1203,10 @@ Current codebase inventory used to ground this plan:
 - [x] Run full macOS/Metal validation: `make clean && make test`.
 - [x] Run examples/bench smoke checks: `make mlp`, `make gpt`, and relevant GPT bench target.
 
-### 24.13 Add CUDA/Vulkan skeletons after registry is stable
+### 24.13 Deferred: CUDA/Vulkan skeletons
 
-- [ ] Add CUDA backend runtime skeleton with empty generated CUDA op registry.
-- [ ] Add `src/ops/add/cuda_add_fwd.cu` or `src/ops/scale/cuda_scale_fwd.cu` as first CUDA op.
-- [ ] Verify CUDA unsupported-op path includes op name, dtype/layout/shape reason.
-- [ ] Add Vulkan backend runtime skeleton with empty generated Vulkan op registry.
-- [ ] Add `src/ops/add/vulkan_add_fwd.c` or `src/ops/scale/vulkan_scale_fwd.c` as first Vulkan op.
-- [ ] Verify Vulkan unsupported-op path includes op name, dtype/layout/shape reason.
+CUDA/Vulkan backend skeletons are intentionally deferred. Current supported
+backend scope remains CPU reference plus Metal.
 
 ---
 

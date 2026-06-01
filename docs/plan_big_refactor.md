@@ -1144,13 +1144,13 @@ Current codebase inventory used to ground this plan:
 
 ### 24.7 Split Metal runtime before moving Metal ops
 
-- [ ] Split `src/backends/metal/metal_backend.m` into runtime files: `backend.m`, `runtime.m`, `storage.m`, `compile.m`, `execute.m`, `fusion.m`, plus shared headers.
-- [ ] Keep behavior identical: same vtable, same env vars (`GRADIENTS_METALLIB`, `GD_METAL_MPS`), same fallback behavior.
-- [ ] Move pipeline cache/loading helpers into Metal runtime, still using old central kernel table temporarily.
-- [ ] Move staging/writeback/synchronize logic into runtime files.
-- [ ] Move MPS GEMM planning helpers into either Metal runtime or linalg op capsule, whichever keeps files smaller.
-- [ ] Ensure each new Metal runtime source file is under 1000 LOC.
-- [ ] Validate: `make test` on macOS with Metal enabled passes or skips exactly as before.
+- [x] Split `src/backends/metal/metal_backend.m` into runtime files: `backend.m`, `runtime.m`, `storage.m`, `compile.m`, `execute.m`, `fusion.m`, plus shared headers.
+- [x] Keep behavior identical: same vtable, same env vars (`GRADIENTS_METALLIB`, `GD_METAL_MPS`), same fallback behavior.
+- [x] Move pipeline cache/loading helpers into Metal runtime, still using old central kernel table temporarily.
+- [x] Move staging/writeback/synchronize logic into runtime files.
+- [x] Move MPS GEMM planning helpers into either Metal runtime or linalg op capsule, whichever keeps files smaller.
+- [x] Ensure each new Metal runtime source file is under 1000 LOC.
+- [x] Validate: `make test` on macOS with Metal enabled passes or skips exactly as before.
 
 ### 24.8 Move Metal op host entries into capsules
 

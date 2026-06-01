@@ -1,0 +1,200 @@
+#import "metal_internal.h"
+
+gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc,
+                                     void **handle_out)
+{
+    GDMetalState *st = _gd_metal_state(self);
+
+    *handle_out = NULL;
+    if (desc->device.type != GD_DEVICE_METAL) {
+        return _gd_error(GD_ERR_DEVICE, "metal storage requires a Metal device");
+    }
+    if (desc->memory != GD_MEM_UNIFIED && desc->memory != GD_MEM_HOST) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal storage supports unified/host memory in v1");
+    }
+
+    id<MTLBuffer> buffer = [st.device newBufferWithLength:desc->nbytes
+                                                  options:MTLResourceStorageModeShared];
+    if (buffer == nil) {
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "MTLBuffer allocation failed");
+    }
+    memset(buffer.contents, 0, desc->nbytes);
+    *handle_out = (__bridge_retained void *)buffer;
+    return GD_OK;
+}
+
+void _gd_metal_storage_free(_gd_backend *self, void *handle)
+{
+    (void)self;
+    if (handle != NULL) {
+        id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle; /* ARC releases */
+        (void)buffer;
+    }
+}
+
+gd_status _gd_metal_storage_host_ptr(_gd_backend *self, void *handle, void **ptr_out)
+{
+    (void)self;
+    if (handle == NULL) {
+        return _gd_error(GD_ERR_INVALID_STATE, "metal storage handle is NULL");
+    }
+    {
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+        *ptr_out = buffer.contents;
+    }
+    return GD_OK;
+}
+
+/* Persist any external-leaf mutations (optimizer in-place updates, gradient
+ * slots written via emit_to) from their Metal buffers back to the owning CPU
+ * tensor storage. CPU_REF gets this for free by borrowing leaf storage; Metal
+ * stages copies, so it must copy back after the work completes. */
+gd_status _gd_metal_writeback_externals(_gd_backend *self, _gd_executable *exe)
+{
+    int i = 0;
+    uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+    size_t bytes = 0U;
+    uint64_t count = 0U;
+
+    for (i = 0; i < exe->n_values; ++i) {
+        gd_metal_value *v = &exe->values[i];
+        gd_storage *dst = NULL;
+        void *src = NULL;
+        size_t nbytes = 0U;
+        gd_status status = GD_OK;
+
+        if (v->external == NULL || v->external_alias || !v->needs_writeback) {
+            continue;
+        }
+        dst = gd_tensor_storage(v->external);
+        if (dst == NULL) {
+            continue;
+        }
+        nbytes = gd_storage_nbytes(v->storage);
+        bytes += nbytes;
+        count += 1U;
+        status = gd_storage_data_cpu(v->storage, &src);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = gd_storage_copy_from_cpu(self->ctx, dst, v->leaf_offset, src, nbytes);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    if (start != 0U) {
+        _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WRITEBACK,
+                                 _gd_profile_now_ns() - start, bytes, count);
+    }
+    return GD_OK;
+}
+
+/* Writes back every executable with deferred CPU-backed external mutations and
+ * clears the pending set. Called after the in-flight command buffer completes. */
+gd_status _gd_metal_flush_pending_writebacks(_gd_backend *self)
+{
+    GDMetalState *st = _gd_metal_state(self);
+    gd_status status = GD_OK;
+
+    if (st.pendingExes.count == 0) {
+        return GD_OK;
+    }
+    for (NSValue *boxed in st.pendingExes) {
+        _gd_executable *exe = (_gd_executable *)boxed.pointerValue;
+        gd_status s = _gd_metal_writeback_externals(self, exe);
+        if (s != GD_OK && status == GD_OK) {
+            status = s;
+        }
+    }
+    [st.pendingExes removeAllObjects];
+    return status;
+}
+
+/* Registers an executable's CPU-backed mutated externals for deferred writeback.
+ * The host storages are marked pending so a later read resolves the flush; the
+ * executable is added to the pending set (deduped) for the next synchronize. */
+void _gd_metal_register_pending_writeback(_gd_backend *self, _gd_executable *exe)
+{
+    GDMetalState *st = _gd_metal_state(self);
+    NSValue *boxed = [NSValue valueWithPointer:exe];
+    int i = 0;
+
+    if (![st.pendingExes containsObject:boxed]) {
+        [st.pendingExes addObject:boxed];
+    }
+    for (i = 0; i < exe->n_values; ++i) {
+        gd_metal_value *v = &exe->values[i];
+        gd_storage *dst = NULL;
+
+        if (v->external == NULL || v->external_alias || !v->needs_writeback) {
+            continue;
+        }
+        dst = gd_tensor_storage(v->external);
+        if (dst != NULL) {
+            _gd_storage_set_pending_flush(dst, self, exe);
+        }
+    }
+}
+
+gd_status _gd_metal_synchronize(_gd_backend *self)
+{
+    GDMetalState *st = _gd_metal_state(self);
+    id<MTLCommandBuffer> cmd = st.inFlight;
+
+    if (cmd == nil) {
+        /* No GPU work in flight, but a prior sync may have left writebacks queued
+         * (it never happens today, but keep the set authoritative). */
+        return _gd_metal_flush_pending_writebacks(self);
+    }
+    {
+        uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+        [cmd waitUntilCompleted];
+        if (start != 0U) {
+            _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WAIT,
+                                     _gd_profile_now_ns() - start, 0U, 1U);
+        }
+    }
+    st.inFlight = nil;
+    if (cmd.status == MTLCommandBufferStatusError) {
+        const char *reason = cmd.error != nil
+                                 ? cmd.error.localizedDescription.UTF8String
+                                 : "command buffer failed";
+        [st.pendingExes removeAllObjects];
+        return _gd_error(GD_ERR_BACKEND, reason);
+    }
+    return _gd_metal_flush_pending_writebacks(self);
+}
+
+/* P4 flush hook: a host read hit a storage this backend marked pending. The
+ * command buffer is serial, so syncing the latest in-flight buffer completes all
+ * earlier ones; we then write back every pending executable. `cookie` is
+ * advisory (the registering executable); we flush the whole pending set. */
+gd_status _gd_metal_flush_pending(_gd_backend *self, void *cookie)
+{
+    (void)cookie;
+    return _gd_metal_synchronize(self);
+}
+
+gd_status _gd_metal_upload(_gd_backend *self, void *dst_handle, size_t dst_off,
+                              const void *src, size_t nbytes)
+{
+    (void)self;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)dst_handle;
+    memcpy((unsigned char *)buffer.contents + dst_off, src, nbytes);
+    return GD_OK;
+}
+
+gd_status _gd_metal_download(_gd_backend *self, void *src_handle, size_t src_off,
+                                void *dst, size_t nbytes)
+{
+    /* Blocking read (P4): the CPU only observes GPU writes after completion. */
+    gd_status status = _gd_metal_synchronize(self);
+    if (status != GD_OK) {
+        return status;
+    }
+    {
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)src_handle;
+        memcpy(dst, (const unsigned char *)buffer.contents + src_off, nbytes);
+    }
+    return GD_OK;
+}

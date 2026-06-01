@@ -1,7 +1,7 @@
 #ifndef GRADIENTS_METAL_KERNEL_TYPES_H
 #define GRADIENTS_METAL_KERNEL_TYPES_H
 
-/* Shared layout contract between the Objective-C host (metal_backend.m) and the
+/* Shared layout contract between the Objective-C host runtime and the
  * Metal shading language kernels (kernels.metal). Keep this POD and restricted
  * to types valid in both C and MSL (plain int/float). Sizes are element counts;
  * strides are not needed because v1 produced values are contiguous and inputs

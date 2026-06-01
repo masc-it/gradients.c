@@ -1157,11 +1157,13 @@ kernel void gd_adamw(device float *param                 [[buffer(0)]],
                      device float *v                     [[buffer(3)]],
                      device const float *step            [[buffer(4)]],
                      constant gd_metal_adamw_params &p    [[buffer(5)]],
+                     device const float *lr_tensor       [[buffer(6)]],
                      uint gid                            [[thread_position_in_grid]])
 {
     if ((int)gid >= p.numel) {
         return;
     }
+    float lr = p.use_lr_tensor != 0 ? lr_tensor[0] : p.lr;
     float t = step[0];
     float bc1 = 1.0f - pow(p.beta1, t);
     float bc2 = 1.0f - pow(p.beta2, t);
@@ -1174,8 +1176,8 @@ kernel void gd_adamw(device float *param                 [[buffer(0)]],
 
     m[gid] = mi;
     v[gid] = vi;
-    pp -= p.lr * p.weight_decay * pp;            /* decoupled weight decay */
-    pp -= p.lr * mhat / (sqrt(vhat) + p.eps);
+    pp -= lr * p.weight_decay * pp;            /* decoupled weight decay */
+    pp -= lr * mhat / (sqrt(vhat) + p.eps);
     param[gid] = pp;
 }
 

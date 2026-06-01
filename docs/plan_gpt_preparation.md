@@ -44,7 +44,7 @@ Not enough for real GPT training:
 - [x] tokenizer stack
 - [x] corpus preprocessing / packed token shards
 - [x] production data loader
-- [ ] LR scheduler without graph rebuilds
+- [x] LR scheduler without graph rebuilds
 - [ ] global grad clipping
 - [ ] checkpoint/resume
 - [ ] parameter groups
@@ -558,10 +558,15 @@ typedef struct gd_lr_scheduler_config {
 } gd_lr_scheduler_config;
 ```
 
+Implemented in `include/gradients/optim.h`, `src/nn/optim.c`, CPU_REF, Metal,
+and `tests/test_optim.c` / `tests/test_metal.c`.
+
 Tests:
 
-- exact LR values at step 0, warmup end, mid cosine, final.
-- AdamW update changes when LR tensor changes without graph rebuild.
+- [x] exact LR values at step 0, warmup end, mid cosine, final.
+- [x] scheduler writes mutable scalar tensor.
+- [x] AdamW update changes when LR tensor changes without graph rebuild.
+- [x] CPU_REF and Metal AdamW LR tensor paths pass.
 
 ---
 
@@ -944,9 +949,9 @@ Not required for first real training, but important later:
 
 ### P4 — Mutable LR + scheduler
 
-- [ ] LR tensor input for AdamW.
-- [ ] warmup + cosine scheduler.
-- [ ] tests without graph rebuild.
+- [x] LR tensor input for AdamW.
+- [x] warmup + cosine scheduler.
+- [x] tests without graph rebuild.
 
 ### P5 — Gradient clipping
 

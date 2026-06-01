@@ -24,6 +24,13 @@ typedef struct gd_adamw_config {
     gd_device state_device;
 } gd_adamw_config;
 
+typedef struct gd_lr_scheduler_config {
+    float max_lr;
+    float min_lr;
+    int warmup_steps;
+    int total_steps;
+} gd_lr_scheduler_config;
+
 gd_status gd_adamw_create(gd_context *ctx,
                           gd_tensor **params,
                           int n_params,
@@ -32,7 +39,19 @@ gd_status gd_adamw_create(gd_context *ctx,
 void gd_optimizer_destroy(gd_optimizer *optimizer);
 
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer);
+gd_status gd_optimizer_step_lr(gd_context *ctx,
+                               gd_optimizer *optimizer,
+                               gd_tensor *lr_scalar);
 gd_status gd_optimizer_zero_grad(gd_context *ctx, gd_optimizer *optimizer);
+
+gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,
+                                int step,
+                                float *lr_out);
+gd_status gd_lr_scheduler_write(gd_context *ctx,
+                                const gd_lr_scheduler_config *config,
+                                int step,
+                                gd_tensor *lr_scalar,
+                                float *lr_out);
 
 #ifdef __cplusplus
 }

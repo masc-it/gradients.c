@@ -356,8 +356,21 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         if (status != GD_OK) {
             return status;
         }
+        if (node->n_inputs != 5 && node->n_inputs != 6) {
+            return _gd_error(GD_ERR_INTERNAL, "adamw_step expects 5 or 6 inputs");
+        }
+        if (node->n_inputs == 6) {
+            status = require_f32(in_desc[5]);
+            if (status != GD_OK) {
+                return status;
+            }
+            if (in_desc[5]->ndim != 0) {
+                return _gd_error(GD_ERR_SHAPE, "adamw lr tensor must be scalar");
+            }
+        }
         return _gd_cpu_k_adamw(in_desc[0], in_data[0], in_data[1], in_data[2],
                                in_data[3], in_data[4],
+                               node->n_inputs == 6 ? in_data[5] : NULL,
                                node->attrs.lr, node->attrs.beta1, node->attrs.beta2,
                                node->attrs.eps, node->attrs.weight_decay);
     case _GD_OP_REDUCE_TO:

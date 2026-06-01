@@ -177,6 +177,7 @@ typedef struct gd_metal_reduce_to_params {
 
 typedef struct gd_metal_adamw_params {
     int numel;
+    int use_lr_tensor;
     float lr;
     float beta1;
     float beta2;

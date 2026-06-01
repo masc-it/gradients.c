@@ -2219,6 +2219,7 @@ static void encode_adamw(id<MTLComputeCommandEncoder> enc,
     gd_metal_adamw_params p;
 
     p.numel = (int)numel;
+    p.use_lr_tensor = node->n_inputs == 6 ? 1 : 0;
     p.lr = node->attrs.lr;
     p.beta1 = node->attrs.beta1;
     p.beta2 = node->attrs.beta2;
@@ -2231,6 +2232,9 @@ static void encode_adamw(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:value_buffer(exe, node->inputs[3]) offset:0 atIndex:3];
     [enc setBuffer:value_buffer(exe, node->inputs[4]) offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
+    [enc setBuffer:value_buffer(exe, node->inputs[node->n_inputs == 6 ? 5 : 4])
+            offset:0
+           atIndex:6];
     if (numel > 0) {
         dispatch_1d(enc, pso, (NSUInteger)numel);
     }

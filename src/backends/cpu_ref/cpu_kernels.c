@@ -1283,6 +1283,7 @@ gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
                           float *m,
                           float *v,
                           const float *step,
+                          const float *lr_tensor,
                           float lr,
                           float beta1,
                           float beta2,
@@ -1294,9 +1295,13 @@ gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
     double t = (double)step[0];
     double bc1 = 1.0 - pow((double)beta1, t);
     double bc2 = 1.0 - pow((double)beta2, t);
+    double step_lr = lr_tensor != NULL ? (double)lr_tensor[0] : (double)lr;
 
     if (t < 1.0) {
         return _gd_error(GD_ERR_INVALID_STATE, "adamw step counter must be >= 1");
+    }
+    if (!isfinite(step_lr) || step_lr < 0.0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw lr must be finite and nonnegative");
     }
     for (i = 0; i < total; ++i) {
         double g = (double)grad[i];
@@ -1308,8 +1313,8 @@ gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
 
         m[i] = (float)mi;
         v[i] = (float)vi;
-        p -= (double)lr * (double)weight_decay * p;        /* decoupled weight decay */
-        p -= (double)lr * mhat / (sqrt(vhat) + (double)eps);
+        p -= step_lr * (double)weight_decay * p;        /* decoupled weight decay */
+        p -= step_lr * mhat / (sqrt(vhat) + (double)eps);
         param[i] = (float)p;
     }
     return GD_OK;

@@ -27,6 +27,21 @@ static int close_to(float a, float b)
     return diff <= 1e-5F * (1.0F + fabsf(b));
 }
 
+static gd_status make_scalar(gd_context *ctx, float value, gd_tensor **out)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor_desc desc;
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 0, NULL, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_empty(ctx, &desc, out);
+    if (status != GD_OK) {
+        return status;
+    }
+    return gd_tensor_copy_from_cpu(ctx, *out, &value, sizeof(value));
+}
+
 static gd_status make_param(gd_context *ctx, int64_t n, const float *data, gd_tensor **out)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -125,6 +140,113 @@ static int test_adamw_steps(gd_context *ctx)
     return 0;
 }
 
+static int test_lr_scheduler_values(void)
+{
+    gd_lr_scheduler_config cfg;
+    float lr = -1.0F;
+    const float pi = 3.14159265358979323846F;
+    float expect_mid;
+
+    cfg.max_lr = 0.1F;
+    cfg.min_lr = 0.01F;
+    cfg.warmup_steps = 10;
+    cfg.total_steps = 110;
+
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 0, &lr));
+    CHECK_TRUE(close_to(lr, 0.0F));
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 5, &lr));
+    CHECK_TRUE(close_to(lr, 0.05F));
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 10, &lr));
+    CHECK_TRUE(close_to(lr, 0.1F));
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 60, &lr));
+    expect_mid = cfg.min_lr + 0.5F * (cfg.max_lr - cfg.min_lr) *
+                              (1.0F + cosf(pi * 0.5F));
+    CHECK_TRUE(close_to(lr, expect_mid));
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 110, &lr));
+    CHECK_TRUE(close_to(lr, cfg.min_lr));
+    CHECK_OK(gd_lr_scheduler_value(&cfg, 999, &lr));
+    CHECK_TRUE(close_to(lr, cfg.min_lr));
+    return 0;
+}
+
+static int test_adamw_lr_tensor(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    float pinit[3] = {1.0F, -2.0F, 0.5F};
+    float g[3] = {0.5F, -1.0F, 0.25F};
+    float lrs[2] = {0.1F, 0.01F};
+    gd_adamw_config cfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_tensor *lr = NULL;
+    gd_graph *graph = NULL;
+    float ref_p[3];
+    float ref_m[3] = {0, 0, 0};
+    float ref_v[3] = {0, 0, 0};
+    float got[3];
+    int step = 0;
+    int i = 0;
+
+    cfg.lr = 0.0F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.01F;
+
+    memcpy(ref_p, pinit, sizeof(pinit));
+    CHECK_OK(make_param(ctx, 3, pinit, &param));
+    CHECK_OK(make_scalar(ctx, lrs[0], &lr));
+    CHECK_OK(gd_adamw_create(ctx, &param, 1, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step_lr(ctx, opt, lr));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+
+    for (step = 1; step <= 2; ++step) {
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, lr, &lrs[step - 1], sizeof(float)));
+        CHECK_OK(gd_graph_run(graph));
+        ref_adamw(ref_p, ref_m, ref_v, g, 3, step, lrs[step - 1], cfg.beta1,
+                  cfg.beta2, cfg.eps, cfg.weight_decay);
+        CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, got, sizeof(got)));
+        for (i = 0; i < 3; ++i) {
+            CHECK_TRUE(close_to(got[i], ref_p[i]));
+        }
+    }
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(lr);
+    gd_tensor_release(param);
+    return 0;
+}
+
+static int test_lr_scheduler_write(gd_context *ctx)
+{
+    gd_lr_scheduler_config cfg;
+    gd_tensor *lr_tensor = NULL;
+    float lr = -1.0F;
+    float got = -1.0F;
+
+    cfg.max_lr = 0.2F;
+    cfg.min_lr = 0.02F;
+    cfg.warmup_steps = 4;
+    cfg.total_steps = 20;
+    CHECK_OK(make_scalar(ctx, 0.0F, &lr_tensor));
+    CHECK_OK(gd_lr_scheduler_write(ctx, &cfg, 2, lr_tensor, &lr));
+    CHECK_TRUE(close_to(lr, 0.1F));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, lr_tensor, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, lr));
+    gd_tensor_release(lr_tensor);
+    return 0;
+}
+
 static int test_tied_single_update(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -185,7 +307,11 @@ int main(void)
     gd_context *ctx = NULL;
 
     CHECK_OK(gd_context_create(&ctx));
-    if (test_adamw_steps(ctx) != 0 || test_tied_single_update(ctx) != 0) {
+    if (test_lr_scheduler_values() != 0 ||
+        test_adamw_steps(ctx) != 0 ||
+        test_adamw_lr_tensor(ctx) != 0 ||
+        test_lr_scheduler_write(ctx) != 0 ||
+        test_tied_single_update(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

@@ -1,5 +1,6 @@
 #include "gradients/optim.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 #include "gradients/ops.h"
@@ -56,17 +57,19 @@ static gd_status make_state_like(gd_context *ctx, gd_tensor *param, gd_tensor **
 
 static gd_status validate_config(const gd_adamw_config *cfg)
 {
-    if (cfg->lr < 0.0F) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw lr must be nonnegative");
+    if (!isfinite(cfg->lr) || cfg->lr < 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw lr must be finite and nonnegative");
     }
-    if (cfg->beta1 <= 0.0F || cfg->beta1 >= 1.0F || cfg->beta2 <= 0.0F || cfg->beta2 >= 1.0F) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw betas must be in (0,1)");
+    if (!isfinite(cfg->beta1) || !isfinite(cfg->beta2) ||
+        cfg->beta1 <= 0.0F || cfg->beta1 >= 1.0F ||
+        cfg->beta2 <= 0.0F || cfg->beta2 >= 1.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw betas must be finite and in (0,1)");
     }
-    if (cfg->eps <= 0.0F) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw eps must be positive");
+    if (!isfinite(cfg->eps) || cfg->eps <= 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw eps must be finite and positive");
     }
-    if (cfg->weight_decay < 0.0F) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw weight_decay must be nonnegative");
+    if (!isfinite(cfg->weight_decay) || cfg->weight_decay < 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "adamw weight_decay must be finite and nonnegative");
     }
     if (cfg->state_dtype != GD_DTYPE_INVALID && cfg->state_dtype != GD_DTYPE_F32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "adamw v1 supports F32 optimizer state only");
@@ -198,7 +201,25 @@ void gd_optimizer_destroy(gd_optimizer *optimizer)
     _gd_set_last_error(GD_OK, NULL);
 }
 
-gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
+static gd_status validate_lr_tensor(gd_tensor *lr_scalar)
+{
+    const gd_tensor_desc *desc = NULL;
+    if (lr_scalar == NULL) {
+        return GD_OK;
+    }
+    if (gd_tensor_dtype(lr_scalar) != GD_DTYPE_F32) {
+        return _gd_error(GD_ERR_DTYPE, "adamw lr tensor must be F32");
+    }
+    desc = _gd_tensor_desc_ptr(lr_scalar);
+    if (desc->ndim != 0) {
+        return _gd_error(GD_ERR_SHAPE, "adamw lr tensor must be scalar");
+    }
+    return GD_OK;
+}
+
+static gd_status optimizer_step_impl(gd_context *ctx,
+                                     gd_optimizer *optimizer,
+                                     gd_tensor *lr_scalar)
 {
     gd_status status = GD_OK;
     gd_graph *graph = NULL;
@@ -207,6 +228,10 @@ gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
 
     if (ctx == NULL || optimizer == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step argument is NULL");
+    }
+    status = validate_lr_tensor(lr_scalar);
+    if (status != GD_OK) {
+        return status;
     }
     graph = _gd_context_active_graph(ctx);
     if (graph == NULL) {
@@ -226,7 +251,8 @@ gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
 
     for (i = 0; i < optimizer->n_slots; ++i) {
         gd_tensor *grad = NULL;
-        gd_tensor *inputs[5];
+        gd_tensor *inputs[6];
+        int n_inputs = lr_scalar != NULL ? 6 : 5;
 
         status = _gd_tensor_ensure_grad(ctx, optimizer->slots[i].param, &grad);
         if (status != GD_OK) {
@@ -237,13 +263,107 @@ gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
         inputs[2] = optimizer->slots[i].m;
         inputs[3] = optimizer->slots[i].v;
         inputs[4] = optimizer->step;
-        status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP, inputs, 5, &attrs);
+        inputs[5] = lr_scalar;
+        status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP, inputs, n_inputs, &attrs);
         if (status != GD_OK) {
             return status;
         }
     }
 
     _gd_set_last_error(GD_OK, NULL);
+    return GD_OK;
+}
+
+gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
+{
+    return optimizer_step_impl(ctx, optimizer, NULL);
+}
+
+gd_status gd_optimizer_step_lr(gd_context *ctx,
+                               gd_optimizer *optimizer,
+                               gd_tensor *lr_scalar)
+{
+    if (lr_scalar == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_lr lr_scalar is NULL");
+    }
+    return optimizer_step_impl(ctx, optimizer, lr_scalar);
+}
+
+gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,
+                                int step,
+                                float *lr_out)
+{
+    const double pi = 3.14159265358979323846264338327950288;
+    double lr;
+    double progress;
+    int warmup_steps;
+    int total_steps;
+
+    if (config == NULL || lr_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "lr scheduler argument is NULL");
+    }
+    if (!isfinite(config->max_lr) || !isfinite(config->min_lr) ||
+        config->max_lr < 0.0F || config->min_lr < 0.0F ||
+        config->min_lr > config->max_lr) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid lr scheduler bounds");
+    }
+    if (config->warmup_steps < 0 || config->total_steps <= 0 ||
+        config->warmup_steps > config->total_steps) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid lr scheduler steps");
+    }
+    if (step < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "lr scheduler step must be nonnegative");
+    }
+
+    warmup_steps = config->warmup_steps;
+    total_steps = config->total_steps;
+    if (warmup_steps > 0 && step < warmup_steps) {
+        lr = (double)config->max_lr * (double)step / (double)warmup_steps;
+    } else if (total_steps == warmup_steps) {
+        lr = (double)config->min_lr;
+    } else {
+        progress = (double)(step - warmup_steps) / (double)(total_steps - warmup_steps);
+        if (progress < 0.0) {
+            progress = 0.0;
+        }
+        if (progress > 1.0) {
+            progress = 1.0;
+        }
+        lr = (double)config->min_lr +
+             0.5 * ((double)config->max_lr - (double)config->min_lr) *
+             (1.0 + cos(pi * progress));
+    }
+    *lr_out = (float)lr;
+    return GD_OK;
+}
+
+gd_status gd_lr_scheduler_write(gd_context *ctx,
+                                const gd_lr_scheduler_config *config,
+                                int step,
+                                gd_tensor *lr_scalar,
+                                float *lr_out)
+{
+    float lr = 0.0F;
+    gd_status status;
+
+    if (ctx == NULL || lr_scalar == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "lr scheduler write argument is NULL");
+    }
+    status = validate_lr_tensor(lr_scalar);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_lr_scheduler_value(config, step, &lr);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_copy_from_cpu(ctx, lr_scalar, &lr, sizeof(lr));
+    if (status != GD_OK) {
+        return status;
+    }
+    if (lr_out != NULL) {
+        *lr_out = lr;
+    }
     return GD_OK;
 }
 

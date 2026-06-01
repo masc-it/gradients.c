@@ -605,6 +605,72 @@ static int test_f16_cast_leaf_grad(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_linear_leaf_grads(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t s22[2] = {2, 2};
+    int64_t s2[1] = {2};
+    uint16_t xh[4] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U};
+    uint16_t wh[4] = {0x3c00U, 0x0000U, 0x0000U, 0x3c00U};
+    uint16_t bh[2] = {0x0000U, 0x0000U};
+    float gw[4] = {0};
+    float gb[2] = {0};
+    gd_tensor_desc desc;
+    gd_tensor *x = NULL;
+    gd_tensor *w = NULL;
+    gd_tensor *bias = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *yf = NULL;
+    gd_tensor *m0 = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, s22, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &x));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
+    CHECK_OK(gd_tensor_set_requires_grad(x, true));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &w));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wh, sizeof(wh)));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s2, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &bias));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, bias, bh, sizeof(bh)));
+    CHECK_OK(gd_tensor_set_requires_grad(bias, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_linear(ctx, x, w, bias, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
+    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_grad(w, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gw, sizeof(gw)));
+    CHECK_TRUE(fabsf(gw[0] - 1.0F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gw[1] - 1.0F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gw[2] - 1.5F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gw[3] - 1.5F) <= 1.0e-6F);
+    CHECK_OK(gd_tensor_grad(bias, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gb, sizeof(gb)));
+    CHECK_TRUE(fabsf(gb[0] - 0.5F) <= 1.0e-6F);
+    CHECK_TRUE(fabsf(gb[1] - 0.5F) <= 1.0e-6F);
+    gd_tensor_release(loss);
+    gd_tensor_release(m0);
+    gd_tensor_release(yf);
+    gd_tensor_release(y);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(bias);
+    gd_tensor_release(w);
+    gd_tensor_release(x);
+    return 0;
+}
+
 static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
                                  const float *data, gd_tensor **out)
 {
@@ -645,6 +711,7 @@ int main(void)
 
     CHECK_OK(gd_context_create(&ctx));
     CHECK_TRUE(test_f16_cast_leaf_grad(ctx) == 0);
+    CHECK_TRUE(test_f16_linear_leaf_grads(ctx) == 0);
 
     {
         two_in t = {0};

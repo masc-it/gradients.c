@@ -92,6 +92,18 @@ gd_status _gd_bwd_accumulate(_gd_bwd_ctx *b, int value_id, gd_tensor *contrib)
     }
 }
 
+static bool value_is_f16_leaf(const _gd_bwd_ctx *b, int value_id)
+{
+    gd_tensor *leaf = NULL;
+
+    if (b == NULL || b->graph == NULL || value_id < 0 || value_id >= b->graph->n_values) {
+        return false;
+    }
+    leaf = b->graph->values[value_id].external;
+    return leaf != NULL && gd_tensor_requires_grad(leaf) &&
+           b->graph->values[value_id].desc.dtype == GD_DTYPE_F16;
+}
+
 static bool desc_same_shape(const gd_tensor_desc *a, const gd_tensor_desc *b)
 {
     int i = 0;
@@ -122,6 +134,9 @@ gd_status _gd_bwd_accumulate_broadcast(_gd_bwd_ctx *b, int value_id, gd_tensor *
     }
     attrs.has_reduce_to_desc = true;
     attrs.reduce_to_desc = *target;
+    if (value_is_f16_leaf(b, value_id) && gdesc->dtype == GD_DTYPE_F32) {
+        attrs.reduce_to_desc.dtype = GD_DTYPE_F32;
+    }
     status = _gd_emit_checked(b->ctx, _GD_OP_REDUCE_TO, &grad, 1, &attrs, &reduced, 1);
     if (status != GD_OK) {
         return status;

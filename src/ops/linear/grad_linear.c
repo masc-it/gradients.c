@@ -1,5 +1,71 @@
 #include "../grad_impl.h"
 
+static bool value_needs_f32_grad(_gd_bwd_ctx *b, int value_id)
+{
+    gd_tensor *leaf = NULL;
+
+    if (value_id < 0 || value_id >= b->graph->n_values) {
+        return false;
+    }
+    leaf = b->graph->values[value_id].external;
+    return leaf != NULL && gd_tensor_requires_grad(leaf) &&
+           b->graph->values[value_id].desc.dtype == GD_DTYPE_F16;
+}
+
+static gd_status matmul_grad_product(_gd_bwd_ctx *b,
+                                     int target_id,
+                                     const gd_matmul_desc *desc,
+                                     gd_tensor *lhs,
+                                     gd_tensor *rhs,
+                                     gd_tensor **out)
+{
+    gd_status status = GD_OK;
+    gd_matmul_desc local = *desc;
+    gd_tensor *l = lhs;
+    gd_tensor *r = rhs;
+    gd_tensor *lc = NULL;
+    gd_tensor *rc = NULL;
+
+    if (value_needs_f32_grad(b, target_id)) {
+        local.compute.compute_dtype = GD_DTYPE_F32;
+        local.compute.accum_dtype = GD_DTYPE_F32;
+        if (gd_tensor_dtype(lhs) != GD_DTYPE_F32) {
+            status = gd_cast(_gd_bwd_context(b), lhs, GD_DTYPE_F32, &lc);
+            if (status != GD_OK) { return status; }
+            l = lc;
+        }
+        if (gd_tensor_dtype(rhs) != GD_DTYPE_F32) {
+            status = gd_cast(_gd_bwd_context(b), rhs, GD_DTYPE_F32, &rc);
+            if (status != GD_OK) {
+                gd_tensor_release(lc);
+                return status;
+            }
+            r = rc;
+        }
+    }
+    status = gd_matmul_ex(_gd_bwd_context(b), &local, l, r, out);
+    gd_tensor_release(lc);
+    gd_tensor_release(rc);
+    return status;
+}
+
+static gd_status accumulate_bias_grad(_gd_bwd_ctx *b, int value_id, gd_tensor *go)
+{
+    gd_status status = GD_OK;
+    gd_tensor *grad = go;
+    gd_tensor *casted = NULL;
+
+    if (value_needs_f32_grad(b, value_id) && gd_tensor_dtype(go) != GD_DTYPE_F32) {
+        status = gd_cast(_gd_bwd_context(b), go, GD_DTYPE_F32, &casted);
+        if (status != GD_OK) {
+            return status;
+        }
+        grad = casted;
+    }
+    status = _gd_bwd_accumulate_broadcast(b, value_id, grad);
+    gd_tensor_release(casted);
+    return status;
+}
 
 static gd_status matmul_pair_backward(_gd_bwd_ctx *b,
                                       gd_tensor *go,
@@ -28,11 +94,11 @@ static gd_status matmul_pair_backward(_gd_bwd_ctx *b,
     if (trans_a) {
         desc.trans_a = trans_b;
         desc.trans_b = true;
-        status = gd_matmul_ex(_gd_bwd_context(b), &desc, bb, go, &da);
+        status = matmul_grad_product(b, a_id, &desc, bb, go, &da);
     } else {
         desc.trans_a = false;
         desc.trans_b = !trans_b;
-        status = gd_matmul_ex(_gd_bwd_context(b), &desc, go, bb, &da);
+        status = matmul_grad_product(b, a_id, &desc, go, bb, &da);
     }
     if (status != GD_OK) {
         return status;
@@ -46,11 +112,11 @@ static gd_status matmul_pair_backward(_gd_bwd_ctx *b,
     if (trans_b) {
         desc.trans_a = true;
         desc.trans_b = trans_a;
-        status = gd_matmul_ex(_gd_bwd_context(b), &desc, go, a, &db);
+        status = matmul_grad_product(b, b_id, &desc, go, a, &db);
     } else {
         desc.trans_a = !trans_a;
         desc.trans_b = false;
-        status = gd_matmul_ex(_gd_bwd_context(b), &desc, a, go, &db);
+        status = matmul_grad_product(b, b_id, &desc, a, go, &db);
     }
     if (status != GD_OK) {
         return status;
@@ -74,7 +140,7 @@ static gd_status linear_backward(_gd_bwd_ctx *b, const _gd_node *node)
         return status;
     }
     if (node->n_inputs == 3) {
-        status = _gd_bwd_accumulate_broadcast(b, node->inputs[2], go);
+        status = accumulate_bias_grad(b, node->inputs[2], go);
         if (status != GD_OK) {
             return status;
         }

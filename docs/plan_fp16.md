@@ -256,17 +256,17 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
   - [ ] cast later contributions before `gd_add()`.
   - [ ] ensure accumulated grad tensor dtype matches accumulator dtype.
 - [ ] Update `_gd_bwd_accumulate_broadcast()`:
-  - [ ] reduce/cast to accumulator dtype for leaf params.
-  - [ ] preserve broadcast correctness.
+  - [x] reduce/cast to accumulator dtype for leaf params.
+  - [x] preserve broadcast correctness.
 - [x] Update final leaf write:
   - [x] copy if accumulated dtype equals grad slot dtype.
   - [x] cast if needed.
   - [x] assert leaf grad slot remains F32 for F16 params.
-- [ ] Matmul/linear backward policy:
-  - [ ] activation-input gradients may be F16 for memory/perf.
-  - [ ] parameter gradients must be F32.
-  - [ ] implement F16xF16->F32 dW path or explicit cast-to-F32 correctness path.
-  - [ ] avoid computing dW as F16 then widening; that loses training precision.
+- [x] Matmul/linear backward policy:
+  - [x] activation-input gradients may be F16 for memory/perf.
+  - [x] parameter gradients must be F32.
+  - [x] implement F16xF16->F32 dW path or explicit cast-to-F32 correctness path.
+  - [x] avoid computing dW as F16 then widening; that loses training precision.
 - [ ] Op-specific backward dtype fixes:
   - [ ] RMSNorm backward: dx F16 allowed, dweight F32.
   - [ ] embedding backward: dweight F32.
@@ -276,8 +276,8 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
 - [ ] Tests:
   - [x] F16 param receives F32 grad slot.
   - [ ] two gradient paths accumulate into one F32 grad.
-  - [ ] broadcast grad accumulation casts/reduces correctly.
-  - [ ] matmul weight grad dtype is F32 under F16 training.
+  - [x] broadcast grad accumulation casts/reduces correctly.
+  - [x] matmul weight grad dtype is F32 under F16 training.
   - [ ] no accidental F16 leaf grad in GPT.
 
 ## Phase 6: AdamW master params
@@ -298,7 +298,7 @@ Goal: optimizer updates stable F32 master weights and refreshes F16 model params
   - [x] step consumes F32 grad.
   - [x] update master in F32.
   - [x] cast master -> model param after successful step.
-  - [ ] do not refresh model param when step is skipped by AMP.
+  - [x] do not refresh model param when step is skipped by AMP.
 - [x] Update CPU and Metal AdamW kernels if needed:
   - [x] F32 master path.
   - [x] F32 grads/state.
@@ -343,8 +343,8 @@ Goal: production-safe F16 training loop.
 Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
 
 - [ ] Linear/matmul backward supports required dtype combinations:
-  - [ ] dX F16 output path.
-  - [ ] dW F32 output path.
+  - [x] dX F16 output path.
+  - [x] dW F32 output path.
   - [ ] tied LM weight grad F32.
 - [ ] RMSNorm backward typed F16/F32 as defined.
 - [ ] activation backward typed F16.

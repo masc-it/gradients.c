@@ -358,10 +358,10 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
   - [ ] validate dk/dv effects through following projection dW remain F32 at leaf.
 - [x] lmCE backward typed F16 hidden + F32 weight grad.
 - [x] `clip_grad_norm` consumes F32 grads and computes norm in F32.
-- [ ] Add no-fallback GPT training test with small model.
-- [ ] Add toy overfit test:
-  - [ ] F16+AMP loss decreases.
-  - [ ] no NaN under default scaler.
+- [x] Add no-fallback GPT training test with small model.
+- [x] Add toy overfit test:
+  - [x] F16+AMP loss decreases.
+  - [x] no NaN under default scaler.
   - [ ] final loss close enough to F32 baseline for tiny run.
 
 ## Phase 9: integration with GPT and benchmarks

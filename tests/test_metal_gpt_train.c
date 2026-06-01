@@ -242,6 +242,83 @@ static int train_collect(gd_context *ctx, gd_device dev, int steps,
     return 0;
 }
 
+static int test_f16_amp_train_metal(gd_context *ctx, gd_tensor *tokens, gd_tensor *pos,
+                                    gd_tensor *targets)
+{
+    gd_gpt *gpt = NULL;
+    gd_gpt_config cfg = tiny_config();
+    gd_optimizer *opt = NULL;
+    gd_amp_scaler *scaler = NULL;
+    gd_tensor **params = NULL;
+    gd_graph *g = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *scaled = NULL;
+    gd_tensor *clip_norm = NULL;
+    gd_tensor *grad = NULL;
+    gd_adamw_config acfg = {0};
+    gd_amp_scaler_config scfg = {0};
+    int n_params = 0;
+    int step = 0;
+    float loss0 = 0.0f;
+    float lossN = 0.0f;
+    bool stepped = false;
+
+    cfg.param_dtype = GD_DTYPE_F16;
+    CHECK_OK(gd_gpt_create(ctx, &cfg, GPT_SEED, &gpt));
+    CHECK_OK(gd_gpt_parameters(gpt, &params, &n_params));
+    acfg.lr = 0.03f;
+    acfg.beta1 = 0.9f;
+    acfg.beta2 = 0.999f;
+    acfg.eps = 1e-8f;
+    acfg.weight_decay = 0.0f;
+    acfg.master_param_policy = GD_MASTER_PARAM_AUTO;
+    scfg.init_scale = 8.0f;
+    scfg.growth_factor = 2.0f;
+    scfg.backoff_factor = 0.5f;
+    scfg.growth_interval = 4;
+    scfg.min_scale = 1.0f;
+    scfg.max_scale = 1024.0f;
+    CHECK_OK(gd_adamw_create(ctx, params, n_params, &acfg, &opt));
+    CHECK_OK(gd_amp_scaler_create(ctx, &scfg, &scaler));
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_forward_loss(ctx, gpt, tokens, pos, targets, &loss));
+    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
+    CHECK_OK(gd_amp_scaler_scale_loss(ctx, scaler, loss, &scaled));
+    CHECK_OK(gd_backward(ctx, scaled));
+    CHECK_OK(gd_optimizer_step_amp_clip(ctx, opt, scaler, 1.0f, &clip_norm));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+
+    for (step = 0; step < 16; ++step) {
+        CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+        CHECK_OK(gd_graph_run(g));
+        CHECK_OK(gd_synchronize(ctx, METAL));
+        CHECK_OK(gd_amp_scaler_update(ctx, scaler, &stepped));
+        CHECK_TRUE(stepped);
+        CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &lossN, sizeof(lossN)));
+        CHECK_TRUE(isfinite(lossN));
+        if (step == 0) {
+            loss0 = lossN;
+            CHECK_OK(gd_tensor_grad(params[0], &grad));
+            CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+        }
+    }
+    fprintf(stderr, "[gpt] f16 amp metal loss %.4f -> %.4f\n", (double)loss0, (double)lossN);
+    CHECK_TRUE(lossN < loss0);
+
+    gd_tensor_release(clip_norm);
+    gd_tensor_release(scaled);
+    gd_tensor_release(loss);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_amp_scaler_destroy(scaler);
+    gd_optimizer_destroy(opt);
+    gd_gpt_destroy(gpt);
+    return 0;
+}
+
 static int test_train_parity(gd_context *ctx, gd_tensor *tokens, gd_tensor *pos,
                              gd_tensor *targets)
 {
@@ -360,6 +437,7 @@ int main(void)
         rc |= test_forward_parity(ctx, tokens, pos);
         if (mps_enabled) {
             rc |= test_forward_loss_parity(ctx, tokens, pos, targets);
+            rc |= test_f16_amp_train_metal(ctx, tokens, pos, targets);
         }
         rc |= test_train_parity(ctx, tokens, pos, targets);
     } else {

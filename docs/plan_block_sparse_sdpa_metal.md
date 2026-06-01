@@ -140,11 +140,12 @@ query-block skip matters most.
   query range per key block (partial-sum of dk/dv). All partials live in one
   scratch buffer carved into regions (`sdpa_bwd_scratch_layout`), bound at byte
   offsets. **Validated and measured — see §6.3.**
-- [ ] B2 — **Sliding-window block-skip** (skip blocks above the diagonal *and*
-  below the window). **Expected to win where B1 does not**: a window caps *every*
-  query block's key scan to `w`, so it shortens the critical path itself (unlike
-  causal, which leaves the last block scanning all `Tk`). Parity vs windowed
-  reference.
+- [x] B2 — **Sliding-window block-skip / fast path** (skip blocks above the
+  diagonal *and* below the window). Implemented for GPT-style causal/no-bias/
+  no-prefix Metal forward + backward via dedicated lane kernels. A window caps
+  every query/key scan to `w`, so it shortens the critical path itself (unlike
+  full causal, which leaves the last block scanning all `Tk`). Parity is covered
+  by existing causal+window CPU↔Metal tests.
 - [ ] B3 — **General block-sparse**: `block_mask` graph value + host pattern
   builders in `nn.h` (`causal`, `sliding_window(w)`, `block_sparse(custom)` e.g.
   BigBird window+global+random); forward + the per-query-block kernels visit the

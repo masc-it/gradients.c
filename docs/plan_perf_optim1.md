@@ -196,5 +196,6 @@ Long-context release check (`d=256 B=4 T=2048`, 1 warmup + 4 measured):
 For planned GPT training workloads, efficient long-context attention remains the
 largest gate, but MPS GEMM dispatch removed the next major non-attention gap.
 At `T=1024`, attention is still the majority of traced time; at `T=512` and
-wider `T=1024`, GEMM is no longer the obvious next target. Next high-upside work
-should return to attention or improve trainer production features.
+wider `T=1024`, GEMM is no longer the obvious next target. Opt-in causal
+sliding-window attention now gives the largest long-context throughput gain for
+models that can use local attention; exact full causal remains the default.

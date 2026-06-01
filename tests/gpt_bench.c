@@ -22,6 +22,7 @@
  *   GD_BENCH_KV_HEADS         key/value heads (default = heads)
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
  *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
+ *   GD_BENCH_ATTN_WINDOW      causal sliding-window attention size (default 0=full)
  *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
  *   GD_BENCH_LR_MAX=0.001     training: scheduler max LR
  *   GD_BENCH_LR_MIN=0.0001    training: scheduler min LR
@@ -195,6 +196,7 @@ int main(void)
     cfg.n_kv_heads = env_int("GD_BENCH_KV_HEADS", cfg.n_heads);
     cfg.head_dim = env_int("GD_BENCH_HEAD_DIM", 64);
     cfg.d_ff = env_int("GD_BENCH_DFF", 4 * cfg.d_model);
+    cfg.attention_window = env_int("GD_BENCH_ATTN_WINDOW", 0);
     cfg.max_seq_len = T;
     cfg.rope_theta = 10000.0F;
     cfg.norm_eps = 1e-5F;
@@ -213,6 +215,11 @@ int main(void)
     if (cfg.d_model != cfg.n_heads * cfg.head_dim) {
         fprintf(stderr, "config error: d_model (%d) must equal n_heads*head_dim (%d*%d)\n",
                 cfg.d_model, cfg.n_heads, cfg.head_dim);
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    if (cfg.attention_window < 0) {
+        fprintf(stderr, "config error: attention window must be non-negative\n");
         gd_context_destroy(ctx);
         return 1;
     }
@@ -267,6 +274,10 @@ int main(void)
         printf("  mlp         : %s\n", cfg.mlp_kind == GD_GPT_MLP_SWIGLU ? "swiglu" : "gelu");
     }
     printf("  batch x seq : %d x %d\n", B, T);
+    printf("  attention   : %s", cfg.attention_window > 0 ? "causal window " : "full causal\n");
+    if (cfg.attention_window > 0) {
+        printf("%d\n", cfg.attention_window);
+    }
     printf("  iters       : %d (warmup %d)\n", iters, warmup);
     printf("  fwd GFLOP   : %.3f   step GFLOP: %.3f\n", fwd_gflop, step_gflop);
 

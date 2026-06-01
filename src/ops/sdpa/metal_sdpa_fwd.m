@@ -34,8 +34,7 @@ static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
     if (fast != NULL && fast[0] == '0') {
         return false;
     }
-    return p != NULL && p->causal != 0 && p->window == 0 && p->prefix_len == 0 &&
-           p->has_bias == 0;
+    return p != NULL && p->causal != 0 && p->prefix_len == 0 && p->has_bias == 0;
 }
 
 static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
@@ -70,15 +69,25 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         splitk_pso != nil && combine_pso != nil) {
         bool lane_split = false;
         if (sdpa_is_causal_no_bias(&p)) {
-            id<MTLComputePipelineState> lane_fast = _gd_metal_pipeline_named(ctx->state,
-                                                                            "gd_sdpa_splitk_causal_lane8");
-            id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state,
-                                                                        "gd_sdpa_splitk_causal");
-            if (lane_fast != nil) {
-                splitk_pso = lane_fast;
-                lane_split = true;
-            } else if (fast != nil) {
-                splitk_pso = fast;
+            if (p.window > 0) {
+                id<MTLComputePipelineState> window_fast =
+                    _gd_metal_pipeline_named(ctx->state,
+                                             "gd_sdpa_splitk_causal_window_lane8");
+                if (window_fast != nil) {
+                    splitk_pso = window_fast;
+                    lane_split = true;
+                }
+            } else {
+                id<MTLComputePipelineState> lane_fast = _gd_metal_pipeline_named(ctx->state,
+                                                                                "gd_sdpa_splitk_causal_lane8");
+                id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state,
+                                                                            "gd_sdpa_splitk_causal");
+                if (lane_fast != nil) {
+                    splitk_pso = lane_fast;
+                    lane_split = true;
+                } else if (fast != nil) {
+                    splitk_pso = fast;
+                }
             }
         }
         p.n_splits = _gd_metal_sdpa_num_splits(p.Tk);

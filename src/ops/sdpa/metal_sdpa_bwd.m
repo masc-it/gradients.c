@@ -34,8 +34,7 @@ static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
     if (fast != NULL && fast[0] == '0') {
         return false;
     }
-    return p != NULL && p->causal != 0 && p->window == 0 && p->prefix_len == 0 &&
-           p->has_bias == 0;
+    return p != NULL && p->causal != 0 && p->prefix_len == 0 && p->has_bias == 0;
 }
 
 static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
@@ -97,27 +96,46 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             bool sdq_lane_split = false;
             NSUInteger sdq_threads = GD_METAL_SDPA_BQ;
             if (sdpa_is_causal_no_bias(&p)) {
-                id<MTLComputePipelineState> fast_sdq_lane =
-                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal_lane8");
-                id<MTLComputePipelineState> fast_sdq =
-                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
-                id<MTLComputePipelineState> fast_dks_wide =
-                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal_k16");
-                id<MTLComputePipelineState> fast_dks =
-                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
-                if (fast_sdq_lane != nil) {
-                    sdq_pso = fast_sdq_lane;
-                    sdq_lane_split = true;
-                    sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
-                } else if (fast_sdq != nil) {
-                    sdq_pso = fast_sdq;
-                }
-                if (fast_dks_wide != nil) {
-                    dks_pso = fast_dks_wide;
-                    dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
-                    dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
-                } else if (fast_dks != nil) {
-                    dks_pso = fast_dks;
+                if (p.window > 0) {
+                    id<MTLComputePipelineState> fast_sdq_window =
+                        _gd_metal_pipeline_named(st,
+                                                 "gd_sdpa_bwd_stats_dq_split_causal_window_lane8");
+                    id<MTLComputePipelineState> fast_dks_window =
+                        _gd_metal_pipeline_named(st,
+                                                 "gd_sdpa_bwd_dkv_split_causal_window_k16");
+                    if (fast_sdq_window != nil) {
+                        sdq_pso = fast_sdq_window;
+                        sdq_lane_split = true;
+                        sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
+                    }
+                    if (fast_dks_window != nil) {
+                        dks_pso = fast_dks_window;
+                        dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
+                        dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
+                    }
+                } else {
+                    id<MTLComputePipelineState> fast_sdq_lane =
+                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal_lane8");
+                    id<MTLComputePipelineState> fast_sdq =
+                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
+                    id<MTLComputePipelineState> fast_dks_wide =
+                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal_k16");
+                    id<MTLComputePipelineState> fast_dks =
+                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
+                    if (fast_sdq_lane != nil) {
+                        sdq_pso = fast_sdq_lane;
+                        sdq_lane_split = true;
+                        sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
+                    } else if (fast_sdq != nil) {
+                        sdq_pso = fast_sdq;
+                    }
+                    if (fast_dks_wide != nil) {
+                        dks_pso = fast_dks_wide;
+                        dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
+                        dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
+                    } else if (fast_dks != nil) {
+                        dks_pso = fast_dks;
+                    }
                 }
             }
             id<MTLBuffer> go_b = _gd_metal_value_buffer(exe, node->inputs[0]);

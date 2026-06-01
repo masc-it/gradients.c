@@ -132,6 +132,9 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     if (cfg.powlu_m == 0.0f) {
         cfg.powlu_m = 3.0f;
     }
+    if (cfg.attention_window < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "attention_window must be non-negative");
+    }
     if (cfg.mlp_kind != GD_GPT_MLP_POWLU && cfg.mlp_kind != GD_GPT_MLP_SWIGLU &&
         cfg.mlp_kind != GD_GPT_MLP_GELU) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid gpt mlp kind");
@@ -357,7 +360,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     int64_t kv4[4] = {B, T, Hkv, Dh};
     int64_t o3[3] = {B, T, Hq * Dh};
     gd_rope_config rope = {c->rope_theta, 0, false};
-    gd_sdpa_config sdpa = {0.0f, true, 0, 0};
+    gd_sdpa_config sdpa = {0.0f, true, c->attention_window, 0};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
     gd_tensor *om = NULL, *op = NULL, *out = NULL;

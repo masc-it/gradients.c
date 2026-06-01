@@ -268,11 +268,47 @@ Wider 17.23M-param profile (`d_model=384`, 6 layers, 6 heads) now shows:
 | `B=4 T=1024` | `1407.0 ms` | `241.3 ms` | `565.3 ms` | `386.5 ms` | `57%` |
 | `B=4 T=2048` | `4181.3 ms` | `859.4 ms` | `2211.1 ms` | `741.6 ms` | `73%` |
 
+## Follow-up: causal sliding-window fast path
+
+Full causal attention stays exact by default, but GPT configs can now opt into
+causal sliding-window attention via `gd_gpt_config.attention_window` or
+`GD_BENCH_ATTN_WINDOW`. Added dedicated no-bias/prefix-free Metal kernels so the
+window path keeps the 128-thread lane structure while bounding every query/key
+scan to the local window:
+
+- `gd_sdpa_splitk_causal_window_lane8`
+- `gd_sdpa_bwd_stats_dq_split_causal_window_lane8`
+- `gd_sdpa_bwd_dkv_split_causal_window_k16`
+
+These are separate kernels from full causal so the default full-attention kernels
+keep their no-window inner loop. Existing generic SDPA still handles bias/prefix
+and unsupported forms.
+
+Trace matrix for opt-in windowed GPT (`d=256`, 6 layers):
+
+| shape | window | traced step | `sdpa` | `sdpa_bwd` | attention share |
+|---|---:|---:|---:|---:|---:|
+| `B=8 T=1024` | `256` | `879.3 ms` | `121.4 ms` | `334.9 ms` | `52%` |
+| `B=8 T=1024` | `512` | `1151.4 ms` | `190.5 ms` | `544.2 ms` | `64%` |
+| `B=4 T=2048` | `256` | `931.1 ms` | `134.9 ms` | `362.3 ms` | `53%` |
+| `B=4 T=2048` | `512` | `1281.3 ms` | `222.1 ms` | `636.9 ms` | `67%` |
+
+Release runs (dense GFLOP/s estimate is still printed by the harness; tokens/s
+is the useful wall metric for windowed attention):
+
+| shape | window | mean ms/iter | best ms/iter | best tokens/s |
+|---|---:|---:|---:|---:|
+| `B=8 T=1024` | full | `1144.3` | `1139.3` | `7191` |
+| `B=8 T=1024` | `256` | `661.9` | `659.0` | `12431` |
+| `B=8 T=1024` | `512` | `933.5` | `930.5` | `8804` |
+| `B=4 T=2048` | full | `2000.7` | `1995.0` | `4106` |
+| `B=4 T=2048` | `256` | `694.2` | `692.2` | `11834` |
+| `B=4 T=2048` | `512` | `1053.9` | `1049.6` | `7805` |
+
 ## Next work
 
-1. Planned MPS GEMM dispatch is now wired (see `plan_perf_optim1.md`), so the
-   next kernel pass should return to attention: remaining dK/dV split and causal
-   forward/combine costs dominate long-context traces.
+1. Full causal exact attention remains the default and still dominates long
+   contexts; further wins need dK/dV or algorithmic changes.
 2. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
 3. Add production GPT trainer items (checkpoint/resume, eval loop, generation,
-   KV cache) once kernel profile is no longer hiding trainer bottlenecks.
+   KV cache) now that both full and windowed attention paths are usable.

@@ -106,7 +106,7 @@ gd_status _gd_cpu_k_embedding_bwd(const gd_tensor_desc *table_desc, float *dtabl
 
 /* Rotary position embedding. sin_sign = +1 forward, -1 backward (transpose
  * rotation). x/out are [.., heads, head_dim]; positions index leading rows. */
-gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
+gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, void *out, const void *x,
                          const gd_tensor_desc *pos_desc, const void *pos,
                          float theta, int n_dims, int interleaved, float sin_sign);
 

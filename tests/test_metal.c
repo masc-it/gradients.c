@@ -408,6 +408,48 @@ static int test_metal_f16_embedding_transpose(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_rope(gd_context *ctx)
+{
+    int64_t xshape[4] = {1, 2, 1, 4};
+    int64_t pshape[2] = {1, 2};
+    float xdata[8] = {1.0F, 2.0F, 3.0F, 4.0F, 1.0F, 0.0F, 0.0F, 1.0F};
+    int32_t pos_data[2] = {0, 1};
+    float got[8] = {0};
+    gd_rope_config cfg = {10000.0F, 4, false};
+    gd_tensor *x = NULL, *pos = NULL, *xh = NULL, *rh = NULL, *r = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_f32(ctx, 4, xshape, xdata, &x));
+    CHECK_OK(make_i32(ctx, 2, pshape, pos_data, &pos));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_rope(ctx, xh, pos, &cfg, &rh));
+    CHECK_OK(gd_cast(ctx, rh, GD_DTYPE_F32, &r));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, r, got, sizeof(got)));
+    for (i = 0; i < 4; ++i) {
+        CHECK_TRUE(fabsf(got[i] - xdata[i]) <= 2.0e-2F);
+    }
+    {
+        float c0 = cosf(1.0F);
+        float s0 = sinf(1.0F);
+        float c1 = cosf(0.01F);
+        float s1 = sinf(0.01F);
+        float expect[4] = {c0, -s1, s0, c1};
+        for (i = 0; i < 4; ++i) {
+            CHECK_TRUE(fabsf(got[4 + i] - expect[i]) <= 2.0e-2F);
+        }
+    }
+    gd_tensor_release(r); gd_tensor_release(rh); gd_tensor_release(xh);
+    CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(pos); gd_tensor_release(x);
+    return 0;
+}
+
 static int test_metal_f16_mps_gemm(gd_context *ctx)
 {
     int64_t xshape[2] = {2, 3};
@@ -1268,6 +1310,7 @@ int main(void)
     rc |= test_metal_f16_unsupported_reject(ctx);
     rc |= test_metal_f16_elementwise(ctx);
     rc |= test_metal_f16_embedding_transpose(ctx);
+    rc |= test_metal_f16_rope(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);
     if (mps_enabled) {

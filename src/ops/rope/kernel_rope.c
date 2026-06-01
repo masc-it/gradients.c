@@ -22,7 +22,7 @@ static int64_t embedding_id(const gd_tensor_desc *ids_desc, const void *ids, int
     return (int64_t)((const int32_t *)ids)[p];
 }
 
-gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
+gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, void *out, const void *x,
                          const gd_tensor_desc *pos_desc, const void *pos,
                          float theta, int n_dims, int interleaved, float sin_sign)
 {
@@ -41,7 +41,15 @@ gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
         int64_t d = 0;
 
         for (d = n_dims; d < head_dim; ++d) {
-            out[base + d] = x[base + d];
+            float value = 0.0F;
+            gd_status status = _gd_cpu_load_float(desc, x, base + d, &value);
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_store_float(desc, out, base + d, value);
+            if (status != GD_OK) {
+                return status;
+            }
         }
         for (i = 0; i < half; ++i) {
             double inv = pow((double)theta, -(2.0 * (double)i) / (double)n_dims);
@@ -50,10 +58,28 @@ gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, float *out, const float *x,
             double s = sin(angle) * (double)sin_sign;
             int a = interleaved ? (2 * i) : i;
             int bb = interleaved ? (2 * i + 1) : (i + half);
-            double x1 = (double)x[base + a];
-            double x2 = (double)x[base + bb];
-            out[base + a] = (float)(x1 * c - x2 * s);
-            out[base + bb] = (float)(x1 * s + x2 * c);
+            float f1 = 0.0F;
+            float f2 = 0.0F;
+            double x1 = 0.0;
+            double x2 = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, x, base + a, &f1);
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_load_float(desc, x, base + bb, &f2);
+            if (status != GD_OK) {
+                return status;
+            }
+            x1 = (double)f1;
+            x2 = (double)f2;
+            status = _gd_cpu_store_float(desc, out, base + a, (float)(x1 * c - x2 * s));
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_store_float(desc, out, base + bb, (float)(x1 * s + x2 * c));
+            if (status != GD_OK) {
+                return status;
+            }
         }
     }
     return GD_OK;

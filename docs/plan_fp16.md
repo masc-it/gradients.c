@@ -213,9 +213,9 @@ CPU fallback.
   - [x] load F16 input/weight.
   - [x] compute sumsq/inv in F32.
   - [x] store F16 output.
-- [ ] RoPE forward:
-  - [ ] load/store F16.
-  - [ ] compute trig/rotate in F32.
+- [x] RoPE forward:
+  - [x] load/store F16.
+  - [x] compute trig/rotate in F32.
 - [ ] Softmax forward if used outside SDPA:
   - [ ] F32 max/sum.
   - [ ] F16 output.

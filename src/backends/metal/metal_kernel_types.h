@@ -265,6 +265,7 @@ typedef struct gd_metal_rope_params {
     int head_dim;
     int n_dims;      /* rotary dims (even, <= head_dim) */
     int interleaved;
+    int dtype;       /* GD_METAL_DT_* input/output dtype */
     float theta;
     float sin_sign;
 } gd_metal_rope_params;

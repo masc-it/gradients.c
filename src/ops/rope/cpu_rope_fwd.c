@@ -21,10 +21,6 @@ static gd_status rope_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_rope(out_desc, out_data, x_data, pos_desc, pos_data,
                           node->attrs.rope_theta, node->attrs.rope_n_dims,
                           node->attrs.rope_interleaved, 1.0F);

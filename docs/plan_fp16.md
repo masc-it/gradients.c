@@ -271,7 +271,7 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
   - [x] RMSNorm backward: dx F16 allowed, dweight F32.
   - [x] embedding backward: dweight F32.
   - [ ] lmCE backward: hidden grad F16 allowed, weight grad F32.
-  - [ ] SDPA backward: dq F16 allowed, dk/dv F16 for activations; param-facing grads F32 through projections.
+  - [x] SDPA backward: dq F16 allowed, dk/dv F16 for activations; param-facing grads F32 through projections.
   - [x] activations: preserve incoming grad dtype unless leaf accumulation requires F32.
 - [ ] Tests:
   - [x] F16 param receives F32 grad slot.
@@ -351,10 +351,10 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
 - [x] activation backward typed F16.
 - [x] RoPE backward typed F16.
 - [x] embedding backward accumulates F32 weight grad.
-- [ ] SDPA backward typed F16:
-  - [ ] full causal path.
-  - [ ] sliding-window path.
-  - [ ] F32 stats and softmax math.
+- [x] SDPA backward typed F16:
+  - [x] full causal path.
+  - [x] sliding-window path.
+  - [x] F32 stats and softmax math.
   - [ ] validate dk/dv effects through following projection dW remain F32 at leaf.
 - [ ] lmCE backward typed F16 hidden + F32 weight grad.
 - [ ] `clip_grad_norm` consumes F32 grads and computes norm in F32.

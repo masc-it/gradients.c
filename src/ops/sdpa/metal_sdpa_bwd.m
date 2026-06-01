@@ -25,6 +25,8 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
     p->n_splits = 1;
     p->split_len = p->Tk;
+    p->dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(q_desc->dtype, &p->dtype);
 }
 
 static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
@@ -74,7 +76,7 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
      * threadgroups into per-split partials, then reduce. stats/dq split the key
      * range (per query block); dkv splits the query range (per key block). */
     {
-        int nsplit = _gd_metal_sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
+        int nsplit = q->dtype == GD_DTYPE_F16 ? 1 : _gd_metal_sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
         if (nsplit > 1) {
             gd_metal_sdpa_bwd_layout L = _gd_metal_sdpa_bwd_scratch_layout(p.B, p.Hq, p.Hkv, p.Tq, p.Tk,
                                                         p.Dh, nsplit);
@@ -276,7 +278,7 @@ static gd_status sdpa_bwd_plan(_gd_metal_plan_ctx *ctx)
         int Dh = (int)qd->sizes[3];
         int Tk = (int)kd->sizes[1];
         int Hkv = (int)kd->sizes[2];
-        int nsplit = _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
+        int nsplit = qd->dtype == GD_DTYPE_F16 ? 1 : _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
         int64_t nfloats = Dh <= GD_METAL_SDPA_DHT && nsplit > 1
                               ? _gd_metal_sdpa_bwd_scratch_layout(B, Hq, Hkv, Tq, Tk, Dh, nsplit).total
                               : (int64_t)B * Hq * Tq * 3;
@@ -293,6 +295,7 @@ static gd_status sdpa_bwd_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_sdpa_bwd = {
     .kind = _GD_OP_SDPA_BWD,
     .name = "sdpa_bwd",
+    .support = _gd_metal_support_f32_f16_same_dtype,
     .plan = sdpa_bwd_plan,
     .encode = sdpa_bwd_encode,
 };

@@ -25,6 +25,8 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
     p->n_splits = 1;
     p->split_len = p->Tk;
+    p->dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(q_desc->dtype, &p->dtype);
 }
 
 static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)

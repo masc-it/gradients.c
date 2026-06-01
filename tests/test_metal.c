@@ -543,6 +543,54 @@ static int test_metal_f16_sdpa(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_sdpa_backward(gd_context *ctx)
+{
+    int64_t shape[4] = {1, 3, 1, 4};
+    float qdata[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F, -1.1F, 1.2F};
+    float kdata[12] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float vdata[12] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F, -1.1F, 1.2F};
+    float gq[12] = {0};
+    gd_sdpa_config cfg = {0.0F, true, 0, 0};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y = NULL, *yf = NULL, *m0 = NULL, *m1 = NULL, *m2 = NULL, *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(make_f32(ctx, 4, shape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 4, shape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 4, shape, vdata, &v));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa(ctx, qh, kh, vh, NULL, &cfg, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
+    CHECK_OK(gd_mean(ctx, m0, 0, false, &m1));
+    CHECK_OK(gd_mean(ctx, m1, 0, false, &m2));
+    CHECK_OK(gd_mean(ctx, m2, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_OK(gd_tensor_grad(q, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gq, sizeof(gq)));
+    CHECK_TRUE(isfinite(gq[0]) && isfinite(gq[11]));
+    gd_tensor_release(loss); gd_tensor_release(m2); gd_tensor_release(m1); gd_tensor_release(m0);
+    gd_tensor_release(yf); gd_tensor_release(y); gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+    CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
 static int test_metal_f16_rope(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -1510,6 +1558,7 @@ int main(void)
     rc |= test_metal_f16_embedding_transpose(ctx);
     rc |= test_metal_f16_cross_entropy(ctx);
     rc |= test_metal_f16_sdpa(ctx);
+    rc |= test_metal_f16_sdpa_backward(ctx);
     rc |= test_metal_f16_rope(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);

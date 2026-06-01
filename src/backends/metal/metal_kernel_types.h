@@ -263,6 +263,7 @@ typedef struct gd_metal_sdpa_params {
     int Tkb;
     int n_splits;   /* split-K: number of key partitions (>=1) */
     int split_len;  /* split-K: keys per partition (BK-aligned multiple) */
+    int dtype;      /* GD_METAL_DT_* q/k/v/output dtype */
 } gd_metal_sdpa_params;
 
 /* Rotary embedding; one thread per (.., head) row over head_dim. sin_sign is

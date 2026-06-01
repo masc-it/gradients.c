@@ -83,17 +83,30 @@ static inline float gd_sdpa_bias_at(device const float *bias,
     int jb = (p.Tkb == 1) ? 0 : j;
     return bias[((bb * p.Hb + hb) * p.Tqb + ib) * p.Tkb + jb];
 }
+static inline float gd_sdpa_bias_at_typed(device const uchar *bias,
+                                          constant gd_metal_sdpa_params &p,
+                                          int b, int hq, int i, int j)
+{
+    if (!p.has_bias) {
+        return 0.0f;
+    }
+    int bb = (p.Bb == 1) ? 0 : b;
+    int hb = (p.Hb == 1) ? 0 : hq;
+    int ib = (p.Tqb == 1) ? 0 : i;
+    int jb = (p.Tkb == 1) ? 0 : j;
+    return gd_load_float(bias, p.dtype, (uint)(((bb * p.Hb + hb) * p.Tqb + ib) * p.Tkb + jb));
+}
 static inline int gd_sdpa_split_len(int T, int n)
 {
     int len = (T + n - 1) / n;
     len = ((len + GD_SDPA_BK - 1) / GD_SDPA_BK) * GD_SDPA_BK;
     return (len < GD_SDPA_BK) ? GD_SDPA_BK : len;
 }
-kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
-                              device const float *q             [[buffer(1)]],
-                              device const float *k             [[buffer(2)]],
-                              device const float *v             [[buffer(3)]],
-                              device const float *bias          [[buffer(4)]],
+kernel void gd_sdpa_bwd_stats(device const uchar *go            [[buffer(0)]],
+                              device const uchar *q             [[buffer(1)]],
+                              device const uchar *k             [[buffer(2)]],
+                              device const uchar *v             [[buffer(3)]],
+                              device const uchar *bias          [[buffer(4)]],
                               device float *stats               [[buffer(5)]],
                               constant gd_metal_sdpa_params &p   [[buffer(6)]],
                               uint tgid [[threadgroup_position_in_grid]],
@@ -116,8 +129,8 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
     float qreg[GD_SDPA_DHT];
     float goreg[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
-        qreg[c] = active ? q[qbase + c] : 0.0f;
-        goreg[c] = active ? go[qbase + c] : 0.0f;
+        qreg[c] = active ? gd_load_float(q, p.dtype, (uint)(qbase + c)) : 0.0f;
+        goreg[c] = active ? gd_load_float(go, p.dtype, (uint)(qbase + c)) : 0.0f;
     }
     float m = -INFINITY;
     float l = 0.0f;
@@ -133,8 +146,8 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
             int jj = idx / p.Dh;
             int c = idx % p.Dh;
             int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
-            ksh[jj * p.Dh + c] = k[kbase + c];
-            vsh[jj * p.Dh + c] = v[kbase + c];
+            ksh[jj * p.Dh + c] = gd_load_float(k, p.dtype, (uint)(kbase + c));
+            vsh[jj * p.Dh + c] = gd_load_float(v, p.dtype, (uint)(kbase + c));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
@@ -147,7 +160,7 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
                         s += qreg[c] * ksh[jj * p.Dh + c];
                         dp += goreg[c] * vsh[jj * p.Dh + c];
                     }
-                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    s = p.scale * s + gd_sdpa_bias_at_typed(bias, p, b, hq, i, j);
                     float mnew = (s > m) ? s : m;
                     float corr = exp(m - mnew);
                     float e = exp(s - mnew);
@@ -166,12 +179,12 @@ kernel void gd_sdpa_bwd_stats(device const float *go            [[buffer(0)]],
         stats[sbase + 2] = (l > 0.0f) ? (raw / l) : 0.0f;
     }
 }
-kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
-                           device const float *q             [[buffer(1)]],
-                           device const float *k             [[buffer(2)]],
-                           device const float *v             [[buffer(3)]],
-                           device const float *bias          [[buffer(4)]],
-                           device float *dq                  [[buffer(5)]],
+kernel void gd_sdpa_bwd_dq(device const uchar *go            [[buffer(0)]],
+                           device const uchar *q             [[buffer(1)]],
+                           device const uchar *k             [[buffer(2)]],
+                           device const uchar *v             [[buffer(3)]],
+                           device const uchar *bias          [[buffer(4)]],
+                           device uchar *dq                  [[buffer(5)]],
                            constant gd_metal_sdpa_params &p   [[buffer(6)]],
                            device const float *stats         [[buffer(7)]],
                            uint tgid [[threadgroup_position_in_grid]],
@@ -199,8 +212,8 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
     float goreg[GD_SDPA_DHT];
     float dqacc[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
-        qreg[c] = active ? q[qbase + c] : 0.0f;
-        goreg[c] = active ? go[qbase + c] : 0.0f;
+        qreg[c] = active ? gd_load_float(q, p.dtype, (uint)(qbase + c)) : 0.0f;
+        goreg[c] = active ? gd_load_float(go, p.dtype, (uint)(qbase + c)) : 0.0f;
         dqacc[c] = 0.0f;
     }
     bool run = active && l > 0.0f;
@@ -215,8 +228,8 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
             int jj = idx / p.Dh;
             int c = idx % p.Dh;
             int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
-            ksh[jj * p.Dh + c] = k[kbase + c];
-            vsh[jj * p.Dh + c] = v[kbase + c];
+            ksh[jj * p.Dh + c] = gd_load_float(k, p.dtype, (uint)(kbase + c));
+            vsh[jj * p.Dh + c] = gd_load_float(v, p.dtype, (uint)(kbase + c));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (run) {
@@ -229,7 +242,7 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
                         s += qreg[c] * ksh[jj * p.Dh + c];
                         dp += goreg[c] * vsh[jj * p.Dh + c];
                     }
-                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    s = p.scale * s + gd_sdpa_bias_at_typed(bias, p, b, hq, i, j);
                     float pj = exp(s - m) / l;
                     float ds = pj * (dp - D);
                     for (int c = 0; c < p.Dh; ++c) {
@@ -242,17 +255,17 @@ kernel void gd_sdpa_bwd_dq(device const float *go            [[buffer(0)]],
     }
     if (active) {
         for (int c = 0; c < p.Dh; ++c) {
-            dq[qbase + c] = dqacc[c];
+            gd_store_float(dq, p.dtype, (uint)(qbase + c), dqacc[c]);
         }
     }
 }
-kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
-                            device const float *q             [[buffer(1)]],
-                            device const float *k             [[buffer(2)]],
-                            device const float *v             [[buffer(3)]],
-                            device const float *bias          [[buffer(4)]],
-                            device float *dk                  [[buffer(5)]],
-                            device float *dv                  [[buffer(6)]],
+kernel void gd_sdpa_bwd_dkv(device const uchar *go            [[buffer(0)]],
+                            device const uchar *q             [[buffer(1)]],
+                            device const uchar *k             [[buffer(2)]],
+                            device const uchar *v             [[buffer(3)]],
+                            device const uchar *bias          [[buffer(4)]],
+                            device uchar *dk                  [[buffer(5)]],
+                            device uchar *dv                  [[buffer(6)]],
                             constant gd_metal_sdpa_params &p   [[buffer(7)]],
                             device const float *stats         [[buffer(8)]],
                             uint tgid [[threadgroup_position_in_grid]],
@@ -279,8 +292,8 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
     float dkacc[GD_SDPA_DHT];
     float dvacc[GD_SDPA_DHT];
     for (int c = 0; c < p.Dh; ++c) {
-        kreg[c] = active ? k[kbase + c] : 0.0f;
-        vreg[c] = active ? v[kbase + c] : 0.0f;
+        kreg[c] = active ? gd_load_float(k, p.dtype, (uint)(kbase + c)) : 0.0f;
+        vreg[c] = active ? gd_load_float(v, p.dtype, (uint)(kbase + c)) : 0.0f;
         dkacc[c] = 0.0f;
         dvacc[c] = 0.0f;
     }
@@ -297,8 +310,8 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
                 int ii = idx / p.Dh;
                 int c = idx % p.Dh;
                 int qb2 = ((b * p.Tq + (qb + ii)) * p.Hq + hq) * p.Dh;
-                qsh[ii * p.Dh + c] = q[qb2 + c];
-                gsh[ii * p.Dh + c] = go[qb2 + c];
+                qsh[ii * p.Dh + c] = gd_load_float(q, p.dtype, (uint)(qb2 + c));
+                gsh[ii * p.Dh + c] = gd_load_float(go, p.dtype, (uint)(qb2 + c));
             }
             for (int ii = (int)tid; ii < tile; ii += GD_SDPA_BQ) {
                 int sb = ((b * p.Hq + hq) * p.Tq + (qb + ii)) * 3;
@@ -325,7 +338,7 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
                         s += qsh[ii * p.Dh + c] * kreg[c];
                         dp += gsh[ii * p.Dh + c] * vreg[c];
                     }
-                    s = p.scale * s + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    s = p.scale * s + gd_sdpa_bias_at_typed(bias, p, b, hq, i, j);
                     float pj = exp(s - mm) / l;
                     float ds = pj * (dp - D);
                     for (int c = 0; c < p.Dh; ++c) {
@@ -339,8 +352,8 @@ kernel void gd_sdpa_bwd_dkv(device const float *go            [[buffer(0)]],
     }
     if (active) {
         for (int c = 0; c < p.Dh; ++c) {
-            dk[kbase + c] = dkacc[c];
-            dv[kbase + c] = dvacc[c];
+            gd_store_float(dk, p.dtype, (uint)(kbase + c), dkacc[c]);
+            gd_store_float(dv, p.dtype, (uint)(kbase + c), dvacc[c]);
         }
     }
 }

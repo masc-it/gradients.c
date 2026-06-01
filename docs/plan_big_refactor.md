@@ -1099,18 +1099,18 @@ Current codebase inventory used to ground this plan:
 
 ### 24.4 Add checked emit and move meta/public wrappers into capsules
 
-- [ ] Implement `_gd_emit_checked()` using active graph lookup, op registry arity checks, input desc collection, meta call, and graph emit.
-- [ ] Move generic shape helpers from `src/ops/shape.c` into `src/ops/meta_common.c` / `src/ops/meta_common.h`.
-- [ ] Migrate simple public wrappers from `src/ops/op_schema.c` into capsules: `add`, `mul`, `scale`, `relu`, `silu`, `gelu`.
-- [ ] Migrate linalg wrappers/meta: `matmul`, `linear`.
-- [ ] Migrate reductions/meta: `sum`, `mean`, `softmax`, `reduce_to`.
-- [ ] Migrate norm/loss/embedding/rope/attention wrappers/meta: `rms_norm`, `cross_entropy`, `lm_cross_entropy`, `embedding`, `rope`, `sdpa`.
-- [ ] Migrate misc wrappers/meta: `powlu`, `cast`, `transpose`, `assert_finite`, `assert_close`.
-- [ ] Keep `include/gradients/ops.h` manual for first pass; only move implementations.
-- [ ] Delete or shrink `src/ops/op_schema.c` after all public wrappers move.
-- [ ] Delete or shrink `src/ops/shape.c` after all meta code moves.
-- [ ] Validate: `tests/test_ops`, `tests/test_graph`, `tests/test_debug` pass under CPU.
-- [ ] Validate: `make test GD_ENABLE_METAL=0` still passes.
+- [x] Implement `_gd_emit_checked()` using active graph lookup, op registry arity checks, input desc collection, meta call, and graph emit.
+- [x] Move generic shape helpers from `src/ops/shape.c` into `src/ops/meta_common.c` / `src/ops/meta_common.h`.
+- [x] Migrate simple public wrappers from `src/ops/op_schema.c` into capsules: `add`, `mul`, `scale`, `relu`, `silu`, `gelu`.
+- [x] Migrate linalg wrappers/meta: `matmul`, `linear`.
+- [x] Migrate reductions/meta: `sum`, `mean`, `softmax`, `reduce_to`.
+- [x] Migrate norm/loss/embedding/rope/attention wrappers/meta: `rms_norm`, `cross_entropy`, `lm_cross_entropy`, `embedding`, `rope`, `sdpa`.
+- [x] Migrate misc wrappers/meta: `powlu`, `cast`, `transpose`, `assert_finite`, `assert_close`.
+- [x] Keep `include/gradients/ops.h` manual for first pass; only move implementations.
+- [x] Delete or shrink `src/ops/op_schema.c` after all public wrappers move.
+- [x] Delete or shrink `src/ops/shape.c` after all meta code moves.
+- [x] Validate: `tests/test_ops`, `tests/test_graph`, `tests/test_debug` pass under CPU.
+- [x] Validate: `make test GD_ENABLE_METAL=0` still passes.
 
 ### 24.5 Move autograd rules into op capsules
 

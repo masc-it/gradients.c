@@ -287,6 +287,7 @@ $(GENERATED_FILES): $(GEN_OPS_STAMP)
 
 $(LIB): $(OBJ)
 	@mkdir -p $(@D)
+	@$(RM) $@
 ifeq ($(strip $(OBJ)),)
 	@printf '[lib] no source files found under %s/; creating placeholder archive\n' '$(SRC_DIR)'
 	@printf '!<arch>\n' > $@

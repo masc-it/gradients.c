@@ -48,6 +48,8 @@ typedef struct _gd_op_attrs {
     float weight_decay;          /* ADAMW */
     float atol;                  /* ASSERT_CLOSE */
     float rtol;                  /* ASSERT_CLOSE */
+    bool has_reduce_to_desc;      /* REDUCE_TO: target descriptor present */
+    gd_tensor_desc reduce_to_desc; /* REDUCE_TO target output descriptor */
 } _gd_op_attrs;
 
 typedef struct _gd_value {

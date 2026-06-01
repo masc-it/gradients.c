@@ -5,7 +5,7 @@
 #include "../core/internal.h"
 #include "../core/tensor_internal.h"
 #include "../graph/graph_internal.h"
-#include "../ops/ops_internal.h"
+#include "../ops/op_impl.h"
 
 typedef struct bwd_ctx {
     gd_context *ctx;
@@ -89,11 +89,14 @@ static gd_status accumulate_broadcast(bwd_ctx *b, int value_id, gd_tensor *grad)
     const gd_tensor_desc *gdesc = _gd_tensor_desc_ptr(grad);
     gd_tensor *reduced = NULL;
     gd_status status = GD_OK;
+    _gd_op_attrs attrs = {0};
 
     if (desc_same_shape(target, gdesc)) {
         return accumulate(b, value_id, grad);
     }
-    status = _gd_graph_emit(b->graph, _GD_OP_REDUCE_TO, &grad, 1, NULL, target, &reduced);
+    attrs.has_reduce_to_desc = true;
+    attrs.reduce_to_desc = *target;
+    status = _gd_emit_checked(b->ctx, _GD_OP_REDUCE_TO, &grad, 1, &attrs, &reduced, 1);
     if (status != GD_OK) {
         return status;
     }

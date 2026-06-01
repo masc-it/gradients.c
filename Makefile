@@ -3,7 +3,7 @@
 # Examples:
 #   make test        # build lib + tests, then run tests
 #   make mlp         # build lib + examples/mlp/mlp, then run MLP example
-#   make check       # build, run docs checks, run tests
+#   make check       # build, run docs/size checks, run tests
 
 SHELL := /bin/bash
 
@@ -25,6 +25,7 @@ AR ?= ar
 RM := rm -rf
 
 CPPFLAGS ?= -I$(INCLUDE_DIR)
+CPPFLAGS += -I$(BUILD_DIR)/generated
 CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
           -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
           -Wmissing-prototypes -Wno-unused-parameter
@@ -79,6 +80,25 @@ MOBJ := $(patsubst %.m,$(BUILD_DIR)/%.o,$(MSRC))
 OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC)) $(MOBJ)
 DEP := $(OBJ:.o=.d)
 
+# ----- Generated operator registry inputs -----------------------------------
+OP_CORE_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/core_*.c))
+OP_GRAD_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/grad_*.c))
+CPU_OP_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/cpu_*.c))
+METAL_OP_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.m))
+METAL_OP_SHADER_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.metal))
+
+GENERATED_DIR := $(BUILD_DIR)/generated
+GEN_OPS_BIN := $(BUILD_DIR)/tools/gen_ops
+GEN_OPS_STAMP := $(GENERATED_DIR)/.gen_ops.stamp
+GENERATED_FILES := \
+  $(GENERATED_DIR)/op_kind.h \
+  $(GENERATED_DIR)/op_registry.inc \
+  $(GENERATED_DIR)/bwd_registry.inc \
+  $(GENERATED_DIR)/cpu_registry.inc \
+  $(GENERATED_DIR)/metal_registry.inc \
+  $(GENERATED_DIR)/metal_shaders.mk \
+  $(GENERATED_DIR)/op_matrix.md
+
 # gpt_bench is a profiling harness, not a correctness test: exclude it from the
 # auto-discovered test runner (build/run via `make gpt-bench`).
 GPT_BENCH_SRC := $(TEST_DIR)/gpt_bench.c
@@ -98,13 +118,15 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check clean list
+.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
 	@printf '%s\n' '  make build       build library'
 	@printf '%s\n' '  make test        build library + tests, then run all tests'
-	@printf '%s\n' '  make check       build, run docs checks, then run tests'
+	@printf '%s\n' '  make check       build, run docs/size checks, then run tests'
+	@printf '%s\n' '  make size-check  warn >800 LOC and fail new non-allowlisted >1000 LOC'
+	@printf '%s\n' '  make generated   regenerate operator registry scaffolding'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
 	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
@@ -122,7 +144,7 @@ all: check
 build: $(LIB) $(METALLIB)
 	@printf '[build] ok (metal=%s)\n' '$(GD_ENABLE_METAL)'
 
-check: build docs-check test tools
+check: build docs-check size-check test tools
 	@printf '[check] ok\n'
 
 test tests: build $(TEST_BINS)
@@ -192,6 +214,41 @@ docs-check: build
 	@grep -q '/Users/mascit/projects/dnn.c/' $(DOCS_DIR)/plan_mlp.md
 	@printf '[docs-check] ok\n'
 
+size-check-report:
+	@set -euo pipefail; \
+	found=0; \
+	while IFS= read -r f; do \
+		n=$$(wc -l < "$$f" | tr -d ' '); \
+		if (( n > 1000 )); then \
+			printf 'size-check-report: FAIL-threshold %s has %s lines\n' "$$f" "$$n"; \
+			found=1; \
+		elif (( n > 800 )); then \
+			printf 'size-check-report: WARN-threshold %s has %s lines\n' "$$f" "$$n"; \
+			found=1; \
+		fi; \
+	done < <(find $(SRC_DIR) $(INCLUDE_DIR) -type f \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.metal' -o -name '*.cu' \) | sort); \
+	if (( found == 0 )); then printf '[size-check-report] no files over 800 LOC\n'; fi
+
+size-check:
+	@set -euo pipefail; \
+	allowlist='$(DOCS_DIR)/size_allowlist.txt'; \
+	test -f "$$allowlist"; \
+	fail=0; \
+	while IFS= read -r f; do \
+		n=$$(wc -l < "$$f" | tr -d ' '); \
+		if (( n > 1000 )); then \
+			if awk -v p="$$f" '($$0 !~ /^[[:space:]]*(#|$$)/ && $$1 == p) { found = 1 } END { exit found ? 0 : 1 }' "$$allowlist"; then \
+				printf 'size-check: WARN allowlisted %s has %s lines\n' "$$f" "$$n"; \
+			else \
+				printf 'size-check: FAIL %s has %s lines (>1000) and is not allowlisted\n' "$$f" "$$n"; \
+				fail=1; \
+			fi; \
+		elif (( n > 800 )); then \
+			printf 'size-check: WARN %s has %s lines\n' "$$f" "$$n"; \
+		fi; \
+	done < <(find $(SRC_DIR) $(INCLUDE_DIR) -type f \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.metal' -o -name '*.cu' \) | sort); \
+	exit $$fail
+
 list:
 	@printf 'SRC:\n%s\n' '$(SRC)'
 	@printf 'TEST_SRC:\n%s\n' '$(TEST_SRC)'
@@ -207,6 +264,27 @@ clean:
 	@printf '[clean] removed %s\n' '$(BUILD_DIR)'
 
 # ----- Build rules ----------------------------------------------------------
+generated: $(GEN_OPS_STAMP)
+	@printf '[generated] ok\n'
+
+$(GEN_OPS_BIN): tools/gen_ops.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(GEN_OPS_STAMP): $(GEN_OPS_BIN) $(OP_CORE_FILES) $(OP_GRAD_FILES) $(CPU_OP_FILES) $(METAL_OP_FILES) $(METAL_OP_SHADER_FILES)
+	@mkdir -p $(GENERATED_DIR)
+	@$< \
+	  --out $(GENERATED_DIR) \
+	  --core $(OP_CORE_FILES) \
+	  --grad $(OP_GRAD_FILES) \
+	  --cpu $(CPU_OP_FILES) \
+	  --metal $(METAL_OP_FILES) \
+	  --metal-shaders $(METAL_OP_SHADER_FILES)
+	@touch $@
+
+$(GENERATED_FILES): $(GEN_OPS_STAMP)
+	@test -f $@
+
 $(LIB): $(OBJ)
 	@mkdir -p $(@D)
 ifeq ($(strip $(OBJ)),)
@@ -216,11 +294,11 @@ else
 	$(AR) rcs $@ $(OBJ)
 endif
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c $(GEN_OPS_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: %.m
+$(BUILD_DIR)/%.o: %.m $(GEN_OPS_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 

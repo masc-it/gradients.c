@@ -15,6 +15,16 @@ static gd_status matmul_encode(_gd_metal_encode_ctx *ctx)
     id<MTLComputePipelineState> pso = ctx->pso;
     _gd_executable *exe = ctx->exe;
     const _gd_node *node = ctx->node;
+    GDMPSGemmPlan *mps = exe->node_mps != NULL
+                             ? (__bridge GDMPSGemmPlan *)exe->node_mps[ctx->node_id]
+                             : nil;
+
+    /* `matmul_plan` prebuilds MPS descriptors for contiguous GEMMs. Use that
+     * path when available; otherwise fall back to the portable Metal kernel for
+     * broadcasted or offset/non-contiguous shapes. */
+    if (mps != nil) {
+        return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, mps);
+    }
 
     const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
     const gd_tensor_desc *a_desc = &exe->graph->values[node->inputs[0]].desc;

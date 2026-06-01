@@ -270,8 +270,9 @@ Wider 17.23M-param profile (`d_model=384`, 6 layers, 6 heads) now shows:
 
 ## Next work
 
-1. Attention remains dominant for long context, but `T=512` and wider `T=1024`
-   now expose GEMM/MPS and LMCE enough to profile next.
+1. Planned MPS GEMM dispatch is now wired (see `plan_perf_optim1.md`), so the
+   next kernel pass should return to attention: remaining dK/dV split and causal
+   forward/combine costs dominate long-context traces.
 2. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
 3. Add production GPT trainer items (checkpoint/resume, eval loop, generation,
    KV cache) once kernel profile is no longer hiding trainer bottlenecks.

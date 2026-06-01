@@ -1,6 +1,6 @@
 # Performance optimization pass 1
 
-Status: profiling baseline captured.
+Status: baseline captured; command-buffer chunking, SDPA kernels, and planned MPS GEMM dispatch landed.
 
 ## Goal
 
@@ -157,10 +157,44 @@ faster than trace, as expected.
    20M-ish configs or shorter sequence lengths.
 5. Keep fused LMCE as-is for now. At vocab 8k it is not current bottleneck.
 
+## Follow-up: planned MPS GEMM dispatch
+
+After SDPA lane-kernel work, GEMM became visible enough to re-profile. The
+compiler already built `GDMPSGemmPlan` objects for contiguous no-bias `linear`
+and supported `matmul` nodes when `GD_METAL_MPS=1`, but the encode path still
+always dispatched the portable Metal GEMM kernel. Wired `linear` and `matmul`
+encode to use the preplanned MPS matrix multiplication path when present, while
+keeping the existing Metal kernel fallback for bias, broadcasted, offset, or
+non-contiguous cases.
+
+Trace deltas (`GD_PROFILE=trace`, one measured iteration):
+
+| shape | step before | step after | `linear` before -> after | `matmul` before -> after |
+|---|---:|---:|---:|---:|
+| `d=256 B=8 T=512` | `614.0 ms` | `519.5 ms` | `70.9 -> 44.6 ms` | `126.3 -> 64.4 ms` |
+| `d=256 B=8 T=1024` | `1559.8 ms` | `1347.0 ms` | `125.4 -> 68.4 ms` | `227.6 -> 102.7 ms` |
+| `d=384 B=4 T=1024` | `1297.2 ms` | `1083.7 ms` | `135.3 -> 68.2 ms` | `247.9 -> 105.9 ms` |
+
+Requested release run (`d=256 B=8 T=1024`, 2 warmup + 10 measured):
+
+| metric | before MPS dispatch | after MPS dispatch |
+|---|---:|---:|
+| mean ms/iter | `1323.6` | `1133.0` |
+| best ms/iter | `1320.0` | `1131.3` |
+| best tokens/s | `6206` | `7241` |
+| best GFLOP/s | `427.7` | `499.0` |
+
+Long-context release check (`d=256 B=4 T=2048`, 1 warmup + 4 measured):
+
+- mean: `2000.7 ms/iter`
+- best: `1995.0 ms/iter`
+- best tokens/s: `4106`
+- best GFLOP/s: `360.5`
+
 ## Current conclusion
 
 For planned GPT training workloads, efficient long-context attention remains the
-gate. Command-buffer chunking removed a large executor-level cliff, but trace
-attribution still says `sdpa + sdpa_bwd` dominate long-context training. At
-`T=1024`, attention is roughly three quarters of step time; at `T=2048`, it is
-closer to seven eighths.
+largest gate, but MPS GEMM dispatch removed the next major non-attention gap.
+At `T=1024`, attention is still the majority of traced time; at `T=512` and
+wider `T=1024`, GEMM is no longer the obvious next target. Next high-upside work
+should return to attention or improve trainer production features.

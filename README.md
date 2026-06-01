@@ -1,8 +1,10 @@
 # gradients.c
 
-`gradients.c` is a small C tensor/autograd runtime with graph capture, CPU
-reference execution, and Metal acceleration. It keeps operator definitions,
-shape/meta logic, autograd rules, and backend kernels in per-op capsules.
+`gradients.c` is a small C tensor/autograd runtime focused on speed and ease
+of extension: new ops, new architectures, new attention mechanisms, and new
+backend kernels should be straightforward to add. It provides graph capture,
+CPU reference execution, and Metal acceleration, with operator definitions,
+shape/meta logic, autograd rules, and backend kernels kept in per-op capsules.
 
 ## Adding a new operator
 

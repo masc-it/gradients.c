@@ -413,6 +413,7 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         return _gd_cpu_k_assert_close(in_desc[0], in_data[0], in_data[1],
                                       node->attrs.atol, node->attrs.rtol);
     case _GD_OP_INVALID:
+    case _GD_OP_COUNT:
     case _GD_OP_BACKWARD:
     case _GD_OP_ZERO_GRAD:
     case _GD_OP_OPTIMIZER_STEP:

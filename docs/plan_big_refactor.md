@@ -1084,18 +1084,18 @@ Current codebase inventory used to ground this plan:
 
 ### 24.3 Introduce core op registry without changing execution
 
-- [ ] Add `src/ops/op_impl.h` with `_gd_op_def`, `_gd_meta_fn`, op flags, and `_gd_emit_checked` declaration.
-- [ ] Create core capsule files for every current `_GD_OP_*` in `src/graph/graph_internal.h`.
-- [ ] Include current public fwd ops: `add`, `mul`, `scale`, `matmul`, `linear`, `relu`, `silu`, `powlu`, `sum`, `mean`, `rms_norm`, `softmax`, `cross_entropy`, `lm_cross_entropy`, `cast`, `gelu`, `transpose`, `embedding`, `rope`, `sdpa`.
-- [ ] Include current internal/support ops: `copy`, `relu_bwd`, `silu_bwd`, `powlu_bwd`, `softmax_bwd`, `sum_bwd`, `mean_bwd`, `cross_entropy_bwd`, `lm_cross_entropy_bwd`, `gelu_bwd`, `embedding_bwd`, `rope_bwd`, `sdpa_bwd`, `rms_norm_bwd`, `rms_norm_wbwd`, `step_inc`, `adamw_step`, `reduce_to`, `assert_finite`, `assert_close`.
-- [ ] Audit current reserved/legacy enum values: `_GD_OP_BACKWARD`, `_GD_OP_ZERO_GRAD`, `_GD_OP_OPTIMIZER_STEP`; either create explicit reserved core defs or remove them if no code emits them.
-- [ ] Generate `_GD_OP_*` enum from core files into `build/generated/op_kind.h`.
-- [ ] Replace manual enum in `src/graph/graph_internal.h` with generated enum include.
-- [ ] Generate op registry extern table into `op_registry.inc`.
-- [ ] Replace `_gd_op_kind_name()` switch in `src/graph/graph.c` with registry lookup.
-- [ ] Add `tests/test_op_registry.c` for op def presence, names, arity, output count, and enum count.
-- [ ] Validate generated names match current graph dump/test expectations.
-- [ ] Validate: `make test GD_ENABLE_METAL=0` still passes.
+- [x] Add `src/ops/op_impl.h` with `_gd_op_def`, `_gd_meta_fn`, op flags, and `_gd_emit_checked` declaration.
+- [x] Create core capsule files for every current `_GD_OP_*` in `src/graph/graph_internal.h`.
+- [x] Include current public fwd ops: `add`, `mul`, `scale`, `matmul`, `linear`, `relu`, `silu`, `powlu`, `sum`, `mean`, `rms_norm`, `softmax`, `cross_entropy`, `lm_cross_entropy`, `cast`, `gelu`, `transpose`, `embedding`, `rope`, `sdpa`, `clip_grad_norm`.
+- [x] Include current internal/support ops: `copy`, `relu_bwd`, `silu_bwd`, `powlu_bwd`, `softmax_bwd`, `sum_bwd`, `mean_bwd`, `cross_entropy_bwd`, `lm_cross_entropy_bwd`, `gelu_bwd`, `embedding_bwd`, `rope_bwd`, `sdpa_bwd`, `rms_norm_bwd`, `rms_norm_wbwd`, `step_inc`, `adamw_step`, `reduce_to`, `assert_finite`, `assert_close`.
+- [x] Audit current reserved/legacy enum values: `_GD_OP_BACKWARD`, `_GD_OP_ZERO_GRAD`, `_GD_OP_OPTIMIZER_STEP`; either create explicit reserved core defs or remove them if no code emits them.
+- [x] Generate `_GD_OP_*` enum from core files into `build/generated/op_kind.h`.
+- [x] Replace manual enum in `src/graph/graph_internal.h` with generated enum include.
+- [x] Generate op registry extern table into `op_registry.inc`.
+- [x] Replace `_gd_op_kind_name()` switch in `src/graph/graph.c` with registry lookup.
+- [x] Add `tests/test_op_registry.c` for op def presence, names, arity, output count, and enum count.
+- [x] Validate generated names match current graph dump/test expectations.
+- [x] Validate: `make test GD_ENABLE_METAL=0` still passes.
 
 ### 24.4 Add checked emit and move meta/public wrappers into capsules
 

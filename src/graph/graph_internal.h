@@ -7,6 +7,7 @@
 #include "gradients/dtype.h"
 #include "gradients/graph.h"
 #include "gradients/tensor.h"
+#include "op_kind.h"
 
 #define _GD_OP_MAX_INPUTS 256
 
@@ -16,55 +17,6 @@ typedef enum _gd_graph_state {
     _GD_GRAPH_FINALIZED,
     _GD_GRAPH_COMPILED
 } _gd_graph_state;
-
-typedef enum _gd_op_kind {
-    _GD_OP_INVALID = 0,
-    _GD_OP_ADD,
-    _GD_OP_MUL,
-    _GD_OP_SCALE,
-    _GD_OP_MATMUL,
-    _GD_OP_LINEAR,
-    _GD_OP_RELU,
-    _GD_OP_SILU,
-    _GD_OP_POWLU,
-    _GD_OP_SUM,
-    _GD_OP_MEAN,
-    _GD_OP_RMS_NORM,
-    _GD_OP_SOFTMAX,
-    _GD_OP_CROSS_ENTROPY,
-    _GD_OP_LM_CROSS_ENTROPY,
-    _GD_OP_CAST,
-    _GD_OP_GELU,
-    _GD_OP_TRANSPOSE,
-    _GD_OP_EMBEDDING,
-    _GD_OP_ROPE,
-    _GD_OP_SDPA,
-    _GD_OP_BACKWARD,
-    _GD_OP_ZERO_GRAD,
-    _GD_OP_OPTIMIZER_STEP,
-    _GD_OP_CLIP_GRAD_NORM,
-    _GD_OP_ASSERT_FINITE,
-    _GD_OP_ASSERT_CLOSE,
-    /* Internal backward/support ops (not part of the public op set). */
-    _GD_OP_COPY,
-    _GD_OP_RELU_BWD,
-    _GD_OP_SILU_BWD,
-    _GD_OP_POWLU_BWD,
-    _GD_OP_SOFTMAX_BWD,
-    _GD_OP_SUM_BWD,
-    _GD_OP_MEAN_BWD,
-    _GD_OP_CROSS_ENTROPY_BWD,
-    _GD_OP_LM_CROSS_ENTROPY_BWD,
-    _GD_OP_GELU_BWD,
-    _GD_OP_EMBEDDING_BWD,
-    _GD_OP_ROPE_BWD,
-    _GD_OP_SDPA_BWD,
-    _GD_OP_RMS_NORM_BWD,
-    _GD_OP_RMS_NORM_WBWD,
-    _GD_OP_STEP_INC,
-    _GD_OP_ADAMW_STEP,
-    _GD_OP_REDUCE_TO
-} _gd_op_kind;
 
 typedef struct _gd_op_attrs {
     float scale;                 /* SCALE / CLIP_GRAD_NORM max_norm */

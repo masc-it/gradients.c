@@ -98,6 +98,7 @@ const char *_gd_graph_state_name(_gd_graph_state state);
 const char *_gd_op_kind_name(_gd_op_kind op);
 
 gd_status _gd_graph_clear(gd_graph *graph);
+void _gd_graph_free_executable(gd_graph *graph);
 gd_status _gd_graph_note_virtual_tensor_create(gd_graph *graph, gd_tensor *tensor);
 void _gd_graph_note_virtual_tensor_release(gd_graph *graph, gd_tensor *tensor);
 

@@ -1189,7 +1189,7 @@ Current codebase inventory used to ground this plan:
 - [ ] Split `src/tokenizer/tokenizer.c` into training, model IO, encode, decode, and common helpers under `src/tokenizer/`.
 - [ ] Split `src/dataset/dataset.c` into dataset core, text/token storage, batching/index helpers, and IO helpers.
 - [ ] Split `src/core/tensor.c` into descriptor/view logic, materialization/copy, grad metadata, and lifecycle/refcount glue.
-- [ ] Split `src/graph/graph.c` into graph lifecycle/capture, emit/import, compile/run, debug/materialize helpers.
+- [x] Split `src/graph/graph.c` into graph lifecycle/capture, emit/import, compile/run, debug/materialize helpers.
 - [ ] Remove each file from `docs/size_allowlist.txt` once under 1000 LOC.
 - [ ] Validate: `make test GD_ENABLE_METAL=0` still passes after each split.
 

@@ -15,6 +15,7 @@ static gd_status lm_cross_entropy_bwd_run(_gd_cpu_exec *exec, const _gd_node *no
     const gd_tensor_desc *weight_desc = NULL;
     const gd_tensor_desc *targets_desc = NULL;
     const gd_tensor_desc *dhidden_desc = NULL;
+    const gd_tensor_desc *dweight_desc = NULL;
 
     if (node->n_inputs != 6 || node->n_outputs != 2) {
         return _gd_error(GD_ERR_INTERNAL, "lm_cross_entropy_bwd expects stats inputs");
@@ -47,16 +48,16 @@ static gd_status lm_cross_entropy_bwd_run(_gd_cpu_exec *exec, const _gd_node *no
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_exec_output(exec, node, 1, &dweight_data, NULL);
+    status = _gd_cpu_exec_output(exec, node, 1, &dweight_data, &dweight_desc);
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(dhidden_desc);
-    if (status != GD_OK) {
-        return status;
+    if ((dhidden_desc->dtype != GD_DTYPE_F32 && dhidden_desc->dtype != GD_DTYPE_F16) ||
+        (dweight_desc->dtype != GD_DTYPE_F32 && dweight_desc->dtype != GD_DTYPE_F16)) {
+        return _gd_error(GD_ERR_DTYPE, "lm_cross_entropy_bwd outputs must be F32 or F16");
     }
-    return _gd_cpu_k_lm_cross_entropy_bwd(hidden_desc, dhidden_data, hidden_data,
-                                          weight_desc, dweight_data, weight_data,
+    return _gd_cpu_k_lm_cross_entropy_bwd(hidden_desc, dhidden_desc, dhidden_data, hidden_data,
+                                          weight_desc, dweight_desc, dweight_data, weight_data,
                                           targets_desc, targets_data, go_data,
                                           row_max_data, row_sum_data);
 }

@@ -78,6 +78,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_lmce_fwd_chunk",
     "gd_lmce_loss_rows",
     "gd_lmce_dlogits_chunk",
+    "gd_lmce_store_dx_f16",
     "gd_embedding_bwd_scatter",
     "gd_rms_norm_wbwd_reduce",
 };

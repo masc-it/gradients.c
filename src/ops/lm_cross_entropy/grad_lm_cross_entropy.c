@@ -1,5 +1,31 @@
 #include "../grad_impl.h"
 
+static bool value_needs_f32_grad(_gd_bwd_ctx *b, int value_id)
+{
+    gd_tensor *leaf = NULL;
+
+    if (value_id < 0 || value_id >= b->graph->n_values) {
+        return false;
+    }
+    leaf = b->graph->values[value_id].external;
+    return leaf != NULL && gd_tensor_requires_grad(leaf) &&
+           b->graph->values[value_id].desc.dtype == GD_DTYPE_F16;
+}
+
+static gd_status f32_grad_desc_if_needed(_gd_bwd_ctx *b, int value_id, gd_tensor_desc *desc)
+{
+    const gd_tensor_desc *base = _gd_bwd_value_desc(b, value_id);
+
+    if (base == NULL || desc == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy grad desc argument is NULL");
+    }
+    *desc = *base;
+    if (value_needs_f32_grad(b, value_id)) {
+        return gd_tensor_desc_contiguous(GD_DTYPE_F32, base->device, base->ndim, base->sizes, desc);
+    }
+    return GD_OK;
+}
+
 static gd_status lm_cross_entropy_backward(_gd_bwd_ctx *b, const _gd_node *node)
 {
     gd_status status = GD_OK;
@@ -46,7 +72,10 @@ static gd_status lm_cross_entropy_backward(_gd_bwd_ctx *b, const _gd_node *node)
     inputs[4] = row_max;
     inputs[5] = row_sum;
     out_descs[0] = *_gd_bwd_value_desc(b, node->inputs[0]);
-    out_descs[1] = *_gd_bwd_value_desc(b, node->inputs[1]);
+    status = f32_grad_desc_if_needed(b, node->inputs[1], &out_descs[1]);
+    if (status != GD_OK) {
+        return status;
+    }
     status = _gd_bwd_emit_multi(b, _GD_OP_LM_CROSS_ENTROPY_BWD, inputs, 6, NULL,
                                 out_descs, 2, grads);
     if (status != GD_OK) {

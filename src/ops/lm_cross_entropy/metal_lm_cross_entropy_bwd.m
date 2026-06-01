@@ -11,7 +11,22 @@ static gd_status lm_cross_entropy_bwd_support(const _gd_metal_plan_ctx *ctx)
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd needs GD_METAL_MPS=1");
     }
     if (ctx->graph != NULL) {
+        const gd_tensor_desc *hidden = &ctx->graph->values[ctx->node->inputs[0]].desc;
+        const gd_tensor_desc *weight = &ctx->graph->values[ctx->node->inputs[1]].desc;
         const gd_tensor_desc *targets = &ctx->graph->values[ctx->node->inputs[2]].desc;
+        const gd_tensor_desc *go = &ctx->graph->values[ctx->node->inputs[3]].desc;
+        const gd_tensor_desc *dhidden = &ctx->graph->values[ctx->node->outputs[0]].desc;
+        const gd_tensor_desc *dweight = &ctx->graph->values[ctx->node->outputs[1]].desc;
+        if (hidden->dtype != GD_DTYPE_F32 && hidden->dtype != GD_DTYPE_F16) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd supports F32/F16 hidden");
+        }
+        if (weight->dtype != hidden->dtype) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd needs matching hidden/weight dtype");
+        }
+        if (dhidden->dtype != hidden->dtype || dweight->dtype != GD_DTYPE_F32 ||
+            go->dtype != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd output dtype mismatch");
+        }
         if (targets->dtype != GD_DTYPE_I32) {
             return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd needs I32 targets");
         }
@@ -28,7 +43,12 @@ static gd_status lm_cross_entropy_bwd_plan(_gd_metal_plan_ctx *ctx)
     int rows = D > 0 ? (int)(_gd_metal_desc_numel(x_desc) / D) : 0;
     int chunk = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
     if (rows > 0 && chunk > 0) {
-        ctx->exe->node_scratch_bytes[ctx->node_id] = _gd_metal_lmce_bwd_scratch_bytes_for(rows, chunk);
+        const gd_tensor_desc *dx_desc = &ctx->graph->values[ctx->node->outputs[0]].desc;
+        size_t bytes = _gd_metal_lmce_bwd_scratch_bytes_for(rows, chunk);
+        if (dx_desc->dtype == GD_DTYPE_F16) {
+            bytes += (size_t)rows * (size_t)D * sizeof(float);
+        }
+        ctx->exe->node_scratch_bytes[ctx->node_id] = bytes;
     }
     return GD_OK;
 }
@@ -50,7 +70,15 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
     int V = (int)w_desc->sizes[0];
     int rows = D > 0 ? (int)(_gd_metal_desc_numel(x_desc) / D) : 0;
     int chunk_max = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
+    const gd_tensor_desc *dx_desc = &exe->graph->values[node->outputs[0]].desc;
+    const gd_tensor_desc *dw_desc = &exe->graph->values[node->outputs[1]].desc;
     gd_metal_lmce_scratch_layout L = {0};
+    NSUInteger input_elem = (NSUInteger)gd_dtype_sizeof(x_desc->dtype);
+    NSUInteger dx_elem = (NSUInteger)gd_dtype_sizeof(dx_desc->dtype);
+    NSUInteger dw_elem = (NSUInteger)gd_dtype_sizeof(dw_desc->dtype);
+    MPSDataType input_type = x_desc->dtype == GD_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+    MPSDataType dx_type = dx_desc->dtype == GD_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+    MPSDataType dw_type = dw_desc->dtype == GD_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
     id<MTLBuffer> x_b = _gd_metal_value_buffer(exe, node->inputs[0]);
     id<MTLBuffer> w_b = _gd_metal_value_buffer(exe, node->inputs[1]);
     id<MTLBuffer> t_b = _gd_metal_value_buffer(exe, node->inputs[2]);
@@ -60,6 +88,8 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
     id<MTLBuffer> dx_b = _gd_metal_value_buffer(exe, node->outputs[0]);
     id<MTLBuffer> dw_b = _gd_metal_value_buffer(exe, node->outputs[1]);
     id<MTLComputePipelineState> dlogits_pso = _gd_metal_pipeline_named(st, "gd_lmce_dlogits_chunk");
+    id<MTLComputePipelineState> dx_store_pso = _gd_metal_pipeline_named(st, "gd_lmce_store_dx_f16");
+    NSUInteger dx_tmp_off = (NSUInteger)_gd_metal_lmce_bwd_scratch_bytes_for(rows, chunk_max);
 
     if (!st.useMPS) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy_bwd needs GD_METAL_MPS=1");
@@ -75,19 +105,23 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
     if (scratch == nil || dlogits_pso == nil || rows <= 0 || D <= 0 || V <= 0) {
         return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd plan missing");
     }
+    if (dx_desc->dtype == GD_DTYPE_F16 && dx_store_pso == nil) {
+        return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd F16 dx kernel missing");
+    }
 
     for (int c0 = 0; c0 < V; c0 += chunk_max) {
         int csz = V - c0;
         if (csz > chunk_max) {
             csz = chunk_max;
         }
-        MPSMatrix *xm = _gd_metal_mps_matrix(x_b, 0, (NSUInteger)rows, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *wm = _gd_metal_mps_matrix(w_b, (NSUInteger)c0 * (NSUInteger)D * sizeof(float),
+        MPSMatrix *xm = _gd_metal_mps_matrix_typed(x_b, 0, (NSUInteger)rows, (NSUInteger)D,
+                                   (NSUInteger)D * input_elem, input_type);
+        MPSMatrix *wm = _gd_metal_mps_matrix_typed(w_b, (NSUInteger)c0 * (NSUInteger)D * input_elem,
                                    (NSUInteger)csz, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *lm = _gd_metal_mps_matrix(scratch, L.logits_off, (NSUInteger)rows,
-                                   (NSUInteger)csz, (NSUInteger)csz * sizeof(float));
+                                   (NSUInteger)D * input_elem, input_type);
+        MPSMatrix *lm = _gd_metal_mps_matrix_typed(scratch, L.logits_off, (NSUInteger)rows,
+                                   (NSUInteger)csz, (NSUInteger)csz * sizeof(float),
+                                   MPSDataTypeFloat32);
         gd_status status = _gd_metal_encode_mps_mm(cmd, enc, st.device, xm, wm, lm,
                                          false, true, (NSUInteger)rows,
                                          (NSUInteger)csz, (NSUInteger)D, 0.0);
@@ -104,11 +138,15 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
         [*enc setBytes:&p length:sizeof(p) atIndex:5];
         _gd_metal_dispatch_1d(*enc, dlogits_pso, (NSUInteger)rows * (NSUInteger)csz);
 
-        MPSMatrix *dxm = _gd_metal_mps_matrix(dx_b, 0, (NSUInteger)rows, (NSUInteger)D,
-                                    (NSUInteger)D * sizeof(float));
-        MPSMatrix *dwm = _gd_metal_mps_matrix(dw_b, (NSUInteger)c0 * (NSUInteger)D * sizeof(float),
+        MPSMatrix *dxm = dx_desc->dtype == GD_DTYPE_F16
+                              ? _gd_metal_mps_matrix_typed(scratch, dx_tmp_off,
+                                    (NSUInteger)rows, (NSUInteger)D,
+                                    (NSUInteger)D * sizeof(float), MPSDataTypeFloat32)
+                              : _gd_metal_mps_matrix_typed(dx_b, 0, (NSUInteger)rows, (NSUInteger)D,
+                                    (NSUInteger)D * dx_elem, dx_type);
+        MPSMatrix *dwm = _gd_metal_mps_matrix_typed(dw_b, (NSUInteger)c0 * (NSUInteger)D * dw_elem,
                                     (NSUInteger)csz, (NSUInteger)D,
-                                    (NSUInteger)D * sizeof(float));
+                                    (NSUInteger)D * dw_elem, dw_type);
         status = _gd_metal_encode_mps_mm(cmd, enc, st.device, lm, wm, dxm,
                                false, false, (NSUInteger)rows, (NSUInteger)D,
                                (NSUInteger)csz, c0 == 0 ? 0.0 : 1.0);
@@ -121,6 +159,14 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
         if (status != GD_OK) {
             return status;
         }
+    }
+    if (dx_desc->dtype == GD_DTYPE_F16) {
+        gd_metal_lmce_params p = {rows, D, V, 0, chunk_max, 0};
+        [*enc setComputePipelineState:dx_store_pso];
+        [*enc setBuffer:scratch offset:dx_tmp_off atIndex:0];
+        [*enc setBuffer:dx_b offset:0 atIndex:1];
+        [*enc setBytes:&p length:sizeof(p) atIndex:2];
+        _gd_metal_dispatch_1d(*enc, dx_store_pso, (NSUInteger)rows * (NSUInteger)D);
     }
     return GD_OK;
 }

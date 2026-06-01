@@ -507,6 +507,54 @@ static int test_metal_f16_lm_cross_entropy(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_lm_cross_entropy_backward(gd_context *ctx)
+{
+    int64_t hs[2] = {2, 4};
+    int64_t ws[2] = {5, 4};
+    int64_t ts[1] = {2};
+    uint16_t hh_data[8] = {0x3800U, 0xbc00U, 0x3c00U, 0x4000U,
+                           0xb800U, 0x3400U, 0x3e00U, 0xc000U};
+    uint16_t wh_data[20] = {0x3000U, 0xb400U, 0x3800U, 0x0000U,
+                            0x3c00U, 0x3400U, 0xb800U, 0x3000U,
+                            0xbc00U, 0x3800U, 0x3400U, 0x3c00U,
+                            0x3e00U, 0xbe00U, 0x3000U, 0xb400U,
+                            0xc000U, 0x3c00U, 0x3800U, 0x3400U};
+    int32_t targets_data[2] = {1, 3};
+    float gw[20] = {0};
+    gd_tensor_desc hdesc;
+    gd_tensor_desc wdesc;
+    gd_tensor_desc tdesc;
+    gd_tensor *h = NULL, *w = NULL, *targets = NULL, *loss = NULL, *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, METAL, 2, hs, &hdesc));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, METAL, 2, ws, &wdesc));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, METAL, 1, ts, &tdesc));
+    CHECK_OK(gd_tensor_empty(ctx, &hdesc, &h));
+    CHECK_OK(gd_tensor_empty(ctx, &wdesc, &w));
+    CHECK_OK(gd_tensor_empty(ctx, &tdesc, &targets));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, h, hh_data, sizeof(hh_data)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wh_data, sizeof(wh_data)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, targets, targets_data, sizeof(targets_data)));
+    CHECK_OK(gd_tensor_set_requires_grad(h, true));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_lm_cross_entropy(ctx, h, w, targets, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_OK(gd_tensor_grad(w, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gw, sizeof(gw)));
+    CHECK_TRUE(isfinite(gw[0]) && isfinite(gw[19]));
+    gd_tensor_release(loss); CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(targets); gd_tensor_release(w); gd_tensor_release(h);
+    return 0;
+}
+
 static int test_metal_f16_sdpa(gd_context *ctx)
 {
     int64_t shape[4] = {1, 3, 1, 4};
@@ -1565,6 +1613,7 @@ int main(void)
     if (mps_enabled) {
         rc |= test_metal_f16_mps_gemm(ctx);
         rc |= test_metal_f16_lm_cross_entropy(ctx);
+        rc |= test_metal_f16_lm_cross_entropy_backward(ctx);
     }
     rc |= test_metal_reduce_parity(ctx);
     rc |= test_metal_powlu_parity(ctx);

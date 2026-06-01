@@ -244,6 +244,58 @@ static int test_metal_f16_unsupported_reject(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_mps_gemm(gd_context *ctx)
+{
+    int64_t xshape[2] = {2, 3};
+    int64_t wshape[2] = {3, 2};
+    float xdata[6] = {1.0F, 2.0F, 3.0F, -1.0F, 0.5F, 4.0F};
+    float wdata[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
+    float expect[4] = {3.0F, 4.0F, -1.5F, 7.125F};
+    float got_mm[4] = {0};
+    float got_lin[4] = {0};
+    gd_tensor *x = NULL;
+    gd_tensor *w = NULL;
+    gd_tensor *xh = NULL;
+    gd_tensor *wh = NULL;
+    gd_tensor *mmh = NULL;
+    gd_tensor *linh = NULL;
+    gd_tensor *mm = NULL;
+    gd_tensor *lin = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_f32(ctx, 2, xshape, xdata, &x));
+    CHECK_OK(make_f32(ctx, 2, wshape, wdata, &w));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_cast(ctx, w, GD_DTYPE_F16, &wh));
+    CHECK_OK(gd_matmul(ctx, xh, wh, &mmh));
+    CHECK_OK(gd_cast(ctx, mmh, GD_DTYPE_F32, &mm));
+    CHECK_OK(gd_linear(ctx, xh, wh, NULL, &linh));
+    CHECK_OK(gd_cast(ctx, linh, GD_DTYPE_F32, &lin));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, mm, got_mm, sizeof(got_mm)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, lin, got_lin, sizeof(got_lin)));
+    for (i = 0; i < 4; ++i) {
+        CHECK_TRUE(fabsf(got_mm[i] - expect[i]) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_lin[i] - expect[i]) <= 2.0e-2F);
+    }
+    gd_tensor_release(lin);
+    gd_tensor_release(mm);
+    gd_tensor_release(linh);
+    gd_tensor_release(mmh);
+    gd_tensor_release(wh);
+    gd_tensor_release(xh);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(w);
+    gd_tensor_release(x);
+    return 0;
+}
+
 static gd_status make_i32(gd_context *ctx, int ndim, const int64_t *sizes, const int32_t *data,
                           gd_tensor **out)
 {
@@ -1052,6 +1104,9 @@ int main(void)
     rc |= test_metal_f16_unsupported_reject(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);
+    if (mps_enabled) {
+        rc |= test_metal_f16_mps_gemm(ctx);
+    }
     rc |= test_metal_reduce_parity(ctx);
     rc |= test_metal_powlu_parity(ctx);
     rc |= test_metal_cross_entropy_parity(ctx);

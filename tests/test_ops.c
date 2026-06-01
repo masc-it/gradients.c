@@ -487,6 +487,61 @@ static int test_f16_cast_cpu(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_matmul_linear_cpu(gd_context *ctx)
+{
+    int64_t xshape[2] = {2, 3};
+    int64_t wshape[2] = {3, 2};
+    float xdata[6] = {1.0F, 2.0F, 3.0F, -1.0F, 0.5F, 4.0F};
+    float wdata[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
+    float expect[4] = {3.0F, 4.0F, -1.5F, 7.125F};
+    float got_mm[4] = {0};
+    float got_lin[4] = {0};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor *x = NULL;
+    gd_tensor *w = NULL;
+    gd_tensor *xh = NULL;
+    gd_tensor *wh = NULL;
+    gd_tensor *mmh = NULL;
+    gd_tensor *linh = NULL;
+    gd_tensor *mm = NULL;
+    gd_tensor *lin = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, xshape, &x));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, wshape, &w));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xdata, sizeof(xdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wdata, sizeof(wdata)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_cast(ctx, w, GD_DTYPE_F16, &wh));
+    CHECK_OK(gd_matmul(ctx, xh, wh, &mmh));
+    CHECK_OK(gd_cast(ctx, mmh, GD_DTYPE_F32, &mm));
+    CHECK_OK(gd_linear(ctx, xh, wh, NULL, &linh));
+    CHECK_OK(gd_cast(ctx, linh, GD_DTYPE_F32, &lin));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, mm, got_mm, sizeof(got_mm)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, lin, got_lin, sizeof(got_lin)));
+    for (i = 0; i < 4; ++i) {
+        CHECK_TRUE(fabsf(got_mm[i] - expect[i]) <= 1.0e-2F);
+        CHECK_TRUE(fabsf(got_lin[i] - expect[i]) <= 1.0e-2F);
+    }
+    gd_tensor_release(lin);
+    gd_tensor_release(mm);
+    gd_tensor_release(linh);
+    gd_tensor_release(mmh);
+    gd_tensor_release(wh);
+    gd_tensor_release(xh);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(w);
+    gd_tensor_release(x);
+    return 0;
+}
+
 static int test_chain_dump(gd_context *ctx)
 {
     int64_t xs[2] = {2, 3};
@@ -537,7 +592,8 @@ int main(void)
     if (test_elementwise(ctx) != 0 || test_powlu_schema(ctx) != 0 ||
         test_matmul(ctx) != 0 || test_sdpa_prefix_schema(ctx) != 0 ||
         test_linear(ctx) != 0 || test_reduce_softmax_ce_cast(ctx) != 0 ||
-        test_f16_cast_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
+        test_f16_cast_cpu(ctx) != 0 || test_f16_matmul_linear_cpu(ctx) != 0 ||
+        test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

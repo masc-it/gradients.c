@@ -1,5 +1,15 @@
 #import "metal_op.h"
 
+static bool mps_gemm_dtype_supported(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F32 || dtype == GD_DTYPE_F16;
+}
+
+static MPSDataType mps_gemm_dtype(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+}
+
 gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
 {
     GDMetalState *st = ctx->state;
@@ -13,9 +23,9 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
         const gd_tensor_desc *a_desc = &graph->values[node->inputs[0]].desc;
         const gd_tensor_desc *b_desc = &graph->values[node->inputs[1]].desc;
         const gd_tensor_desc *out_desc = &graph->values[node->outputs[0]].desc;
-        if (a_desc->dtype == GD_DTYPE_F32 && b_desc->dtype == GD_DTYPE_F32 &&
-            out_desc->dtype == GD_DTYPE_F32 && a_desc->layout == GD_LAYOUT_CONTIGUOUS &&
-            b_desc->layout == GD_LAYOUT_CONTIGUOUS &&
+        if (a_desc->dtype == b_desc->dtype && b_desc->dtype == out_desc->dtype &&
+            mps_gemm_dtype_supported(out_desc->dtype) &&
+            a_desc->layout == GD_LAYOUT_CONTIGUOUS && b_desc->layout == GD_LAYOUT_CONTIGUOUS &&
             out_desc->layout == GD_LAYOUT_CONTIGUOUS &&
             a_desc->storage_offset_bytes == 0 && b_desc->storage_offset_bytes == 0 &&
             out_desc->storage_offset_bytes == 0) {
@@ -90,30 +100,32 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
                      out_desc->sizes[out_desc->ndim - 1] == result_cols;
             }
             if (ok && result_rows > 0 && result_cols > 0 && inner > 0 && batch > 0U) {
-                NSUInteger a_row_bytes = a_cols_desc * sizeof(float);
-                NSUInteger b_row_bytes = b_cols_desc * sizeof(float);
-                NSUInteger out_row_bytes = out_cols_desc * sizeof(float);
+                NSUInteger elem_size = (NSUInteger)gd_dtype_sizeof(out_desc->dtype);
+                MPSDataType dtype = mps_gemm_dtype(out_desc->dtype);
+                NSUInteger a_row_bytes = a_cols_desc * elem_size;
+                NSUInteger b_row_bytes = b_cols_desc * elem_size;
+                NSUInteger out_row_bytes = out_cols_desc * elem_size;
                 MPSMatrixDescriptor *ad = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:a_rows_desc
                                      columns:a_cols_desc
                                     matrices:batch
                                     rowBytes:a_row_bytes
                                  matrixBytes:a_rows_desc * a_row_bytes
-                                    dataType:MPSDataTypeFloat32];
+                                    dataType:dtype];
                 MPSMatrixDescriptor *bd = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:b_rows_desc
                                      columns:b_cols_desc
                                     matrices:batch
                                     rowBytes:b_row_bytes
                                  matrixBytes:b_rows_desc * b_row_bytes
-                                    dataType:MPSDataTypeFloat32];
+                                    dataType:dtype];
                 MPSMatrixDescriptor *od = [MPSMatrixDescriptor
                     matrixDescriptorWithRows:out_rows_desc
                                      columns:out_cols_desc
                                     matrices:batch
                                     rowBytes:out_row_bytes
                                  matrixBytes:out_rows_desc * out_row_bytes
-                                    dataType:MPSDataTypeFloat32];
+                                    dataType:dtype];
                 GDMPSGemmPlan *plan = [GDMPSGemmPlan new];
                 plan.kernel = [[MPSMatrixMultiplication alloc]
                     initWithDevice:st.device

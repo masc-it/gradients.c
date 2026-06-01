@@ -1,5 +1,7 @@
 #include "../../backends/cpu_ref/cpu_backend.h"
 
+#include "../../core/internal.h"
+
 #include <stdint.h>
 
 static int64_t desc_numel(const gd_tensor_desc *desc)
@@ -13,13 +15,43 @@ static int64_t desc_numel(const gd_tensor_desc *desc)
     return numel;
 }
 
+static gd_status load_float(const gd_tensor_desc *desc, const void *data,
+                            int64_t i, float *out)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        *out = ((const float *)data)[i];
+        return GD_OK;
+    case GD_DTYPE_F16:
+        *out = _gd_f16_bits_to_f32(((const uint16_t *)data)[i]);
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF matmul supports F32/F16 only");
+    }
+}
+
+static gd_status store_float(const gd_tensor_desc *desc, void *data,
+                             int64_t i, float value)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        ((float *)data)[i] = value;
+        return GD_OK;
+    case GD_DTYPE_F16:
+        ((uint16_t *)data)[i] = _gd_f32_to_f16_bits(value);
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF matmul supports F32/F16 only");
+    }
+}
+
 gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
-                           float *out,
+                           void *out,
                            const gd_tensor_desc *a_desc,
-                           const float *a,
+                           const void *a,
                            bool trans_a,
                            const gd_tensor_desc *b_desc,
-                           const float *b,
+                           const void *b,
                            bool trans_b)
 {
     int batch_ndim = out_desc->ndim - 2;
@@ -77,9 +109,25 @@ gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
                 for (kk = 0; kk < k; ++kk) {
                     int64_t a_off = trans_a ? (kk * a_cols + row) : (row * a_cols + kk);
                     int64_t b_off = trans_b ? (col * b_cols + kk) : (kk * b_cols + col);
-                    acc += (double)a[a_base + a_off] * (double)b[b_base + b_off];
+                    float av = 0.0F;
+                    float bv = 0.0F;
+                    gd_status status = load_float(a_desc, a, a_base + a_off, &av);
+                    if (status != GD_OK) {
+                        return status;
+                    }
+                    status = load_float(b_desc, b, b_base + b_off, &bv);
+                    if (status != GD_OK) {
+                        return status;
+                    }
+                    acc += (double)av * (double)bv;
                 }
-                out[batch_lin * out_mat + row * n + col] = (float)acc;
+                {
+                    int64_t out_off = batch_lin * out_mat + row * n + col;
+                    gd_status status = store_float(out_desc, out, out_off, (float)acc);
+                    if (status != GD_OK) {
+                        return status;
+                    }
+                }
             }
         }
     }
@@ -87,13 +135,13 @@ gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
 }
 
 gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
-                           float *out,
+                           void *out,
                            const gd_tensor_desc *x_desc,
-                           const float *x,
+                           const void *x,
                            const gd_tensor_desc *w_desc,
-                           const float *w,
+                           const void *w,
                            bool trans_w,
-                           const float *bias)
+                           const void *bias)
 {
     int64_t in_features = x_desc->sizes[x_desc->ndim - 1];
     int64_t out_features = out_desc->sizes[out_desc->ndim - 1];
@@ -104,13 +152,36 @@ gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
     for (r = 0; r < rows; ++r) {
         int64_t o = 0;
         for (o = 0; o < out_features; ++o) {
-            double acc = bias != NULL ? (double)bias[o] : 0.0;
+            double acc = 0.0;
             int64_t kk = 0;
+            if (bias != NULL) {
+                float bv = 0.0F;
+                gd_status status = load_float(out_desc, bias, o, &bv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                acc = (double)bv;
+            }
             for (kk = 0; kk < in_features; ++kk) {
                 int64_t w_off = trans_w ? (o * in_features + kk) : (kk * out_features + o);
-                acc += (double)x[r * in_features + kk] * (double)w[w_off];
+                float xv = 0.0F;
+                float wv = 0.0F;
+                gd_status status = load_float(x_desc, x, r * in_features + kk, &xv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                status = load_float(w_desc, w, w_off, &wv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                acc += (double)xv * (double)wv;
             }
-            out[r * out_features + o] = (float)acc;
+            {
+                gd_status status = store_float(out_desc, out, r * out_features + o, (float)acc);
+                if (status != GD_OK) {
+                    return status;
+                }
+            }
         }
     }
     return GD_OK;

@@ -23,21 +23,21 @@ gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2
                               const float *x1, const float *x2, const float *go,
                               float m);
 gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
-                           float *out,
+                           void *out,
                            const gd_tensor_desc *a_desc,
-                           const float *a,
+                           const void *a,
                            bool trans_a,
                            const gd_tensor_desc *b_desc,
-                           const float *b,
+                           const void *b,
                            bool trans_b);
 gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
-                           float *out,
+                           void *out,
                            const gd_tensor_desc *x_desc,
-                           const float *x,
+                           const void *x,
                            const gd_tensor_desc *w_desc,
-                           const float *w,
+                           const void *w,
                            bool trans_w,
-                           const float *bias);
+                           const void *bias);
 gd_status _gd_cpu_k_reduce(const gd_tensor_desc *out_desc,
                            float *out,
                            const gd_tensor_desc *x_desc,

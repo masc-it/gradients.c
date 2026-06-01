@@ -1,12 +1,74 @@
 #import "../../backends/metal/metal_op.h"
 
+static bool matmul_dtype_supported(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F32 || dtype == GD_DTYPE_F16;
+}
+
+static bool matmul_node_uses_f16(const _gd_metal_plan_ctx *ctx)
+{
+    const _gd_node *node = ctx->node;
+    const gd_tensor_desc *a_desc = &ctx->graph->values[node->inputs[0]].desc;
+    const gd_tensor_desc *b_desc = &ctx->graph->values[node->inputs[1]].desc;
+    const gd_tensor_desc *out_desc = &ctx->graph->values[node->outputs[0]].desc;
+
+    return a_desc->dtype == GD_DTYPE_F16 || b_desc->dtype == GD_DTYPE_F16 ||
+           out_desc->dtype == GD_DTYPE_F16;
+}
+
+static gd_status matmul_support(const _gd_metal_plan_ctx *ctx)
+{
+    gd_status status = GD_OK;
+    const _gd_node *node = NULL;
+    const gd_tensor_desc *a_desc = NULL;
+    const gd_tensor_desc *b_desc = NULL;
+    const gd_tensor_desc *out_desc = NULL;
+
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal matmul support ctx is NULL");
+    }
+    node = ctx->node;
+    status = _gd_op_validate_arity(node->op, node->n_inputs, node->n_outputs);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'matmul'");
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    a_desc = &ctx->graph->values[node->inputs[0]].desc;
+    b_desc = &ctx->graph->values[node->inputs[1]].desc;
+    out_desc = &ctx->graph->values[node->outputs[0]].desc;
+    if (!matmul_dtype_supported(a_desc->dtype) || !matmul_dtype_supported(b_desc->dtype) ||
+        !matmul_dtype_supported(out_desc->dtype)) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal matmul supports F32/F16 only");
+    }
+    if (a_desc->dtype != b_desc->dtype || b_desc->dtype != out_desc->dtype) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal matmul requires matching input/output dtypes");
+    }
+    if (out_desc->dtype == GD_DTYPE_F16 && (ctx->state == nil || !ctx->state.useMPS)) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal F16 matmul needs GD_METAL_MPS=1");
+    }
+    return GD_OK;
+}
+
 static gd_status matmul_plan(_gd_metal_plan_ctx *ctx)
 {
     gd_status status = _gd_metal_plan_default(ctx);
     if (status != GD_OK) {
         return status;
     }
-    return _gd_metal_plan_mps_gemm(ctx);
+    status = _gd_metal_plan_mps_gemm(ctx);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (ctx->graph != NULL && matmul_node_uses_f16(ctx) &&
+        ctx->exe->node_mps[ctx->node_id] == NULL) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal F16 matmul requires an MPS GEMM plan");
+    }
+    return GD_OK;
 }
 
 static gd_status matmul_encode(_gd_metal_encode_ctx *ctx)
@@ -21,7 +83,8 @@ static gd_status matmul_encode(_gd_metal_encode_ctx *ctx)
 
     /* `matmul_plan` prebuilds MPS descriptors for contiguous GEMMs. Use that
      * path when available; otherwise fall back to the portable Metal kernel for
-     * broadcasted or offset/non-contiguous shapes. */
+     * broadcasted or offset/non-contiguous F32 shapes. F16 never uses the
+     * portable F32 kernel; planning fails if no MPS plan exists. */
     if (mps != nil) {
         return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, mps);
     }
@@ -76,6 +139,7 @@ static gd_status matmul_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_matmul = {
     .kind = _GD_OP_MATMUL,
     .name = "matmul",
+    .support = matmul_support,
     .plan = matmul_plan,
     .encode = matmul_encode,
 };

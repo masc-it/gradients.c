@@ -29,10 +29,6 @@ static gd_status linear_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_linear(out_desc, out_data, x_desc, x_data, w_desc, w_data,
                             node->attrs.trans_b, bias_data);
 }

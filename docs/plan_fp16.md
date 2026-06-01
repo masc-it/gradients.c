@@ -172,21 +172,21 @@ Goal: `gd_backward()` keeps scalar F32 contract even with F16 models.
 
 Goal: unlock main FLOPS path first.
 
-- [ ] Extend `_gd_metal_plan_mps_gemm()` dtype mapping:
-  - [ ] F32 descriptors -> `MPSDataTypeFloat32` as today.
-  - [ ] F16 descriptors -> `MPSDataTypeFloat16`.
-  - [ ] row bytes and matrix bytes use `gd_dtype_sizeof()`.
-  - [ ] output descriptor may be F16 or F32 when backend supports it.
+- [x] Extend `_gd_metal_plan_mps_gemm()` dtype mapping:
+  - [x] F32 descriptors -> `MPSDataTypeFloat32` as today.
+  - [x] F16 descriptors -> `MPSDataTypeFloat16`.
+  - [x] row bytes and matrix bytes use `gd_dtype_sizeof()`.
+  - [x] output descriptor may be F16 when backend supports it.
 - [ ] Verify MPS behavior empirically:
   - [ ] F16 input/F16 output speed.
   - [ ] F16 input/F32 output support and speed.
-  - [ ] numerical error vs CPU F32 reference.
+  - [x] numerical error vs CPU F32 reference on small GEMMs.
   - [ ] whether accumulation precision is acceptable for training.
 - [ ] If MPS cannot produce required F32 param grads efficiently, add custom Metal
       F16xF16->F32 GEMM for gradient outputs before claiming training perf.
-- [ ] Add dtype-aware MPS plan rejection with fallback only to supported Metal kernel.
+- [x] Add dtype-aware MPS plan rejection with fallback only to supported Metal kernel.
 - [ ] Add matmul/linear tests:
-  - [ ] F16 forward output parity vs F32 reference tolerance.
+  - [x] F16 forward output parity vs F32 reference tolerance.
   - [ ] transposed weight path.
   - [ ] batched matmul path.
   - [ ] non-contiguous/offset rejection remains safe.

@@ -23,6 +23,11 @@
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
  *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
  *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
+ *   GD_BENCH_LR_MAX=0.001     training: scheduler max LR
+ *   GD_BENCH_LR_MIN=0.0001    training: scheduler min LR
+ *   GD_BENCH_LR_WARMUP=N      training: warmup steps (default warmup iters)
+ *   GD_BENCH_LR_TOTAL=N       training: cosine horizon (default warmup+iters)
+ *   GD_BENCH_GRAD_CLIP=1.0    training: global grad norm cap; <=0 disables
  *   GD_BENCH_MLP=powlu|swiglu|gelu (default powlu)
  *   GD_POWLU_M=3.0            PowLU exponent parameter
  *
@@ -154,7 +159,14 @@ int main(void)
     gd_graph *g = NULL;
     gd_tensor *logits = NULL;
     gd_tensor *loss = NULL;
+    gd_tensor *lr_tensor = NULL;
+    gd_tensor *grad_norm = NULL;
+    gd_tensor_desc scalar_desc;
     gd_adamw_config acfg = {0};
+    gd_lr_scheduler_config lcfg = {0};
+    float grad_clip = env_float("GD_BENCH_GRAD_CLIP", 1.0F);
+    float last_lr = 0.0F;
+    int global_step = 0;
     int i = 0;
     double ms_per_iter = 0.0;
     double fwd_gflop = 0.0;
@@ -259,11 +271,28 @@ int main(void)
     printf("  fwd GFLOP   : %.3f   step GFLOP: %.3f\n", fwd_gflop, step_gflop);
 
     if (train_mode) {
-        acfg.lr = 0.001F;
+        lcfg.max_lr = env_float("GD_BENCH_LR_MAX", 0.001F);
+        lcfg.min_lr = env_float("GD_BENCH_LR_MIN", lcfg.max_lr * 0.1F);
+        lcfg.warmup_steps = env_int("GD_BENCH_LR_WARMUP", warmup);
+        lcfg.total_steps = env_int("GD_BENCH_LR_TOTAL", warmup + (iters > 0 ? iters : 1));
+        if (lcfg.total_steps <= 0) {
+            lcfg.total_steps = 1;
+        }
+        acfg.lr = 0.0F; /* mutable LR tensor drives AdamW */
         acfg.beta1 = 0.9F;
         acfg.beta2 = 0.999F;
         acfg.eps = 1e-8F;
         CHECK(gd_adamw_create(ctx, params, n_params, &acfg, &opt));
+        CHECK(gd_tensor_desc_contiguous(GD_DTYPE_F32, target, 0, NULL, &scalar_desc));
+        CHECK(gd_tensor_empty(ctx, &scalar_desc, &lr_tensor));
+        CHECK(gd_lr_scheduler_write(ctx, &lcfg, 0, lr_tensor, &last_lr));
+        printf("  lr schedule : max=%.4g min=%.4g warmup=%d total=%d\n",
+               (double)lcfg.max_lr, (double)lcfg.min_lr,
+               lcfg.warmup_steps, lcfg.total_steps);
+        printf("  grad clip   : %s", grad_clip > 0.0F ? "global-norm " : "disabled\n");
+        if (grad_clip > 0.0F) {
+            printf("%.4g\n", (double)grad_clip);
+        }
     }
 
     CHECK(gd_graph_create(ctx, &g));
@@ -271,13 +300,19 @@ int main(void)
     if (train_mode && fused_lmce) {
         CHECK(gd_gpt_forward_loss(ctx, model, tokens, positions, targets, &loss));
         CHECK(gd_backward(ctx, loss));
-        CHECK(gd_optimizer_step(ctx, opt));
+        if (grad_clip > 0.0F) {
+            CHECK(gd_clip_grad_norm(ctx, params, n_params, grad_clip, &grad_norm));
+        }
+        CHECK(gd_optimizer_step_lr(ctx, opt, lr_tensor));
     } else {
         CHECK(gd_gpt_forward(ctx, model, tokens, positions, &logits));
         if (train_mode) {
             CHECK(gd_cross_entropy(ctx, logits, targets, 2, &loss));
             CHECK(gd_backward(ctx, loss));
-            CHECK(gd_optimizer_step(ctx, opt));
+            if (grad_clip > 0.0F) {
+                CHECK(gd_clip_grad_norm(ctx, params, n_params, grad_clip, &grad_norm));
+            }
+            CHECK(gd_optimizer_step_lr(ctx, opt, lr_tensor));
         }
     }
     CHECK(gd_graph_end(ctx));
@@ -288,6 +323,10 @@ int main(void)
      * fully excluded from the measured window. */
     printf("  warmup (%d iters)...\n", warmup);
     for (i = 0; i < warmup; ++i) {
+        if (train_mode) {
+            CHECK(gd_lr_scheduler_write(ctx, &lcfg, global_step, lr_tensor, &last_lr));
+            global_step += 1;
+        }
         CHECK(gd_graph_run(g));
     }
     CHECK(gd_synchronize(ctx, target));
@@ -301,6 +340,10 @@ int main(void)
         for (i = 0; i < iters; ++i) {
             double a = now_ms();
             double b = 0.0;
+            if (train_mode) {
+                CHECK(gd_lr_scheduler_write(ctx, &lcfg, global_step, lr_tensor, &last_lr));
+                global_step += 1;
+            }
             CHECK(gd_graph_run(g));
             CHECK(gd_synchronize(ctx, target));
             b = now_ms();
@@ -310,7 +353,12 @@ int main(void)
                 if (i == 0 || iter_ms < best_ms) {
                     best_ms = iter_ms;
                 }
-                printf("  iter %3d/%d  %.3f ms\n", i + 1, iters, iter_ms);
+                if (train_mode) {
+                    printf("  iter %3d/%d  %.3f ms  lr %.4g\n",
+                           i + 1, iters, iter_ms, (double)last_lr);
+                } else {
+                    printf("  iter %3d/%d  %.3f ms\n", i + 1, iters, iter_ms);
+                }
             }
         }
         ms_per_iter = iters > 0 ? total_ms / (double)iters : 0.0;
@@ -323,13 +371,21 @@ int main(void)
         }
     }
 
+    if (train_mode && grad_norm != NULL) {
+        float last_norm = 0.0F;
+        CHECK(gd_tensor_copy_to_cpu(ctx, grad_norm, &last_norm, sizeof(last_norm)));
+        printf("  grad norm   : %.4g (last measured step)\n", (double)last_norm);
+    }
+
     gd_tensor_release(logits);
     gd_tensor_release(loss);
+    gd_tensor_release(grad_norm);
     CHECK(gd_graph_reset(g));
     CHECK(gd_graph_destroy(g));
     if (opt != NULL) {
         gd_optimizer_destroy(opt);
     }
+    gd_tensor_release(lr_tensor);
     gd_gpt_destroy(model);
     gd_tensor_release(tokens);
     gd_tensor_release(positions);

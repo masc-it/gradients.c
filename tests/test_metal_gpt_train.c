@@ -259,6 +259,7 @@ static int test_f16_amp_train_metal(gd_context *ctx, gd_tensor *tokens, gd_tenso
     gd_amp_scaler_config scfg = {0};
     int n_params = 0;
     int step = 0;
+    int i = 0;
     float loss0 = 0.0f;
     float lossN = 0.0f;
     bool stepped = false;
@@ -301,8 +302,10 @@ static int test_f16_amp_train_metal(gd_context *ctx, gd_tensor *tokens, gd_tenso
         CHECK_TRUE(isfinite(lossN));
         if (step == 0) {
             loss0 = lossN;
-            CHECK_OK(gd_tensor_grad(params[0], &grad));
-            CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+            for (i = 0; i < n_params; ++i) {
+                CHECK_OK(gd_tensor_grad(params[i], &grad));
+                CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+            }
         }
     }
     fprintf(stderr, "[gpt] f16 amp metal loss %.4f -> %.4f\n", (double)loss0, (double)lossN);

@@ -23,8 +23,9 @@
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
  *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
  *   GD_BENCH_ATTN_WINDOW      causal sliding-window attention size (default 0=full)
- *   GD_BENCH_DTYPE=f32|f16    parameter/activation dtype (F16 is forward-only v1)
- *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
+ *   GD_BENCH_DTYPE=f32|f16    parameter/activation dtype
+ *   GD_BENCH_AMP=1            training: dynamic loss scaling (required for F16)
+ *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss (required for F16)
  *   GD_BENCH_LR_MAX=0.001     training: scheduler max LR
  *   GD_BENCH_LR_MIN=0.0001    training: scheduler min LR
  *   GD_BENCH_LR_WARMUP=N      training: warmup steps (default warmup iters)
@@ -38,6 +39,7 @@
 
 #include "gradients/gradients.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -146,6 +148,7 @@ int main(void)
     const char *mode_env = getenv("GD_BENCH_MODE");
     int train_mode = (mode_env == NULL) || (strcmp(mode_env, "fwd") != 0);
     int fused_lmce = env_int("GD_BENCH_FUSED_LMCE", 0) != 0;
+    int amp_enabled = env_flag_enabled("GD_BENCH_AMP");
     const char *dtype_env = getenv("GD_BENCH_DTYPE");
     gd_dtype bench_dtype = GD_DTYPE_F32;
 
@@ -157,6 +160,7 @@ int main(void)
     gd_gpt_config cfg = {0};
     gd_gpt *model = NULL;
     gd_optimizer *opt = NULL;
+    gd_amp_scaler *scaler = NULL;
     gd_tensor **params = NULL;
     int n_params = 0;
     long total_params = 0;
@@ -173,13 +177,16 @@ int main(void)
     gd_graph *g = NULL;
     gd_tensor *logits = NULL;
     gd_tensor *loss = NULL;
+    gd_tensor *scaled_loss = NULL;
     gd_tensor *lr_tensor = NULL;
     gd_tensor *grad_norm = NULL;
     gd_tensor_desc scalar_desc;
     gd_adamw_config acfg = {0};
     gd_lr_scheduler_config lcfg = {0};
+    gd_amp_scaler_config scfg = {0};
     float grad_clip = env_float("GD_BENCH_GRAD_CLIP", 1.0F);
     float last_lr = 0.0F;
+    bool amp_stepped = false;
     int global_step = 0;
     int i = 0;
     double ms_per_iter = 0.0;
@@ -248,8 +255,13 @@ int main(void)
         gd_context_destroy(ctx);
         return 1;
     }
-    if (train_mode && cfg.param_dtype == GD_DTYPE_F16) {
-        fprintf(stderr, "config error: GD_BENCH_DTYPE=f16 is forward-only until AMP training lands\n");
+    if (train_mode && cfg.param_dtype == GD_DTYPE_F16 && !amp_enabled) {
+        fprintf(stderr, "config error: GD_BENCH_DTYPE=f16 training requires GD_BENCH_AMP=1\n");
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    if (train_mode && cfg.param_dtype == GD_DTYPE_F16 && !fused_lmce) {
+        fprintf(stderr, "config error: GD_BENCH_DTYPE=f16 training requires GD_BENCH_FUSED_LMCE=1\n");
         gd_context_destroy(ctx);
         return 1;
     }
@@ -298,8 +310,9 @@ int main(void)
     /* Print the setup up front so a long/slow run is observable immediately. */
     printf("gpt_bench\n");
     printf("  device      : %s\n", target.type == GD_DEVICE_METAL ? "metal" : "cpu");
-    printf("  mode        : %s%s\n", train_mode ? "train (fwd+bwd+adamw)" : "forward",
-           (train_mode && fused_lmce) ? " + fused_lmce" : "");
+    printf("  mode        : %s%s%s\n", train_mode ? "train (fwd+bwd+adamw)" : "forward",
+           (train_mode && fused_lmce) ? " + fused_lmce" : "",
+           (train_mode && amp_enabled) ? " + amp" : "");
     printf("  dtype       : %s\n", gd_dtype_name(cfg.param_dtype));
     printf("  params      : %ld (%.2fM)\n", total_params, (double)total_params / 1e6);
     printf("  config      : d_model=%d layers=%d heads=%d kv_heads=%d head_dim=%d d_ff=%d vocab=%d\n",
@@ -326,17 +339,31 @@ int main(void)
         if (lcfg.total_steps <= 0) {
             lcfg.total_steps = 1;
         }
-        acfg.lr = 0.0F; /* mutable LR tensor drives AdamW */
+        acfg.lr = amp_enabled ? lcfg.max_lr : 0.0F; /* non-AMP uses mutable LR tensor */
         acfg.beta1 = 0.9F;
         acfg.beta2 = 0.999F;
         acfg.eps = 1e-8F;
+        acfg.master_param_policy = GD_MASTER_PARAM_AUTO;
         CHECK(gd_adamw_create(ctx, params, n_params, &acfg, &opt));
-        CHECK(gd_tensor_desc_contiguous(GD_DTYPE_F32, target, 0, NULL, &scalar_desc));
-        CHECK(gd_tensor_empty(ctx, &scalar_desc, &lr_tensor));
-        CHECK(gd_lr_scheduler_write(ctx, &lcfg, 0, lr_tensor, &last_lr));
-        printf("  lr schedule : max=%.4g min=%.4g warmup=%d total=%d\n",
-               (double)lcfg.max_lr, (double)lcfg.min_lr,
-               lcfg.warmup_steps, lcfg.total_steps);
+        if (amp_enabled) {
+            scfg.init_scale = env_float("GD_BENCH_AMP_SCALE", 32768.0F);
+            scfg.growth_factor = 2.0F;
+            scfg.backoff_factor = 0.5F;
+            scfg.growth_interval = env_int("GD_BENCH_AMP_GROWTH", 2000);
+            scfg.min_scale = 1.0F;
+            scfg.max_scale = 1048576.0F;
+            CHECK(gd_amp_scaler_create(ctx, &scfg, &scaler));
+            printf("  lr          : fixed %.4g (AMP path)\n", (double)acfg.lr);
+            printf("  amp scale   : %.4g growth_interval=%d\n",
+                   (double)gd_amp_scaler_scale(scaler), scfg.growth_interval);
+        } else {
+            CHECK(gd_tensor_desc_contiguous(GD_DTYPE_F32, target, 0, NULL, &scalar_desc));
+            CHECK(gd_tensor_empty(ctx, &scalar_desc, &lr_tensor));
+            CHECK(gd_lr_scheduler_write(ctx, &lcfg, 0, lr_tensor, &last_lr));
+            printf("  lr schedule : max=%.4g min=%.4g warmup=%d total=%d\n",
+                   (double)lcfg.max_lr, (double)lcfg.min_lr,
+                   lcfg.warmup_steps, lcfg.total_steps);
+        }
         printf("  grad clip   : %s", grad_clip > 0.0F ? "global-norm " : "disabled\n");
         if (grad_clip > 0.0F) {
             printf("%.4g\n", (double)grad_clip);
@@ -347,20 +374,40 @@ int main(void)
     CHECK(gd_graph_begin(ctx, g));
     if (train_mode && fused_lmce) {
         CHECK(gd_gpt_forward_loss(ctx, model, tokens, positions, targets, &loss));
-        CHECK(gd_backward(ctx, loss));
-        if (grad_clip > 0.0F) {
-            CHECK(gd_clip_grad_norm(ctx, params, n_params, grad_clip, &grad_norm));
-        }
-        CHECK(gd_optimizer_step_lr(ctx, opt, lr_tensor));
-    } else {
-        CHECK(gd_gpt_forward(ctx, model, tokens, positions, &logits));
-        if (train_mode) {
-            CHECK(gd_cross_entropy(ctx, logits, targets, 2, &loss));
+        if (amp_enabled) {
+            CHECK(gd_amp_scaler_scale_loss(ctx, scaler, loss, &scaled_loss));
+            CHECK(gd_backward(ctx, scaled_loss));
+            if (grad_clip > 0.0F) {
+                CHECK(gd_optimizer_step_amp_clip(ctx, opt, scaler, grad_clip, &grad_norm));
+            } else {
+                CHECK(gd_optimizer_step_amp(ctx, opt, scaler));
+            }
+        } else {
             CHECK(gd_backward(ctx, loss));
             if (grad_clip > 0.0F) {
                 CHECK(gd_clip_grad_norm(ctx, params, n_params, grad_clip, &grad_norm));
             }
             CHECK(gd_optimizer_step_lr(ctx, opt, lr_tensor));
+        }
+    } else {
+        CHECK(gd_gpt_forward(ctx, model, tokens, positions, &logits));
+        if (train_mode) {
+            CHECK(gd_cross_entropy(ctx, logits, targets, 2, &loss));
+            if (amp_enabled) {
+                CHECK(gd_amp_scaler_scale_loss(ctx, scaler, loss, &scaled_loss));
+                CHECK(gd_backward(ctx, scaled_loss));
+                if (grad_clip > 0.0F) {
+                    CHECK(gd_optimizer_step_amp_clip(ctx, opt, scaler, grad_clip, &grad_norm));
+                } else {
+                    CHECK(gd_optimizer_step_amp(ctx, opt, scaler));
+                }
+            } else {
+                CHECK(gd_backward(ctx, loss));
+                if (grad_clip > 0.0F) {
+                    CHECK(gd_clip_grad_norm(ctx, params, n_params, grad_clip, &grad_norm));
+                }
+                CHECK(gd_optimizer_step_lr(ctx, opt, lr_tensor));
+            }
         }
     }
     CHECK(gd_graph_end(ctx));
@@ -371,11 +418,19 @@ int main(void)
      * fully excluded from the measured window. */
     printf("  warmup (%d iters)...\n", warmup);
     for (i = 0; i < warmup; ++i) {
-        if (train_mode) {
+        if (train_mode && !amp_enabled) {
             CHECK(gd_lr_scheduler_write(ctx, &lcfg, global_step, lr_tensor, &last_lr));
             global_step += 1;
+        } else if (train_mode) {
+            global_step += 1;
+        }
+        if (train_mode) {
+            CHECK(gd_optimizer_zero_grad(ctx, opt));
         }
         CHECK(gd_graph_run(g));
+        if (train_mode && amp_enabled) {
+            CHECK(gd_amp_scaler_update(ctx, scaler, &amp_stepped));
+        }
     }
     CHECK(gd_synchronize(ctx, target));
 
@@ -388,12 +443,20 @@ int main(void)
         for (i = 0; i < iters; ++i) {
             double a = now_ms();
             double b = 0.0;
-            if (train_mode) {
+            if (train_mode && !amp_enabled) {
                 CHECK(gd_lr_scheduler_write(ctx, &lcfg, global_step, lr_tensor, &last_lr));
                 global_step += 1;
+            } else if (train_mode) {
+                global_step += 1;
+            }
+            if (train_mode) {
+                CHECK(gd_optimizer_zero_grad(ctx, opt));
             }
             CHECK(gd_graph_run(g));
             CHECK(gd_synchronize(ctx, target));
+            if (train_mode && amp_enabled) {
+                CHECK(gd_amp_scaler_update(ctx, scaler, &amp_stepped));
+            }
             b = now_ms();
             {
                 double iter_ms = b - a;
@@ -401,7 +464,11 @@ int main(void)
                 if (i == 0 || iter_ms < best_ms) {
                     best_ms = iter_ms;
                 }
-                if (train_mode) {
+                if (train_mode && amp_enabled) {
+                    printf("  iter %3d/%d  %.3f ms  scale %.4g %s\n",
+                           i + 1, iters, iter_ms, (double)gd_amp_scaler_scale(scaler),
+                           amp_stepped ? "step" : "skip");
+                } else if (train_mode) {
                     printf("  iter %3d/%d  %.3f ms  lr %.4g\n",
                            i + 1, iters, iter_ms, (double)last_lr);
                 } else {
@@ -427,12 +494,14 @@ int main(void)
 
     gd_tensor_release(logits);
     gd_tensor_release(loss);
+    gd_tensor_release(scaled_loss);
     gd_tensor_release(grad_norm);
     CHECK(gd_graph_reset(g));
     CHECK(gd_graph_destroy(g));
     if (opt != NULL) {
         gd_optimizer_destroy(opt);
     }
+    gd_amp_scaler_destroy(scaler);
     gd_tensor_release(lr_tensor);
     gd_gpt_destroy(model);
     gd_tensor_release(tokens);

@@ -5,6 +5,18 @@
 
 #include "gradients/graph.h"
 #include "gradients/tensor.h"
+#include "refcount.h"
+
+struct gd_tensor {
+    gd_refcount refcount;
+    gd_tensor_desc desc;
+    gd_storage *storage;
+    gd_graph *graph;
+    int value_id;
+    bool requires_grad;
+    gd_tensor *grad;
+    char *name;
+};
 
 gd_status _gd_tensor_create_virtual(gd_graph *graph,
                                     int value_id,

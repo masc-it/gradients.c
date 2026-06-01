@@ -1199,9 +1199,9 @@ Current codebase inventory used to ground this plan:
 - [x] Remove all oversized source files from `docs/size_allowlist.txt`.
 - [x] Make `size-check` hard-fail all source files over 1000 LOC with no allowlist exceptions.
 - [x] Regenerate `build/generated/op_matrix.md` and verify it lists core/grad/CPU/Metal coverage by op.
-- [ ] Run full CPU validation: `make clean && make test GD_ENABLE_METAL=0`.
-- [ ] Run full macOS/Metal validation: `make clean && make test`.
-- [ ] Run examples/bench smoke checks: `make mlp`, `make gpt`, and relevant GPT bench target.
+- [x] Run full CPU validation: `make clean && make test GD_ENABLE_METAL=0`.
+- [x] Run full macOS/Metal validation: `make clean && make test`.
+- [x] Run examples/bench smoke checks: `make mlp`, `make gpt`, and relevant GPT bench target.
 
 ### 24.13 Add CUDA/Vulkan skeletons after registry is stable
 

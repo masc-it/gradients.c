@@ -5,9 +5,10 @@
 /* Long GPT graphs run faster when submitted as a stream of small command
  * buffers instead of one monolithic buffer. On M-series GPUs, large command
  * buffers with repeated scratch-buffer hazards (notably long-context SDPA)
- * hit a scheduler/hazard-tracking cliff. Keep the default conservative and
- * override with GD_METAL_CMD_CHUNK=0 to force the old single-buffer path. */
-#define GD_METAL_DEFAULT_CMD_CHUNK 8
+ * hit a scheduler/hazard-tracking cliff. Causal SDPA specializations need a
+ * slightly smaller chunk to stay on the fast sustained path for long training
+ * runs. Override with GD_METAL_CMD_CHUNK=0 to force the old single-buffer path. */
+#define GD_METAL_DEFAULT_CMD_CHUNK 4
 
 static int metal_command_chunk_size(void)
 {

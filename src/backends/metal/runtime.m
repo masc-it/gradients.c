@@ -1,5 +1,7 @@
 #import "metal_internal.h"
 
+#include <stdlib.h>
+
 @implementation GDMetalState
 @end
 
@@ -26,14 +28,42 @@ gd_metal_sdpa_bwd_layout _gd_metal_sdpa_bwd_scratch_layout(int B, int Hq, int Hk
 /* Split-K key partitioning for the forward SDPA, derived purely from Tk so the
  * compile-time scratch size and the encode-time dispatch agree. Returns 1 (no
  * split) for short sequences, keeping them on the single-pass tiled kernel. */
+static int metal_env_positive_int(const char *name, int fallback, int min_value, int max_value)
+{
+    const char *v = getenv(name);
+    char *end = NULL;
+    long n = fallback;
+
+    if (v == NULL || v[0] == '\0') {
+        return fallback;
+    }
+    n = strtol(v, &end, 10);
+    if (end == v || n < (long)min_value) {
+        return fallback;
+    }
+    if (n > (long)max_value) {
+        return max_value;
+    }
+    return (int)n;
+}
+
 int _gd_metal_sdpa_num_splits(int Tk)
 {
-    int s = (Tk + GD_METAL_SDPA_SPLIT_MIN - 1) / GD_METAL_SDPA_SPLIT_MIN;
+    int split_min = metal_env_positive_int("GD_METAL_SDPA_SPLIT_MIN",
+                                           GD_METAL_SDPA_SPLIT_MIN,
+                                           GD_METAL_SDPA_BK,
+                                           1 << 20);
+    int split_max = metal_env_positive_int("GD_METAL_SDPA_SPLIT_MAX",
+                                           GD_METAL_SDPA_SPLIT_MAX,
+                                           1,
+                                           1024);
+    int s = (Tk + split_min - 1) / split_min;
+
     if (s < 1) {
         s = 1;
     }
-    if (s > GD_METAL_SDPA_SPLIT_MAX) {
-        s = GD_METAL_SDPA_SPLIT_MAX;
+    if (s > split_max) {
+        s = split_max;
     }
     return s;
 }

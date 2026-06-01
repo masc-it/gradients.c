@@ -131,8 +131,10 @@ Evidence:
 | `B=4 T=2048`, command chunk 8 | `~4.52s` | chunking fixes long-context case too |
 
 Implemented fix: normal Metal execution now submits graphs as a stream of small
-command buffers, default chunk size `8` encoded graph nodes. `GD_METAL_CMD_CHUNK=0`
-forces the old single-command-buffer path for A/B testing.
+command buffers. Initial default was `8` encoded graph nodes; the SDPA causal
+specialization pass later lowered the default to `4` for better sustained
+long-context training. `GD_METAL_CMD_CHUNK=0` forces the old
+single-command-buffer path for A/B testing.
 
 Post-fix baseline for original command (`B=8 T=1024`, 2 warmup + 10 measured):
 
@@ -149,8 +151,8 @@ faster than trace, as expected.
 
 1. Keep command-buffer chunking enabled by default; use `GD_METAL_CMD_CHUNK=0`
    only for regression/debug A/B tests.
-2. Optimize `sdpa_bwd` Metal kernel.
-3. Optimize `sdpa` Metal forward kernel.
+2. Optimize `sdpa_bwd` Metal kernel (see `plan_sdpa_perf_optim.md`).
+3. Optimize `sdpa` Metal forward kernel (see `plan_sdpa_perf_optim.md`).
 4. Re-profile GEMM/MPS after attention improvements, especially for wider
    20M-ish configs or shorter sequence lengths.
 5. Keep fused LMCE as-is for now. At vocab 8k it is not current bottleneck.

@@ -1,5 +1,7 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdlib.h>
+
 static void fill_sdpa_params(gd_metal_sdpa_params *p,
                              const gd_tensor_desc *q_desc,
                              const gd_tensor_desc *k_desc,
@@ -23,6 +25,17 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
     p->n_splits = 1;
     p->split_len = p->Tk;
+}
+
+static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
+{
+    const char *fast = getenv("GD_METAL_SDPA_CAUSAL_FAST");
+
+    if (fast != NULL && fast[0] == '0') {
+        return false;
+    }
+    return p != NULL && p->causal != 0 && p->window == 0 && p->prefix_len == 0 &&
+           p->has_bias == 0;
 }
 
 static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
@@ -81,6 +94,16 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             id<MTLComputePipelineState> sdqc_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_combine");
             id<MTLComputePipelineState> dks_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split");
             id<MTLComputePipelineState> dkr_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_reduce");
+            if (sdpa_is_causal_no_bias(&p)) {
+                id<MTLComputePipelineState> fast_sdq =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
+                id<MTLComputePipelineState> fast_dks =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
+                if (fast_sdq != nil && fast_dks != nil) {
+                    sdq_pso = fast_sdq;
+                    dks_pso = fast_dks;
+                }
+            }
             id<MTLBuffer> go_b = _gd_metal_value_buffer(exe, node->inputs[0]);
             id<MTLBuffer> q_b = _gd_metal_value_buffer(exe, node->inputs[1]);
             id<MTLBuffer> k_b = _gd_metal_value_buffer(exe, node->inputs[2]);

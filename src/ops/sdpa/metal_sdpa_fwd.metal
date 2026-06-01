@@ -52,6 +52,25 @@ static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk,
     }
     return lim;
 }
+static inline int gd_sdpa_causal_kb_end(int q0, int bq, int Tq, int Tk)
+{
+    int qmax = q0 + bq - 1;
+    if (qmax > Tq - 1) {
+        qmax = Tq - 1;
+    }
+    int lim = qmax + (Tk - Tq) + 1;
+    if (lim < 0) {
+        lim = 0;
+    }
+    if (lim > Tk) {
+        lim = Tk;
+    }
+    return lim;
+}
+static inline bool gd_sdpa_causal_allowed(int i, int j, int Tq, int Tk)
+{
+    return j <= i + (Tk - Tq);
+}
 static inline float gd_sdpa_dot(device const float *a, device const float *b, int n)
 {
     float s = 0.0f;
@@ -154,6 +173,87 @@ kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
         }
     }
 }
+kernel void gd_sdpa_tiled_causal(device const float *q              [[buffer(0)]],
+                                  device const float *k              [[buffer(1)]],
+                                  device const float *v              [[buffer(2)]],
+                                  device const float *bias           [[buffer(3)]],
+                                  device float *out                  [[buffer(4)]],
+                                  constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                                  uint tgid [[threadgroup_position_in_grid]],
+                                  uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int qb = (int)tgid % n_qb;
+    int r = (int)tgid / n_qb; /* b*Hq + hq */
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_causal_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk);
+    for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        int tile = kb_end - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        /* Cooperatively stage this key tile (all threads participate). */
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_causal_allowed(i, j, p.Tq, p.Tk)) {
+                    float s = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    s *= p.scale;
+                    float mnew = (s > m) ? s : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(s - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        if (l > 0.0f) {
+            for (int c = 0; c < p.Dh; ++c) {
+                out[qbase + c] = acc[c] / l;
+            }
+        } else {
+            for (int c = 0; c < p.Dh; ++c) {
+                out[qbase + c] = 0.0f;
+            }
+        }
+    }
+}
 kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
                            device const float *k              [[buffer(1)]],
                            device const float *v              [[buffer(2)]],
@@ -216,6 +316,90 @@ kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
                         ss += qreg[c] * ksh[jj * p.Dh + c];
                     }
                     ss = p.scale * ss + gd_sdpa_bias_at(bias, p, b, hq, i, j);
+                    float mnew = (ss > m) ? ss : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(ss - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        for (int c = 0; c < p.Dh; ++c) {
+            partials[base + c] = acc[c];
+        }
+        partials[base + p.Dh] = m;
+        partials[base + p.Dh + 1] = l;
+    }
+}
+kernel void gd_sdpa_splitk_causal(device const float *q              [[buffer(0)]],
+                                   device const float *k              [[buffer(1)]],
+                                   device const float *v              [[buffer(2)]],
+                                   device const float *bias           [[buffer(3)]],
+                                   device float *partials             [[buffer(4)]],
+                                   constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                                   uint tgid [[threadgroup_position_in_grid]],
+                                   uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int s = (int)tgid % p.n_splits;
+    int t2 = (int)tgid / p.n_splits;
+    int qb = t2 % n_qb;
+    int r = t2 / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_causal_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk);
+    int k_lo = s * p.split_len;
+    int k_hi = k_lo + p.split_len;
+    if (k_hi > kb_end) {
+        k_hi = kb_end;
+    }
+    for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        int tile = k_hi - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = k[kbase + c];
+            vsh[jj * p.Dh + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_causal_allowed(i, j, p.Tq, p.Tk)) {
+                    float ss = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        ss += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    ss *= p.scale;
                     float mnew = (ss > m) ? ss : m;
                     float corr = exp(m - mnew);
                     float e = exp(ss - mnew);

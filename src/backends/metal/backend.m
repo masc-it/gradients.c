@@ -45,11 +45,15 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv",
     "gd_sdpa_bwd_stats",
     "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
+    "gd_sdpa_tiled_causal", /* GPT-style causal/no-bias forward */
     "gd_sdpa_splitk",  /* split-K forward (long context) */
+    "gd_sdpa_splitk_causal", /* GPT-style causal/no-bias split-K forward */
     "gd_sdpa_combine", /* split-K combine pass */
     "gd_sdpa_bwd_stats_dq_split",
+    "gd_sdpa_bwd_stats_dq_split_causal",
     "gd_sdpa_bwd_stats_dq_combine",
     "gd_sdpa_bwd_dkv_split",
+    "gd_sdpa_bwd_dkv_split_causal",
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
     "gd_add_rms_norm", /* F4: residual add + RMSNorm forward */

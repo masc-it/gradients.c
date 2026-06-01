@@ -1,5 +1,7 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdlib.h>
+
 static void fill_sdpa_params(gd_metal_sdpa_params *p,
                              const gd_tensor_desc *q_desc,
                              const gd_tensor_desc *k_desc,
@@ -23,6 +25,17 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     p->Tkb = bias_desc != NULL ? (int)bias_desc->sizes[3] : 1;
     p->n_splits = 1;
     p->split_len = p->Tk;
+}
+
+static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
+{
+    const char *fast = getenv("GD_METAL_SDPA_CAUSAL_FAST");
+
+    if (fast != NULL && fast[0] == '0') {
+        return false;
+    }
+    return p != NULL && p->causal != 0 && p->window == 0 && p->prefix_len == 0 &&
+           p->has_bias == 0;
 }
 
 static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
@@ -55,6 +68,12 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
      * allocated at compile (Dh <= DHT and >1 split). */
     if (p.Dh <= GD_METAL_SDPA_DHT && scratch != nil &&
         splitk_pso != nil && combine_pso != nil) {
+        if (sdpa_is_causal_no_bias(&p)) {
+            id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_causal");
+            if (fast != nil) {
+                splitk_pso = fast;
+            }
+        }
         p.n_splits = _gd_metal_sdpa_num_splits(p.Tk);
         p.split_len = _gd_metal_sdpa_split_len(p.Tk, p.n_splits);
         /* Pass 1: per-split partial online-softmax into scratch. */
@@ -92,6 +111,12 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
     if (p.Dh <= GD_METAL_SDPA_DHT) {
         /* Tiled: one threadgroup per (b, hq, query-block) of GD_METAL_SDPA_BQ. */
         NSUInteger groups = (NSUInteger)(p.B * p.Hq * n_qb);
+        if (sdpa_is_causal_no_bias(&p)) {
+            id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_tiled_causal");
+            if (fast != nil) {
+                pso = fast;
+            }
+        }
         [enc setComputePipelineState:pso];
         if (groups > 0) {
             [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)

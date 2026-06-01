@@ -1195,10 +1195,10 @@ Current codebase inventory used to ground this plan:
 
 ### 24.12 Remove compatibility shims and enforce final policy
 
-- [ ] Delete empty legacy files: old `op_schema.c`, old `shape.c`, old CPU/Metal central switches, old kernel monoliths.
-- [ ] Remove all oversized source files from `docs/size_allowlist.txt`.
-- [ ] Make `size-check` hard-fail all source files over 1000 LOC with no allowlist exceptions.
-- [ ] Regenerate `build/generated/op_matrix.md` and verify it lists core/grad/CPU/Metal coverage by op.
+- [x] Delete empty legacy files: old `op_schema.c`, old `shape.c`, old CPU/Metal central switches, old kernel monoliths.
+- [x] Remove all oversized source files from `docs/size_allowlist.txt`.
+- [x] Make `size-check` hard-fail all source files over 1000 LOC with no allowlist exceptions.
+- [x] Regenerate `build/generated/op_matrix.md` and verify it lists core/grad/CPU/Metal coverage by op.
 - [ ] Run full CPU validation: `make clean && make test GD_ENABLE_METAL=0`.
 - [ ] Run full macOS/Metal validation: `make clean && make test`.
 - [ ] Run examples/bench smoke checks: `make mlp`, `make gpt`, and relevant GPT bench target.

@@ -1,2 +1,2 @@
-# Current source files over 1000 LOC allowed during big refactor.
-# Format: path owner reason removal_target
+# No source files are allowlisted.
+# size-check hard-fails any source file over 1000 LOC.

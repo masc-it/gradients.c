@@ -127,7 +127,7 @@ help:
 	@printf '%s\n' '  make build       build library'
 	@printf '%s\n' '  make test        build library + tests, then run all tests'
 	@printf '%s\n' '  make check       build, run docs/size checks, then run tests'
-	@printf '%s\n' '  make size-check  warn >800 LOC and fail new non-allowlisted >1000 LOC'
+	@printf '%s\n' '  make size-check  warn >800 LOC and fail >1000 LOC'
 	@printf '%s\n' '  make generated   regenerate operator registry scaffolding'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
@@ -233,18 +233,12 @@ size-check-report:
 
 size-check:
 	@set -euo pipefail; \
-	allowlist='$(DOCS_DIR)/size_allowlist.txt'; \
-	test -f "$$allowlist"; \
 	fail=0; \
 	while IFS= read -r f; do \
 		n=$$(wc -l < "$$f" | tr -d ' '); \
 		if (( n > 1000 )); then \
-			if awk -v p="$$f" '($$0 !~ /^[[:space:]]*(#|$$)/ && $$1 == p) { found = 1 } END { exit found ? 0 : 1 }' "$$allowlist"; then \
-				printf 'size-check: WARN allowlisted %s has %s lines\n' "$$f" "$$n"; \
-			else \
-				printf 'size-check: FAIL %s has %s lines (>1000) and is not allowlisted\n' "$$f" "$$n"; \
-				fail=1; \
-			fi; \
+			printf 'size-check: FAIL %s has %s lines (>1000)\n' "$$f" "$$n"; \
+			fail=1; \
 		elif (( n > 800 )); then \
 			printf 'size-check: WARN %s has %s lines\n' "$$f" "$$n"; \
 		fi; \

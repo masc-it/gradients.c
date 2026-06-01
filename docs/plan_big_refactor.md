@@ -1114,20 +1114,20 @@ Current codebase inventory used to ground this plan:
 
 ### 24.5 Move autograd rules into op capsules
 
-- [ ] Add `src/autograd/autograd_internal.h` exposing `_gd_bwd_ctx` helpers for rule files.
-- [ ] Add `_gd_bwd_rule` type and generated `bwd_registry.inc` lookup.
-- [ ] Move elementwise rules: `add`, `mul`, `scale`.
-- [ ] Move activation rules: `relu`, `silu`, `powlu`, `gelu`.
-- [ ] Move linalg rules: `matmul`, `linear`.
-- [ ] Move reduction rules: `sum`, `mean`, `softmax`.
-- [ ] Move loss rules: `cross_entropy`, `lm_cross_entropy`.
-- [ ] Move layout/index/attention/norm rules: `copy`, `transpose`, `embedding`, `rope`, `rms_norm`, `sdpa`.
-- [ ] Add explicit unsupported rule entry for `cast` with current message `cast backward is not supported in v1`.
-- [ ] Replace `backward_node()` switch in `src/autograd/autograd.c` with registry dispatch.
-- [ ] Keep engine responsibilities in `autograd.c`: traversal, seed grad, accumulation, leaf grad writes, cleanup.
-- [ ] Add `tests/test_autograd_registry.c` to require grad rules for every `GD_OPF_DIFF` public op or explicit unsupported reason.
-- [ ] Validate: `tests/test_autograd` and `tests/test_metal_gpt_train` pass under CPU.
-- [ ] Validate: `make test GD_ENABLE_METAL=0` still passes.
+- [x] Add `src/autograd/autograd_internal.h` exposing `_gd_bwd_ctx` helpers for rule files.
+- [x] Add `_gd_bwd_rule` type and generated `bwd_registry.inc` lookup.
+- [x] Move elementwise rules: `add`, `mul`, `scale`.
+- [x] Move activation rules: `relu`, `silu`, `powlu`, `gelu`.
+- [x] Move linalg rules: `matmul`, `linear`.
+- [x] Move reduction rules: `sum`, `mean`, `softmax`.
+- [x] Move loss rules: `cross_entropy`, `lm_cross_entropy`.
+- [x] Move layout/index/attention/norm rules: `copy`, `transpose`, `embedding`, `rope`, `rms_norm`, `sdpa`.
+- [x] Add explicit unsupported rule entry for `cast` with current message `cast backward is not supported in v1`.
+- [x] Replace `backward_node()` switch in `src/autograd/autograd.c` with registry dispatch.
+- [x] Keep engine responsibilities in `autograd.c`: traversal, seed grad, accumulation, leaf grad writes, cleanup.
+- [x] Add `tests/test_autograd_registry.c` to require grad rules for every `GD_OPF_DIFF` public op or explicit unsupported reason.
+- [x] Validate: `tests/test_autograd` and `tests/test_metal_gpt_train` pass under CPU.
+- [x] Validate: `make test GD_ENABLE_METAL=0` still passes.
 
 ### 24.6 Move CPU_REF op implementations into capsules
 

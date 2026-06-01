@@ -34,7 +34,9 @@ static gd_status rope_bwd_encode(_gd_metal_encode_ctx *ctx)
     p.rows = p.head_dim > 0 ? (int)(_gd_metal_desc_numel(out_desc) / head_dim) : 0;
     p.n_dims = node->attrs.rope_n_dims;
     p.interleaved = node->attrs.rope_interleaved;
-    p.dtype = GD_METAL_DT_F32;
+    if (_gd_metal_dtype_code(out_desc->dtype, &p.dtype) != GD_OK) {
+        return _gd_error(GD_ERR_DTYPE, "metal rope_bwd dtype unsupported");
+    }
     p.theta = node->attrs.rope_theta;
     p.sin_sign = sin_sign;
     [enc setComputePipelineState:pso];

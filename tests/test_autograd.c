@@ -864,6 +864,65 @@ static int test_f16_activation_backwards(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_rope_backward(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t xs[3] = {2, 1, 4};
+    int64_t ps[1] = {2};
+    uint16_t xh[8] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U,
+                      0x3800U, 0xbc00U, 0xc000U, 0x3c00U};
+    int32_t pos[2] = {0, 1};
+    float gx[8] = {0};
+    gd_tensor_desc xdesc;
+    gd_tensor_desc pdesc;
+    gd_rope_config cfg = {0};
+    gd_tensor *x = NULL;
+    gd_tensor *p = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *yf = NULL;
+    gd_tensor *m0 = NULL;
+    gd_tensor *m1 = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 3, xs, &xdesc));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, ps, &pdesc));
+    CHECK_OK(gd_tensor_empty(ctx, &xdesc, &x));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
+    CHECK_OK(gd_tensor_set_requires_grad(x, true));
+    CHECK_OK(gd_tensor_empty(ctx, &pdesc, &p));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, p, pos, sizeof(pos)));
+    cfg.theta = 10000.0F;
+    cfg.n_dims = 4;
+    cfg.interleaved = false;
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_rope(ctx, x, p, &cfg, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
+    CHECK_OK(gd_mean(ctx, m0, 0, false, &m1));
+    CHECK_OK(gd_mean(ctx, m1, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_grad(x, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gx, sizeof(gx)));
+    CHECK_TRUE(isfinite(gx[0]) && isfinite(gx[7]));
+    gd_tensor_release(loss);
+    gd_tensor_release(m1);
+    gd_tensor_release(m0);
+    gd_tensor_release(yf);
+    gd_tensor_release(y);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(p);
+    gd_tensor_release(x);
+    return 0;
+}
+
 static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
                                  const float *data, gd_tensor **out)
 {
@@ -908,6 +967,7 @@ int main(void)
     CHECK_TRUE(test_f16_embedding_leaf_grad(ctx) == 0);
     CHECK_TRUE(test_f16_rms_norm_weight_grad(ctx) == 0);
     CHECK_TRUE(test_f16_activation_backwards(ctx) == 0);
+    CHECK_TRUE(test_f16_rope_backward(ctx) == 0);
 
     {
         two_in t = {0};

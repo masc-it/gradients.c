@@ -349,7 +349,7 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
   - [ ] tied LM weight grad F32.
 - [x] RMSNorm backward typed F16/F32 as defined.
 - [x] activation backward typed F16.
-- [ ] RoPE backward typed F16.
+- [x] RoPE backward typed F16.
 - [x] embedding backward accumulates F32 weight grad.
 - [ ] SDPA backward typed F16:
   - [ ] full causal path.

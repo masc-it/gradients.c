@@ -93,6 +93,8 @@ gd_status gd_tensor_from_storage(gd_context *ctx,
 gd_status gd_tensor_retain(gd_tensor *tensor);
 void gd_tensor_release(gd_tensor *tensor);
 
+/* Raw byte transfer helpers. Buffers must already use tensor dtype/layout bytes;
+ * no numeric dtype conversion is performed. Use gd_cast for typed conversion. */
 gd_status gd_tensor_copy_from_cpu(gd_context *ctx,
                                   gd_tensor *dst,
                                   const void *src,

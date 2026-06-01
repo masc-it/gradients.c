@@ -443,10 +443,11 @@ static int test_reduce_softmax_ce_cast(gd_context *ctx)
 
 static int test_f16_cast_cpu(gd_context *ctx)
 {
-    int64_t s6[1] = {6};
-    float data[6] = {0.0F, 1.0F, -2.5F, 1.0F / 3.0F, 65504.0F, 1.0e-8F};
-    float roundtrip[6] = {0};
-    uint16_t half_bits[6] = {0};
+    int64_t s11[1] = {11};
+    float data[11] = {0.0F, 1.0F, -2.5F, 1.0F / 3.0F, 65504.0F, 1.0e-8F,
+                      INFINITY, -INFINITY, NAN, 5.96046448e-8F, 6.103515625e-5F};
+    float roundtrip[11] = {0};
+    uint16_t half_bits[11] = {0};
     gd_device cpu = {GD_DEVICE_CPU, 0};
     gd_tensor_desc f16_desc;
     gd_tensor *x = NULL;
@@ -457,10 +458,10 @@ static int test_f16_cast_cpu(gd_context *ctx)
     size_t alignment = 0U;
     int i = 0;
 
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s6, &f16_desc));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s11, &f16_desc));
     CHECK_OK(gd_tensor_desc_nbytes(&f16_desc, &nbytes, &alignment));
     CHECK_TRUE(nbytes == sizeof(half_bits));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 1, s6, &x));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 1, s11, &x));
     CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, data, sizeof(data)));
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
@@ -475,9 +476,22 @@ static int test_f16_cast_cpu(gd_context *ctx)
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, y, roundtrip, sizeof(roundtrip)));
     CHECK_TRUE(half_bits[1] == 0x3c00U);
     CHECK_TRUE(half_bits[2] == 0xc100U);
-    for (i = 0; i < 6; ++i) {
-        float tol = 1.0e-3F * (fabsf(data[i]) > 1.0F ? fabsf(data[i]) : 1.0F);
-        CHECK_TRUE(fabsf(roundtrip[i] - data[i]) <= tol);
+    CHECK_TRUE(half_bits[5] == 0x0000U);
+    CHECK_TRUE(half_bits[6] == 0x7c00U);
+    CHECK_TRUE(half_bits[7] == 0xfc00U);
+    CHECK_TRUE((half_bits[8] & 0x7c00U) == 0x7c00U && (half_bits[8] & 0x03ffU) != 0U);
+    CHECK_TRUE(half_bits[9] == 0x0001U);
+    CHECK_TRUE(half_bits[10] == 0x0400U);
+    for (i = 0; i < 11; ++i) {
+        if (isnan(data[i])) {
+            CHECK_TRUE(isnan(roundtrip[i]));
+        } else if (isinf(data[i])) {
+            CHECK_TRUE(isinf(roundtrip[i]) &&
+                       ((signbit(roundtrip[i]) != 0) == (signbit(data[i]) != 0)));
+        } else {
+            float tol = 1.0e-3F * (fabsf(data[i]) > 1.0F ? fabsf(data[i]) : 1.0F);
+            CHECK_TRUE(fabsf(roundtrip[i] - data[i]) <= tol);
+        }
     }
     gd_tensor_release(y);
     gd_tensor_release(h);

@@ -453,7 +453,7 @@ gd_status gd_tensor_copy_to_cpu(gd_context *ctx, gd_tensor *src,
                                 void *dst, size_t nbytes);
 ```
 
-These are explicit transfers/materializations; they are not compute fallbacks. `gd_tensor_copy_from_cpu` requires `dst` to be materialized. `gd_tensor_copy_to_cpu` materializes virtual `src` if needed.
+These are explicit transfers/materializations; they are not compute fallbacks. `gd_tensor_copy_from_cpu` requires `dst` to be materialized. `gd_tensor_copy_to_cpu` materializes virtual `src` if needed. Both helpers copy raw tensor storage bytes only: caller buffers must already be encoded in the tensor dtype/layout (for example binary16 bytes for `GD_DTYPE_F16`). Use `gd_cast` for numeric dtype conversion.
 
 Queries:
 

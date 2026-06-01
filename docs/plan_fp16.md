@@ -137,7 +137,7 @@ understand.
   - [x] `_gd_f32_to_f16_bits(float)`.
   - [x] `_gd_f16_bits_to_f32(uint16_t)`.
   - [x] deterministic round-to-nearest-even behavior.
-  - [ ] NaN/Inf/subnormal tests.
+  - [x] NaN/Inf/subnormal tests.
 - [ ] Extend CPU_REF typed load/store helpers:
   - [x] F32 load/store.
   - [x] F16 load/store through F32 compute.
@@ -150,7 +150,7 @@ understand.
   - [x] F32 -> F16 -> F32 tolerance.
   - [x] CPU/Metal cast parity.
   - [x] materialize virtual F16 tensor to CPU.
-- [ ] Add raw-copy docs: `gd_tensor_copy_from_cpu()` remains raw bytes; typed
+- [x] Add raw-copy docs: `gd_tensor_copy_from_cpu()` remains raw bytes; typed
       conversion uses `gd_cast` or new helper if added.
 
 ## Phase 2: loss dtype and scalar correctness

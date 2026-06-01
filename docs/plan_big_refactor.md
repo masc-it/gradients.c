@@ -1131,16 +1131,16 @@ Current codebase inventory used to ground this plan:
 
 ### 24.6 Move CPU_REF op implementations into capsules
 
-- [ ] Add `src/backends/cpu_ref/cpu_op.h` with `_gd_cpu_op`, support fn, run fn, and `_gd_cpu_exec` access helpers.
-- [ ] Generate `cpu_registry.inc` from `cpu_<op>_<role>.c` files.
-- [ ] Replace `cpu_run_node()` switch in `src/backends/cpu_ref/cpu_ref.c` with CPU op lookup.
-- [ ] Move simple CPU ops into capsules: `add`, `mul`, `scale`, `relu`, `silu`, `gelu`, `copy`, `cast`.
-- [ ] Move linalg/reduction/norm/loss/index/attention CPU ops into capsules.
-- [ ] Move internal backward CPU ops into capsules.
-- [ ] Split `src/backends/cpu_ref/cpu_kernels.c` into shared helpers plus per-op `cpu_*` files until file is under 1000 LOC or removed.
-- [ ] Keep CPU_REF support complete for all graph ops used by existing tests.
-- [ ] Add `tests/test_backend_registry.c` coverage for CPU_REF missing-op errors.
-- [ ] Validate: `make test GD_ENABLE_METAL=0` still passes.
+- [x] Add `src/backends/cpu_ref/cpu_op.h` with `_gd_cpu_op`, support fn, run fn, and `_gd_cpu_exec` access helpers.
+- [x] Generate `cpu_registry.inc` from `cpu_<op>_<role>.c` files.
+- [x] Replace `cpu_run_node()` switch in `src/backends/cpu_ref/cpu_ref.c` with CPU op lookup.
+- [x] Move simple CPU ops into capsules: `add`, `mul`, `scale`, `relu`, `silu`, `gelu`, `copy`, `cast`.
+- [x] Move linalg/reduction/norm/loss/index/attention CPU ops into capsules.
+- [x] Move internal backward CPU ops into capsules.
+- [x] Split `src/backends/cpu_ref/cpu_kernels.c` into shared helpers plus per-op `cpu_*` files until file is under 1000 LOC or removed.
+- [x] Keep CPU_REF support complete for all graph ops used by existing tests.
+- [x] Add `tests/test_backend_registry.c` coverage for CPU_REF missing-op errors.
+- [x] Validate: `make test GD_ENABLE_METAL=0` still passes.
 
 ### 24.7 Split Metal runtime before moving Metal ops
 

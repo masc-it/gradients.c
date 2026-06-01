@@ -13,6 +13,12 @@ extern "C" {
 
 typedef struct gd_optimizer gd_optimizer;
 
+typedef enum gd_master_param_policy {
+    GD_MASTER_PARAM_AUTO = 0,
+    GD_MASTER_PARAM_DISABLED = 1,
+    GD_MASTER_PARAM_ALWAYS = 2
+} gd_master_param_policy;
+
 typedef struct gd_adamw_config {
     float lr;
     float beta1;
@@ -20,6 +26,7 @@ typedef struct gd_adamw_config {
     float eps;
     float weight_decay;
     gd_dtype state_dtype;
+    gd_master_param_policy master_param_policy;
     int use_state_device;
     gd_device state_device;
 } gd_adamw_config;

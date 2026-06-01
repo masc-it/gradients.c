@@ -13,8 +13,8 @@ default path.
 - [ ] FP16 is opt-in until correctness, fallback, and perf gates pass.
 - [ ] No pure-FP16 training mode. Training is mixed precision only.
 - [ ] FP16 storage is allowed; numerically sensitive accumulation stays F32.
-- [ ] Leaf gradients consumed by optimizers are F32.
-- [ ] AdamW state and master params are F32 for F16 model params.
+- [x] Leaf gradients consumed by optimizers are F32.
+- [x] AdamW state and master params are F32 for F16 model params.
 - [ ] Loss scalar passed to `gd_backward()` is F32.
 - [ ] Metal F16 graphs must fail closed if unsupported, not silently CPU-fallback.
 - [ ] CPU_REF supports every F16 op claimed as public/supported, for parity tests.
@@ -38,15 +38,15 @@ default path.
 ### Training contract
 
 - [ ] Model params used by forward/backward: F16.
-- [ ] Optimizer-owned master params: F32.
-- [ ] AdamW `m`/`v`: F32.
+- [x] Optimizer-owned master params: F32.
+- [x] AdamW `m`/`v`: F32.
 - [ ] Forward activations: F16 where safe.
 - [ ] Backward activation grads: F16 allowed for internal flow.
-- [ ] Parameter gradients: F32 before accumulation into leaf grad slots.
+- [x] Parameter gradients: F32 before accumulation into leaf grad slots.
 - [ ] Reductions, norms, softmax, SDPA stats, CE/lmCE: F32 math.
 - [ ] Loss scaling: dynamic scaler scales F32 loss, unscales F32 grads, checks
       finite, skips optimizer step on NaN/Inf.
-- [ ] Optimizer step updates F32 master, then casts master -> F16 model param.
+- [x] Optimizer step updates F32 master, then casts master -> F16 model param.
 
 ## Current gradients.c design fit
 
@@ -74,12 +74,13 @@ clear gradient dtype rules, optimizer master ownership, and F32 loss/scaler flow
 - [ ] Keep `gd_context_set_compute_policy(ctx, {F16, F32})` as v1 autocast knob.
 - [x] Add `GD_BENCH_DTYPE=f32|f16` to `gpt_bench`.
 - [ ] Add `GD_BENCH_AMP=1` for training with dynamic loss scaling.
-- [ ] Extend `gd_adamw_config` with master-param policy:
+- [x] Extend `gd_adamw_config` with master-param policy:
 
 ```c
 typedef enum gd_master_param_policy {
-    GD_MASTER_PARAM_NONE = 0,      /* F32 params only */
-    GD_MASTER_PARAM_F32_COPY       /* required for F16/BF16 params */
+    GD_MASTER_PARAM_AUTO = 0,      /* F16 params use F32 master */
+    GD_MASTER_PARAM_DISABLED = 1,  /* F32 params only */
+    GD_MASTER_PARAM_ALWAYS = 2     /* all params update through F32 master */
 } gd_master_param_policy;
 ```
 
@@ -257,10 +258,10 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
 - [ ] Update `_gd_bwd_accumulate_broadcast()`:
   - [ ] reduce/cast to accumulator dtype for leaf params.
   - [ ] preserve broadcast correctness.
-- [ ] Update final leaf write:
-  - [ ] copy if accumulated dtype equals grad slot dtype.
-  - [ ] cast if needed.
-  - [ ] assert leaf grad slot remains F32 for F16 params.
+- [x] Update final leaf write:
+  - [x] copy if accumulated dtype equals grad slot dtype.
+  - [x] cast if needed.
+  - [x] assert leaf grad slot remains F32 for F16 params.
 - [ ] Matmul/linear backward policy:
   - [ ] activation-input gradients may be F16 for memory/perf.
   - [ ] parameter gradients must be F32.
@@ -273,7 +274,7 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
   - [ ] SDPA backward: dq F16 allowed, dk/dv F16 for activations; param-facing grads F32 through projections.
   - [ ] activations: preserve incoming grad dtype unless leaf accumulation requires F32.
 - [ ] Tests:
-  - [ ] F16 param receives F32 grad slot.
+  - [x] F16 param receives F32 grad slot.
   - [ ] two gradient paths accumulate into one F32 grad.
   - [ ] broadcast grad accumulation casts/reduces correctly.
   - [ ] matmul weight grad dtype is F32 under F16 training.
@@ -283,30 +284,30 @@ Goal: F16 training graph produces F32 leaf grads without losing precision first.
 
 Goal: optimizer updates stable F32 master weights and refreshes F16 model params.
 
-- [ ] Extend optimizer slot:
-  - [ ] `param` model tensor, F32 or F16.
-  - [ ] optional `master` F32 tensor for F16 params.
-  - [ ] `m` F32.
-  - [ ] `v` F32.
-- [ ] Extend AdamW creation:
-  - [ ] F32 params use current in-place behavior.
-  - [ ] F16 params require `GD_MASTER_PARAM_F32_COPY`.
-  - [ ] initialize master by casting param -> F32.
-  - [ ] deduplicate tied params correctly.
+- [x] Extend optimizer slot:
+  - [x] `param` model tensor, F32 or F16.
+  - [x] optional `master` F32 tensor for F16 params.
+  - [x] `m` F32.
+  - [x] `v` F32.
+- [x] Extend AdamW creation:
+  - [x] F32 params use current in-place behavior.
+  - [x] F16 params use F32 master under `GD_MASTER_PARAM_AUTO`.
+  - [x] initialize master by casting param -> F32.
+  - [x] deduplicate tied params correctly.
 - [ ] Extend AdamW step:
-  - [ ] step consumes F32 grad.
-  - [ ] update master in F32.
-  - [ ] cast master -> model param after successful step.
+  - [x] step consumes F32 grad.
+  - [x] update master in F32.
+  - [x] cast master -> model param after successful step.
   - [ ] do not refresh model param when step is skipped by AMP.
-- [ ] Update CPU and Metal AdamW kernels if needed:
-  - [ ] F32 master path.
-  - [ ] F32 grads/state.
-  - [ ] F16 model param refresh kernel/cast.
+- [x] Update CPU and Metal AdamW kernels if needed:
+  - [x] F32 master path.
+  - [x] F32 grads/state.
+  - [x] F16 model param refresh kernel/cast.
 - [ ] Tests:
-  - [ ] F16 param AdamW creates F32 master.
-  - [ ] master changes after step.
-  - [ ] F16 param refresh matches rounded master.
-  - [ ] F32 AdamW behavior unchanged.
+  - [x] F16 param AdamW creates F32 master.
+  - [x] master changes after step.
+  - [x] F16 param refresh matches rounded master.
+  - [x] F32 AdamW behavior unchanged.
   - [ ] tied embeddings share one master slot/update.
 
 ## Phase 7: AMP loss scaler, unscale, finite check, skip step

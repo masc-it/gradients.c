@@ -1,6 +1,7 @@
 #include "gradients/optim.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +15,9 @@
 
 typedef struct adamw_slot {
     gd_tensor *param;  /* retained */
-    gd_tensor *m;      /* owned */
-    gd_tensor *v;      /* owned */
+    gd_tensor *master; /* owned F32 update target for F16 params, optional */
+    gd_tensor *m;      /* owned F32 state */
+    gd_tensor *v;      /* owned F32 state */
     float weight_decay;
     float lr_scale;
 } adamw_slot;
@@ -60,6 +62,63 @@ static gd_status make_state_like(gd_context *ctx, gd_tensor *param, gd_tensor **
     return gd_tensor_empty(ctx, &desc, out);
 }
 
+static int64_t tensor_numel(gd_tensor *tensor)
+{
+    const gd_tensor_desc *desc = _gd_tensor_desc_ptr(tensor);
+    int64_t n = 1;
+    int i = 0;
+
+    for (i = 0; i < desc->ndim; ++i) {
+        n *= desc->sizes[i];
+    }
+    return n;
+}
+
+static gd_status init_master_from_param(gd_context *ctx, gd_tensor *param, gd_tensor *master)
+{
+    const gd_tensor_desc *pd = _gd_tensor_desc_ptr(param);
+    int64_t n = tensor_numel(param);
+    size_t param_nbytes = 0U;
+    uint16_t *half = NULL;
+    float *full = NULL;
+    gd_status status = gd_tensor_desc_nbytes(pd, &param_nbytes, NULL);
+    int64_t i = 0;
+
+    if (status != GD_OK) {
+        return status;
+    }
+    if (n < 0 || (uint64_t)n > (uint64_t)SIZE_MAX / sizeof(float)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "optimizer parameter is too large");
+    }
+    full = malloc((size_t)n * sizeof(float));
+    if (full == NULL) {
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate master init buffer");
+    }
+    if (pd->dtype == GD_DTYPE_F32) {
+        status = gd_tensor_copy_to_cpu(ctx, param, full, param_nbytes);
+    } else if (pd->dtype == GD_DTYPE_F16) {
+        half = malloc(param_nbytes);
+        if (half == NULL) {
+            free(full);
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate master init buffer");
+        }
+        status = gd_tensor_copy_to_cpu(ctx, param, half, param_nbytes);
+        if (status == GD_OK) {
+            for (i = 0; i < n; ++i) {
+                full[i] = _gd_f16_bits_to_f32(half[i]);
+            }
+        }
+    } else {
+        status = _gd_error(GD_ERR_UNSUPPORTED, "adamw supports F32/F16 parameters only");
+    }
+    if (status == GD_OK) {
+        status = gd_tensor_copy_from_cpu(ctx, master, full, (size_t)n * sizeof(float));
+    }
+    free(half);
+    free(full);
+    return status;
+}
+
 static gd_status validate_config(const gd_adamw_config *cfg)
 {
     if (!isfinite(cfg->lr) || cfg->lr < 0.0F) {
@@ -78,6 +137,11 @@ static gd_status validate_config(const gd_adamw_config *cfg)
     }
     if (cfg->state_dtype != GD_DTYPE_INVALID && cfg->state_dtype != GD_DTYPE_F32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "adamw v1 supports F32 optimizer state only");
+    }
+    if (cfg->master_param_policy != GD_MASTER_PARAM_AUTO &&
+        cfg->master_param_policy != GD_MASTER_PARAM_DISABLED &&
+        cfg->master_param_policy != GD_MASTER_PARAM_ALWAYS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid adamw master param policy");
     }
     return GD_OK;
 }
@@ -99,6 +163,15 @@ static gd_status validate_group(const gd_param_group *group)
     return GD_OK;
 }
 
+static bool adamw_slot_uses_master(const gd_optimizer *opt, gd_tensor *p)
+{
+    if (opt->config.master_param_policy == GD_MASTER_PARAM_ALWAYS) {
+        return true;
+    }
+    return opt->config.master_param_policy == GD_MASTER_PARAM_AUTO &&
+           gd_tensor_dtype(p) == GD_DTYPE_F16;
+}
+
 static gd_status add_adamw_slot(gd_context *ctx,
                                  gd_optimizer *opt,
                                  gd_tensor *p,
@@ -106,17 +179,23 @@ static gd_status add_adamw_slot(gd_context *ctx,
                                  float lr_scale)
 {
     gd_status status = GD_OK;
+    bool use_master = false;
     int j = 0;
 
     if (p == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "optimizer parameter is NULL");
     }
-    if (gd_tensor_dtype(p) != GD_DTYPE_F32) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "adamw v1 supports F32 parameters only");
+    if (gd_tensor_dtype(p) != GD_DTYPE_F32 && gd_tensor_dtype(p) != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "adamw supports F32/F16 parameters only");
+    }
+    if (gd_tensor_dtype(p) == GD_DTYPE_F16 &&
+        opt->config.master_param_policy == GD_MASTER_PARAM_DISABLED) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "adamw F16 parameters require F32 master params");
     }
     if (!gd_tensor_requires_grad(p)) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "optimizer parameter must require grad");
     }
+    use_master = adamw_slot_uses_master(opt, p);
     for (j = 0; j < opt->n_slots; ++j) {
         if (same_parameter(opt->slots[j].param, p)) {
             if (opt->slots[j].weight_decay != weight_decay ||
@@ -135,17 +214,37 @@ static gd_status add_adamw_slot(gd_context *ctx,
     opt->slots[opt->n_slots].param = p;
     opt->slots[opt->n_slots].weight_decay = weight_decay;
     opt->slots[opt->n_slots].lr_scale = lr_scale;
+    if (use_master) {
+        status = make_state_like(ctx, p, &opt->slots[opt->n_slots].master);
+        if (status != GD_OK) {
+            gd_tensor_release(p);
+            opt->slots[opt->n_slots].param = NULL;
+            return status;
+        }
+        status = init_master_from_param(ctx, p, opt->slots[opt->n_slots].master);
+        if (status != GD_OK) {
+            gd_tensor_release(p);
+            gd_tensor_release(opt->slots[opt->n_slots].master);
+            opt->slots[opt->n_slots].param = NULL;
+            opt->slots[opt->n_slots].master = NULL;
+            return status;
+        }
+    }
     status = make_state_like(ctx, p, &opt->slots[opt->n_slots].m);
     if (status != GD_OK) {
         gd_tensor_release(p);
+        gd_tensor_release(opt->slots[opt->n_slots].master);
         opt->slots[opt->n_slots].param = NULL;
+        opt->slots[opt->n_slots].master = NULL;
         return status;
     }
     status = make_state_like(ctx, p, &opt->slots[opt->n_slots].v);
     if (status != GD_OK) {
         gd_tensor_release(p);
+        gd_tensor_release(opt->slots[opt->n_slots].master);
         gd_tensor_release(opt->slots[opt->n_slots].m);
         opt->slots[opt->n_slots].param = NULL;
+        opt->slots[opt->n_slots].master = NULL;
         opt->slots[opt->n_slots].m = NULL;
         return status;
     }
@@ -268,6 +367,7 @@ void gd_optimizer_destroy(gd_optimizer *optimizer)
     }
     for (i = 0; i < optimizer->n_slots; ++i) {
         gd_tensor_release(optimizer->slots[i].param);
+        gd_tensor_release(optimizer->slots[i].master);
         gd_tensor_release(optimizer->slots[i].m);
         gd_tensor_release(optimizer->slots[i].v);
     }
@@ -325,25 +425,47 @@ static gd_status optimizer_step_impl(gd_context *ctx,
     attrs.eps = optimizer->config.eps;
 
     for (i = 0; i < optimizer->n_slots; ++i) {
+        adamw_slot *slot = &optimizer->slots[i];
         gd_tensor *grad = NULL;
+        gd_tensor *update_param = slot->master != NULL ? slot->master : slot->param;
         gd_tensor *inputs[6];
         int n_inputs = lr_scalar != NULL ? 6 : 5;
 
-        status = _gd_tensor_ensure_grad(ctx, optimizer->slots[i].param, &grad);
+        status = _gd_tensor_ensure_grad(ctx, slot->param, &grad);
         if (status != GD_OK) {
             return status;
         }
-        attrs.weight_decay = optimizer->slots[i].weight_decay;
-        attrs.scale = optimizer->slots[i].lr_scale;
-        inputs[0] = optimizer->slots[i].param;
+        if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_DTYPE, "adamw requires F32 gradients");
+        }
+        attrs.weight_decay = slot->weight_decay;
+        attrs.scale = slot->lr_scale;
+        inputs[0] = update_param;
         inputs[1] = grad;
-        inputs[2] = optimizer->slots[i].m;
-        inputs[3] = optimizer->slots[i].v;
+        inputs[2] = slot->m;
+        inputs[3] = slot->v;
         inputs[4] = optimizer->step;
         inputs[5] = lr_scalar;
         status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP, inputs, n_inputs, &attrs);
         if (status != GD_OK) {
             return status;
+        }
+        if (slot->master != NULL) {
+            gd_tensor *refreshed = slot->master;
+            gd_tensor *casted = NULL;
+
+            if (gd_tensor_dtype(slot->param) != GD_DTYPE_F32) {
+                status = gd_cast(ctx, slot->master, gd_tensor_dtype(slot->param), &casted);
+                if (status != GD_OK) {
+                    return status;
+                }
+                refreshed = casted;
+            }
+            status = _gd_graph_emit_to(graph, _GD_OP_COPY, &refreshed, 1, NULL, slot->param);
+            gd_tensor_release(casted);
+            if (status != GD_OK) {
+                return status;
+            }
         }
     }
 
@@ -477,7 +599,7 @@ gd_status gd_optimizer_save(gd_optimizer *optimizer, const char *path)
 {
     gd_status status = GD_OK;
     FILE *f = NULL;
-    uint32_t version = 1U;
+    uint32_t version = 2U;
     uint32_t n_slots = 0U;
     int i = 0;
 
@@ -505,38 +627,58 @@ gd_status gd_optimizer_save(gd_optimizer *optimizer, const char *path)
     for (i = 0; i < optimizer->n_slots && status == GD_OK; ++i) {
         adamw_slot *slot = &optimizer->slots[i];
         const gd_tensor_desc *desc = _gd_tensor_desc_ptr(slot->param);
-        size_t nbytes = 0U;
-        uint64_t nbytes64 = 0U;
+        size_t state_nbytes = 0U;
+        size_t master_nbytes = 0U;
+        uint64_t state_nbytes64 = 0U;
+        uint64_t master_nbytes64 = 0U;
         uint32_t dtype = (uint32_t)desc->dtype;
         int32_t ndim = (int32_t)desc->ndim;
         void *m_buf = NULL;
         void *v_buf = NULL;
+        void *master_buf = NULL;
 
-        status = tensor_nbytes(slot->param, &nbytes);
+        status = tensor_nbytes(slot->m, &state_nbytes);
         if (status != GD_OK) { break; }
-        nbytes64 = (uint64_t)nbytes;
-        m_buf = malloc(nbytes);
-        v_buf = malloc(nbytes);
-        if (m_buf == NULL || v_buf == NULL) {
+        state_nbytes64 = (uint64_t)state_nbytes;
+        if (slot->master != NULL) {
+            status = tensor_nbytes(slot->master, &master_nbytes);
+            if (status != GD_OK) { break; }
+            master_nbytes64 = (uint64_t)master_nbytes;
+        }
+        m_buf = malloc(state_nbytes);
+        v_buf = malloc(state_nbytes);
+        if (slot->master != NULL) {
+            master_buf = malloc(master_nbytes);
+        }
+        if (m_buf == NULL || v_buf == NULL || (slot->master != NULL && master_buf == NULL)) {
             free(m_buf);
             free(v_buf);
+            free(master_buf);
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate optimizer save buffer");
             break;
         }
-        status = gd_tensor_copy_to_cpu(optimizer->ctx, slot->m, m_buf, nbytes);
+        status = gd_tensor_copy_to_cpu(optimizer->ctx, slot->m, m_buf, state_nbytes);
         if (status == GD_OK) {
-            status = gd_tensor_copy_to_cpu(optimizer->ctx, slot->v, v_buf, nbytes);
+            status = gd_tensor_copy_to_cpu(optimizer->ctx, slot->v, v_buf, state_nbytes);
+        }
+        if (status == GD_OK && slot->master != NULL) {
+            status = gd_tensor_copy_to_cpu(optimizer->ctx, slot->master, master_buf, master_nbytes);
         }
         if (status == GD_OK) { status = optim_write_all(f, &dtype, sizeof(dtype)); }
         if (status == GD_OK) { status = optim_write_all(f, &ndim, sizeof(ndim)); }
         if (status == GD_OK) { status = optim_write_all(f, desc->sizes, sizeof(desc->sizes)); }
         if (status == GD_OK) { status = optim_write_all(f, &slot->weight_decay, sizeof(float)); }
         if (status == GD_OK) { status = optim_write_all(f, &slot->lr_scale, sizeof(float)); }
-        if (status == GD_OK) { status = optim_write_all(f, &nbytes64, sizeof(nbytes64)); }
-        if (status == GD_OK) { status = optim_write_all(f, m_buf, nbytes); }
-        if (status == GD_OK) { status = optim_write_all(f, v_buf, nbytes); }
+        if (status == GD_OK) { status = optim_write_all(f, &state_nbytes64, sizeof(state_nbytes64)); }
+        if (status == GD_OK) { status = optim_write_all(f, &master_nbytes64, sizeof(master_nbytes64)); }
+        if (status == GD_OK) { status = optim_write_all(f, m_buf, state_nbytes); }
+        if (status == GD_OK) { status = optim_write_all(f, v_buf, state_nbytes); }
+        if (status == GD_OK && slot->master != NULL) {
+            status = optim_write_all(f, master_buf, master_nbytes);
+        }
         free(m_buf);
         free(v_buf);
+        free(master_buf);
     }
     if (fclose(f) != 0 && status == GD_OK) {
         status = _gd_error(GD_ERR_IO, "failed to close optimizer checkpoint");
@@ -565,7 +707,7 @@ gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path)
         status = _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid optimizer checkpoint magic");
     }
     if (status == GD_OK) { status = optim_read_all(f, &version, sizeof(version)); }
-    if (status == GD_OK && version != 1U) {
+    if (status == GD_OK && version != 1U && version != 2U) {
         status = _gd_error(GD_ERR_UNSUPPORTED, "unsupported optimizer checkpoint version");
     }
     if (status == GD_OK) { status = optim_read_all(f, &n_slots, sizeof(n_slots)); }
@@ -587,11 +729,15 @@ gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path)
         int64_t sizes[GD_MAX_DIMS];
         float weight_decay = 0.0F;
         float lr_scale = 0.0F;
-        uint64_t nbytes64 = 0U;
-        size_t nbytes = 0U;
-        size_t expected_nbytes = 0U;
+        uint64_t state_nbytes64 = 0U;
+        uint64_t master_nbytes64 = 0U;
+        size_t state_nbytes = 0U;
+        size_t master_nbytes = 0U;
+        size_t expected_state_nbytes = 0U;
+        size_t expected_master_nbytes = 0U;
         void *m_buf = NULL;
         void *v_buf = NULL;
+        void *master_buf = NULL;
         int dim = 0;
 
         memset(sizes, 0, sizeof(sizes));
@@ -600,18 +746,31 @@ gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path)
         if (status == GD_OK) { status = optim_read_all(f, sizes, sizeof(sizes)); }
         if (status == GD_OK) { status = optim_read_all(f, &weight_decay, sizeof(weight_decay)); }
         if (status == GD_OK) { status = optim_read_all(f, &lr_scale, sizeof(lr_scale)); }
-        if (status == GD_OK) { status = optim_read_all(f, &nbytes64, sizeof(nbytes64)); }
+        if (status == GD_OK) { status = optim_read_all(f, &state_nbytes64, sizeof(state_nbytes64)); }
+        if (status == GD_OK && version >= 2U) {
+            status = optim_read_all(f, &master_nbytes64, sizeof(master_nbytes64));
+        }
         if (status != GD_OK) { break; }
-        if (nbytes64 > (uint64_t)SIZE_MAX) {
+        if (state_nbytes64 > (uint64_t)SIZE_MAX || master_nbytes64 > (uint64_t)SIZE_MAX) {
             status = _gd_error(GD_ERR_INVALID_ARGUMENT, "optimizer tensor is too large");
             break;
         }
-        nbytes = (size_t)nbytes64;
-        status = tensor_nbytes(slot->param, &expected_nbytes);
+        state_nbytes = (size_t)state_nbytes64;
+        master_nbytes = (size_t)master_nbytes64;
+        status = tensor_nbytes(slot->m, &expected_state_nbytes);
         if (status != GD_OK) { break; }
+        if (slot->master != NULL) {
+            status = tensor_nbytes(slot->master, &expected_master_nbytes);
+            if (status != GD_OK) { break; }
+        }
+        if (version == 1U && slot->master != NULL) {
+            status = _gd_error(GD_ERR_UNSUPPORTED,
+                               "optimizer checkpoint missing master params");
+            break;
+        }
         if ((uint32_t)desc->dtype != dtype || (int32_t)desc->ndim != ndim ||
-            expected_nbytes != nbytes || slot->weight_decay != weight_decay ||
-            slot->lr_scale != lr_scale) {
+            expected_state_nbytes != state_nbytes || expected_master_nbytes != master_nbytes ||
+            slot->weight_decay != weight_decay || slot->lr_scale != lr_scale) {
             status = _gd_error(GD_ERR_SHAPE, "optimizer checkpoint slot metadata mismatch");
             break;
         }
@@ -622,20 +781,36 @@ gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path)
             }
         }
         if (status != GD_OK) { break; }
-        m_buf = malloc(nbytes);
-        v_buf = malloc(nbytes);
-        if (m_buf == NULL || v_buf == NULL) {
+        m_buf = malloc(state_nbytes);
+        v_buf = malloc(state_nbytes);
+        if (slot->master != NULL) {
+            master_buf = malloc(master_nbytes);
+        }
+        if (m_buf == NULL || v_buf == NULL || (slot->master != NULL && master_buf == NULL)) {
             free(m_buf);
             free(v_buf);
+            free(master_buf);
             status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate optimizer load buffer");
             break;
         }
-        status = optim_read_all(f, m_buf, nbytes);
-        if (status == GD_OK) { status = optim_read_all(f, v_buf, nbytes); }
-        if (status == GD_OK) { status = gd_tensor_copy_from_cpu(optimizer->ctx, slot->m, m_buf, nbytes); }
-        if (status == GD_OK) { status = gd_tensor_copy_from_cpu(optimizer->ctx, slot->v, v_buf, nbytes); }
+        status = optim_read_all(f, m_buf, state_nbytes);
+        if (status == GD_OK) { status = optim_read_all(f, v_buf, state_nbytes); }
+        if (status == GD_OK && slot->master != NULL) {
+            status = optim_read_all(f, master_buf, master_nbytes);
+        }
+        if (status == GD_OK) {
+            status = gd_tensor_copy_from_cpu(optimizer->ctx, slot->m, m_buf, state_nbytes);
+        }
+        if (status == GD_OK) {
+            status = gd_tensor_copy_from_cpu(optimizer->ctx, slot->v, v_buf, state_nbytes);
+        }
+        if (status == GD_OK && slot->master != NULL) {
+            status = gd_tensor_copy_from_cpu(optimizer->ctx, slot->master, master_buf,
+                                             master_nbytes);
+        }
         free(m_buf);
         free(v_buf);
+        free(master_buf);
     }
     if (fclose(f) != 0 && status == GD_OK) {
         status = _gd_error(GD_ERR_IO, "failed to close optimizer checkpoint");

@@ -1,6 +1,7 @@
 #include "gradients/gradients.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -55,6 +56,26 @@ static gd_status make_param(gd_context *ctx, int64_t n, const float *data, gd_te
         return status;
     }
     status = gd_tensor_copy_from_cpu(ctx, *out, data, (size_t)n * sizeof(float));
+    if (status != GD_OK) {
+        return status;
+    }
+    return gd_tensor_set_requires_grad(*out, true);
+}
+
+static gd_status make_f16_param(gd_context *ctx, int64_t n, const uint16_t *data,
+                                gd_tensor **out)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor_desc desc;
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, &n, &desc);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_empty(ctx, &desc, out);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_copy_from_cpu(ctx, *out, data, (size_t)n * sizeof(uint16_t));
     if (status != GD_OK) {
         return status;
     }
@@ -667,6 +688,62 @@ static int test_checkpoint_resume(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_adamw_master_checkpoint(gd_context *ctx)
+{
+    const char *opt_path = "build/test_optim_f16_opt.gdopt";
+    uint16_t init[1] = {0x3554U};
+    uint16_t saved_param[1] = {0};
+    uint16_t ref[1] = {0};
+    uint16_t got[1] = {0};
+    float grad_data[1] = {0.01F};
+    gd_adamw_config cfg = {0};
+    gd_tensor *p_ref = NULL;
+    gd_tensor *p_save = NULL;
+    gd_tensor *p_load = NULL;
+    gd_tensor *grad = NULL;
+    gd_optimizer *o_ref = NULL;
+    gd_optimizer *o_save = NULL;
+    gd_optimizer *o_load = NULL;
+
+    cfg.lr = 0.0001F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.01F;
+
+    CHECK_OK(make_f16_param(ctx, 1, init, &p_ref));
+    CHECK_OK(gd_adamw_create(ctx, &p_ref, 1, &cfg, &o_ref));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, o_ref));
+    CHECK_OK(gd_tensor_grad(p_ref, &grad));
+    CHECK_TRUE(grad != NULL);
+    CHECK_TRUE(gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_TRUE(one_adamw_step(ctx, o_ref, p_ref, grad_data, sizeof(grad_data)) == 0);
+    CHECK_TRUE(one_adamw_step(ctx, o_ref, p_ref, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_ref, ref, sizeof(ref)));
+    CHECK_TRUE(ref[0] != init[0]);
+
+    CHECK_OK(make_f16_param(ctx, 1, init, &p_save));
+    CHECK_OK(gd_adamw_create(ctx, &p_save, 1, &cfg, &o_save));
+    CHECK_TRUE(one_adamw_step(ctx, o_save, p_save, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_save, saved_param, sizeof(saved_param)));
+    CHECK_OK(gd_optimizer_save(o_save, opt_path));
+
+    CHECK_OK(make_f16_param(ctx, 1, saved_param, &p_load));
+    CHECK_OK(gd_adamw_create(ctx, &p_load, 1, &cfg, &o_load));
+    CHECK_OK(gd_optimizer_load(o_load, opt_path));
+    CHECK_TRUE(one_adamw_step(ctx, o_load, p_load, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_load, got, sizeof(got)));
+    CHECK_TRUE(got[0] == ref[0]);
+
+    gd_optimizer_destroy(o_load);
+    gd_optimizer_destroy(o_save);
+    gd_optimizer_destroy(o_ref);
+    gd_tensor_release(p_load);
+    gd_tensor_release(p_save);
+    gd_tensor_release(p_ref);
+    return 0;
+}
+
 static int test_tied_single_update(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -735,6 +812,7 @@ int main(void)
         test_gpt_parameter_groups(ctx) != 0 ||
         test_lr_scheduler_write(ctx) != 0 ||
         test_clip_grad_norm(ctx) != 0 ||
+        test_f16_adamw_master_checkpoint(ctx) != 0 ||
         test_clip_before_adamw(ctx) != 0 ||
         test_checkpoint_resume(ctx) != 0 ||
         test_tied_single_update(ctx) != 0) {

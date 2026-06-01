@@ -167,6 +167,103 @@ kernel void gd_sdpa_splitk_causal_window_lane8(device const float *q            
     }
 }
 
+kernel void gd_sdpa_splitk_causal_window_lane8_f16(device const half *q              [[buffer(0)]],
+                                                    device const half *k              [[buffer(1)]],
+                                                    device const half *v              [[buffer(2)]],
+                                                    device const half *bias           [[buffer(3)]],
+                                                    device float *partials             [[buffer(4)]],
+                                                    constant gd_metal_sdpa_params &p    [[buffer(5)]],
+                                                    uint tgid [[threadgroup_position_in_grid]],
+                                                    uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_CAUSAL_QROWS - 1) / GD_SDPA_CAUSAL_QROWS;
+    int s = (int)tgid % p.n_splits;
+    int t2 = (int)tgid / p.n_splits;
+    int qb = t2 % n_qb;
+    int r = t2 / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int group = p.Hq / p.Hkv;
+    int hkv = hq / group;
+    int local_q = (int)tid / GD_SDPA_DKV_LANES;
+    int lane = (int)tid - local_q * GD_SDPA_DKV_LANES;
+    int i = qb * GD_SDPA_CAUSAL_QROWS + local_q;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DKV_CMAX];
+    float acc[GD_SDPA_DKV_CMAX];
+    int nchan = 0;
+    for (int c = lane; c < p.Dh; c += GD_SDPA_DKV_LANES) {
+        qreg[nchan] = active ? (float)q[qbase + c] : 0.0f;
+        acc[nchan] = 0.0f;
+        nchan++;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int q0 = qb * GD_SDPA_CAUSAL_QROWS;
+    int kb_start = gd_sdpa_window_kb_start(q0, p.Tq, p.Tk, p.window);
+    int kb_end = gd_sdpa_window_kb_end(q0, GD_SDPA_CAUSAL_QROWS, p.Tq, p.Tk);
+    int k_lo = s * p.split_len;
+    int k_hi = k_lo + p.split_len;
+    if (k_hi > kb_end) {
+        k_hi = kb_end;
+    }
+    if (k_lo < kb_start) {
+        k_lo = kb_start;
+    }
+    for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        int tile = k_hi - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_CAUSAL_THREADS) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = (float)k[kbase + c];
+            vsh[jj * p.Dh + c] = (float)v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_window_allowed(i, j, p.Tq, p.Tk, p.window)) {
+                    float ss = 0.0f;
+                    for (int x = 0, c = lane; x < nchan; ++x, c += GD_SDPA_DKV_LANES) {
+                        ss += qreg[x] * ksh[jj * p.Dh + c];
+                    }
+                    ss = gd_sdpa_sum_lanes8(ss) * p.scale;
+                    float mnew = (ss > m) ? ss : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(ss - mnew);
+                    l = l * corr + e;
+                    for (int x = 0, c = lane; x < nchan; ++x, c += GD_SDPA_DKV_LANES) {
+                        acc[x] = acc[x] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        for (int x = 0, c = lane; x < nchan; ++x, c += GD_SDPA_DKV_LANES) {
+            partials[base + c] = acc[x];
+        }
+        if (lane == 0) {
+            partials[base + p.Dh] = m;
+            partials[base + p.Dh + 1] = l;
+        }
+    }
+    (void)bias;
+}
+
 kernel void gd_sdpa_bwd_stats_dq_split_causal_window_lane8(device const float *go           [[buffer(0)]],
                                                             device const float *q            [[buffer(1)]],
                                                             device const float *k            [[buffer(2)]],

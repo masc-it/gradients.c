@@ -116,7 +116,18 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         splitk_pso != nil && combine_pso != nil) {
         bool lane_split = false;
         if (f16) {
-            splitk_pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_f16");
+            if (sdpa_is_causal_no_bias(&p) && p.window > 0) {
+                id<MTLComputePipelineState> window_fast =
+                    _gd_metal_pipeline_named(ctx->state,
+                                             "gd_sdpa_splitk_causal_window_lane8_f16");
+                if (window_fast != nil) {
+                    splitk_pso = window_fast;
+                    lane_split = true;
+                }
+            }
+            if (!lane_split) {
+                splitk_pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_f16");
+            }
             combine_pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_combine_f16");
             if (splitk_pso == nil || combine_pso == nil) {
                 return _gd_error(GD_ERR_BACKEND, "metal sdpa F16 split-K pipeline missing");

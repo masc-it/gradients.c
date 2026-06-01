@@ -177,9 +177,11 @@ typedef struct gd_metal_reduce_to_params {
 
 typedef struct gd_metal_clip_norm_params {
     int numel;
-    int scratch_offset;
-    int total_groups;
+    int scratch_offset; /* partial/reduce source offset in float scratch elements */
+    int dst_offset;     /* reduce destination offset in float scratch elements */
+    int total_groups;   /* reduce output groups */
     int scale_index;
+    int finalize;
     float max_norm;
     float eps;
 } gd_metal_clip_norm_params;

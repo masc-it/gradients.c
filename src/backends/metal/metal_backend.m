@@ -119,6 +119,8 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_add_rms_norm", /* F4: residual add + RMSNorm forward */
     "gd_rms_norm_bwd_add", /* F4: RMSNorm backward + residual grad add */
     "gd_cross_entropy_reduce",
+    "gd_clip_norm_reduce",
+    "gd_clip_norm_scale",
     "gd_lmce_fwd_chunk",
     "gd_lmce_loss_rows",
     "gd_lmce_dlogits_chunk",
@@ -129,6 +131,9 @@ static const char *const g_metal_extra_kernels[] = {
 /* Threadgroup size for the RMSNorm-family reductions; must match GD_RMS_TG in
  * kernels.metal (power of two for the tree reduction). */
 #define GD_METAL_RMS_TG 256
+#define GD_METAL_CLIP_NORM_TG 256
+#define GD_METAL_CLIP_NORM_ITEMS 4
+#define GD_METAL_CLIP_NORM_CHUNK (GD_METAL_CLIP_NORM_TG * GD_METAL_CLIP_NORM_ITEMS)
 
 /* Backward split-K scratch is one buffer carved into four regions (float counts
  * and offsets). When n_splits==1 only the stats region is used (the original
@@ -288,8 +293,6 @@ static id<MTLComputePipelineState> pipeline_named(GDMetalState *st, const char *
 {
     return st.pipelinesByName[[NSString stringWithUTF8String:name]];
 }
-
-#define GD_METAL_CLIP_NORM_TG 256
 
 static int64_t desc_numel(const gd_tensor_desc *desc)
 {
@@ -1124,19 +1127,27 @@ static gd_status metal_compile(_gd_backend *self, gd_graph *graph, _gd_executabl
             if (op == _GD_OP_CLIP_GRAD_NORM) {
                 int in_i = 0;
                 int64_t total_groups = 0;
-                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_clip_norm_finalize");
+                int64_t reduce_groups = 0;
+                exe->node_pso2[j] = (__bridge void *)pipeline_named(st, "gd_clip_norm_reduce");
                 exe->node_pso3[j] = (__bridge void *)pipeline_named(st, "gd_clip_norm_scale");
+                if (exe->node_pso2[j] == NULL || exe->node_pso3[j] == NULL) {
+                    status = _gd_error(GD_ERR_BACKEND, "metal clip_grad_norm kernels missing");
+                    goto fail;
+                }
                 for (in_i = 0; in_i < node->n_inputs; ++in_i) {
                     const gd_tensor_desc *gd = &graph->values[node->inputs[in_i]].desc;
                     int64_t numel = desc_numel(gd);
-                    total_groups += (numel + GD_METAL_CLIP_NORM_TG - 1) /
-                                    GD_METAL_CLIP_NORM_TG;
+                    total_groups += (numel + GD_METAL_CLIP_NORM_CHUNK - 1) /
+                                    GD_METAL_CLIP_NORM_CHUNK;
                 }
                 if (total_groups <= 0) {
                     status = _gd_error(GD_ERR_SHAPE, "clip_grad_norm has no elements");
                     goto fail;
                 }
-                exe->node_scratch_bytes[j] = (size_t)(total_groups + 1) * sizeof(float);
+                reduce_groups = (total_groups + GD_METAL_CLIP_NORM_TG - 1) /
+                                GD_METAL_CLIP_NORM_TG;
+                exe->node_scratch_bytes[j] = (size_t)(total_groups + reduce_groups + 1) *
+                                             sizeof(float);
                 if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
                     scratch_max_bytes = exe->node_scratch_bytes[j];
                 }
@@ -2234,7 +2245,7 @@ static void encode_step_inc(id<MTLComputeCommandEncoder> enc,
 
 static gd_status encode_clip_grad_norm(id<MTLComputeCommandEncoder> enc,
                                       id<MTLComputePipelineState> partial_pso,
-                                      id<MTLComputePipelineState> finalize_pso,
+                                      id<MTLComputePipelineState> reduce_pso,
                                       id<MTLComputePipelineState> scale_pso,
                                       id<MTLBuffer> scratch,
                                       _gd_executable *exe,
@@ -2244,8 +2255,13 @@ static gd_status encode_clip_grad_norm(id<MTLComputeCommandEncoder> enc,
     int i = 0;
     int scratch_offset = 0;
     int total_groups = 0;
+    int reduce_groups_max = 0;
+    int scale_index = 0;
+    int src_offset = 0;
+    int dst_offset = 0;
+    int src_count = 0;
 
-    if (partial_pso == nil || finalize_pso == nil || scale_pso == nil || scratch == nil) {
+    if (partial_pso == nil || reduce_pso == nil || scale_pso == nil || scratch == nil) {
         return _gd_error(GD_ERR_BACKEND, "metal clip_grad_norm pipeline/scratch missing");
     }
     if (node->n_inputs <= 0 || node->n_outputs != 1) {
@@ -2254,25 +2270,32 @@ static gd_status encode_clip_grad_norm(id<MTLComputeCommandEncoder> enc,
     for (i = 0; i < node->n_inputs; ++i) {
         const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
         int64_t numel64 = desc_numel(desc);
-        int groups = (int)((numel64 + GD_METAL_CLIP_NORM_TG - 1) / GD_METAL_CLIP_NORM_TG);
-        if (numel64 > INT_MAX || groups <= 0) {
+        int64_t groups64 = (numel64 + GD_METAL_CLIP_NORM_CHUNK - 1) /
+                           GD_METAL_CLIP_NORM_CHUNK;
+        if (numel64 > INT_MAX || groups64 > INT_MAX || groups64 <= 0) {
             return _gd_error(GD_ERR_SHAPE, "clip_grad_norm input too large");
         }
-        total_groups += groups;
+        if (total_groups > INT_MAX - (int)groups64) {
+            return _gd_error(GD_ERR_SHAPE, "clip_grad_norm has too many groups");
+        }
+        total_groups += (int)groups64;
     }
     if (total_groups <= 0) {
         return _gd_error(GD_ERR_SHAPE, "clip_grad_norm has no elements");
     }
+    reduce_groups_max = (total_groups + GD_METAL_CLIP_NORM_TG - 1) /
+                        GD_METAL_CLIP_NORM_TG;
+    scale_index = total_groups + reduce_groups_max;
 
     for (i = 0; i < node->n_inputs; ++i) {
         const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
         int64_t numel64 = desc_numel(desc);
-        int groups = (int)((numel64 + GD_METAL_CLIP_NORM_TG - 1) / GD_METAL_CLIP_NORM_TG);
+        int groups = (int)((numel64 + GD_METAL_CLIP_NORM_CHUNK - 1) /
+                           GD_METAL_CLIP_NORM_CHUNK);
         memset(&p, 0, sizeof(p));
         p.numel = (int)numel64;
         p.scratch_offset = scratch_offset;
-        p.total_groups = total_groups;
-        p.scale_index = total_groups;
+        p.scale_index = scale_index;
         p.max_norm = node->attrs.scale;
         p.eps = node->attrs.eps;
         [enc setComputePipelineState:partial_pso];
@@ -2284,24 +2307,40 @@ static gd_status encode_clip_grad_norm(id<MTLComputeCommandEncoder> enc,
         scratch_offset += groups;
     }
 
-    memset(&p, 0, sizeof(p));
-    p.total_groups = total_groups;
-    p.scale_index = total_groups;
-    p.max_norm = node->attrs.scale;
-    p.eps = node->attrs.eps;
-    [enc setComputePipelineState:finalize_pso];
-    [enc setBuffer:scratch offset:0 atIndex:0];
-    [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch_1d(enc, finalize_pso, 1);
+    src_offset = 0;
+    dst_offset = total_groups;
+    src_count = total_groups;
+    for (;;) {
+        int groups = (src_count + GD_METAL_CLIP_NORM_TG - 1) / GD_METAL_CLIP_NORM_TG;
+        memset(&p, 0, sizeof(p));
+        p.numel = src_count;
+        p.scratch_offset = src_offset;
+        p.dst_offset = dst_offset;
+        p.total_groups = groups;
+        p.scale_index = scale_index;
+        p.finalize = groups == 1 ? 1 : 0;
+        p.max_norm = node->attrs.scale;
+        p.eps = node->attrs.eps;
+        [enc setComputePipelineState:reduce_pso];
+        [enc setBuffer:scratch offset:0 atIndex:0];
+        [enc setBuffer:value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(GD_METAL_CLIP_NORM_TG, 1, 1)];
+        if (groups == 1) {
+            break;
+        }
+        src_count = groups;
+        src_offset = dst_offset;
+        dst_offset = src_offset == 0 ? total_groups : 0;
+    }
 
     for (i = 0; i < node->n_inputs; ++i) {
         const gd_tensor_desc *desc = &exe->graph->values[node->inputs[i]].desc;
         int64_t numel64 = desc_numel(desc);
         memset(&p, 0, sizeof(p));
         p.numel = (int)numel64;
-        p.total_groups = total_groups;
-        p.scale_index = total_groups;
+        p.scale_index = scale_index;
         [enc setComputePipelineState:scale_pso];
         [enc setBuffer:value_buffer(exe, node->inputs[i]) offset:0 atIndex:0];
         [enc setBuffer:scratch offset:0 atIndex:1];

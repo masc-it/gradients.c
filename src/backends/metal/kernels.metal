@@ -4,6 +4,7 @@
 using namespace metal;
 
 #define GD_CLIP_NORM_TG 256
+#define GD_CLIP_NORM_ITEMS 4
 
 /* Reproduces broadcast_offset() from the CPU reference kernel: walk the input's
  * own dims right-aligned against the output index, treating size-1 dims as
@@ -1147,17 +1148,20 @@ kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
 kernel void gd_clip_norm_partial(device const float *grad                 [[buffer(0)]],
                                  device float *scratch                   [[buffer(1)]],
                                  constant gd_metal_clip_norm_params &p   [[buffer(2)]],
-                                 uint gid                                [[thread_position_in_grid]],
                                  uint tid                                [[thread_index_in_threadgroup]],
                                  uint tg                                 [[threadgroup_position_in_grid]])
 {
     threadgroup float partial[GD_CLIP_NORM_TG];
-    float v = 0.0f;
-    if ((int)gid < p.numel) {
-        float g = grad[gid];
-        v = g * g;
+    const int base = (int)tg * GD_CLIP_NORM_TG * GD_CLIP_NORM_ITEMS + (int)tid;
+    float sum = 0.0f;
+    for (int k = 0; k < GD_CLIP_NORM_ITEMS; ++k) {
+        int idx = base + k * GD_CLIP_NORM_TG;
+        if (idx < p.numel) {
+            float g = grad[idx];
+            sum += g * g;
+        }
     }
-    partial[tid] = v;
+    partial[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = GD_CLIP_NORM_TG / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -1170,25 +1174,39 @@ kernel void gd_clip_norm_partial(device const float *grad                 [[buff
     }
 }
 
-kernel void gd_clip_norm_finalize(device float *scratch                  [[buffer(0)]],
-                                  device float *norm_out                 [[buffer(1)]],
-                                  constant gd_metal_clip_norm_params &p  [[buffer(2)]],
-                                  uint gid                               [[thread_position_in_grid]])
+kernel void gd_clip_norm_reduce(device float *scratch                  [[buffer(0)]],
+                                device float *norm_out                 [[buffer(1)]],
+                                constant gd_metal_clip_norm_params &p  [[buffer(2)]],
+                                uint tid                               [[thread_index_in_threadgroup]],
+                                uint tg                                [[threadgroup_position_in_grid]])
 {
-    if (gid != 0) {
-        return;
+    threadgroup float partial[GD_CLIP_NORM_TG];
+    int idx = (int)tg * GD_CLIP_NORM_TG + (int)tid;
+    float sum = 0.0f;
+    if (idx < p.numel) {
+        sum = scratch[p.scratch_offset + idx];
     }
-    float sumsq = 0.0f;
-    for (int i = 0; i < p.total_groups; ++i) {
-        sumsq += scratch[i];
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = GD_CLIP_NORM_TG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float norm = sqrt(sumsq);
-    float scale = 1.0f;
-    if (norm > p.max_norm) {
-        scale = p.max_norm / (norm + p.eps);
+    if (tid == 0) {
+        if (p.finalize != 0 && p.total_groups == 1) {
+            float norm = sqrt(partial[0]);
+            float scale = 1.0f;
+            if (norm > p.max_norm) {
+                scale = p.max_norm / (norm + p.eps);
+            }
+            scratch[p.scale_index] = scale;
+            norm_out[0] = norm;
+        } else {
+            scratch[p.dst_offset + (int)tg] = partial[0];
+        }
     }
-    scratch[p.scale_index] = scale;
-    norm_out[0] = norm;
 }
 
 kernel void gd_clip_norm_scale(device float *grad                       [[buffer(0)]],
@@ -1199,7 +1217,11 @@ kernel void gd_clip_norm_scale(device float *grad                       [[buffer
     if ((int)gid >= p.numel) {
         return;
     }
-    grad[gid] *= scratch[p.scale_index];
+    float scale = scratch[p.scale_index];
+    if (scale == 1.0f) {
+        return;
+    }
+    grad[gid] *= scale;
 }
 
 kernel void gd_step_inc(device float *step [[buffer(0)]],

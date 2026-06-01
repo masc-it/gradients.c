@@ -1,5 +1,24 @@
 #import "../../backends/metal/metal_op.h"
 
+static gd_status rms_norm_wbwd_support(const _gd_metal_plan_ctx *ctx)
+{
+    const _gd_node *node = ctx->node;
+    gd_dtype dtype = GD_DTYPE_INVALID;
+
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    dtype = ctx->graph->values[node->inputs[0]].desc.dtype;
+    if (dtype != GD_DTYPE_F32 && dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_wbwd supports F32/F16 input");
+    }
+    if (ctx->graph->values[node->inputs[1]].desc.dtype != dtype ||
+        ctx->graph->values[node->outputs[0]].desc.dtype != GD_DTYPE_F32) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_wbwd expects matching grad and F32 output");
+    }
+    return GD_OK;
+}
+
 static gd_status rms_norm_wbwd_plan(_gd_metal_plan_ctx *ctx)
 {
     gd_status status = _gd_metal_plan_default(ctx);
@@ -42,7 +61,9 @@ static gd_status rms_norm_wbwd_encode(_gd_metal_encode_ctx *ctx)
     p.last = (int)x_desc->sizes[x_desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(x_desc) / p.last) : 0;
     p.eps = node->attrs.eps;
-    p.dtype = GD_METAL_DT_F32;
+    if (_gd_metal_dtype_code(x_desc->dtype, &p.dtype) != GD_OK) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_wbwd dtype unsupported");
+    }
     if (p.rows <= 0 || p.last <= 0) {
         return GD_OK;
     }
@@ -71,6 +92,7 @@ static gd_status rms_norm_wbwd_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_rms_norm_wbwd = {
     .kind = _GD_OP_RMS_NORM_WBWD,
     .name = "rms_norm_wbwd",
+    .support = rms_norm_wbwd_support,
     .plan = rms_norm_wbwd_plan,
     .encode = rms_norm_wbwd_encode,
 };

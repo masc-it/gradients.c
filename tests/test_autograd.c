@@ -727,6 +727,56 @@ static int test_f16_embedding_leaf_grad(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_rms_norm_weight_grad(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t xs[2] = {2, 2};
+    int64_t ws[1] = {2};
+    uint16_t xh[4] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U};
+    uint16_t wh[2] = {0x3c00U, 0x3c00U};
+    float gw[2] = {0};
+    gd_tensor_desc desc;
+    gd_tensor *x = NULL;
+    gd_tensor *w = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *yf = NULL;
+    gd_tensor *m0 = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, xs, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &x));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, ws, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &w));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wh, sizeof(wh)));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_rms_norm(ctx, x, w, 1.0e-5F, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
+    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_grad(w, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gw, sizeof(gw)));
+    CHECK_TRUE(isfinite(gw[0]) && isfinite(gw[1]));
+    gd_tensor_release(loss);
+    gd_tensor_release(m0);
+    gd_tensor_release(yf);
+    gd_tensor_release(y);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(w);
+    gd_tensor_release(x);
+    return 0;
+}
+
 static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
                                  const float *data, gd_tensor **out)
 {
@@ -769,6 +819,7 @@ int main(void)
     CHECK_TRUE(test_f16_cast_leaf_grad(ctx) == 0);
     CHECK_TRUE(test_f16_linear_leaf_grads(ctx) == 0);
     CHECK_TRUE(test_f16_embedding_leaf_grad(ctx) == 0);
+    CHECK_TRUE(test_f16_rms_norm_weight_grad(ctx) == 0);
 
     {
         two_in t = {0};

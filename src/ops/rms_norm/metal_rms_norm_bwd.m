@@ -1,5 +1,25 @@
 #import "../../backends/metal/metal_op.h"
 
+static gd_status rms_norm_bwd_support(const _gd_metal_plan_ctx *ctx)
+{
+    const _gd_node *node = ctx->node;
+    gd_dtype dtype = GD_DTYPE_INVALID;
+
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    dtype = ctx->graph->values[node->inputs[0]].desc.dtype;
+    if (dtype != GD_DTYPE_F32 && dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_bwd supports F32/F16");
+    }
+    if (ctx->graph->values[node->inputs[1]].desc.dtype != dtype ||
+        ctx->graph->values[node->inputs[2]].desc.dtype != dtype ||
+        ctx->graph->values[node->outputs[0]].desc.dtype != dtype) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_bwd inputs/output must share dtype");
+    }
+    return GD_OK;
+}
+
 static gd_status rms_norm_bwd_encode(_gd_metal_encode_ctx *ctx)
 {
     id<MTLComputeCommandEncoder> enc = *ctx->encoder;
@@ -14,7 +34,9 @@ static gd_status rms_norm_bwd_encode(_gd_metal_encode_ctx *ctx)
     p.last = (int)desc->sizes[desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(desc) / p.last) : 0;
     p.eps = node->attrs.eps;
-    p.dtype = GD_METAL_DT_F32;
+    if (_gd_metal_dtype_code(desc->dtype, &p.dtype) != GD_OK) {
+        return _gd_error(GD_ERR_DTYPE, "metal rms_norm_bwd dtype unsupported");
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
@@ -30,5 +52,6 @@ static gd_status rms_norm_bwd_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_rms_norm_bwd = {
     .kind = _GD_OP_RMS_NORM_BWD,
     .name = "rms_norm_bwd",
+    .support = rms_norm_bwd_support,
     .encode = rms_norm_bwd_encode,
 };

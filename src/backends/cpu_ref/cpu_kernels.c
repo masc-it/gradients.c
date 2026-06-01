@@ -405,9 +405,9 @@ gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, float *dx,
-                                 const float *x, const float *weight,
-                                 const float *go, float eps)
+gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, void *dx,
+                                 const void *x, const void *weight,
+                                 const void *go, float eps)
 {
     int64_t last = desc->sizes[desc->ndim - 1];
     int64_t rows = desc_numel(desc) / last;
@@ -421,26 +421,47 @@ gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, float *dx,
         int64_t c = 0;
 
         for (c = 0; c < last; ++c) {
-            double v = (double)x[r * last + c];
-            sumsq += v * v;
+            float xf = 0.0F;
+            gd_status status = _gd_cpu_load_float(desc, x, r * last + c, &xf);
+            if (status != GD_OK) { return status; }
+            sumsq += (double)xf * (double)xf;
         }
         inv = 1.0 / sqrt(sumsq / (double)last + (double)eps);
         inv3 = inv * inv * inv;
         for (c = 0; c < last; ++c) {
-            A += (double)go[r * last + c] * (double)weight[c] * (double)x[r * last + c];
+            float gf = 0.0F;
+            float wf = 0.0F;
+            float xf = 0.0F;
+            gd_status status = _gd_cpu_load_float(desc, go, r * last + c, &gf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, weight, c, &wf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, x, r * last + c, &xf);
+            if (status != GD_OK) { return status; }
+            A += (double)gf * (double)wf * (double)xf;
         }
         for (c = 0; c < last; ++c) {
-            double gi = (double)go[r * last + c];
-            double xi = (double)x[r * last + c];
-            double wi = (double)weight[c];
-            dx[r * last + c] = (float)(inv * gi * wi - xi * inv3 * A / (double)last);
+            float gf = 0.0F;
+            float xf = 0.0F;
+            float wf = 0.0F;
+            double d = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, go, r * last + c, &gf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, x, r * last + c, &xf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, weight, c, &wf);
+            if (status != GD_OK) { return status; }
+            d = inv * (double)gf * (double)wf -
+                (double)xf * inv3 * A / (double)last;
+            status = _gd_cpu_store_float(desc, dx, r * last + c, (float)d);
+            if (status != GD_OK) { return status; }
         }
     }
     return GD_OK;
 }
 
 gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
-                                  const float *x, const float *go, float eps)
+                                  const void *x, const void *go, float eps)
 {
     int64_t last = x_desc->sizes[x_desc->ndim - 1];
     int64_t rows = desc_numel(x_desc) / last;
@@ -455,12 +476,20 @@ gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
         double inv = 0.0;
 
         for (c = 0; c < last; ++c) {
-            double v = (double)x[r * last + c];
-            sumsq += v * v;
+            float xf = 0.0F;
+            gd_status status = _gd_cpu_load_float(x_desc, x, r * last + c, &xf);
+            if (status != GD_OK) { return status; }
+            sumsq += (double)xf * (double)xf;
         }
         inv = 1.0 / sqrt(sumsq / (double)last + (double)eps);
         for (c = 0; c < last; ++c) {
-            dweight[c] += (float)((double)go[r * last + c] * (double)x[r * last + c] * inv);
+            float gf = 0.0F;
+            float xf = 0.0F;
+            gd_status status = _gd_cpu_load_float(x_desc, go, r * last + c, &gf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(x_desc, x, r * last + c, &xf);
+            if (status != GD_OK) { return status; }
+            dweight[c] += (float)((double)gf * (double)xf * inv);
         }
     }
     return GD_OK;

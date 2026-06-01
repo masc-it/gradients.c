@@ -55,11 +55,11 @@ gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
                              const void *weight,
                              float eps);
 /* RMSNorm backward: dx (input gradient) and dweight (weight gradient). */
-gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, float *dx,
-                                 const float *x, const float *weight,
-                                 const float *go, float eps);
+gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, void *dx,
+                                 const void *x, const void *weight,
+                                 const void *go, float eps);
 gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
-                                  const float *x, const float *go, float eps);
+                                  const void *x, const void *go, float eps);
 gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const gd_tensor_desc *logits_desc,
                                   const void *logits,

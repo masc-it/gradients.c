@@ -25,9 +25,8 @@ static gd_status rms_norm_bwd_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
+    if (out_desc->dtype != GD_DTYPE_F32 && out_desc->dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_DTYPE, "rms_norm_bwd output must be F32 or F16");
     }
     return _gd_cpu_k_rms_norm_bwd(out_desc, out_data, x_data, weight_data, go_data,
                                   node->attrs.eps);

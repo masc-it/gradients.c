@@ -1,5 +1,17 @@
 #include "../grad_impl.h"
 
+static bool value_needs_f32_grad(_gd_bwd_ctx *b, int value_id)
+{
+    gd_tensor *leaf = NULL;
+
+    if (value_id < 0 || value_id >= b->graph->n_values) {
+        return false;
+    }
+    leaf = b->graph->values[value_id].external;
+    return leaf != NULL && gd_tensor_requires_grad(leaf) &&
+           b->graph->values[value_id].desc.dtype == GD_DTYPE_F16;
+}
+
 static gd_status rms_norm_backward(_gd_bwd_ctx *b, const _gd_node *node)
 {
     gd_status status = GD_OK;
@@ -19,6 +31,9 @@ static gd_status rms_norm_backward(_gd_bwd_ctx *b, const _gd_node *node)
     }
     x_desc = *_gd_bwd_value_desc(b, node->inputs[0]);
     w_desc = *_gd_bwd_value_desc(b, node->inputs[1]);
+    if (value_needs_f32_grad(b, node->inputs[1])) {
+        w_desc.dtype = GD_DTYPE_F32;
+    }
     attrs.eps = node->attrs.eps;
     status = _gd_bwd_fwd(b, node->inputs[0], &x);
     if (status == GD_OK) {

@@ -1,7 +1,7 @@
 #include "metal_common.metal"
 
-kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
-                             device const float *go              [[buffer(1)]],
+kernel void gd_rms_norm_wbwd(device const uchar *x               [[buffer(0)]],
+                             device const uchar *go              [[buffer(1)]],
                              device float *partial               [[buffer(2)]],
                              constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
                              uint tgid  [[threadgroup_position_in_grid]],
@@ -24,7 +24,7 @@ kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
         int rbase = (row0 + (int)tid) * p.last;
         float ss = 0.0f;
         for (int cc = 0; cc < p.last; ++cc) {
-            float v = x[rbase + cc];
+            float v = gd_load_float(x, p.dtype, (uint)(rbase + cc));
             ss += v * v;
         }
         inv_sh[tid] = 1.0f / sqrt(ss / (float)p.last + p.eps);
@@ -33,7 +33,9 @@ kernel void gd_rms_norm_wbwd(device const float *x               [[buffer(0)]],
     if (c < p.last) {
         for (int i = 0; i < tile; ++i) {
             int rbase = (row0 + i) * p.last;
-            acc += go[rbase + c] * x[rbase + c] * inv_sh[i];
+            float g = gd_load_float(go, p.dtype, (uint)(rbase + c));
+            float xv = gd_load_float(x, p.dtype, (uint)(rbase + c));
+            acc += g * xv * inv_sh[i];
         }
         partial[rb * p.last + c] = acc;
     }

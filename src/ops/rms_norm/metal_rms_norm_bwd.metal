@@ -1,9 +1,9 @@
 #include "metal_common.metal"
 
-kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
-                            device const float *weight          [[buffer(1)]],
-                            device const float *go              [[buffer(2)]],
-                            device float *dx                    [[buffer(3)]],
+kernel void gd_rms_norm_bwd(device const uchar *x               [[buffer(0)]],
+                            device const uchar *weight          [[buffer(1)]],
+                            device const uchar *go              [[buffer(2)]],
+                            device uchar *dx                    [[buffer(3)]],
                             constant gd_metal_rmsnorm_params &p  [[buffer(4)]],
                             uint tgid  [[threadgroup_position_in_grid]],
                             uint tid    [[thread_index_in_threadgroup]],
@@ -19,9 +19,11 @@ kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
     float lss = 0.0f;
     float la = 0.0f;
     for (int c = (int)tid; c < p.last; c += (int)tgsz) {
-        float v = x[base + c];
+        float v = gd_load_float(x, p.dtype, (uint)(base + c));
+        float g = gd_load_float(go, p.dtype, (uint)(base + c));
+        float w = gd_load_float(weight, p.dtype, (uint)c);
         lss += v * v;
-        la += go[base + c] * weight[c] * v;
+        la += g * w * v;
     }
     pss[tid] = lss;
     pa[tid] = la;
@@ -37,7 +39,11 @@ kernel void gd_rms_norm_bwd(device const float *x               [[buffer(0)]],
     float inv3 = inv * inv * inv;
     float A = pa[0];
     for (int c = (int)tid; c < p.last; c += (int)tgsz) {
-        dx[base + c] = inv * go[base + c] * weight[c] - x[base + c] * inv3 * A / (float)p.last;
+        float g = gd_load_float(go, p.dtype, (uint)(base + c));
+        float w = gd_load_float(weight, p.dtype, (uint)c);
+        float xv = gd_load_float(x, p.dtype, (uint)(base + c));
+        gd_store_float(dx, p.dtype, (uint)(base + c),
+                       inv * g * w - xv * inv3 * A / (float)p.last);
     }
 }
 kernel void gd_rms_norm_bwd_add(device const float *x               [[buffer(0)]],

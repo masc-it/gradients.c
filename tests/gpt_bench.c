@@ -23,6 +23,7 @@
  *   GD_BENCH_HEAD_DIM         per-head dim (default 64; d_model==heads*head_dim)
  *   GD_BENCH_DFF              MLP hidden size (default 4*d_model = 1024)
  *   GD_BENCH_ATTN_WINDOW      causal sliding-window attention size (default 0=full)
+ *   GD_BENCH_DTYPE=f32|f16    parameter/activation dtype (F16 is forward-only v1)
  *   GD_BENCH_FUSED_LMCE=1     training: use fused tied-LM-head CE loss
  *   GD_BENCH_LR_MAX=0.001     training: scheduler max LR
  *   GD_BENCH_LR_MIN=0.0001    training: scheduler min LR
@@ -67,6 +68,16 @@ static float env_float(const char *name, float fallback)
         return fallback;
     }
     return strtof(v, NULL);
+}
+
+static int env_flag_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    if (v == NULL || v[0] == '\0') {
+        return 0;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+           strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
 }
 
 static double now_ms(void)
@@ -135,6 +146,8 @@ int main(void)
     const char *mode_env = getenv("GD_BENCH_MODE");
     int train_mode = (mode_env == NULL) || (strcmp(mode_env, "fwd") != 0);
     int fused_lmce = env_int("GD_BENCH_FUSED_LMCE", 0) != 0;
+    const char *dtype_env = getenv("GD_BENCH_DTYPE");
+    gd_dtype bench_dtype = GD_DTYPE_F32;
 
     int B = env_int("GD_BENCH_B", 1);
     int T = env_int("GD_BENCH_T", 128);
@@ -202,6 +215,18 @@ int main(void)
     cfg.norm_eps = 1e-5F;
     cfg.mlp_kind = GD_GPT_MLP_POWLU;
     cfg.powlu_m = env_float("GD_POWLU_M", 3.0F);
+    if (dtype_env != NULL && dtype_env[0] != '\0') {
+        if (strcmp(dtype_env, "f16") == 0 || strcmp(dtype_env, "fp16") == 0) {
+            bench_dtype = GD_DTYPE_F16;
+        } else if (strcmp(dtype_env, "f32") == 0 || strcmp(dtype_env, "fp32") == 0) {
+            bench_dtype = GD_DTYPE_F32;
+        } else {
+            fprintf(stderr, "config error: GD_BENCH_DTYPE must be f32 or f16\n");
+            gd_context_destroy(ctx);
+            return 1;
+        }
+    }
+    cfg.param_dtype = bench_dtype;
     {
         const char *mlp_env = getenv("GD_BENCH_MLP");
         if (mlp_env != NULL && strcmp(mlp_env, "swiglu") == 0) {
@@ -220,6 +245,17 @@ int main(void)
     }
     if (cfg.attention_window < 0) {
         fprintf(stderr, "config error: attention window must be non-negative\n");
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    if (train_mode && cfg.param_dtype == GD_DTYPE_F16) {
+        fprintf(stderr, "config error: GD_BENCH_DTYPE=f16 is forward-only until AMP training lands\n");
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    if (target.type == GD_DEVICE_METAL && cfg.param_dtype == GD_DTYPE_F16 &&
+        !env_flag_enabled("GD_METAL_MPS")) {
+        fprintf(stderr, "config error: Metal F16 GPT forward needs GD_METAL_MPS=1\n");
         gd_context_destroy(ctx);
         return 1;
     }
@@ -264,6 +300,7 @@ int main(void)
     printf("  device      : %s\n", target.type == GD_DEVICE_METAL ? "metal" : "cpu");
     printf("  mode        : %s%s\n", train_mode ? "train (fwd+bwd+adamw)" : "forward",
            (train_mode && fused_lmce) ? " + fused_lmce" : "");
+    printf("  dtype       : %s\n", gd_dtype_name(cfg.param_dtype));
     printf("  params      : %ld (%.2fM)\n", total_params, (double)total_params / 1e6);
     printf("  config      : d_model=%d layers=%d heads=%d kv_heads=%d head_dim=%d d_ff=%d vocab=%d\n",
            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.d_ff,

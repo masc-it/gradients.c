@@ -136,6 +136,42 @@ static int test_forward_loss_parity(gd_context *ctx, gd_tensor *tokens,
     return 0;
 }
 
+static int collect_f16_forward_loss(gd_context *ctx, gd_device dev,
+                                    gd_tensor *tokens, gd_tensor *pos,
+                                    gd_tensor *targets, float *loss_out)
+{
+    gd_gpt *gpt = NULL;
+    gd_gpt_config cfg = tiny_config();
+    gd_tensor **params = NULL;
+    int n_params = 0;
+    gd_graph *g = NULL;
+    gd_tensor *loss = NULL;
+    float loss_value = 0.0f;
+    int i = 0;
+
+    cfg.param_dtype = GD_DTYPE_F16;
+    CHECK_OK(gd_gpt_create(ctx, &cfg, GPT_SEED, &gpt));
+    CHECK_OK(gd_gpt_parameters(gpt, &params, &n_params));
+    for (i = 0; i < n_params; ++i) {
+        CHECK_TRUE(gd_tensor_dtype(params[i]) == GD_DTYPE_F16);
+    }
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_forward_loss(ctx, gpt, tokens, pos, targets, &loss));
+    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, dev));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, dev));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &loss_value, sizeof(loss_value)));
+    CHECK_TRUE(isfinite(loss_value));
+    *loss_out = loss_value;
+    gd_tensor_release(loss);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_gpt_destroy(gpt);
+    return 0;
+}
+
 static int64_t tensor_numel(gd_tensor *t)
 {
     int64_t n = 1;
@@ -311,6 +347,15 @@ int main(void)
     }
 
     rc |= test_overfit(ctx, tokens, pos, targets); /* CPU-only, always runs */
+    {
+        float loss_cpu = 0.0f;
+        rc |= collect_f16_forward_loss(ctx, CPU, tokens, pos, targets, &loss_cpu);
+        if (metal && mps_enabled && rc == 0) {
+            float loss_mtl = 0.0f;
+            rc |= collect_f16_forward_loss(ctx, METAL, tokens, pos, targets, &loss_mtl);
+            CHECK_TRUE(fabsf(loss_cpu - loss_mtl) <= 5.0e-2f);
+        }
+    }
     if (metal) {
         rc |= test_forward_parity(ctx, tokens, pos);
         if (mps_enabled) {

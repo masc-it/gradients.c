@@ -24,13 +24,13 @@ default path.
 
 ### Inference contract
 
-- [ ] Model params: F16.
-- [ ] Activations: F16 unless op explicitly returns F32 stats/loss.
+- [x] Model params: F16.
+- [x] Activations: F16 unless op explicitly returns F32 stats/loss.
 - [ ] GEMM/linear: F16 input/output storage, F32 accumulation or backend-verified
       equivalent precision.
 - [ ] RMSNorm/reductions/softmax/SDPA: F16 load/store with F32 reduction, stats,
       score, and normalization math.
-- [ ] LM head / lmCE: F16 hidden/weight storage with F32 logits math and F32 loss
+- [x] LM head / lmCE: F16 hidden/weight storage with F32 logits math and F32 loss
       when a loss is requested.
 - [ ] KV cache path, once added, stores F16 K/V by default and computes attention
       stats in F32.
@@ -70,9 +70,9 @@ clear gradient dtype rules, optimizer master ownership, and F32 loss/scaler flow
 
 ### Minimal v1 APIs
 
-- [ ] Add `gd_gpt_config.param_dtype` with default `GD_DTYPE_F32`.
+- [x] Add `gd_gpt_config.param_dtype` with default `GD_DTYPE_F32`.
 - [ ] Keep `gd_context_set_compute_policy(ctx, {F16, F32})` as v1 autocast knob.
-- [ ] Add `GD_BENCH_DTYPE=f32|f16` to `gpt_bench`.
+- [x] Add `GD_BENCH_DTYPE=f32|f16` to `gpt_bench`.
 - [ ] Add `GD_BENCH_AMP=1` for training with dynamic loss scaling.
 - [ ] Extend `gd_adamw_config` with master-param policy:
 
@@ -232,10 +232,10 @@ CPU fallback.
   - [x] output F16.
   - Note: first F16 path uses generic tiled/split-K kernels; causal/window F16 specializations remain perf work.
 - [x] Fused residual+RMSNorm path typed for F16 or disabled safely for F16.
-- [ ] Fused lmCE forward supports F16 hidden/weight with F32 stats/loss.
+- [x] Fused lmCE forward supports F16 hidden/weight with F32 stats/loss.
 - [ ] Add GPT inference/forward-only harness if missing:
-  - [ ] `GD_BENCH_MODE=infer|forward|train`.
-  - [ ] `GD_BENCH_DTYPE=f16`.
+  - [x] `GD_BENCH_MODE=infer|forward|train` (current spelling: `fwd|train`).
+  - [x] `GD_BENCH_DTYPE=f16`.
   - [ ] report fallback count.
 - [ ] Acceptance for inference phase:
   - [ ] F16 GPT forward/loss parity vs F32 tolerance on tiny graph.

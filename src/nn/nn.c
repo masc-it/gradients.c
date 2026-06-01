@@ -1,6 +1,7 @@
 #include "gradients/nn.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -46,12 +47,16 @@ static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64
                               float scale, int ones, uint64_t *rng, gd_tensor **slot)
 {
     gd_device device = gd_context_default_device(g->ctx);
+    gd_dtype dtype = g->cfg.param_dtype;
     gd_tensor_desc desc;
     gd_tensor *t = NULL;
     int64_t numel = 1;
-    float *buf = NULL;
+    size_t elem_size = gd_dtype_sizeof(dtype);
+    size_t nbytes = 0U;
+    void *buf = NULL;
     int i = 0;
-    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, device, ndim, sizes, &desc);
+    int64_t j = 0;
+    gd_status status = gd_tensor_desc_contiguous(dtype, device, ndim, sizes, &desc);
 
     if (status != GD_OK) {
         return status;
@@ -63,15 +68,28 @@ static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64
     for (i = 0; i < ndim; ++i) {
         numel *= sizes[i];
     }
-    buf = malloc((size_t)numel * sizeof(float));
+    if (numel < 0 || elem_size == 0U || (uint64_t)numel > (uint64_t)SIZE_MAX / elem_size) {
+        gd_tensor_release(t);
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt parameter size overflows");
+    }
+    nbytes = (size_t)numel * elem_size;
+    buf = malloc(nbytes > 0U ? nbytes : 1U);
     if (buf == NULL) {
         gd_tensor_release(t);
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate parameter init buffer");
     }
-    for (i = 0; i < (int)numel; ++i) {
-        buf[i] = ones ? 1.0f : scale * nrand(rng);
+    if (dtype == GD_DTYPE_F32) {
+        float *f = (float *)buf;
+        for (j = 0; j < numel; ++j) {
+            f[j] = ones ? 1.0f : scale * nrand(rng);
+        }
+    } else {
+        uint16_t *h = (uint16_t *)buf;
+        for (j = 0; j < numel; ++j) {
+            h[j] = _gd_f32_to_f16_bits(ones ? 1.0f : scale * nrand(rng));
+        }
     }
-    status = gd_tensor_copy_from_cpu(g->ctx, t, buf, (size_t)numel * sizeof(float));
+    status = gd_tensor_copy_from_cpu(g->ctx, t, buf, nbytes);
     free(buf);
     if (status == GD_OK) {
         status = gd_tensor_set_requires_grad(t, true);
@@ -134,6 +152,12 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     }
     if (cfg.attention_window < 0) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "attention_window must be non-negative");
+    }
+    if (cfg.param_dtype == GD_DTYPE_INVALID) {
+        cfg.param_dtype = GD_DTYPE_F32;
+    }
+    if (cfg.param_dtype != GD_DTYPE_F32 && cfg.param_dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt param_dtype must be F32 or F16 in v1");
     }
     if (cfg.mlp_kind != GD_GPT_MLP_POWLU && cfg.mlp_kind != GD_GPT_MLP_SWIGLU &&
         cfg.mlp_kind != GD_GPT_MLP_GELU) {

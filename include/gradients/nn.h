@@ -38,6 +38,7 @@ typedef struct gd_gpt_config {
     gd_gpt_mlp_kind mlp_kind;
     float powlu_m;     /* 0 => 3.0; valid 0 < m < 10 */
     int attention_window; /* 0 => full causal; >0 => causal sliding-window */
+    gd_dtype param_dtype; /* 0/GD_DTYPE_INVALID => F32; F16 enables forward-only v1 */
     bool tie_embeddings; /* LM head shares the token embedding */
 } gd_gpt_config;
 

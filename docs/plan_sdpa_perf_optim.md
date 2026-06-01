@@ -1,6 +1,6 @@
 # SDPA Metal performance optimization
 
-Status: causal SDPA specialization, SIMD dK/dV, and forward lane kernels complete.
+Status: causal SDPA specialization plus lane-parallel fwd/bwd split kernels complete.
 
 ## Goal
 
@@ -184,12 +184,42 @@ Long-context release check (`B=4 T=2048`, 1 warmup + 4 measured):
 - best tokens/s: `2662`
 - best GFLOP/s: `233.7`
 
+## Follow-up: causal stats+dq channel lanes
+
+The fused stats+dq split path was still one thread per query row. Added
+`gd_sdpa_bwd_stats_dq_split_causal_lane8`, mirroring the forward lane kernel:
+8 query rows × 8 channel lanes per threadgroup, SIMD shuffle reductions for
+`q·k` and `dO·v`, unchanged stats/dq partial layout, unchanged combine pass.
+
+Trace matrix after stats+dq lanes:
+
+| shape | traced step | `sdpa` | `sdpa_bwd` | attention share |
+|---|---:|---:|---:|---:|
+| `B=8 T=256` | `355.7 ms` | `28.4 ms` | `60.3 ms` | `25%` |
+| `B=8 T=512` | `678.6 ms` | `88.0 ms` | `219.7 ms` | `45%` |
+| `B=8 T=1024` | `1782.7 ms` | `307.3 ms` | `858.3 ms` | `65%` |
+| `B=4 T=2048` | `2895.2 ms` | `564.6 ms` | `1695.3 ms` | `78%` |
+
+Requested release run (`B=8 T=1024`, 2 warmup + 10 measured):
+
+| metric | after fwd lanes | after stats+dq lanes |
+|---|---:|---:|
+| mean ms/iter | `1775.2` | `1541.9` |
+| best ms/iter | `1768.2` | `1539.5` |
+| best tokens/s | `4633` | `5321` |
+| best GFLOP/s | `319.3` | `366.7` |
+
+Long-context release check (`B=4 T=2048`, 1 warmup + 4 measured):
+
+- mean: `2657.3 ms/iter`
+- best: `2652.3 ms/iter`
+- best tokens/s: `3089`
+- best GFLOP/s: `271.1`
+
 ## Next work
 
-1. `sdpa_bwd` is again the main attention bottleneck; optimize the causal
-   stats+dq split path with the same channel-lane structure if scratch/occupancy
-   allows.
-2. Re-profile wider 12--20M configs; GEMM share may rise after the attention wins.
+1. Re-profile wider 12--20M configs; GEMM share should be much more visible now.
+2. Attention at `T=1024` is still ~65% in trace, but smaller configs may now be
+   GEMM/LMCE bound; avoid guessing before matrix profiling.
 3. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
-4. Only after attention drops below ~50% of step, retune residual elementwise
-   tail.
+4. Only after wider profiles, retune residual elementwise tail.

@@ -52,6 +52,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_combine", /* split-K combine pass */
     "gd_sdpa_bwd_stats_dq_split",
     "gd_sdpa_bwd_stats_dq_split_causal",
+    "gd_sdpa_bwd_stats_dq_split_causal_lane8",
     "gd_sdpa_bwd_stats_dq_combine",
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_split_causal",

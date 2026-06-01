@@ -91,7 +91,7 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         [enc setBuffer:_gd_metal_value_buffer(exe, bias_input) offset:0 atIndex:3];
         [enc setBuffer:scratch offset:0 atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
-        int split_q = lane_split ? GD_METAL_SDPA_FWD_CAUSAL_QROWS : GD_METAL_SDPA_BQ;
+        int split_q = lane_split ? GD_METAL_SDPA_CAUSAL_QROWS : GD_METAL_SDPA_BQ;
         int split_n_qb = (p.Tq + split_q - 1) / split_q;
         NSUInteger sgroups = (NSUInteger)(p.B * p.Hq * split_n_qb * p.n_splits);
         if (sgroups > 0) {

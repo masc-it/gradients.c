@@ -444,7 +444,7 @@ kernel void gd_sdpa_splitk_causal_lane8(device const float *q              [[buf
     threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
     threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
 
-    int n_qb = (p.Tq + GD_SDPA_FWD_CAUSAL_QROWS - 1) / GD_SDPA_FWD_CAUSAL_QROWS;
+    int n_qb = (p.Tq + GD_SDPA_CAUSAL_QROWS - 1) / GD_SDPA_CAUSAL_QROWS;
     int s = (int)tgid % p.n_splits;
     int t2 = (int)tgid / p.n_splits;
     int qb = t2 % n_qb;
@@ -455,7 +455,7 @@ kernel void gd_sdpa_splitk_causal_lane8(device const float *q              [[buf
     int hkv = hq / group;
     int local_q = (int)tid / GD_SDPA_DKV_LANES;
     int lane = (int)tid - local_q * GD_SDPA_DKV_LANES;
-    int i = qb * GD_SDPA_FWD_CAUSAL_QROWS + local_q;
+    int i = qb * GD_SDPA_CAUSAL_QROWS + local_q;
     bool active = i < p.Tq;
     int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
 
@@ -470,8 +470,8 @@ kernel void gd_sdpa_splitk_causal_lane8(device const float *q              [[buf
     float m = -INFINITY;
     float l = 0.0f;
 
-    int kb_end = gd_sdpa_causal_kb_end(qb * GD_SDPA_FWD_CAUSAL_QROWS,
-                                        GD_SDPA_FWD_CAUSAL_QROWS,
+    int kb_end = gd_sdpa_causal_kb_end(qb * GD_SDPA_CAUSAL_QROWS,
+                                        GD_SDPA_CAUSAL_QROWS,
                                         p.Tq,
                                         p.Tk);
     int k_lo = s * p.split_len;

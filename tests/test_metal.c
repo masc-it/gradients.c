@@ -228,7 +228,7 @@ static int test_metal_f16_unsupported_reject(gd_context *ctx)
     float data[4] = {1.0F, 2.0F, 3.0F, 4.0F};
     gd_tensor *x = NULL;
     gd_tensor *xh = NULL;
-    gd_tensor *sm = NULL;
+    gd_tensor *sum = NULL;
     gd_graph *g = NULL;
     gd_status status = GD_OK;
 
@@ -236,11 +236,11 @@ static int test_metal_f16_unsupported_reject(gd_context *ctx)
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
     CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
-    CHECK_OK(gd_softmax(ctx, xh, -1, &sm));
+    CHECK_OK(gd_sum(ctx, xh, -1, false, &sum));
     CHECK_OK(gd_graph_end(ctx));
     status = gd_graph_compile(g, METAL);
     CHECK_TRUE(status == GD_ERR_UNSUPPORTED);
-    gd_tensor_release(sm);
+    gd_tensor_release(sum);
     gd_tensor_release(xh);
     CHECK_OK(gd_graph_destroy(g));
     gd_tensor_release(x);
@@ -287,11 +287,12 @@ static int test_metal_f16_elementwise(gd_context *ctx)
     float got_silu[4] = {0};
     float got_gelu[4] = {0};
     float got_powlu[4] = {0};
+    float got_softmax[4] = {0};
     gd_tensor *x = NULL, *y = NULL, *xh = NULL, *yh = NULL;
     gd_tensor *addh = NULL, *mulh = NULL, *scaleh = NULL, *reluh = NULL;
-    gd_tensor *siluh = NULL, *geluh = NULL, *powluh = NULL;
+    gd_tensor *siluh = NULL, *geluh = NULL, *powluh = NULL, *softmaxh = NULL;
     gd_tensor *add = NULL, *mul = NULL, *scale = NULL, *relu = NULL;
-    gd_tensor *silu = NULL, *gelu = NULL, *powlu = NULL;
+    gd_tensor *silu = NULL, *gelu = NULL, *powlu = NULL, *softmax = NULL;
     gd_graph *g = NULL;
     int i = 0;
 
@@ -308,6 +309,7 @@ static int test_metal_f16_elementwise(gd_context *ctx)
     CHECK_OK(gd_silu(ctx, xh, &siluh));
     CHECK_OK(gd_gelu(ctx, xh, true, &geluh));
     CHECK_OK(gd_powlu(ctx, xh, yh, 3.0F, &powluh));
+    CHECK_OK(gd_softmax(ctx, xh, 0, &softmaxh));
     CHECK_OK(gd_cast(ctx, addh, GD_DTYPE_F32, &add));
     CHECK_OK(gd_cast(ctx, mulh, GD_DTYPE_F32, &mul));
     CHECK_OK(gd_cast(ctx, scaleh, GD_DTYPE_F32, &scale));
@@ -315,6 +317,7 @@ static int test_metal_f16_elementwise(gd_context *ctx)
     CHECK_OK(gd_cast(ctx, siluh, GD_DTYPE_F32, &silu));
     CHECK_OK(gd_cast(ctx, geluh, GD_DTYPE_F32, &gelu));
     CHECK_OK(gd_cast(ctx, powluh, GD_DTYPE_F32, &powlu));
+    CHECK_OK(gd_cast(ctx, softmaxh, GD_DTYPE_F32, &softmax));
     CHECK_OK(gd_graph_end(ctx));
     CHECK_OK(gd_graph_compile(g, METAL));
     CHECK_OK(gd_graph_run(g));
@@ -326,18 +329,21 @@ static int test_metal_f16_elementwise(gd_context *ctx)
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, silu, got_silu, sizeof(got_silu)));
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, gelu, got_gelu, sizeof(got_gelu)));
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, powlu, got_powlu, sizeof(got_powlu)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, softmax, got_softmax, sizeof(got_softmax)));
     for (i = 0; i < 4; ++i) {
         CHECK_TRUE(fabsf(got_add[i] - (xdata[i] + ydata[i])) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_mul[i] - (xdata[i] * ydata[i])) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_scale[i] - (0.5F * xdata[i])) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_relu[i] - (xdata[i] > 0.0F ? xdata[i] : 0.0F)) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_silu[i] - (xdata[i] * metal_test_sigmoid(xdata[i]))) <= 2.0e-2F);
+        float sm_sum = expf(xdata[0]) + expf(xdata[1]) + expf(xdata[2]) + expf(xdata[3]);
         CHECK_TRUE(fabsf(got_gelu[i] - metal_test_gelu_tanh(xdata[i])) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_powlu[i] - metal_test_powlu(xdata[i], ydata[i])) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_softmax[i] - expf(xdata[i]) / sm_sum) <= 2.0e-2F);
     }
-    gd_tensor_release(powlu); gd_tensor_release(gelu); gd_tensor_release(silu);
+    gd_tensor_release(softmax); gd_tensor_release(powlu); gd_tensor_release(gelu); gd_tensor_release(silu);
     gd_tensor_release(relu); gd_tensor_release(scale); gd_tensor_release(mul); gd_tensor_release(add);
-    gd_tensor_release(powluh); gd_tensor_release(geluh); gd_tensor_release(siluh);
+    gd_tensor_release(softmaxh); gd_tensor_release(powluh); gd_tensor_release(geluh); gd_tensor_release(siluh);
     gd_tensor_release(reluh); gd_tensor_release(scaleh); gd_tensor_release(mulh); gd_tensor_release(addh);
     gd_tensor_release(yh); gd_tensor_release(xh); CHECK_OK(gd_graph_destroy(g));
     gd_tensor_release(y); gd_tensor_release(x);

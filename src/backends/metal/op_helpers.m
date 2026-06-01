@@ -159,6 +159,8 @@ gd_status _gd_metal_encode_softmax(_gd_metal_encode_ctx *ctx)
     gd_metal_softmax_params p;
 
     _gd_metal_split_around_dim(desc, node->attrs.dim, &p.outer, &p.d, &p.inner);
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(desc->dtype, &p.dtype);
     [enc setComputePipelineState:ctx->pso];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->outputs[0]) offset:0 atIndex:1];
@@ -177,6 +179,7 @@ gd_status _gd_metal_encode_softmax_bwd(_gd_metal_encode_ctx *ctx)
     gd_metal_softmax_params p;
 
     _gd_metal_split_around_dim(out_desc, node->attrs.dim, &p.outer, &p.d, &p.inner);
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:ctx->pso];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[1]) offset:0 atIndex:1];

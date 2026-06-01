@@ -1,9 +1,9 @@
 #include "metal_common.metal"
 
-kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
-                         device float *out                     [[buffer(1)]],
-                         constant gd_metal_reduce_to_params &p  [[buffer(2)]],
-                         uint gid                              [[thread_position_in_grid]])
+kernel void gd_reduce_to(device const uchar *go               [[buffer(0)]],
+                         device uchar *out                    [[buffer(1)]],
+                         constant gd_metal_reduce_to_params &p [[buffer(2)]],
+                         uint gid                             [[thread_position_in_grid]])
 {
     int t = (int)gid;
     if (t >= p.target_numel) {
@@ -24,9 +24,9 @@ kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
         if (leading_only) {
             float acc = 0.0f;
             for (int r = 0; r < p.go_sizes[0]; ++r) {
-                acc += go[r * p.target_numel + t];
+                acc += gd_load_float(go, p.dtype, (uint)(r * p.target_numel + t));
             }
-            out[t] = acc;
+            gd_store_float(out, p.dtype, (uint)t, acc);
             return;
         }
     }
@@ -77,7 +77,7 @@ kernel void gd_reduce_to(device const float *go                [[buffer(0)]],
             goff += (rem % p.go_sizes[dim]) * go_stride[dim];
             rem /= p.go_sizes[dim];
         }
-        acc += go[goff];
+        acc += gd_load_float(go, p.dtype, (uint)goff);
     }
-    out[t] = acc;
+    gd_store_float(out, p.dtype, (uint)t, acc);
 }

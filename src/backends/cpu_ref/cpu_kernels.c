@@ -3,6 +3,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../../core/internal.h"
@@ -301,7 +302,7 @@ gd_status _gd_cpu_k_reduce(const gd_tensor_desc *out_desc,
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, float *out, const float *x, int dim)
+gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, void *out, const void *x, int dim)
 {
     int64_t inner = 1;
     int64_t outer = 1;
@@ -324,18 +325,35 @@ gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, float *out, const float 
             int64_t c = 0;
 
             for (c = 0; c < d; ++c) {
-                double v = (double)x[(o * d + c) * inner + in];
-                if (v > max_val) {
-                    max_val = v;
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(desc, x, (o * d + c) * inner + in, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                if ((double)f > max_val) {
+                    max_val = (double)f;
                 }
             }
             for (c = 0; c < d; ++c) {
-                double e = exp((double)x[(o * d + c) * inner + in] - max_val);
-                out[(o * d + c) * inner + in] = (float)e;
-                sum += e;
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(desc, x, (o * d + c) * inner + in, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                sum += exp((double)f - max_val);
             }
             for (c = 0; c < d; ++c) {
-                out[(o * d + c) * inner + in] = (float)((double)out[(o * d + c) * inner + in] / sum);
+                int64_t off = (o * d + c) * inner + in;
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(desc, x, off, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                status = _gd_cpu_store_float(desc, out, off,
+                                             (float)(exp((double)f - max_val) / sum));
+                if (status != GD_OK) {
+                    return status;
+                }
             }
         }
     }
@@ -746,24 +764,43 @@ gd_status _gd_cpu_k_assert_close(const gd_tensor_desc *a_desc,
 }
 
 gd_status _gd_cpu_k_reduce_to(const gd_tensor_desc *target_desc,
-                              float *out,
+                              void *out,
                               const gd_tensor_desc *go_desc,
-                              const float *go)
+                              const void *go)
 {
     int64_t target_total = desc_numel(target_desc);
     int64_t go_total = desc_numel(go_desc);
     int64_t i = 0;
     int64_t index[GD_MAX_DIMS];
+    float *acc = NULL;
 
-    for (i = 0; i < target_total; ++i) {
-        out[i] = 0.0F;
+    if (target_total <= 0) {
+        return GD_OK;
+    }
+    acc = (float *)calloc((size_t)target_total, sizeof(float));
+    if (acc == NULL) {
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "cpu reduce_to allocation failed");
     }
     for (i = 0; i < go_total; ++i) {
         int64_t off = 0;
+        float v = 0.0F;
+        gd_status status = _gd_cpu_load_float(go_desc, go, i, &v);
+        if (status != GD_OK) {
+            free(acc);
+            return status;
+        }
         unravel(i, go_desc, index);
         off = broadcast_offset(index, go_desc->ndim, target_desc);
-        out[off] += go[i];
+        acc[off] += v;
     }
+    for (i = 0; i < target_total; ++i) {
+        gd_status status = _gd_cpu_store_float(target_desc, out, i, acc[i]);
+        if (status != GD_OK) {
+            free(acc);
+            return status;
+        }
+    }
+    free(acc);
     return GD_OK;
 }
 

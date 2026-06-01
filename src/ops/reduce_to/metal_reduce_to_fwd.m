@@ -17,6 +17,8 @@ static gd_status reduce_to_encode(_gd_metal_encode_ctx *ctx)
     p.target_numel = (int)_gd_metal_desc_numel(target);
     p.go_ndim = go->ndim;
     p.go_numel = (int)_gd_metal_desc_numel(go);
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(target->dtype, &p.dtype);
     for (i = 0; i < target->ndim; ++i) {
         p.target_sizes[i] = (int)target->sizes[i];
     }
@@ -36,5 +38,6 @@ static gd_status reduce_to_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_reduce_to = {
     .kind = _GD_OP_REDUCE_TO,
     .name = "reduce_to",
+    .support = _gd_metal_support_f32_f16_same_dtype,
     .encode = reduce_to_encode,
 };

@@ -205,9 +205,9 @@ CPU fallback.
   - [x] add/mul/scale.
   - [x] copy.
   - [x] ReLU/SiLU/GELU/PowLU forward.
-- [ ] Shape/data movement kernels typed for F16:
+- [x] Shape/data movement kernels typed for F16:
   - [x] transpose.
-  - [ ] reduce_to where needed.
+  - [x] reduce_to where needed.
   - [x] embedding forward.
 - [x] RMSNorm forward:
   - [x] load F16 input/weight.
@@ -216,9 +216,9 @@ CPU fallback.
 - [x] RoPE forward:
   - [x] load/store F16.
   - [x] compute trig/rotate in F32.
-- [ ] Softmax forward if used outside SDPA:
-  - [ ] F32 max/sum.
-  - [ ] F16 output.
+- [x] Softmax forward if used outside SDPA:
+  - [x] F32 max/sum.
+  - [x] F16 output.
 - [ ] SDPA forward:
   - [ ] full causal F16 path.
   - [ ] sliding-window causal F16 path.

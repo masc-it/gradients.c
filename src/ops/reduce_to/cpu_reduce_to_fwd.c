@@ -16,10 +16,6 @@ static gd_status reduce_to_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_reduce_to(out_desc, out_data, go_desc, go_data);
 }
 

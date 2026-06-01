@@ -153,6 +153,7 @@ typedef struct gd_metal_softmax_params {
     int outer;
     int inner;
     int d;
+    int dtype; /* GD_METAL_DT_* input/output dtype */
 } gd_metal_softmax_params;
 
 typedef struct gd_metal_rmsnorm_params {
@@ -186,6 +187,7 @@ typedef struct gd_metal_reduce_to_params {
     int target_numel;
     int go_ndim;
     int go_numel;
+    int dtype; /* GD_METAL_DT_* input/output dtype */
     int target_sizes[GD_METAL_MAX_DIMS];
     int go_sizes[GD_METAL_MAX_DIMS];
 } gd_metal_reduce_to_params;

@@ -48,7 +48,7 @@ gd_status _gd_cpu_k_reduce(const gd_tensor_desc *out_desc,
                            const float *x,
                            int dim,
                            bool mean);
-gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, float *out, const float *x, int dim);
+gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, void *out, const void *x, int dim);
 gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
                              void *out,
                              const void *x,
@@ -164,9 +164,9 @@ gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
 
 /* Sums `go` (broadcasted output shape) down into `out` (target shape). */
 gd_status _gd_cpu_k_reduce_to(const gd_tensor_desc *target_desc,
-                              float *out,
+                              void *out,
                               const gd_tensor_desc *go_desc,
-                              const float *go);
+                              const void *go);
 
 /* Optimizer kernels. */
 gd_status _gd_cpu_k_assert_finite(const gd_tensor_desc *desc, const float *x);

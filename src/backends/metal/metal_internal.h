@@ -124,6 +124,12 @@ MPSMatrix *_gd_metal_mps_matrix(id<MTLBuffer> buffer,
                                 NSUInteger rows,
                                 NSUInteger cols,
                                 NSUInteger row_bytes);
+MPSMatrix *_gd_metal_mps_matrix_typed(id<MTLBuffer> buffer,
+                                      NSUInteger offset,
+                                      NSUInteger rows,
+                                      NSUInteger cols,
+                                      NSUInteger row_bytes,
+                                      MPSDataType data_type);
 gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,
                                   __strong id<MTLComputeCommandEncoder> *enc,
                                   id<MTLDevice> device,

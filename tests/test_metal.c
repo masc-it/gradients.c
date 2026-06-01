@@ -453,6 +453,60 @@ static int test_metal_f16_cross_entropy(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_lm_cross_entropy(gd_context *ctx)
+{
+    int64_t hshape[2] = {2, 3};
+    int64_t wshape[2] = {4, 3};
+    int64_t tshape[1] = {2};
+    float hdata[6] = {0.5F, -1.0F, 2.0F, -0.25F, 0.75F, 1.5F};
+    float wdata[12] = {0.1F, -0.2F, 0.3F, 0.4F, 0.5F, -0.6F,
+                       -0.7F, 0.8F, 0.9F, -1.0F, 1.1F, 0.2F};
+    int32_t targets_data[2] = {0, 3};
+    float got = 0.0F;
+    gd_tensor *h = NULL, *w = NULL, *targets = NULL, *hh = NULL, *wh = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    double expect = 0.0;
+    int n = 0;
+
+    CHECK_OK(make_f32(ctx, 2, hshape, hdata, &h));
+    CHECK_OK(make_f32(ctx, 2, wshape, wdata, &w));
+    CHECK_OK(make_i32(ctx, 1, tshape, targets_data, &targets));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, h, GD_DTYPE_F16, &hh));
+    CHECK_OK(gd_cast(ctx, w, GD_DTYPE_F16, &wh));
+    CHECK_OK(gd_lm_cross_entropy(ctx, hh, wh, targets, &loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &got, sizeof(got)));
+    for (n = 0; n < 2; ++n) {
+        double logits[4];
+        double maxv = -1.0e30;
+        double sum = 0.0;
+        int v = 0;
+        for (v = 0; v < 4; ++v) {
+            logits[v] = (double)hdata[n * 3 + 0] * (double)wdata[v * 3 + 0] +
+                        (double)hdata[n * 3 + 1] * (double)wdata[v * 3 + 1] +
+                        (double)hdata[n * 3 + 2] * (double)wdata[v * 3 + 2];
+            if (logits[v] > maxv) {
+                maxv = logits[v];
+            }
+        }
+        for (v = 0; v < 4; ++v) {
+            sum += exp(logits[v] - maxv);
+        }
+        expect += -(logits[targets_data[n]] - maxv - log(sum));
+    }
+    expect *= 0.5;
+    CHECK_TRUE(fabsf(got - (float)expect) <= 3.0e-2F);
+    gd_tensor_release(loss); gd_tensor_release(wh); gd_tensor_release(hh);
+    CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(targets); gd_tensor_release(w); gd_tensor_release(h);
+    return 0;
+}
+
 static int test_metal_f16_rope(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -1361,6 +1415,7 @@ int main(void)
     rc |= test_metal_linear_parity(ctx);
     if (mps_enabled) {
         rc |= test_metal_f16_mps_gemm(ctx);
+        rc |= test_metal_f16_lm_cross_entropy(ctx);
     }
     rc |= test_metal_reduce_parity(ctx);
     rc |= test_metal_powlu_parity(ctx);

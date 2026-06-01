@@ -20,9 +20,9 @@ gd_status _gd_cpu_k_lm_cross_entropy(float *out,
                                      float *row_max,
                                      float *row_sum,
                                      const gd_tensor_desc *hidden_desc,
-                                     const float *hidden,
+                                     const void *hidden,
                                      const gd_tensor_desc *weight_desc,
-                                     const float *weight,
+                                     const void *weight,
                                      const gd_tensor_desc *targets_desc,
                                      const void *targets)
 {
@@ -46,7 +46,17 @@ gd_status _gd_cpu_k_lm_cross_entropy(float *out,
             double s = 0.0;
             int64_t d = 0;
             for (d = 0; d < D; ++d) {
-                s += (double)hidden[n * D + d] * (double)weight[v * D + d];
+                float hv = 0.0F;
+                float wv = 0.0F;
+                gd_status status = _gd_cpu_load_float(hidden_desc, hidden, n * D + d, &hv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                status = _gd_cpu_load_float(weight_desc, weight, v * D + d, &wv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                s += (double)hv * (double)wv;
             }
             if (v == target) {
                 target_logit = s;
@@ -59,7 +69,17 @@ gd_status _gd_cpu_k_lm_cross_entropy(float *out,
             double s = 0.0;
             int64_t d = 0;
             for (d = 0; d < D; ++d) {
-                s += (double)hidden[n * D + d] * (double)weight[v * D + d];
+                float hv = 0.0F;
+                float wv = 0.0F;
+                gd_status status = _gd_cpu_load_float(hidden_desc, hidden, n * D + d, &hv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                status = _gd_cpu_load_float(weight_desc, weight, v * D + d, &wv);
+                if (status != GD_OK) {
+                    return status;
+                }
+                s += (double)hv * (double)wv;
             }
             sum += exp(s - max_val);
         }

@@ -11,9 +11,19 @@ static gd_status lm_cross_entropy_support(const _gd_metal_plan_ctx *ctx)
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy needs GD_METAL_MPS=1");
     }
     if (ctx->graph != NULL) {
+        const gd_tensor_desc *hidden = &ctx->graph->values[ctx->node->inputs[0]].desc;
+        const gd_tensor_desc *weight = &ctx->graph->values[ctx->node->inputs[1]].desc;
         const gd_tensor_desc *targets = &ctx->graph->values[ctx->node->inputs[2]].desc;
+        const gd_tensor_desc *loss = &ctx->graph->values[ctx->node->outputs[0]].desc;
         if (targets->dtype != GD_DTYPE_I32) {
             return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy needs I32 targets");
+        }
+        if (hidden->dtype != weight->dtype ||
+            (hidden->dtype != GD_DTYPE_F32 && hidden->dtype != GD_DTYPE_F16)) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy supports matching F32/F16 hidden/weight");
+        }
+        if (loss->dtype != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy outputs F32 loss");
         }
     }
     return GD_OK;
@@ -51,6 +61,8 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     int rows = D > 0 ? (int)(_gd_metal_desc_numel(x_desc) / D) : 0;
     int chunk_max = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
     gd_metal_lmce_scratch_layout L = _gd_metal_lmce_fwd_scratch_layout_for(rows, chunk_max);
+    NSUInteger elem_size = (NSUInteger)gd_dtype_sizeof(x_desc->dtype);
+    MPSDataType input_type = x_desc->dtype == GD_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
     id<MTLBuffer> x_b = _gd_metal_value_buffer(exe, node->inputs[0]);
     id<MTLBuffer> w_b = _gd_metal_value_buffer(exe, node->inputs[1]);
     id<MTLBuffer> t_b = _gd_metal_value_buffer(exe, node->inputs[2]);
@@ -82,13 +94,14 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
         if (csz > chunk_max) {
             csz = chunk_max;
         }
-        MPSMatrix *xm = _gd_metal_mps_matrix(x_b, 0, (NSUInteger)rows, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *wm = _gd_metal_mps_matrix(w_b, (NSUInteger)c0 * (NSUInteger)D * sizeof(float),
+        MPSMatrix *xm = _gd_metal_mps_matrix_typed(x_b, 0, (NSUInteger)rows, (NSUInteger)D,
+                                   (NSUInteger)D * elem_size, input_type);
+        MPSMatrix *wm = _gd_metal_mps_matrix_typed(w_b, (NSUInteger)c0 * (NSUInteger)D * elem_size,
                                    (NSUInteger)csz, (NSUInteger)D,
-                                   (NSUInteger)D * sizeof(float));
-        MPSMatrix *lm = _gd_metal_mps_matrix(scratch, L.logits_off, (NSUInteger)rows,
-                                   (NSUInteger)csz, (NSUInteger)csz * sizeof(float));
+                                   (NSUInteger)D * elem_size, input_type);
+        MPSMatrix *lm = _gd_metal_mps_matrix_typed(scratch, L.logits_off, (NSUInteger)rows,
+                                   (NSUInteger)csz, (NSUInteger)csz * sizeof(float),
+                                   MPSDataTypeFloat32);
         gd_status status = _gd_metal_encode_mps_mm(cmd, enc, st.device, xm, wm, lm,
                                          false, true, (NSUInteger)rows,
                                          (NSUInteger)csz, (NSUInteger)D, 0.0);

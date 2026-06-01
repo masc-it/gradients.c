@@ -257,17 +257,28 @@ gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
     return GD_OK;
 }
 
+MPSMatrix *_gd_metal_mps_matrix_typed(id<MTLBuffer> buffer,
+                                      NSUInteger offset,
+                                      NSUInteger rows,
+                                      NSUInteger cols,
+                                      NSUInteger row_bytes,
+                                      MPSDataType data_type)
+{
+    MPSMatrixDescriptor *d = [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                                                    columns:cols
+                                                                   rowBytes:row_bytes
+                                                                   dataType:data_type];
+    return [[MPSMatrix alloc] initWithBuffer:buffer offset:offset descriptor:d];
+}
+
 MPSMatrix *_gd_metal_mps_matrix(id<MTLBuffer> buffer,
                              NSUInteger offset,
                              NSUInteger rows,
                              NSUInteger cols,
                              NSUInteger row_bytes)
 {
-    MPSMatrixDescriptor *d = [MPSMatrixDescriptor matrixDescriptorWithRows:rows
-                                                                    columns:cols
-                                                                   rowBytes:row_bytes
-                                                                   dataType:MPSDataTypeFloat32];
-    return [[MPSMatrix alloc] initWithBuffer:buffer offset:offset descriptor:d];
+    return _gd_metal_mps_matrix_typed(buffer, offset, rows, cols, row_bytes,
+                                      MPSDataTypeFloat32);
 }
 
 gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,

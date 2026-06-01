@@ -1,5 +1,9 @@
 # gradients.c
 
+`gradients.c` is a small C tensor/autograd runtime with graph capture, CPU
+reference execution, and Metal acceleration. It keeps operator definitions,
+shape/meta logic, autograd rules, and backend kernels in per-op capsules.
+
 ## Adding a new operator
 
 Operators live as small capsules under `src/ops/<op>/`. Registries are generated
@@ -85,7 +89,7 @@ If op is not differentiable, omit `GD_OPF_DIFF` and no grad file needed.
 
 ### 5. Add non-CPU backend support
 
-For Metal or future non-CPU backends, prefer optimized implementations instead
+For Metal or future non-CPU backends (CUDA, Vulkan), prefer optimized implementations instead
 of direct CPU-shaped ports. If no optimized backend implementation exists, leave
 op unsupported and let CPU fallback handle it.
 

@@ -563,6 +563,48 @@ static gd_status build_mlp(gd_context *ctx, void *user, gd_tensor **loss_out)
     return status;
 }
 
+static int test_f16_cast_leaf_grad(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t s4[1] = {4};
+    uint16_t half_data[4] = {0x3c00U, 0x4000U, 0xc200U, 0x4400U};
+    float grad_data[4] = {0};
+    gd_tensor_desc desc;
+    gd_tensor *p = NULL;
+    gd_tensor *pf = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s4, &desc));
+    CHECK_OK(gd_tensor_empty(ctx, &desc, &p));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, p, half_data, sizeof(half_data)));
+    CHECK_OK(gd_tensor_set_requires_grad(p, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, p, GD_DTYPE_F32, &pf));
+    CHECK_OK(gd_mean(ctx, pf, 0, false, &loss));
+    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_grad(p, &grad));
+    CHECK_TRUE(grad != NULL);
+    CHECK_TRUE(gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, grad_data, sizeof(grad_data)));
+    for (i = 0; i < 4; ++i) {
+        CHECK_TRUE(fabsf(grad_data[i] - 0.25F) <= 1.0e-6F);
+    }
+    gd_tensor_release(loss);
+    gd_tensor_release(pf);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(p);
+    return 0;
+}
+
 static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
                                  const float *data, gd_tensor **out)
 {
@@ -602,6 +644,7 @@ int main(void)
     float logits[6] = {0.2F, -0.5F, 1.0F, -1.0F, 0.3F, 0.8F};
 
     CHECK_OK(gd_context_create(&ctx));
+    CHECK_TRUE(test_f16_cast_leaf_grad(ctx) == 0);
 
     {
         two_in t = {0};

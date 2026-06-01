@@ -264,6 +264,8 @@ gd_status gd_backward(gd_context *ctx, gd_tensor *loss)
     for (i = 0; i < b.n_values; ++i) {
         gd_tensor *leaf = graph->values[i].external;
         gd_tensor *grad_slot = NULL;
+        gd_tensor *grad_to_write = b.grad[i];
+        gd_tensor *casted_grad = NULL;
 
         if (leaf == NULL || b.grad[i] == NULL || !gd_tensor_requires_grad(leaf)) {
             continue;
@@ -273,7 +275,16 @@ gd_status gd_backward(gd_context *ctx, gd_tensor *loss)
             bwd_cleanup(&b);
             return status;
         }
-        status = _gd_graph_emit_to(graph, _GD_OP_COPY, &b.grad[i], 1, NULL, grad_slot);
+        if (gd_tensor_dtype(grad_to_write) != GD_DTYPE_F32) {
+            status = gd_cast(ctx, grad_to_write, GD_DTYPE_F32, &casted_grad);
+            if (status != GD_OK) {
+                bwd_cleanup(&b);
+                return status;
+            }
+            grad_to_write = casted_grad;
+        }
+        status = _gd_graph_emit_to(graph, _GD_OP_COPY, &grad_to_write, 1, NULL, grad_slot);
+        gd_tensor_release(casted_grad);
         if (status != GD_OK) {
             bwd_cleanup(&b);
             return status;

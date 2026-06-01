@@ -31,15 +31,13 @@ static int test_public_differentiable_ops_have_rules(void)
         CHECK_TRUE(rule != NULL);
         CHECK_TRUE(rule->op == kind);
         CHECK_TRUE(rule->fn != NULL || rule->unsupported_reason != NULL);
-        if (kind != _GD_OP_CAST) {
-            CHECK_TRUE(rule->fn != NULL);
-            CHECK_TRUE(rule->unsupported_reason == NULL);
-        }
+        CHECK_TRUE(rule->fn != NULL);
+        CHECK_TRUE(rule->unsupported_reason == NULL);
     }
     return 0;
 }
 
-static int test_known_internal_and_unsupported_rules(void)
+static int test_known_internal_rules(void)
 {
     const _gd_bwd_rule *copy_rule = _gd_bwd_rule_for(_GD_OP_COPY);
     const _gd_bwd_rule *cast_rule = _gd_bwd_rule_for(_GD_OP_CAST);
@@ -49,10 +47,8 @@ static int test_known_internal_and_unsupported_rules(void)
     CHECK_TRUE(copy_rule->unsupported_reason == NULL);
 
     CHECK_TRUE(cast_rule != NULL);
-    CHECK_TRUE(cast_rule->fn == NULL);
-    CHECK_TRUE(cast_rule->unsupported_reason != NULL);
-    CHECK_TRUE(strcmp(cast_rule->unsupported_reason,
-                      "cast backward is not supported in v1") == 0);
+    CHECK_TRUE(cast_rule->fn != NULL);
+    CHECK_TRUE(cast_rule->unsupported_reason == NULL);
     return 0;
 }
 
@@ -61,7 +57,7 @@ int main(void)
     if (test_public_differentiable_ops_have_rules() != 0) {
         return 1;
     }
-    if (test_known_internal_and_unsupported_rules() != 0) {
+    if (test_known_internal_rules() != 0) {
         return 1;
     }
     return 0;

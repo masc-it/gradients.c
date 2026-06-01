@@ -507,6 +507,42 @@ static int test_metal_f16_lm_cross_entropy(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_sdpa(gd_context *ctx)
+{
+    int64_t shape[4] = {1, 3, 1, 4};
+    float qdata[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F, -1.1F, 1.2F};
+    float kdata[12] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float vdata[12] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F, -1.1F, 1.2F};
+    gd_sdpa_config cfg = {0.0F, true, 2, 0};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y16h = NULL, *y16 = NULL;
+    gd_graph *g = NULL;
+    gd_compare_options opts = {3.0e-2, 3.0e-2, false};
+
+    CHECK_OK(make_f32(ctx, 4, shape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 4, shape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 4, shape, vdata, &v));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa(ctx, qh, kh, vh, NULL, &cfg, &y16h));
+    CHECK_OK(gd_cast(ctx, y16h, GD_DTYPE_F32, &y16));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(y16); gd_tensor_release(y16h);
+    gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
 static int test_metal_f16_rope(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -1410,6 +1446,7 @@ int main(void)
     rc |= test_metal_f16_elementwise(ctx);
     rc |= test_metal_f16_embedding_transpose(ctx);
     rc |= test_metal_f16_cross_entropy(ctx);
+    rc |= test_metal_f16_sdpa(ctx);
     rc |= test_metal_f16_rope(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);

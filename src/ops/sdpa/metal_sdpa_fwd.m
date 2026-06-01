@@ -37,6 +37,50 @@ static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
     return p != NULL && p->causal != 0 && p->prefix_len == 0 && p->has_bias == 0;
 }
 
+static gd_status sdpa_support(const _gd_metal_plan_ctx *ctx)
+{
+    gd_status status = GD_OK;
+    gd_dtype dtype = GD_DTYPE_INVALID;
+    int i = 0;
+
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal sdpa support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'sdpa'");
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    dtype = ctx->graph->values[ctx->node->outputs[0]].desc.dtype;
+    if (dtype != GD_DTYPE_F32 && dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal sdpa supports F32/F16 tensors only");
+    }
+    if (dtype == GD_DTYPE_F16) {
+        if (_gd_metal_pipeline_named(ctx->state, "gd_sdpa_tiled_f16") == nil ||
+            _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_f16") == nil ||
+            _gd_metal_pipeline_named(ctx->state, "gd_sdpa_combine_f16") == nil ||
+            _gd_metal_pipeline_named(ctx->state, "gd_sdpa_f16") == nil) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal sdpa F16 kernels missing");
+        }
+    }
+    for (i = 0; i < 3; ++i) {
+        if (ctx->graph->values[ctx->node->inputs[i]].desc.dtype != dtype) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal sdpa requires matching q/k/v dtype");
+        }
+    }
+    if (ctx->node->attrs.has_bias &&
+        ctx->graph->values[ctx->node->inputs[3]].desc.dtype != dtype) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal sdpa requires matching bias dtype");
+    }
+    return GD_OK;
+}
+
 static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
 {
     id<MTLComputeCommandEncoder> enc = *ctx->encoder;
@@ -55,6 +99,7 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
     /* bias is always bound; the kernel only reads it when has_bias. Use q as a
      * valid placeholder buffer when absent. */
     int bias_input = node->attrs.has_bias ? node->inputs[3] : node->inputs[0];
+    bool f16 = q->dtype == GD_DTYPE_F16;
     gd_metal_sdpa_params p;
     int n_qb = 0;
 
@@ -68,7 +113,13 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
     if (p.Dh <= GD_METAL_SDPA_DHT && scratch != nil &&
         splitk_pso != nil && combine_pso != nil) {
         bool lane_split = false;
-        if (sdpa_is_causal_no_bias(&p)) {
+        if (f16) {
+            splitk_pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_f16");
+            combine_pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_combine_f16");
+            if (splitk_pso == nil || combine_pso == nil) {
+                return _gd_error(GD_ERR_BACKEND, "metal sdpa F16 split-K pipeline missing");
+            }
+        } else if (sdpa_is_causal_no_bias(&p)) {
             if (p.window > 0) {
                 id<MTLComputePipelineState> window_fast =
                     _gd_metal_pipeline_named(ctx->state,
@@ -130,7 +181,12 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
     if (p.Dh <= GD_METAL_SDPA_DHT) {
         /* Tiled: one threadgroup per (b, hq, query-block) of GD_METAL_SDPA_BQ. */
         NSUInteger groups = (NSUInteger)(p.B * p.Hq * n_qb);
-        if (sdpa_is_causal_no_bias(&p)) {
+        if (f16) {
+            pso = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_tiled_f16");
+            if (pso == nil) {
+                return _gd_error(GD_ERR_BACKEND, "metal sdpa F16 tiled pipeline missing");
+            }
+        } else if (sdpa_is_causal_no_bias(&p)) {
             id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_tiled_causal");
             if (fast != nil) {
                 pso = fast;
@@ -143,8 +199,12 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         }
     } else {
         /* Fallback to the per-(b,hq,i) reference kernel for large head_dim. */
-        id<MTLComputePipelineState> ref = _gd_metal_pipeline_named(ctx->state, "gd_sdpa");
+        id<MTLComputePipelineState> ref = _gd_metal_pipeline_named(ctx->state,
+                                                                   f16 ? "gd_sdpa_f16" : "gd_sdpa");
         int grid = p.B * p.Hq * p.Tq;
+        if (ref == nil) {
+            return _gd_error(GD_ERR_BACKEND, "metal sdpa reference pipeline missing");
+        }
         [enc setComputePipelineState:ref];
         if (grid > 0) {
             _gd_metal_dispatch_1d(enc, ref, (NSUInteger)grid);
@@ -168,8 +228,10 @@ static gd_status sdpa_plan(_gd_metal_plan_ctx *ctx)
         if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
             int64_t npart = qd->sizes[0] * qd->sizes[2] * qd->sizes[1] *
                             nsplit * (Dh + 2);
-            ctx->exe->node_pso2[ctx->node_id] = (__bridge void *)_gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk");
-            ctx->exe->node_pso3[ctx->node_id] = (__bridge void *)_gd_metal_pipeline_named(ctx->state, "gd_sdpa_combine");
+            const char *split_name = qd->dtype == GD_DTYPE_F16 ? "gd_sdpa_splitk_f16" : "gd_sdpa_splitk";
+            const char *combine_name = qd->dtype == GD_DTYPE_F16 ? "gd_sdpa_combine_f16" : "gd_sdpa_combine";
+            ctx->exe->node_pso2[ctx->node_id] = (__bridge void *)_gd_metal_pipeline_named(ctx->state, split_name);
+            ctx->exe->node_pso3[ctx->node_id] = (__bridge void *)_gd_metal_pipeline_named(ctx->state, combine_name);
             if (ctx->exe->node_pso2[ctx->node_id] == NULL || ctx->exe->node_pso3[ctx->node_id] == NULL) {
                 return _gd_error(GD_ERR_BACKEND, "metal sdpa split-K pipeline missing");
             }
@@ -187,6 +249,7 @@ static gd_status sdpa_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_sdpa = {
     .kind = _GD_OP_SDPA,
     .name = "sdpa",
+    .support = sdpa_support,
     .plan = sdpa_plan,
     .encode = sdpa_encode,
 };

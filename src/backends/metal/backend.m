@@ -51,6 +51,10 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_splitk_causal_lane8", /* channel-lane causal split-K forward */
     "gd_sdpa_splitk_causal_window_lane8", /* sliding-window causal split-K forward */
     "gd_sdpa_combine", /* split-K combine pass */
+    "gd_sdpa_f16", /* F16 reference forward */
+    "gd_sdpa_tiled_f16", /* F16 tiled forward */
+    "gd_sdpa_splitk_f16", /* F16 split-K forward */
+    "gd_sdpa_combine_f16", /* F16 split-K combine pass */
     "gd_sdpa_bwd_stats_dq_split",
     "gd_sdpa_bwd_stats_dq_split_causal",
     "gd_sdpa_bwd_stats_dq_split_causal_lane8",

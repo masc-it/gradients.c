@@ -112,11 +112,11 @@ gd_status _gd_cpu_k_rope(const gd_tensor_desc *desc, void *out, const void *x,
 
 /* Scaled dot-product attention (reference). q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh],
  * o[B,Tq,Hq,Dh]; grouped-query via Hq/Hkv. */
-gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, float *o,
-                         const gd_tensor_desc *q_desc, const float *q,
-                         const gd_tensor_desc *k_desc, const float *k,
-                         const gd_tensor_desc *v_desc, const float *v,
-                         const gd_tensor_desc *bias_desc, const float *bias,
+gd_status _gd_cpu_k_sdpa(const gd_tensor_desc *o_desc, void *o,
+                         const gd_tensor_desc *q_desc, const void *q,
+                         const gd_tensor_desc *k_desc, const void *k,
+                         const gd_tensor_desc *v_desc, const void *v,
+                         const gd_tensor_desc *bias_desc, const void *bias,
                          float scale, int causal, int window, int prefix_len);
 gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                              const gd_tensor_desc *k_desc, const float *k,

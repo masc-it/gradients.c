@@ -762,6 +762,53 @@ static int test_f16_lm_cross_entropy_cpu(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_sdpa_cpu(gd_context *ctx)
+{
+    int64_t shape[4] = {1, 3, 1, 4};
+    float qdata[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F, -1.1F, 1.2F};
+    float kdata[12] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float vdata[12] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F, -1.1F, 1.2F};
+    float f32_out[12] = {0};
+    float f16_out[12] = {0};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_sdpa_config cfg = {0.0F, true, 2, 0};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y32 = NULL, *y16h = NULL, *y16 = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, shape, &q));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, shape, &k));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 4, shape, &v));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, q, qdata, sizeof(qdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, k, kdata, sizeof(kdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, v, vdata, sizeof(vdata)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &y32));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa(ctx, qh, kh, vh, NULL, &cfg, &y16h));
+    CHECK_OK(gd_cast(ctx, y16h, GD_DTYPE_F32, &y16));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y32, f32_out, sizeof(f32_out)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y16, f16_out, sizeof(f16_out)));
+    for (i = 0; i < 12; ++i) {
+        CHECK_TRUE(fabsf(f32_out[i] - f16_out[i]) <= 3.0e-2F);
+    }
+    gd_tensor_release(y16); gd_tensor_release(y16h); gd_tensor_release(y32);
+    gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+    CHECK_OK(gd_graph_reset(g)); CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
 static int test_f16_rope_cpu(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -915,8 +962,8 @@ int main(void)
         test_f16_cast_cpu(ctx) != 0 || test_f16_elementwise_cpu(ctx) != 0 ||
         test_f16_embedding_transpose_cpu(ctx) != 0 ||
         test_f16_cross_entropy_cpu(ctx) != 0 || test_f16_lm_cross_entropy_cpu(ctx) != 0 ||
-        test_f16_rope_cpu(ctx) != 0 || test_f16_matmul_linear_cpu(ctx) != 0 ||
-        test_chain_dump(ctx) != 0) {
+        test_f16_sdpa_cpu(ctx) != 0 || test_f16_rope_cpu(ctx) != 0 ||
+        test_f16_matmul_linear_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

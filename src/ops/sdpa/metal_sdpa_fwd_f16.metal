@@ -1,0 +1,327 @@
+#include "metal_common.metal"
+
+static inline bool gd_sdpa_f16_allowed(int i, int j, int Tq, int Tk,
+                                       int causal, int window, int prefix_len)
+{
+    int qpos = i + (Tk - Tq);
+
+    if (causal) {
+        if (prefix_len > 0) {
+            if (qpos < prefix_len) {
+                if (j >= prefix_len) {
+                    return false;
+                }
+            } else if (j > qpos) {
+                return false;
+            }
+        } else if (j > qpos) {
+            return false;
+        }
+    }
+    if (window > 0) {
+        if (prefix_len > 0) {
+            if (qpos >= prefix_len && j >= prefix_len && (qpos - j) >= window) {
+                return false;
+            }
+        } else if ((qpos - j) >= window) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline int gd_sdpa_f16_kb_end(int q0, int bq, int Tq, int Tk,
+                                     int causal, int prefix_len)
+{
+    if (!causal) {
+        return Tk;
+    }
+    int qmax = q0 + bq - 1;
+    if (qmax > Tq - 1) {
+        qmax = Tq - 1;
+    }
+    int qmaxpos = qmax + (Tk - Tq);
+    int lim = qmaxpos + 1;
+    if (prefix_len > 0 && qmaxpos < prefix_len) {
+        lim = prefix_len;
+    }
+    if (lim < 0) {
+        lim = 0;
+    }
+    return lim > Tk ? Tk : lim;
+}
+
+static inline float gd_sdpa_f16_bias_at(device const half *bias,
+                                        constant gd_metal_sdpa_params &p,
+                                        int b, int hq, int i, int j)
+{
+    if (!p.has_bias) {
+        return 0.0f;
+    }
+    int bb = (p.Bb == 1) ? 0 : b;
+    int hb = (p.Hb == 1) ? 0 : hq;
+    int ib = (p.Tqb == 1) ? 0 : i;
+    int jb = (p.Tkb == 1) ? 0 : j;
+    return (float)bias[((bb * p.Hb + hb) * p.Tqb + ib) * p.Tkb + jb];
+}
+
+static inline float gd_sdpa_f16_dot(device const half *a, device const half *b, int n)
+{
+    float s = 0.0f;
+    for (int c = 0; c < n; ++c) {
+        s += (float)a[c] * (float)b[c];
+    }
+    return s;
+}
+
+kernel void gd_sdpa_tiled_f16(device const half *q             [[buffer(0)]],
+                              device const half *k             [[buffer(1)]],
+                              device const half *v             [[buffer(2)]],
+                              device const half *bias          [[buffer(3)]],
+                              device half *out                 [[buffer(4)]],
+                              constant gd_metal_sdpa_params &p [[buffer(5)]],
+                              uint tgid [[threadgroup_position_in_grid]],
+                              uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int qb = (int)tgid % n_qb;
+    int r = (int)tgid / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int hkv = hq / (p.Hq / p.Hkv);
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? (float)q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_f16_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ,
+                                    p.Tq, p.Tk, p.causal, p.prefix_len);
+    for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        int tile = kb_end - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = (float)k[kbase + c];
+            vsh[jj * p.Dh + c] = (float)v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_f16_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
+                    float s = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        s += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    s = p.scale * s + gd_sdpa_f16_bias_at(bias, p, b, hq, i, j);
+                    float mnew = max(m, s);
+                    float corr = exp(m - mnew);
+                    float e = exp(s - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        for (int c = 0; c < p.Dh; ++c) {
+            out[qbase + c] = (half)(l > 0.0f ? acc[c] / l : 0.0f);
+        }
+    }
+}
+
+kernel void gd_sdpa_splitk_f16(device const half *q             [[buffer(0)]],
+                               device const half *k             [[buffer(1)]],
+                               device const half *v             [[buffer(2)]],
+                               device const half *bias          [[buffer(3)]],
+                               device float *partials           [[buffer(4)]],
+                               constant gd_metal_sdpa_params &p [[buffer(5)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float ksh[GD_SDPA_BK * GD_SDPA_DHT];
+    threadgroup float vsh[GD_SDPA_BK * GD_SDPA_DHT];
+
+    int n_qb = (p.Tq + GD_SDPA_BQ - 1) / GD_SDPA_BQ;
+    int s = (int)tgid % p.n_splits;
+    int t2 = (int)tgid / p.n_splits;
+    int qb = t2 % n_qb;
+    int r = t2 / n_qb;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int hkv = hq / (p.Hq / p.Hkv);
+    int i = qb * GD_SDPA_BQ + (int)tid;
+    bool active = i < p.Tq;
+    int qbase = active ? (((b * p.Tq + i) * p.Hq + hq) * p.Dh) : 0;
+
+    float qreg[GD_SDPA_DHT];
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        qreg[c] = active ? (float)q[qbase + c] : 0.0f;
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int kb_end = gd_sdpa_f16_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ,
+                                    p.Tq, p.Tk, p.causal, p.prefix_len);
+    int k_lo = s * p.split_len;
+    int k_hi = k_lo + p.split_len;
+    if (k_hi > kb_end) {
+        k_hi = kb_end;
+    }
+    for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        int tile = k_hi - kb;
+        if (tile > GD_SDPA_BK) {
+            tile = GD_SDPA_BK;
+        }
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+            int jj = idx / p.Dh;
+            int c = idx % p.Dh;
+            int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;
+            ksh[jj * p.Dh + c] = (float)k[kbase + c];
+            vsh[jj * p.Dh + c] = (float)v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_f16_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
+                    float ss = 0.0f;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        ss += qreg[c] * ksh[jj * p.Dh + c];
+                    }
+                    ss = p.scale * ss + gd_sdpa_f16_bias_at(bias, p, b, hq, i, j);
+                    float mnew = max(m, ss);
+                    float corr = exp(m - mnew);
+                    float e = exp(ss - mnew);
+                    l = l * corr + e;
+                    for (int c = 0; c < p.Dh; ++c) {
+                        acc[c] = acc[c] * corr + e * vsh[jj * p.Dh + c];
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        for (int c = 0; c < p.Dh; ++c) {
+            partials[base + c] = acc[c];
+        }
+        partials[base + p.Dh] = m;
+        partials[base + p.Dh + 1] = l;
+    }
+}
+
+kernel void gd_sdpa_combine_f16(device const float *partials     [[buffer(0)]],
+                                device half *out                 [[buffer(1)]],
+                                constant gd_metal_sdpa_params &p [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq;
+    if ((int)gid >= total) {
+        return;
+    }
+    int i = (int)gid % p.Tq;
+    int r = (int)gid / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        acc[c] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int s = 0; s < p.n_splits; ++s) {
+        int base = ((((b * p.Hq + hq) * p.Tq + i) * p.n_splits) + s) * (p.Dh + 2);
+        float ms = partials[base + p.Dh];
+        float ls = partials[base + p.Dh + 1];
+        if (ls <= 0.0f) {
+            continue;
+        }
+        float mnew = max(m, ms);
+        float corr_o = exp(m - mnew);
+        float corr_s = exp(ms - mnew);
+        l = l * corr_o + ls * corr_s;
+        for (int c = 0; c < p.Dh; ++c) {
+            acc[c] = acc[c] * corr_o + partials[base + c] * corr_s;
+        }
+        m = mnew;
+    }
+    for (int c = 0; c < p.Dh; ++c) {
+        out[qbase + c] = (half)(l > 0.0f ? acc[c] / l : 0.0f);
+    }
+}
+
+kernel void gd_sdpa_f16(device const half *q             [[buffer(0)]],
+                        device const half *k             [[buffer(1)]],
+                        device const half *v             [[buffer(2)]],
+                        device const half *bias          [[buffer(3)]],
+                        device half *out                 [[buffer(4)]],
+                        constant gd_metal_sdpa_params &p [[buffer(5)]],
+                        uint gid                         [[thread_position_in_grid]])
+{
+    int total = p.B * p.Hq * p.Tq;
+    if ((int)gid >= total) {
+        return;
+    }
+    int i = (int)gid % p.Tq;
+    int r = (int)gid / p.Tq;
+    int hq = r % p.Hq;
+    int b = r / p.Hq;
+    int hkv = hq / (p.Hq / p.Hkv);
+    int qbase = ((b * p.Tq + i) * p.Hq + hq) * p.Dh;
+
+    float m = -INFINITY;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_f16_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_f16_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_f16_bias_at(bias, p, b, hq, i, j);
+            m = max(m, s);
+        }
+    }
+    float acc[GD_SDPA_DHT];
+    for (int c = 0; c < p.Dh; ++c) {
+        acc[c] = 0.0f;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < p.Tk; ++j) {
+        if (gd_sdpa_f16_allowed(i, j, p.Tq, p.Tk, p.causal, p.window, p.prefix_len)) {
+            int kbase = ((b * p.Tk + j) * p.Hkv + hkv) * p.Dh;
+            float s = p.scale * gd_sdpa_f16_dot(q + qbase, k + kbase, p.Dh)
+                      + gd_sdpa_f16_bias_at(bias, p, b, hq, i, j);
+            float e = exp(s - m);
+            sum += e;
+            for (int c = 0; c < p.Dh; ++c) {
+                acc[c] += e * (float)v[kbase + c];
+            }
+        }
+    }
+    for (int c = 0; c < p.Dh; ++c) {
+        out[qbase + c] = (half)(sum > 0.0f ? acc[c] / sum : 0.0f);
+    }
+}

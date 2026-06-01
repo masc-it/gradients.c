@@ -36,10 +36,6 @@ static gd_status sdpa_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_sdpa(out_desc, out_data, q_desc, q_data, k_desc, k_data, v_desc, v_data,
                           bias_desc, bias_data, node->attrs.attn_scale, node->attrs.causal,
                           node->attrs.sliding_window, node->attrs.prefix_len);

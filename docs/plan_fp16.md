@@ -224,12 +224,13 @@ CPU fallback.
 - [x] Softmax forward if used outside SDPA:
   - [x] F32 max/sum.
   - [x] F16 output.
-- [ ] SDPA forward:
-  - [ ] full causal F16 path.
-  - [ ] sliding-window causal F16 path.
-  - [ ] generic bias/prefix path either F16-supported or rejected clearly.
-  - [ ] scores/stats/online softmax in F32.
-  - [ ] output F16.
+- [x] SDPA forward:
+  - [x] full causal F16 path.
+  - [x] sliding-window causal F16 path.
+  - [x] generic bias/prefix path either F16-supported or rejected clearly.
+  - [x] scores/stats/online softmax in F32.
+  - [x] output F16.
+  - Note: first F16 path uses generic tiled/split-K kernels; causal/window F16 specializations remain perf work.
 - [x] Fused residual+RMSNorm path typed for F16 or disabled safely for F16.
 - [ ] Fused lmCE forward supports F16 hidden/weight with F32 stats/loss.
 - [ ] Add GPT inference/forward-only harness if missing:

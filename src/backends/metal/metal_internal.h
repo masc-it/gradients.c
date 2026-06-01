@@ -26,6 +26,7 @@
 @property (strong) NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *pipelines;
 @property (strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipelinesByName;
 @property (strong) id<MTLCommandBuffer> inFlight;
+@property (strong) NSMutableArray<id<MTLCommandBuffer>> *inFlightBuffers;
 @property (strong) NSMutableArray<NSValue *> *pendingExes;
 @property BOOL useMPS;
 @end

@@ -105,32 +105,60 @@ Additional one-iteration trace checks:
 Attention dominance grows quickly with sequence length. For 1024–2048 context,
 non-attention kernel work has limited upside unless attention improves first.
 
-## Notable anomaly
+## Resolved anomaly: trace faster than normal
 
-`GD_PROFILE=trace` measured about `2.68s/step` for `B=8 T=1024`, while normal
-summary/wall mode measured about `3.33s/step`. Trace mode normally should be
-slower because it serializes one command buffer per node. This suggests the
-single large command buffer path, MPS interop, encoder switching, or scheduling
-may add overhead/stalls not visible in trace attribution.
+`GD_PROFILE=trace` measured about `2.68s/step` for `B=8 T=1024`, while the old
+normal summary/wall path measured about `3.33s/step`. Trace mode should normally
+be slower because it serializes one command buffer per node.
 
-This deserves investigation, but it does not change bottleneck order: both trace
-and normal runs are dominated by GPU execution, and trace points clearly to SDPA.
+Root cause: the normal Metal executor submitted the whole graph as one giant
+command buffer. Long GPT graphs, especially long-context SDPA with repeated large
+scratch-buffer read/write hazards, hit a Metal scheduler/hazard-tracking cliff.
+Trace mode accidentally avoided this by using many small command buffers.
+
+Evidence:
+
+| experiment | result | conclusion |
+|---|---:|---|
+| old monolithic path, `B=8 T=1024` | `~3.35s` | reproduces slow path |
+| trace path, `B=8 T=1024` | `~2.68s` | faster because it chunks by node |
+| command-buffer chunk every 8 graph nodes | `~2.43s mean`, `2.41s best` | fixes cliff and beats trace |
+| compute-encoder split every 8, same command buffer | `~3.24s` | encoder boundaries are not enough |
+| no MPS / no fused LMCE, monolithic | `~3.41s` | not caused by MPS or LMCE |
+| no MPS / no fused LMCE, trace | `~2.70s` | reproduces without MPS |
+| no MPS / no fused LMCE, command chunk 8 | `~2.48s` | chunking still fixes it |
+| `B=4 T=2048`, monolithic | `~6.02s` | larger context worsens cliff |
+| `B=4 T=2048`, command chunk 8 | `~4.52s` | chunking fixes long-context case too |
+
+Implemented fix: normal Metal execution now submits graphs as a stream of small
+command buffers, default chunk size `8` encoded graph nodes. `GD_METAL_CMD_CHUNK=0`
+forces the old single-command-buffer path for A/B testing.
+
+Post-fix baseline for original command (`B=8 T=1024`, 2 warmup + 10 measured):
+
+- mean: `2460.2 ms/iter`
+- best: `2403.5 ms/iter`
+- best throughput: `3408 tok/s`
+- best compute: `234.9 GFLOP/s`
+- profiler wait event reports `items=56` command buffers per step
+
+This resolves the trace-vs-normal contradiction: normal chunked execution is now
+faster than trace, as expected.
 
 ## Optimization order
 
-1. Optimize `sdpa_bwd` Metal kernel.
-2. Optimize `sdpa` Metal forward kernel.
-3. Investigate normal-vs-trace scheduling gap:
-   - huge single command buffer behavior
-   - MPS encode boundaries / compute encoder close-resume cost
-   - possible long dependency chains or command-buffer occupancy issue
+1. Keep command-buffer chunking enabled by default; use `GD_METAL_CMD_CHUNK=0`
+   only for regression/debug A/B tests.
+2. Optimize `sdpa_bwd` Metal kernel.
+3. Optimize `sdpa` Metal forward kernel.
 4. Re-profile GEMM/MPS after attention improvements, especially for wider
    20M-ish configs or shorter sequence lengths.
 5. Keep fused LMCE as-is for now. At vocab 8k it is not current bottleneck.
 
 ## Current conclusion
 
-For planned GPT training workloads, efficient long-context attention is the gate.
-At `T=1024`, attention is roughly three quarters of step time; at `T=2048`, it is
-closer to seven eighths. Further training runs should wait on SDPA forward/backward
-optimization or at least a conscious decision to accept current throughput.
+For planned GPT training workloads, efficient long-context attention remains the
+gate. Command-buffer chunking removed a large executor-level cliff, but trace
+attribution still says `sdpa + sdpa_bwd` dominate long-context training. At
+`T=1024`, attention is roughly three quarters of step time; at `T=2048`, it is
+closer to seven eighths.

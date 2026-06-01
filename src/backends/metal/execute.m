@@ -1,5 +1,48 @@
 #import "metal_op.h"
 
+#include <stdlib.h>
+
+/* Long GPT graphs run faster when submitted as a stream of small command
+ * buffers instead of one monolithic buffer. On M-series GPUs, large command
+ * buffers with repeated scratch-buffer hazards (notably long-context SDPA)
+ * hit a scheduler/hazard-tracking cliff. Keep the default conservative and
+ * override with GD_METAL_CMD_CHUNK=0 to force the old single-buffer path. */
+#define GD_METAL_DEFAULT_CMD_CHUNK 8
+
+static int metal_command_chunk_size(void)
+{
+    const char *v = getenv("GD_METAL_CMD_CHUNK");
+    char *end = NULL;
+    long n = GD_METAL_DEFAULT_CMD_CHUNK;
+
+    if (v == NULL || v[0] == '\0') {
+        return GD_METAL_DEFAULT_CMD_CHUNK;
+    }
+    n = strtol(v, &end, 10);
+    if (end == v || n <= 0) {
+        return 0;
+    }
+    if (n > 1000000L) {
+        return 1000000;
+    }
+    return (int)n;
+}
+
+static bool metal_has_more_encoded_nodes(const _gd_executable *exe, int start, int end)
+{
+    int i = 0;
+
+    if (exe == NULL || exe->graph == NULL) {
+        return false;
+    }
+    for (i = start; i <= end && i < exe->graph->n_nodes; ++i) {
+        if (!exe->node_absorbed[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool metal_needs_stage_now(const _gd_executable *exe)
 {
     int i = 0;
@@ -186,6 +229,9 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
 
     {
         uint64_t encode_start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+        int chunk_size = metal_command_chunk_size();
+        int encoded_in_cmd = 0;
+        int capped_last = last_node < exe->graph->n_nodes ? last_node : exe->graph->n_nodes - 1;
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -215,9 +261,21 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     [enc endEncoding];
                     return status;
                 }
+                encoded_in_cmd++;
+                if (chunk_size > 0 && encoded_in_cmd >= chunk_size &&
+                    metal_has_more_encoded_nodes(exe, i + 1, capped_last)) {
+                    [enc endEncoding];
+                    [cmd commit];
+                    [st.inFlightBuffers addObject:cmd];
+                    st.inFlight = cmd;
+                    cmd = [st.queue commandBuffer];
+                    enc = [cmd computeCommandEncoder];
+                    encoded_in_cmd = 0;
+                }
             }
             [enc endEncoding];
             [cmd commit];
+            [st.inFlightBuffers addObject:cmd];
             st.inFlight = cmd;
         }
         if (encode_start != 0U) {

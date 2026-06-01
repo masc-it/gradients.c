@@ -116,6 +116,7 @@ static gd_status _gd_metal_init(_gd_backend *self, gd_context *ctx, int device_i
         st.pipelines = [NSMutableDictionary dictionary];
         st.pipelinesByName = [NSMutableDictionary dictionary];
         st.inFlight = nil;
+        st.inFlightBuffers = [NSMutableArray array];
         st.pendingExes = [NSMutableArray array];
         st.useMPS = env_flag_enabled("GD_METAL_MPS") ? YES : NO;
 
@@ -163,6 +164,7 @@ static void _gd_metal_shutdown(_gd_backend *self)
     if (self->impl != NULL) {
         GDMetalState *st = (__bridge_transfer GDMetalState *)self->impl; /* ARC releases */
         st.inFlight = nil;
+        [st.inFlightBuffers removeAllObjects];
         [st.pendingExes removeAllObjects];
         self->impl = NULL;
     }

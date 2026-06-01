@@ -139,25 +139,36 @@ void _gd_metal_register_pending_writeback(_gd_backend *self, _gd_executable *exe
 gd_status _gd_metal_synchronize(_gd_backend *self)
 {
     GDMetalState *st = _gd_metal_state(self);
-    id<MTLCommandBuffer> cmd = st.inFlight;
+    id<MTLCommandBuffer> failed = nil;
+    NSUInteger count = st.inFlightBuffers.count;
 
-    if (cmd == nil) {
+    if (count == 0U && st.inFlight != nil) {
+        [st.inFlightBuffers addObject:st.inFlight];
+        count = 1U;
+    }
+    if (count == 0U) {
         /* No GPU work in flight, but a prior sync may have left writebacks queued
          * (it never happens today, but keep the set authoritative). */
         return _gd_metal_flush_pending_writebacks(self);
     }
     {
         uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
-        [cmd waitUntilCompleted];
+        for (id<MTLCommandBuffer> cmd in st.inFlightBuffers) {
+            [cmd waitUntilCompleted];
+            if (failed == nil && cmd.status == MTLCommandBufferStatusError) {
+                failed = cmd;
+            }
+        }
         if (start != 0U) {
             _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WAIT,
-                                     _gd_profile_now_ns() - start, 0U, 1U);
+                                     _gd_profile_now_ns() - start, 0U, (uint64_t)count);
         }
     }
     st.inFlight = nil;
-    if (cmd.status == MTLCommandBufferStatusError) {
-        const char *reason = cmd.error != nil
-                                 ? cmd.error.localizedDescription.UTF8String
+    [st.inFlightBuffers removeAllObjects];
+    if (failed != nil) {
+        const char *reason = failed.error != nil
+                                 ? failed.error.localizedDescription.UTF8String
                                  : "command buffer failed";
         [st.pendingExes removeAllObjects];
         return _gd_error(GD_ERR_BACKEND, reason);

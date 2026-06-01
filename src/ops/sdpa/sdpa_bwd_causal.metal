@@ -36,6 +36,16 @@ static inline int gd_sdpa_split_len(int T, int n)
     len = ((len + GD_SDPA_BK - 1) / GD_SDPA_BK) * GD_SDPA_BK;
     return (len < GD_SDPA_BK) ? GD_SDPA_BK : len;
 }
+#if GD_SDPA_DKV_LANES != 8
+#error "gd_sdpa_bwd_dkv_split_causal assumes 8 channel lanes per key"
+#endif
+static inline float gd_sdpa_sum_lanes8(float x)
+{
+    x += simd_shuffle_xor(x, 1);
+    x += simd_shuffle_xor(x, 2);
+    x += simd_shuffle_xor(x, 4);
+    return x;
+}
 kernel void gd_sdpa_bwd_stats_dq_split_causal(device const float *go           [[buffer(0)]],
                                                device const float *q            [[buffer(1)]],
                                                device const float *k            [[buffer(2)]],
@@ -152,10 +162,6 @@ kernel void gd_sdpa_bwd_dkv_split_causal(device const float *go           [[buff
     threadgroup float msh[GD_SDPA_BK];
     threadgroup float lsh[GD_SDPA_BK];
     threadgroup float dsh[GD_SDPA_BK];
-    threadgroup float ss_part[GD_SDPA_BK * GD_SDPA_DKV_KEYS * GD_SDPA_DKV_LANES];
-    threadgroup float dp_part[GD_SDPA_BK * GD_SDPA_DKV_KEYS * GD_SDPA_DKV_LANES];
-    threadgroup float pjsh[GD_SDPA_BK * GD_SDPA_DKV_KEYS];
-    threadgroup float dssh[GD_SDPA_BK * GD_SDPA_DKV_KEYS];
 
     int n_kb = (p.Tk + GD_SDPA_DKV_KEYS - 1) / GD_SDPA_DKV_KEYS;
     int s = (int)tgid % p.n_splits;
@@ -218,50 +224,27 @@ kernel void gd_sdpa_bwd_dkv_split_causal(device const float *go           [[buff
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (int ii = 0; ii < tile; ++ii) {
+                int i = qb + ii;
                 float ss = 0.0f;
                 float dp = 0.0f;
+                float pj = 0.0f;
+                float ds = 0.0f;
+
                 for (int x = 0, c = lane; x < nchan; ++x, c += GD_SDPA_DKV_LANES) {
                     ss += qsh[ii * p.Dh + c] * kreg[x];
                     dp += gsh[ii * p.Dh + c] * vreg[x];
                 }
-                int rb = (ii * GD_SDPA_DKV_KEYS + local_key) * GD_SDPA_DKV_LANES + lane;
-                ss_part[rb] = ss;
-                dp_part[rb] = dp;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            if (lane == 0) {
-                for (int ii = 0; ii < tile; ++ii) {
-                    int i = qb + ii;
-                    int ob = ii * GD_SDPA_DKV_KEYS + local_key;
-                    float pj = 0.0f;
-                    float ds = 0.0f;
-                    if (active && gd_sdpa_causal_allowed(i, j, p.Tq, p.Tk)) {
-                        float l = lsh[ii];
-                        if (l > 0.0f) {
-                            int rb = ob * GD_SDPA_DKV_LANES;
-                            float ss = 0.0f;
-                            float dp = 0.0f;
-                            for (int ln = 0; ln < GD_SDPA_DKV_LANES; ++ln) {
-                                ss += ss_part[rb + ln];
-                                dp += dp_part[rb + ln];
-                            }
-                            ss *= p.scale;
-                            pj = exp(ss - msh[ii]) / l;
-                            ds = pj * (dp - dsh[ii]);
-                        }
+                ss = gd_sdpa_sum_lanes8(ss);
+                dp = gd_sdpa_sum_lanes8(dp);
+                if (active && gd_sdpa_causal_allowed(i, j, p.Tq, p.Tk)) {
+                    float l = lsh[ii];
+                    if (l > 0.0f) {
+                        ss *= p.scale;
+                        pj = exp(ss - msh[ii]) / l;
+                        ds = pj * (dp - dsh[ii]);
                     }
-                    pjsh[ob] = pj;
-                    dssh[ob] = ds;
                 }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            if (active) {
-                for (int ii = 0; ii < tile; ++ii) {
-                    int ob = ii * GD_SDPA_DKV_KEYS + local_key;
-                    float pj = pjsh[ob];
-                    float ds = dssh[ob];
+                if (active) {
                     for (int x = 0, c = lane; x < nchan; ++x, c += GD_SDPA_DKV_LANES) {
                         dvacc[x] += pj * gsh[ii * p.Dh + c];
                         dkacc[x] += p.scale * ds * qsh[ii * p.Dh + c];

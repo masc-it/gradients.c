@@ -1,6 +1,6 @@
 # SDPA Metal performance optimization
 
-Status: first causal-specialized SDPA kernels landed in working tree.
+Status: causal SDPA specialization plus SIMD dK/dV lane reduction complete.
 
 ## Goal
 
@@ -107,12 +107,54 @@ from previous post-chunk baseline:
 | best tokens/s | `3408` | `3442` |
 | best GFLOP/s | `234.9` | `237.2` |
 
+## Follow-up: dK/dV lane reduction
+
+Temporary subpass cuts showed `sdpa_bwd` at `B=8 T=1024` was approximately:
+
+| cumulative cut | traced `sdpa_bwd` |
+|---|---:|
+| stats+dq split only | `614 ms` |
+| stats+dq split+combine | `637 ms` |
+| + dK/dV split | `1422 ms` |
+| full op | `1426 ms` |
+
+So remaining backward hot spot was `gd_sdpa_bwd_dkv_split_causal`; final reduce
+was negligible. The old causal dK/dV kernel reduced each 8-lane dot product via
+threadgroup scratch (`ss_part`, `dp_part`, `pjsh`, `dssh`) and two extra barriers
+per query tile. Replaced that with 8-lane SIMD shuffle-xor reductions:
+
+```text
+ss = sum_8_lanes(q * k)
+dp = sum_8_lanes(dO * v)
+```
+
+All lanes now compute the same `pj`/`ds` scalars directly and update their owned
+channel slice, eliminating the dot partial scratch and two barriers. Compile-time
+`#error` guards the assumption that `GD_SDPA_DKV_LANES == 8`.
+
+Trace matrix after SIMD dK/dV reduction:
+
+| shape | traced step | `sdpa` | `sdpa_bwd` | attention share |
+|---|---:|---:|---:|---:|
+| `B=8 T=256` | `419.4 ms` | `63.9 ms` | `93.8 ms` | `38%` |
+| `B=8 T=512` | `840.2 ms` | `172.9 ms` | `298.3 ms` | `56%` |
+| `B=8 T=1024` | `2277.7 ms` | `574.1 ms` | `1081.0 ms` | `73%` |
+| `B=4 T=2048` | `3871.9 ms` | `1105.1 ms` | `2095.1 ms` | `83%` |
+
+Requested release run (`B=8 T=1024`, 2 warmup + 10 measured) now:
+
+| metric | after causal specialization | after SIMD dK/dV |
+|---|---:|---:|
+| mean ms/iter | `2391.7` | `2059.9` |
+| best ms/iter | `2380.0` | `2051.4` |
+| best tokens/s | `3442` | `3993` |
+| best GFLOP/s | `237.2` | `275.2` |
+
 ## Next work
 
-1. Profile `gd_sdpa_bwd_dkv_split[_causal]` subpasses directly; remaining bwd
-   time is likely dK/dV dot/reduction work.
-2. Consider a causal fwd split variant that improves `T=2048` too, or remove fwd
-   specialization if repeated runs show stable regression.
+1. Forward `sdpa` is now the largest attention subpass after dK/dV; optimize
+   causal split-K forward or reassess fwd specialization at `T=2048`.
+2. Re-profile wider 12--20M configs; GEMM share may rise after the backward win.
 3. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
-4. Only after attention drops below ~50% of step, retune GEMM/MPS and residual
-   elementwise tail.
+4. Only after attention drops below ~50% of step, retune residual elementwise
+   tail.

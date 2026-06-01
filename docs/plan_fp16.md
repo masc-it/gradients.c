@@ -209,10 +209,10 @@ CPU fallback.
   - [x] transpose.
   - [ ] reduce_to where needed.
   - [x] embedding forward.
-- [ ] RMSNorm forward:
-  - [ ] load F16 input/weight.
-  - [ ] compute sumsq/inv in F32.
-  - [ ] store F16 output.
+- [x] RMSNorm forward:
+  - [x] load F16 input/weight.
+  - [x] compute sumsq/inv in F32.
+  - [x] store F16 output.
 - [ ] RoPE forward:
   - [ ] load/store F16.
   - [ ] compute trig/rotate in F32.

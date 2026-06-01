@@ -343,9 +343,9 @@ gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, float *out, const float 
 }
 
 gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
-                             float *out,
-                             const float *x,
-                             const float *weight,
+                             void *out,
+                             const void *x,
+                             const void *weight,
                              float eps)
 {
     int64_t last = desc->sizes[desc->ndim - 1];
@@ -358,12 +358,30 @@ gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
         int64_t c = 0;
 
         for (c = 0; c < last; ++c) {
-            double v = (double)x[r * last + c];
-            sumsq += v * v;
+            float f = 0.0F;
+            gd_status status = _gd_cpu_load_float(desc, x, r * last + c, &f);
+            if (status != GD_OK) {
+                return status;
+            }
+            sumsq += (double)f * (double)f;
         }
         inv = 1.0 / sqrt(sumsq / (double)last + (double)eps);
         for (c = 0; c < last; ++c) {
-            out[r * last + c] = (float)((double)x[r * last + c] * inv * (double)weight[c]);
+            float xv = 0.0F;
+            float wv = 0.0F;
+            gd_status status = _gd_cpu_load_float(desc, x, r * last + c, &xv);
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_load_float(desc, weight, c, &wv);
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_store_float(desc, out, r * last + c,
+                                         (float)((double)xv * inv * (double)wv));
+            if (status != GD_OK) {
+                return status;
+            }
         }
     }
     return GD_OK;

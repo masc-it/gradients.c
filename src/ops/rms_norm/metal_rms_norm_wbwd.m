@@ -42,6 +42,7 @@ static gd_status rms_norm_wbwd_encode(_gd_metal_encode_ctx *ctx)
     p.last = (int)x_desc->sizes[x_desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(x_desc) / p.last) : 0;
     p.eps = node->attrs.eps;
+    p.dtype = GD_METAL_DT_F32;
     if (p.rows <= 0 || p.last <= 0) {
         return GD_OK;
     }

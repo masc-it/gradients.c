@@ -266,6 +266,7 @@ static void encode_fused_add_rms_norm(id<MTLComputeCommandEncoder> enc,
     p.last = (int)desc->sizes[desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(desc) / p.last) : 0;
     p.eps = head->attrs.eps;
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, add->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, add->inputs[1]) offset:0 atIndex:1];
@@ -291,6 +292,7 @@ static void encode_fused_rms_norm_bwd_add(id<MTLComputeCommandEncoder> enc,
     p.last = (int)desc->sizes[desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(desc) / p.last) : 0;
     p.eps = src->attrs.eps;
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, src->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, src->inputs[1]) offset:0 atIndex:1];

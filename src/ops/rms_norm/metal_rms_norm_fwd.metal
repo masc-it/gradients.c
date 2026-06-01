@@ -1,9 +1,9 @@
 #include "metal_common.metal"
 
-kernel void gd_rms_norm(device const float *x               [[buffer(0)]],
-                        device const float *weight          [[buffer(1)]],
-                        device float *out                   [[buffer(2)]],
-                        constant gd_metal_rmsnorm_params &p  [[buffer(3)]],
+kernel void gd_rms_norm(device const uchar *x              [[buffer(0)]],
+                        device const uchar *weight         [[buffer(1)]],
+                        device uchar *out                  [[buffer(2)]],
+                        constant gd_metal_rmsnorm_params &p [[buffer(3)]],
                         uint tgid  [[threadgroup_position_in_grid]],
                         uint tid    [[thread_index_in_threadgroup]],
                         uint tgsz   [[threads_per_threadgroup]])
@@ -16,7 +16,7 @@ kernel void gd_rms_norm(device const float *x               [[buffer(0)]],
     int base = r * p.last;
     float local = 0.0f;
     for (int c = (int)tid; c < p.last; c += (int)tgsz) {
-        float v = x[base + c];
+        float v = gd_load_float(x, p.dtype, (uint)(base + c));
         local += v * v;
     }
     part[tid] = local;
@@ -29,7 +29,9 @@ kernel void gd_rms_norm(device const float *x               [[buffer(0)]],
     }
     float inv = 1.0f / sqrt(part[0] / (float)p.last + p.eps);
     for (int c = (int)tid; c < p.last; c += (int)tgsz) {
-        out[base + c] = x[base + c] * inv * weight[c];
+        float xv = gd_load_float(x, p.dtype, (uint)(base + c));
+        float wv = gd_load_float(weight, p.dtype, (uint)c);
+        gd_store_float(out, p.dtype, (uint)(base + c), xv * inv * wv);
     }
 }
 kernel void gd_add_rms_norm(device const float *a               [[buffer(0)]],

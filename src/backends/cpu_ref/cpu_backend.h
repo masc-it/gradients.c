@@ -50,9 +50,9 @@ gd_status _gd_cpu_k_reduce(const gd_tensor_desc *out_desc,
                            bool mean);
 gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, float *out, const float *x, int dim);
 gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
-                             float *out,
-                             const float *x,
-                             const float *weight,
+                             void *out,
+                             const void *x,
+                             const void *weight,
                              float eps);
 /* RMSNorm backward: dx (input gradient) and dweight (weight gradient). */
 gd_status _gd_cpu_k_rms_norm_bwd(const gd_tensor_desc *desc, float *dx,

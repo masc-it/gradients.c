@@ -352,13 +352,16 @@ static int test_metal_f16_embedding_transpose(gd_context *ctx)
     float table_data[6] = {1.0F, 1.5F, -2.0F, 0.25F, 3.0F, -4.0F};
     int32_t ids_data[3] = {2, 0, 1};
     float matrix_data[6] = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
+    float weight_data[3] = {1.0F, 0.5F, -1.0F};
     float got_emb[6] = {0};
     float got_tr[6] = {0};
+    float got_rms[6] = {0};
     float expect_emb[6] = {3.0F, -4.0F, 1.0F, 1.5F, -2.0F, 0.25F};
     float expect_tr[6] = {1.0F, 4.0F, 2.0F, 5.0F, 3.0F, 6.0F};
-    gd_tensor *table = NULL, *ids = NULL, *matrix = NULL;
-    gd_tensor *table_h = NULL, *matrix_h = NULL, *emb_h = NULL, *tr_h = NULL;
-    gd_tensor *emb = NULL, *tr = NULL;
+    gd_tensor *table = NULL, *ids = NULL, *matrix = NULL, *weight = NULL;
+    gd_tensor *table_h = NULL, *matrix_h = NULL, *weight_h = NULL;
+    gd_tensor *emb_h = NULL, *tr_h = NULL, *rms_h = NULL;
+    gd_tensor *emb = NULL, *tr = NULL, *rms = NULL;
     gd_graph *g = NULL;
     int perm[2] = {1, 0};
     int i = 0;
@@ -366,27 +369,42 @@ static int test_metal_f16_embedding_transpose(gd_context *ctx)
     CHECK_OK(make_f32(ctx, 2, table_shape, table_data, &table));
     CHECK_OK(make_i32(ctx, 1, ids_shape, ids_data, &ids));
     CHECK_OK(make_f32(ctx, 2, matrix_shape, matrix_data, &matrix));
+    CHECK_OK(make_f32(ctx, 1, ids_shape, weight_data, &weight));
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
     CHECK_OK(gd_cast(ctx, table, GD_DTYPE_F16, &table_h));
     CHECK_OK(gd_cast(ctx, matrix, GD_DTYPE_F16, &matrix_h));
+    CHECK_OK(gd_cast(ctx, weight, GD_DTYPE_F16, &weight_h));
     CHECK_OK(gd_embedding(ctx, table_h, ids, &emb_h));
     CHECK_OK(gd_transpose(ctx, matrix_h, perm, 2, &tr_h));
+    CHECK_OK(gd_rms_norm(ctx, matrix_h, weight_h, 1.0e-5F, &rms_h));
     CHECK_OK(gd_cast(ctx, emb_h, GD_DTYPE_F32, &emb));
     CHECK_OK(gd_cast(ctx, tr_h, GD_DTYPE_F32, &tr));
+    CHECK_OK(gd_cast(ctx, rms_h, GD_DTYPE_F32, &rms));
     CHECK_OK(gd_graph_end(ctx));
     CHECK_OK(gd_graph_compile(g, METAL));
     CHECK_OK(gd_graph_run(g));
     CHECK_OK(gd_synchronize(ctx, METAL));
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, emb, got_emb, sizeof(got_emb)));
     CHECK_OK(gd_tensor_copy_to_cpu(ctx, tr, got_tr, sizeof(got_tr)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, rms, got_rms, sizeof(got_rms)));
     for (i = 0; i < 6; ++i) {
+        int row = i / 3;
+        int col = i % 3;
+        float a = matrix_data[row * 3 + 0];
+        float b = matrix_data[row * 3 + 1];
+        float c = matrix_data[row * 3 + 2];
+        float inv = 1.0F / sqrtf((a * a + b * b + c * c) / 3.0F + 1.0e-5F);
+        float expect_rms = matrix_data[i] * inv * weight_data[col];
         CHECK_TRUE(fabsf(got_emb[i] - expect_emb[i]) <= 2.0e-2F);
         CHECK_TRUE(fabsf(got_tr[i] - expect_tr[i]) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_rms[i] - expect_rms) <= 2.0e-2F);
     }
-    gd_tensor_release(tr); gd_tensor_release(emb); gd_tensor_release(tr_h); gd_tensor_release(emb_h);
-    gd_tensor_release(matrix_h); gd_tensor_release(table_h); CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(matrix); gd_tensor_release(ids); gd_tensor_release(table);
+    gd_tensor_release(rms); gd_tensor_release(tr); gd_tensor_release(emb);
+    gd_tensor_release(rms_h); gd_tensor_release(tr_h); gd_tensor_release(emb_h);
+    gd_tensor_release(weight_h); gd_tensor_release(matrix_h); gd_tensor_release(table_h);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(weight); gd_tensor_release(matrix); gd_tensor_release(ids); gd_tensor_release(table);
     return 0;
 }
 

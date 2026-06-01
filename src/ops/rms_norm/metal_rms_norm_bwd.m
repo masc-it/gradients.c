@@ -14,6 +14,7 @@ static gd_status rms_norm_bwd_encode(_gd_metal_encode_ctx *ctx)
     p.last = (int)desc->sizes[desc->ndim - 1];
     p.rows = p.last > 0 ? (int)(_gd_metal_desc_numel(desc) / p.last) : 0;
     p.eps = node->attrs.eps;
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

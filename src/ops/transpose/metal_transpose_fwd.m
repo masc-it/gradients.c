@@ -17,6 +17,7 @@ static gd_status transpose_encode(_gd_metal_encode_ctx *ctx)
     memset(&p, 0, sizeof(p));
     p.ndim = out_desc->ndim;
     p.numel = (int)numel;
+    p.elem_size = (int)gd_dtype_sizeof(out_desc->dtype);
     for (k = out_desc->ndim - 1; k >= 0; --k) {
         p.in_strides[k] = (int)stride;
         stride *= in_desc->sizes[k];
@@ -38,5 +39,6 @@ static gd_status transpose_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_transpose = {
     .kind = _GD_OP_TRANSPOSE,
     .name = "transpose",
+    .support = _gd_metal_support_f32_f16_same_dtype,
     .encode = transpose_encode,
 };

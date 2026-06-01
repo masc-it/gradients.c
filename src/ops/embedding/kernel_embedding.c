@@ -24,22 +24,32 @@ static int64_t embedding_id(const gd_tensor_desc *ids_desc, const void *ids, int
     return (int64_t)((const int32_t *)ids)[p];
 }
 
-gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, float *out,
-                              const gd_tensor_desc *table_desc, const float *table,
+gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, void *out,
+                              const gd_tensor_desc *table_desc, const void *table,
                               const gd_tensor_desc *ids_desc, const void *ids)
 {
     int64_t vocab = table_desc->sizes[0];
     int64_t dim = table_desc->sizes[1];
     int64_t n = desc_numel(ids_desc);
     int64_t p = 0;
+    int64_t c = 0;
 
-    (void)out_desc;
     for (p = 0; p < n; ++p) {
         int64_t id = embedding_id(ids_desc, ids, p);
         if (id < 0 || id >= vocab) {
             return _gd_error(GD_ERR_SHAPE, "embedding id out of range");
         }
-        memcpy(out + p * dim, table + id * dim, (size_t)dim * sizeof(float));
+        for (c = 0; c < dim; ++c) {
+            float value = 0.0F;
+            gd_status status = _gd_cpu_load_float(table_desc, table, id * dim + c, &value);
+            if (status != GD_OK) {
+                return status;
+            }
+            status = _gd_cpu_store_float(out_desc, out, p * dim + c, value);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
     }
     return GD_OK;
 }

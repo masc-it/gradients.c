@@ -217,11 +217,12 @@ typedef struct gd_metal_gelu_params {
     int dtype;                         /* GD_METAL_DT_*; input/output share dtype */
 } gd_metal_gelu_params;
 
-/* Physical permute of contiguous 4-byte elements. in_strides are element
+/* Physical permute of contiguous fixed-size elements. in_strides are element
  * strides of the contiguous input; out is contiguous. */
 typedef struct gd_metal_transpose_params {
     int ndim;
     int numel;
+    int elem_size;
     int out_sizes[GD_METAL_MAX_DIMS];
     int in_strides[GD_METAL_MAX_DIMS];
     int perm[GD_METAL_MAX_DIMS];
@@ -231,6 +232,7 @@ typedef struct gd_metal_embedding_params {
     int n;     /* number of ids */
     int dim;   /* embedding dimension */
     int vocab; /* table rows */
+    int dtype; /* GD_METAL_DT_* table/output dtype */
 } gd_metal_embedding_params;
 
 /* Scaled dot-product attention. Head-major q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh]. */

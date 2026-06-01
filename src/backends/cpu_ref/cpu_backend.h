@@ -97,8 +97,8 @@ gd_status _gd_cpu_k_transpose(const gd_tensor_desc *out_desc, void *out,
                               const int *perm);
 
 /* Row gather and its scatter-add backward. */
-gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, float *out,
-                              const gd_tensor_desc *table_desc, const float *table,
+gd_status _gd_cpu_k_embedding(const gd_tensor_desc *out_desc, void *out,
+                              const gd_tensor_desc *table_desc, const void *table,
                               const gd_tensor_desc *ids_desc, const void *ids);
 gd_status _gd_cpu_k_embedding_bwd(const gd_tensor_desc *table_desc, float *dtable,
                                   const gd_tensor_desc *go_desc, const float *go,

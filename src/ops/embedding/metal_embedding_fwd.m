@@ -2,13 +2,34 @@
 
 static gd_status embedding_support(const _gd_metal_plan_ctx *ctx)
 {
-    gd_status status = _gd_metal_support_default(ctx);
+    gd_status status = GD_OK;
+    const gd_tensor_desc *table = NULL;
+    const gd_tensor_desc *ids = NULL;
+    const gd_tensor_desc *out = NULL;
 
-    if (status != GD_OK || ctx->graph == NULL) {
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal embedding support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
+    if (status != GD_OK) {
         return status;
     }
-    if (ctx->graph->values[ctx->node->inputs[1]].desc.dtype != GD_DTYPE_I32) {
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'embedding'");
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    table = &ctx->graph->values[ctx->node->inputs[0]].desc;
+    ids = &ctx->graph->values[ctx->node->inputs[1]].desc;
+    out = &ctx->graph->values[ctx->node->outputs[0]].desc;
+    if (ids->dtype != GD_DTYPE_I32) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal embedding needs I32 ids in v1");
+    }
+    if (table->dtype != out->dtype ||
+        (out->dtype != GD_DTYPE_F32 && out->dtype != GD_DTYPE_F16)) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal embedding supports F32/F16 tables only");
     }
     return GD_OK;
 }
@@ -32,6 +53,8 @@ static gd_status embedding_encode(_gd_metal_encode_ctx *ctx)
     p.dim = (int)table->sizes[1];
     p.vocab = (int)table->sizes[0];
     p.n = p.dim > 0 ? (int)(numel / p.dim) : 0;
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &p.dtype);
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

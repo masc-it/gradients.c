@@ -38,6 +38,9 @@ static int close_to(float a, float b)
     return diff <= 1e-4F * (1.0F + (b < 0.0F ? -b : b));
 }
 
+static gd_status make_i32(gd_context *ctx, int ndim, const int64_t *sizes, const int32_t *data,
+                          gd_tensor **out);
+
 static gd_status make_f32(gd_context *ctx, int ndim, const int64_t *sizes, const float *data,
                           gd_tensor **out)
 {
@@ -225,20 +228,19 @@ static int test_metal_f16_unsupported_reject(gd_context *ctx)
     float data[4] = {1.0F, 2.0F, 3.0F, 4.0F};
     gd_tensor *x = NULL;
     gd_tensor *xh = NULL;
-    gd_tensor *tr = NULL;
+    gd_tensor *sm = NULL;
     gd_graph *g = NULL;
     gd_status status = GD_OK;
-    int perm[2] = {1, 0};
 
     CHECK_OK(make_f32(ctx, 2, s22, data, &x));
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
     CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
-    CHECK_OK(gd_transpose(ctx, xh, perm, 2, &tr));
+    CHECK_OK(gd_softmax(ctx, xh, -1, &sm));
     CHECK_OK(gd_graph_end(ctx));
     status = gd_graph_compile(g, METAL);
     CHECK_TRUE(status == GD_ERR_UNSUPPORTED);
-    gd_tensor_release(tr);
+    gd_tensor_release(sm);
     gd_tensor_release(xh);
     CHECK_OK(gd_graph_destroy(g));
     gd_tensor_release(x);
@@ -339,6 +341,52 @@ static int test_metal_f16_elementwise(gd_context *ctx)
     gd_tensor_release(reluh); gd_tensor_release(scaleh); gd_tensor_release(mulh); gd_tensor_release(addh);
     gd_tensor_release(yh); gd_tensor_release(xh); CHECK_OK(gd_graph_destroy(g));
     gd_tensor_release(y); gd_tensor_release(x);
+    return 0;
+}
+
+static int test_metal_f16_embedding_transpose(gd_context *ctx)
+{
+    int64_t table_shape[2] = {3, 2};
+    int64_t ids_shape[1] = {3};
+    int64_t matrix_shape[2] = {2, 3};
+    float table_data[6] = {1.0F, 1.5F, -2.0F, 0.25F, 3.0F, -4.0F};
+    int32_t ids_data[3] = {2, 0, 1};
+    float matrix_data[6] = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
+    float got_emb[6] = {0};
+    float got_tr[6] = {0};
+    float expect_emb[6] = {3.0F, -4.0F, 1.0F, 1.5F, -2.0F, 0.25F};
+    float expect_tr[6] = {1.0F, 4.0F, 2.0F, 5.0F, 3.0F, 6.0F};
+    gd_tensor *table = NULL, *ids = NULL, *matrix = NULL;
+    gd_tensor *table_h = NULL, *matrix_h = NULL, *emb_h = NULL, *tr_h = NULL;
+    gd_tensor *emb = NULL, *tr = NULL;
+    gd_graph *g = NULL;
+    int perm[2] = {1, 0};
+    int i = 0;
+
+    CHECK_OK(make_f32(ctx, 2, table_shape, table_data, &table));
+    CHECK_OK(make_i32(ctx, 1, ids_shape, ids_data, &ids));
+    CHECK_OK(make_f32(ctx, 2, matrix_shape, matrix_data, &matrix));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, table, GD_DTYPE_F16, &table_h));
+    CHECK_OK(gd_cast(ctx, matrix, GD_DTYPE_F16, &matrix_h));
+    CHECK_OK(gd_embedding(ctx, table_h, ids, &emb_h));
+    CHECK_OK(gd_transpose(ctx, matrix_h, perm, 2, &tr_h));
+    CHECK_OK(gd_cast(ctx, emb_h, GD_DTYPE_F32, &emb));
+    CHECK_OK(gd_cast(ctx, tr_h, GD_DTYPE_F32, &tr));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, emb, got_emb, sizeof(got_emb)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tr, got_tr, sizeof(got_tr)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(fabsf(got_emb[i] - expect_emb[i]) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_tr[i] - expect_tr[i]) <= 2.0e-2F);
+    }
+    gd_tensor_release(tr); gd_tensor_release(emb); gd_tensor_release(tr_h); gd_tensor_release(emb_h);
+    gd_tensor_release(matrix_h); gd_tensor_release(table_h); CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(matrix); gd_tensor_release(ids); gd_tensor_release(table);
     return 0;
 }
 
@@ -1201,6 +1249,7 @@ int main(void)
     rc |= test_metal_cast_parity(ctx);
     rc |= test_metal_f16_unsupported_reject(ctx);
     rc |= test_metal_f16_elementwise(ctx);
+    rc |= test_metal_f16_embedding_transpose(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);
     if (mps_enabled) {

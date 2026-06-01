@@ -206,9 +206,9 @@ CPU fallback.
   - [x] copy.
   - [x] ReLU/SiLU/GELU/PowLU forward.
 - [ ] Shape/data movement kernels typed for F16:
-  - [ ] transpose.
+  - [x] transpose.
   - [ ] reduce_to where needed.
-  - [ ] embedding forward.
+  - [x] embedding forward.
 - [ ] RMSNorm forward:
   - [ ] load F16 input/weight.
   - [ ] compute sumsq/inv in F32.

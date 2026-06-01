@@ -588,6 +588,55 @@ static int test_f16_elementwise_cpu(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_embedding_transpose_cpu(gd_context *ctx)
+{
+    int64_t table_shape[2] = {3, 2};
+    int64_t ids_shape[1] = {3};
+    int64_t matrix_shape[2] = {2, 3};
+    float table_data[6] = {1.0F, 1.5F, -2.0F, 0.25F, 3.0F, -4.0F};
+    int32_t ids_data[3] = {2, 0, 1};
+    float matrix_data[6] = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
+    float got_emb[6] = {0};
+    float got_tr[6] = {0};
+    float expect_emb[6] = {3.0F, -4.0F, 1.0F, 1.5F, -2.0F, 0.25F};
+    float expect_tr[6] = {1.0F, 4.0F, 2.0F, 5.0F, 3.0F, 6.0F};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor *table = NULL, *ids = NULL, *matrix = NULL;
+    gd_tensor *table_h = NULL, *matrix_h = NULL, *emb_h = NULL, *tr_h = NULL;
+    gd_tensor *emb = NULL, *tr = NULL;
+    gd_graph *g = NULL;
+    int perm[2] = {1, 0};
+    int i = 0;
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, table_shape, &table));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 1, ids_shape, &ids));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 2, matrix_shape, &matrix));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, table, table_data, sizeof(table_data)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, ids, ids_data, sizeof(ids_data)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, matrix, matrix_data, sizeof(matrix_data)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, table, GD_DTYPE_F16, &table_h));
+    CHECK_OK(gd_cast(ctx, matrix, GD_DTYPE_F16, &matrix_h));
+    CHECK_OK(gd_embedding(ctx, table_h, ids, &emb_h));
+    CHECK_OK(gd_transpose(ctx, matrix_h, perm, 2, &tr_h));
+    CHECK_OK(gd_cast(ctx, emb_h, GD_DTYPE_F32, &emb));
+    CHECK_OK(gd_cast(ctx, tr_h, GD_DTYPE_F32, &tr));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, emb, got_emb, sizeof(got_emb)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tr, got_tr, sizeof(got_tr)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(fabsf(got_emb[i] - expect_emb[i]) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_tr[i] - expect_tr[i]) <= 2.0e-2F);
+    }
+    gd_tensor_release(tr); gd_tensor_release(emb); gd_tensor_release(tr_h); gd_tensor_release(emb_h);
+    gd_tensor_release(matrix_h); gd_tensor_release(table_h); CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(matrix); gd_tensor_release(ids); gd_tensor_release(table);
+    return 0;
+}
+
 static int test_f16_matmul_linear_cpu(gd_context *ctx)
 {
     int64_t xshape[2] = {2, 3};
@@ -694,6 +743,7 @@ int main(void)
         test_matmul(ctx) != 0 || test_sdpa_prefix_schema(ctx) != 0 ||
         test_linear(ctx) != 0 || test_reduce_softmax_ce_cast(ctx) != 0 ||
         test_f16_cast_cpu(ctx) != 0 || test_f16_elementwise_cpu(ctx) != 0 ||
+        test_f16_embedding_transpose_cpu(ctx) != 0 ||
         test_f16_matmul_linear_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;

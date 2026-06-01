@@ -1,6 +1,6 @@
 # SDPA Metal performance optimization
 
-Status: causal SDPA specialization plus SIMD dK/dV lane reduction complete.
+Status: causal SDPA specialization, SIMD dK/dV, and forward lane kernels complete.
 
 ## Goal
 
@@ -150,11 +150,46 @@ Requested release run (`B=8 T=1024`, 2 warmup + 10 measured) now:
 | best tokens/s | `3442` | `3993` |
 | best GFLOP/s | `237.2` | `275.2` |
 
+## Follow-up: causal forward channel lanes
+
+Forward split-K had the same core issue as old dK/dV: one thread owned all 64
+head channels for a query row. Added `gd_sdpa_splitk_causal_lane8`: one
+threadgroup now handles 8 query rows × 8 channel lanes. Each lane owns `Dh/8`
+channels, uses SIMD shuffle-xor to reduce the score across the 8 lanes, and
+writes only its partial-output channel slice. The combine pass and scratch layout
+stay unchanged.
+
+Trace matrix after causal forward lane kernel:
+
+| shape | traced step | `sdpa` | `sdpa_bwd` | attention share |
+|---|---:|---:|---:|---:|
+| `B=8 T=256` | `390.1 ms` | `32.2 ms` | `95.4 ms` | `33%` |
+| `B=8 T=512` | `764.2 ms` | `89.7 ms` | `306.4 ms` | `52%` |
+| `B=8 T=1024` | `2007.4 ms` | `298.3 ms` | `1081.5 ms` | `69%` |
+| `B=4 T=2048` | `3326.8 ms` | `577.6 ms` | `2104.4 ms` | `81%` |
+
+Requested release run (`B=8 T=1024`, 2 warmup + 10 measured):
+
+| metric | after SIMD dK/dV | after fwd lanes |
+|---|---:|---:|
+| mean ms/iter | `2059.9` | `1775.2` |
+| best ms/iter | `2051.4` | `1768.2` |
+| best tokens/s | `3993` | `4633` |
+| best GFLOP/s | `275.2` | `319.3` |
+
+Long-context release check (`B=4 T=2048`, 1 warmup + 4 measured):
+
+- mean: `3087.7 ms/iter`
+- best: `3077.0 ms/iter`
+- best tokens/s: `2662`
+- best GFLOP/s: `233.7`
+
 ## Next work
 
-1. Forward `sdpa` is now the largest attention subpass after dK/dV; optimize
-   causal split-K forward or reassess fwd specialization at `T=2048`.
-2. Re-profile wider 12--20M configs; GEMM share may rise after the backward win.
+1. `sdpa_bwd` is again the main attention bottleneck; optimize the causal
+   stats+dq split path with the same channel-lane structure if scratch/occupancy
+   allows.
+2. Re-profile wider 12--20M configs; GEMM share may rise after the attention wins.
 3. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
 4. Only after attention drops below ~50% of step, retune residual elementwise
    tail.

@@ -68,9 +68,16 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
      * allocated at compile (Dh <= DHT and >1 split). */
     if (p.Dh <= GD_METAL_SDPA_DHT && scratch != nil &&
         splitk_pso != nil && combine_pso != nil) {
+        bool lane_split = false;
         if (sdpa_is_causal_no_bias(&p)) {
-            id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state, "gd_sdpa_splitk_causal");
-            if (fast != nil) {
+            id<MTLComputePipelineState> lane_fast = _gd_metal_pipeline_named(ctx->state,
+                                                                            "gd_sdpa_splitk_causal_lane8");
+            id<MTLComputePipelineState> fast = _gd_metal_pipeline_named(ctx->state,
+                                                                        "gd_sdpa_splitk_causal");
+            if (lane_fast != nil) {
+                splitk_pso = lane_fast;
+                lane_split = true;
+            } else if (fast != nil) {
                 splitk_pso = fast;
             }
         }
@@ -84,7 +91,9 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         [enc setBuffer:_gd_metal_value_buffer(exe, bias_input) offset:0 atIndex:3];
         [enc setBuffer:scratch offset:0 atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
-        NSUInteger sgroups = (NSUInteger)(p.B * p.Hq * n_qb * p.n_splits);
+        int split_q = lane_split ? GD_METAL_SDPA_FWD_CAUSAL_QROWS : GD_METAL_SDPA_BQ;
+        int split_n_qb = (p.Tq + split_q - 1) / split_q;
+        NSUInteger sgroups = (NSUInteger)(p.B * p.Hq * split_n_qb * p.n_splits);
         if (sgroups > 0) {
             [enc dispatchThreadgroups:MTLSizeMake(sgroups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];

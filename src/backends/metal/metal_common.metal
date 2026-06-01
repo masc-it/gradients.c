@@ -16,6 +16,7 @@ using namespace metal;
 #define GD_SDPA_DKV_KEYS GD_METAL_SDPA_DKV_KEYS
 #define GD_SDPA_DKV_LANES (GD_SDPA_BQ / GD_SDPA_DKV_KEYS)
 #define GD_SDPA_DKV_CMAX ((GD_SDPA_DHT + GD_SDPA_DKV_LANES - 1) / GD_SDPA_DKV_LANES)
+#define GD_SDPA_FWD_CAUSAL_QROWS GD_METAL_SDPA_FWD_CAUSAL_QROWS
 
 static __attribute__((unused)) int gd_broadcast_offset(thread const int *out_index,
                                                        int out_ndim,

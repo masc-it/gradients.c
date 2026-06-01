@@ -83,9 +83,10 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             NSUInteger spart_b = (NSUInteger)L.stats_part_off * sizeof(float);
             NSUInteger dqpart_b = (NSUInteger)L.dq_part_off * sizeof(float);
             NSUInteger dkvpart_b = (NSUInteger)L.dkv_part_off * sizeof(float);
-            int n_kb = (p.Tk + GD_METAL_SDPA_DKV_KEYS - 1) / GD_METAL_SDPA_DKV_KEYS;
+            int dkv_keys = GD_METAL_SDPA_DKV_KEYS;
+            NSUInteger dkv_threads = GD_METAL_SDPA_BQ;
             NSUInteger qsplit_groups = 0;
-            NSUInteger ksplit_groups = (NSUInteger)(p.B * p.Hkv * n_kb * nsplit);
+            NSUInteger ksplit_groups = 0;
             NSUInteger q_rows = (NSUInteger)(p.B * p.Hq * p.Tq);
             NSUInteger kv_rows = (NSUInteger)(p.B * p.Hkv * p.Tk);
             GDMetalState *st = ctx->state;
@@ -94,20 +95,28 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             id<MTLComputePipelineState> dks_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split");
             id<MTLComputePipelineState> dkr_pso = _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_reduce");
             bool sdq_lane_split = false;
+            NSUInteger sdq_threads = GD_METAL_SDPA_BQ;
             if (sdpa_is_causal_no_bias(&p)) {
                 id<MTLComputePipelineState> fast_sdq_lane =
                     _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal_lane8");
                 id<MTLComputePipelineState> fast_sdq =
                     _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
+                id<MTLComputePipelineState> fast_dks_wide =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal_k16");
                 id<MTLComputePipelineState> fast_dks =
                     _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
                 if (fast_sdq_lane != nil) {
                     sdq_pso = fast_sdq_lane;
                     sdq_lane_split = true;
+                    sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
                 } else if (fast_sdq != nil) {
                     sdq_pso = fast_sdq;
                 }
-                if (fast_dks != nil) {
+                if (fast_dks_wide != nil) {
+                    dks_pso = fast_dks_wide;
+                    dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
+                    dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
+                } else if (fast_dks != nil) {
                     dks_pso = fast_dks;
                 }
             }
@@ -116,15 +125,15 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             id<MTLBuffer> k_b = _gd_metal_value_buffer(exe, node->inputs[2]);
             id<MTLBuffer> v_b = _gd_metal_value_buffer(exe, node->inputs[3]);
             id<MTLBuffer> bias_b = _gd_metal_value_buffer(exe, bias_input);
-            MTLSize tg = MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1);
-
             if (sdq_pso == nil || sdqc_pso == nil || dks_pso == nil || dkr_pso == nil) {
                 return _gd_error(GD_ERR_BACKEND, "metal sdpa_bwd split-K pipeline missing");
             }
             p.n_splits = nsplit;
             int sdq_qrows = sdq_lane_split ? GD_METAL_SDPA_CAUSAL_QROWS : GD_METAL_SDPA_BQ;
             int sdq_n_qb = (p.Tq + sdq_qrows - 1) / sdq_qrows;
+            int n_kb = (p.Tk + dkv_keys - 1) / dkv_keys;
             qsplit_groups = (NSUInteger)(p.B * p.Hq * sdq_n_qb * nsplit);
+            ksplit_groups = (NSUInteger)(p.B * p.Hkv * n_kb * nsplit);
 
             /* Fused stats+dq: per-split (m,l,raw,acc,ksum) -> final stats+dq.
              * This removes the old second key scan in the dq split pass. */
@@ -138,7 +147,8 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             [enc setBuffer:stats_buf offset:dqpart_b atIndex:6];
             [enc setBytes:&p length:sizeof(p) atIndex:7];
             if (qsplit_groups > 0) {
-                [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1) threadsPerThreadgroup:tg];
+                [enc dispatchThreadgroups:MTLSizeMake(qsplit_groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(sdq_threads, 1, 1)];
             }
             [enc setComputePipelineState:sdqc_pso];
             [enc setBuffer:stats_buf offset:spart_b atIndex:0];
@@ -161,7 +171,8 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             [enc setBytes:&p length:sizeof(p) atIndex:6];
             [enc setBuffer:stats_buf offset:stat_b atIndex:7];
             if (ksplit_groups > 0) {
-                [enc dispatchThreadgroups:MTLSizeMake(ksplit_groups, 1, 1) threadsPerThreadgroup:tg];
+                [enc dispatchThreadgroups:MTLSizeMake(ksplit_groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(dkv_threads, 1, 1)];
             }
             [enc setComputePipelineState:dkr_pso];
             [enc setBuffer:stats_buf offset:dkvpart_b atIndex:0];

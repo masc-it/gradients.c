@@ -56,6 +56,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_stats_dq_combine",
     "gd_sdpa_bwd_dkv_split",
     "gd_sdpa_bwd_dkv_split_causal",
+    "gd_sdpa_bwd_dkv_split_causal_k16",
     "gd_sdpa_bwd_dkv_reduce",
     "gd_silu_mul", /* F1: fused SwiGLU activation */
     "gd_add_rms_norm", /* F4: residual add + RMSNorm forward */

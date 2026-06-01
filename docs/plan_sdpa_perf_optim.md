@@ -1,6 +1,6 @@
 # SDPA Metal performance optimization
 
-Status: causal SDPA specialization plus lane-parallel fwd/bwd split kernels complete.
+Status: causal SDPA specialization plus 128-thread lane-parallel fwd/bwd split kernels complete.
 
 ## Goal
 
@@ -216,10 +216,62 @@ Long-context release check (`B=4 T=2048`, 1 warmup + 4 measured):
 - best tokens/s: `3089`
 - best GFLOP/s: `271.1`
 
+## Follow-up: 128-thread causal split kernels
+
+Two more occupancy/reuse changes landed after the first lane pass:
+
+- `gd_sdpa_bwd_dkv_split_causal_k16`: 16 keys × 8 channel lanes, dispatched with
+  128 threads. This preserves per-key 8-lane dot parallelism while halving key
+  threadgroups versus the 8-key kernel. A 32-key/256-thread A/B was slower.
+- Causal forward and stats+dq lane kernels now use 16 query rows × 8 channel
+  lanes, also 128 threads. A 32-row/256-thread A/B was mixed/slower, especially
+  at `T=512`.
+
+Subpass cuts at `B=8 T=1024` after these changes:
+
+| cumulative cut | traced `sdpa_bwd` |
+|---|---:|
+| stats+dq split only | `345 ms` |
+| stats+dq split+combine | `351 ms` |
+| + dK/dV split | `691 ms` |
+| full op | `704 ms` |
+
+Trace matrix after 128-thread split kernels:
+
+| shape | traced step | `sdpa` | `sdpa_bwd` | attention share |
+|---|---:|---:|---:|---:|
+| `B=8 T=256` | `342.9 ms` | `26.7 ms` | `50.8 ms` | `23%` |
+| `B=8 T=512` | `615.5 ms` | `65.0 ms` | `182.3 ms` | `40%` |
+| `B=8 T=1024` | `1566.9 ms` | `244.5 ms` | `701.8 ms` | `60%` |
+| `B=4 T=2048` | `2477.1 ms` | `443.5 ms` | `1382.8 ms` | `74%` |
+
+Requested release run (`B=8 T=1024`, 2 warmup + 10 measured):
+
+| metric | after stats+dq lanes | after 128-thread split |
+|---|---:|---:|
+| mean ms/iter | `1541.9` | `1323.6` |
+| best ms/iter | `1539.5` | `1320.0` |
+| best tokens/s | `5321` | `6206` |
+| best GFLOP/s | `366.7` | `427.7` |
+
+Long-context release check (`B=4 T=2048`, 1 warmup + 4 measured):
+
+- mean: `2213.5 ms/iter`
+- best: `2209.0 ms/iter`
+- best tokens/s: `3709`
+- best GFLOP/s: `325.6`
+
+Wider 17.23M-param profile (`d_model=384`, 6 layers, 6 heads) now shows:
+
+| shape | traced step | `sdpa` | `sdpa_bwd` | matmul+linear | attention share |
+|---|---:|---:|---:|---:|---:|
+| `B=4 T=1024` | `1407.0 ms` | `241.3 ms` | `565.3 ms` | `386.5 ms` | `57%` |
+| `B=4 T=2048` | `4181.3 ms` | `859.4 ms` | `2211.1 ms` | `741.6 ms` | `73%` |
+
 ## Next work
 
-1. Re-profile wider 12--20M configs; GEMM share should be much more visible now.
-2. Attention at `T=1024` is still ~65% in trace, but smaller configs may now be
-   GEMM/LMCE bound; avoid guessing before matrix profiling.
-3. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
-4. Only after wider profiles, retune residual elementwise tail.
+1. Attention remains dominant for long context, but `T=512` and wider `T=1024`
+   now expose GEMM/MPS and LMCE enough to profile next.
+2. Revisit scratch arena / memory reuse separately; atomic dK/dV is not the path.
+3. Add production GPT trainer items (checkpoint/resume, eval loop, generation,
+   KV cache) once kernel profile is no longer hiding trainer bottlenecks.

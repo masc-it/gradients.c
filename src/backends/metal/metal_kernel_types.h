@@ -36,9 +36,16 @@
 /* dK/dV split kernel: one threadgroup handles this many keys, with the 64
  * threads divided into key lanes over head_dim channels. */
 #define GD_METAL_SDPA_DKV_KEYS 8
-/* Causal/no-bias split kernels: one threadgroup handles this many query rows,
- * with the same 8 channel lanes per row as the dK/dV split kernel. */
-#define GD_METAL_SDPA_CAUSAL_QROWS 8
+#define GD_METAL_SDPA_DKV_LANES (GD_METAL_SDPA_BQ / GD_METAL_SDPA_DKV_KEYS)
+/* Wide causal dK/dV uses 128 threads: 16 keys × 8 channel lanes. */
+#define GD_METAL_SDPA_DKV_WIDE_KEYS 16
+#define GD_METAL_SDPA_DKV_WIDE_LANES 8
+#define GD_METAL_SDPA_DKV_WIDE_THREADS \
+    (GD_METAL_SDPA_DKV_WIDE_KEYS * GD_METAL_SDPA_DKV_WIDE_LANES)
+/* Causal/no-bias query-lane kernels use 8 channel lanes per query row. */
+#define GD_METAL_SDPA_CAUSAL_QROWS 16
+#define GD_METAL_SDPA_CAUSAL_THREADS \
+    (GD_METAL_SDPA_CAUSAL_QROWS * GD_METAL_SDPA_DKV_LANES)
 
 /* Fused LM-head cross entropy processes vocab in chunks so logits/dlogits
  * scratch is [N,chunk] instead of [N,V]. */

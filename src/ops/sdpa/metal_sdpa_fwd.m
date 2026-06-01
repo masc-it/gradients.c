@@ -95,8 +95,9 @@ static gd_status sdpa_kernel(_gd_metal_encode_ctx *ctx)
         int split_n_qb = (p.Tq + split_q - 1) / split_q;
         NSUInteger sgroups = (NSUInteger)(p.B * p.Hq * split_n_qb * p.n_splits);
         if (sgroups > 0) {
+            NSUInteger split_threads = lane_split ? GD_METAL_SDPA_CAUSAL_THREADS : GD_METAL_SDPA_BQ;
             [enc dispatchThreadgroups:MTLSizeMake(sgroups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(GD_METAL_SDPA_BQ, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(split_threads, 1, 1)];
         }
         /* Pass 2: combine the splits into the output. */
         [enc setComputePipelineState:combine_pso];

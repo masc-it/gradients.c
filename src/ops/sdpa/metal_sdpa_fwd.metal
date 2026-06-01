@@ -484,7 +484,7 @@ kernel void gd_sdpa_splitk_causal_lane8(device const float *q              [[buf
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;
         }
-        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_BQ) {
+        for (int idx = (int)tid; idx < tile * p.Dh; idx += GD_SDPA_CAUSAL_THREADS) {
             int jj = idx / p.Dh;
             int c = idx % p.Dh;
             int kbase = ((b * p.Tk + (kb + jj)) * p.Hkv + hkv) * p.Dh;

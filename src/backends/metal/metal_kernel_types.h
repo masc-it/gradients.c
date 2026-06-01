@@ -170,6 +170,7 @@ typedef struct gd_metal_ce_params {
     int inner;
     int classes;
     int positions;     /* outer*inner */
+    int dtype;         /* GD_METAL_DT_* logits dtype for forward */
 } gd_metal_ce_params;
 
 typedef struct gd_metal_lmce_params {

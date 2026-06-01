@@ -33,6 +33,7 @@ static gd_status cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
     _gd_metal_split_around_dim(logits, node->attrs.dim, &p.outer, &dummy, &p.inner);
     p.classes = (int)logits->sizes[node->attrs.dim];
     p.positions = p.outer * p.inner;
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

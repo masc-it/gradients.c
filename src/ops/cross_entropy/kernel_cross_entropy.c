@@ -7,7 +7,7 @@
 
 gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const gd_tensor_desc *logits_desc,
-                                  const float *logits,
+                                  const void *logits,
                                   const gd_tensor_desc *targets_desc,
                                   const void *targets,
                                   int class_dim)
@@ -38,23 +38,41 @@ gd_status _gd_cpu_k_cross_entropy(float *out,
             int64_t pos = o * inner + in;
             int64_t target = is_i64 ? (int64_t)((const int64_t *)targets)[pos]
                                     : (int64_t)((const int32_t *)targets)[pos];
+            double logit_t = 0.0;
 
             if (target < 0 || target >= classes) {
                 return _gd_error(GD_ERR_SHAPE, "cross_entropy target out of range");
             }
             for (c = 0; c < classes; ++c) {
-                double v = (double)logits[(o * classes + c) * inner + in];
-                if (v > max_val) {
-                    max_val = v;
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(logits_desc, logits,
+                                                       (o * classes + c) * inner + in, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                if ((double)f > max_val) {
+                    max_val = (double)f;
                 }
             }
             for (c = 0; c < classes; ++c) {
-                sum += exp((double)logits[(o * classes + c) * inner + in] - max_val);
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(logits_desc, logits,
+                                                       (o * classes + c) * inner + in, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                sum += exp((double)f - max_val);
             }
             {
-                double logit_t = (double)logits[(o * classes + target) * inner + in];
-                loss += -(logit_t - max_val - log(sum));
+                float f = 0.0F;
+                gd_status status = _gd_cpu_load_float(logits_desc, logits,
+                                                       (o * classes + target) * inner + in, &f);
+                if (status != GD_OK) {
+                    return status;
+                }
+                logit_t = (double)f;
             }
+            loss += -(logit_t - max_val - log(sum));
         }
     }
 

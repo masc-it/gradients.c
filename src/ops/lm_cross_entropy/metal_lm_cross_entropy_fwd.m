@@ -108,7 +108,7 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
 
     {
         gd_metal_lmce_params p = {rows, D, V, 0, chunk_max, 0};
-        gd_metal_ce_params rp = {1, 1, V, rows};
+        gd_metal_ce_params rp = {1, 1, V, rows, GD_METAL_DT_F32};
         [*enc setComputePipelineState:loss_pso];
         [*enc setBuffer:m_b offset:0 atIndex:0];
         [*enc setBuffer:l_b offset:0 atIndex:1];

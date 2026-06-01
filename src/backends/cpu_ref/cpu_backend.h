@@ -62,7 +62,7 @@ gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
                                   const float *x, const float *go, float eps);
 gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const gd_tensor_desc *logits_desc,
-                                  const float *logits,
+                                  const void *logits,
                                   const gd_tensor_desc *targets_desc,
                                   const void *targets,
                                   int class_dim);

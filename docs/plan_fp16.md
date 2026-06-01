@@ -160,13 +160,18 @@ Goal: `gd_backward()` keeps scalar F32 contract even with F16 models.
 - [x] Change CE meta so scalar loss output dtype is F32 regardless of logits dtype.
 - [x] Change lmCE meta so output 0 loss is F32 regardless of hidden/weight dtype.
 - [x] Keep lmCE auxiliary outputs (`m`, `l`, target logits or row stats) F32.
-- [ ] Update CPU CE/lmCE kernels to load F16 logits/hidden/weight and compute F32.
-- [ ] Update Metal CE/lmCE kernels to load F16 and compute F32.
+- [ ] Update CPU CE/lmCE kernels to load F16 logits/hidden/weight and compute F32:
+  - [x] CE F16 logits -> F32 loss.
+  - [ ] lmCE F16 hidden/weight -> F32 loss.
+- [ ] Update Metal CE/lmCE kernels to load F16 and compute F32:
+  - [x] CE F16 logits -> F32 loss.
+  - [ ] lmCE F16 hidden/weight -> F32 loss.
 - [ ] Add tests:
   - [x] F16 logits -> F32 CE loss.
   - [x] F16 hidden/weight -> F32 lmCE loss.
   - [ ] `gd_backward(ctx, loss)` accepts F16-model F32 loss.
-  - [ ] loss parity vs F32 baseline within tolerance.
+  - [x] CE loss parity vs F32 baseline within tolerance.
+  - [ ] lmCE loss parity vs F32 baseline within tolerance.
 
 ## Phase 3: F16 MPS GEMM and fallback GEMM
 

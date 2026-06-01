@@ -21,10 +21,6 @@ static gd_status cross_entropy_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(logits_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_cross_entropy(out_data, logits_desc, logits_data,
                                    targets_desc, targets_data, node->attrs.dim);
 }

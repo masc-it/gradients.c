@@ -1,6 +1,6 @@
 #include "metal_common.metal"
 
-kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
+kernel void gd_cross_entropy(device const uchar *logits     [[buffer(0)]],
                              device const int *targets       [[buffer(1)]],
                              device float *losses            [[buffer(2)]],
                              constant gd_metal_ce_params &p   [[buffer(3)]],
@@ -20,7 +20,8 @@ kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
 
     float lmax = -INFINITY;
     for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
-        lmax = max(lmax, logits[(o * p.classes + c) * p.inner + in]);
+        uint idx = (uint)((o * p.classes + c) * p.inner + in);
+        lmax = max(lmax, gd_load_float(logits, p.dtype, idx));
     }
     red[tid] = lmax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -35,7 +36,8 @@ kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
 
     float lsum = 0.0f;
     for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
-        lsum += exp(logits[(o * p.classes + c) * p.inner + in] - maxv);
+        uint idx = (uint)((o * p.classes + c) * p.inner + in);
+        lsum += exp(gd_load_float(logits, p.dtype, idx) - maxv);
     }
     red[tid] = lsum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -46,7 +48,8 @@ kernel void gd_cross_entropy(device const float *logits      [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0) {
-        float logit_t = logits[(o * p.classes + target) * p.inner + in];
+        uint tidx = (uint)((o * p.classes + target) * p.inner + in);
+        float logit_t = gd_load_float(logits, p.dtype, tidx);
         losses[pos] = -(logit_t - maxv - log(red[0]));
     }
 }

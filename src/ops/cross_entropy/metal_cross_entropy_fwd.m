@@ -2,14 +2,31 @@
 
 static gd_status cross_entropy_support(const _gd_metal_plan_ctx *ctx)
 {
-    gd_status status = _gd_metal_support_default(ctx);
+    gd_status status = GD_OK;
+
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal cross_entropy support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
     if (status != GD_OK) {
         return status;
     }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal has no kernel for op 'cross_entropy'");
+    }
     if (ctx->graph != NULL) {
+        const gd_tensor_desc *logits = &ctx->graph->values[ctx->node->inputs[0]].desc;
         const gd_tensor_desc *targets = &ctx->graph->values[ctx->node->inputs[1]].desc;
+        const gd_tensor_desc *out = &ctx->graph->values[ctx->node->outputs[0]].desc;
         if (targets->dtype != GD_DTYPE_I32) {
             return _gd_error(GD_ERR_UNSUPPORTED, "metal cross_entropy needs I32 targets in v1");
+        }
+        if (logits->dtype != GD_DTYPE_F32 && logits->dtype != GD_DTYPE_F16) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal cross_entropy supports F32/F16 logits only");
+        }
+        if (out->dtype != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal cross_entropy outputs F32 loss");
         }
     }
     return GD_OK;
@@ -63,6 +80,8 @@ static gd_status cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     _gd_metal_split_around_dim(logits, node->attrs.dim, &p.outer, &dummy, &p.inner);
     p.classes = (int)logits->sizes[node->attrs.dim];
     p.positions = p.outer * p.inner;
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(logits->dtype, &p.dtype);
     if (reduce_pso == nil || scratch == nil) {
         return _gd_error(GD_ERR_BACKEND, "metal cross_entropy scratch/pipeline missing");
     }

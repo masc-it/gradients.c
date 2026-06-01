@@ -414,6 +414,45 @@ static int test_metal_f16_embedding_transpose(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_f16_cross_entropy(gd_context *ctx)
+{
+    int64_t xshape[2] = {2, 3};
+    int64_t tshape[1] = {2};
+    float logits_data[6] = {1.0F, 2.0F, 0.0F, -1.0F, 0.5F, 3.0F};
+    int32_t targets_data[2] = {1, 2};
+    float got = 0.0F;
+    gd_tensor *x = NULL, *targets = NULL, *xh = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+    double expect = 0.0;
+    int r = 0;
+
+    CHECK_OK(make_f32(ctx, 2, xshape, logits_data, &x));
+    CHECK_OK(make_i32(ctx, 1, tshape, targets_data, &targets));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_cross_entropy(ctx, xh, targets, 1, &loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, METAL));
+    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &got, sizeof(got)));
+    for (r = 0; r < 2; ++r) {
+        float *row = logits_data + r * 3;
+        float maxv = fmaxf(row[0], fmaxf(row[1], row[2]));
+        double sum = exp((double)row[0] - (double)maxv) +
+                     exp((double)row[1] - (double)maxv) +
+                     exp((double)row[2] - (double)maxv);
+        expect += -((double)row[targets_data[r]] - (double)maxv - log(sum));
+    }
+    expect *= 0.5;
+    CHECK_TRUE(fabsf(got - (float)expect) <= 2.0e-2F);
+    gd_tensor_release(loss); gd_tensor_release(xh);
+    CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(targets); gd_tensor_release(x);
+    return 0;
+}
+
 static int test_metal_f16_rope(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -1316,6 +1355,7 @@ int main(void)
     rc |= test_metal_f16_unsupported_reject(ctx);
     rc |= test_metal_f16_elementwise(ctx);
     rc |= test_metal_f16_embedding_transpose(ctx);
+    rc |= test_metal_f16_cross_entropy(ctx);
     rc |= test_metal_f16_rope(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);

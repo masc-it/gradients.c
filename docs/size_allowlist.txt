@@ -1,6 +1,5 @@
 # Current source files over 1000 LOC allowed during big refactor.
 # Format: path owner reason removal_target
-src/backends/metal/kernels.metal owner:mle reason:legacy Metal shader monolith removal_target:plan_big_refactor_24.9
 src/tokenizer/tokenizer.c owner:mle reason:legacy tokenizer training/model/encode/decode monolith removal_target:plan_big_refactor_24.11
 src/graph/graph.c owner:mle reason:legacy graph lifecycle/emit/compile/run monolith removal_target:plan_big_refactor_24.11
 src/dataset/dataset.c owner:mle reason:legacy dataset IO/storage/batching monolith removal_target:plan_big_refactor_24.11

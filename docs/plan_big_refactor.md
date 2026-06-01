@@ -1167,14 +1167,14 @@ Current codebase inventory used to ground this plan:
 
 ### 24.9 Split Metal shaders into op capsules
 
-- [ ] Add `src/backends/metal/metal_common.metal` for shared shader helpers/types includes.
-- [ ] Move simple kernels from `src/backends/metal/kernels.metal` into `src/ops/<op>/metal_<op>_<role>.metal`.
-- [ ] Move linalg/reduction/norm/loss/embedding/rope shaders into op capsule shader files.
-- [ ] Move SDPA fwd/bwd shaders into separate files under `src/ops/sdpa/`; split large fwd/bwd pieces if any file approaches 800 LOC.
-- [ ] Update Makefile to compile all `src/**/*.metal` files into one `gradients.metallib`.
-- [ ] Ensure `metal_kernel_types.h` remains shared ABI header and stays under size limit.
-- [ ] Delete or shrink old `src/backends/metal/kernels.metal`.
-- [ ] Validate: `make test` on macOS with Metal enabled passes.
+- [x] Add `src/backends/metal/metal_common.metal` for shared shader helpers/types includes.
+- [x] Move simple kernels from `src/backends/metal/kernels.metal` into `src/ops/<op>/metal_<op>_<role>.metal`.
+- [x] Move linalg/reduction/norm/loss/embedding/rope shaders into op capsule shader files.
+- [x] Move SDPA fwd/bwd shaders into separate files under `src/ops/sdpa/`; split large fwd/bwd pieces if any file approaches 800 LOC.
+- [x] Update Makefile to compile all `src/**/*.metal` files into one `gradients.metallib`.
+- [x] Ensure `metal_kernel_types.h` remains shared ABI header and stays under size limit.
+- [x] Delete or shrink old `src/backends/metal/kernels.metal`.
+- [x] Validate: `make test` on macOS with Metal enabled passes.
 
 ### 24.10 Public headers and link coverage
 

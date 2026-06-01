@@ -57,7 +57,7 @@ ifeq ($(GD_ENABLE_METAL),1)
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' 2>/dev/null | sort)
 MSRC := $(shell { find $(METAL_DIR) -type f -name '*.m' 2>/dev/null; \
                  find $(SRC_DIR)/ops -type f -name 'metal_*.m' 2>/dev/null; } | sort)
-METAL_SHADERS := $(shell find $(METAL_DIR) -type f -name '*.metal' 2>/dev/null | sort)
+METAL_SHADERS := $(shell find $(SRC_DIR) -type f -name '*.metal' 2>/dev/null | sort)
 # Let C/Obj-C sources conditionally compile the Metal registration path.
 CPPFLAGS += -DGD_ENABLE_METAL=1
 OBJCFLAGS := $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c
@@ -317,9 +317,9 @@ $(BUILD_DIR)/%.o: %.m $(GEN_OPS_STAMP) $(CONFIG_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.air: %.metal
+$(BUILD_DIR)/%.air: %.metal $(METAL_DIR)/metal_common.metal $(METAL_DIR)/metal_kernel_types.h
 	@mkdir -p $(@D)
-	xcrun -sdk macosx metal -c $< -o $@
+	xcrun -sdk macosx metal -I$(METAL_DIR) -c $< -o $@
 
 $(METALLIB): $(patsubst %.metal,$(BUILD_DIR)/%.air,$(METAL_SHADERS))
 	@mkdir -p $(@D)

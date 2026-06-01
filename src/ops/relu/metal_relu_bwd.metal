@@ -1,13 +1,15 @@
 #include "metal_common.metal"
 
-kernel void gd_relu_bwd(device const float *x             [[buffer(0)]],
-                        device const float *go            [[buffer(1)]],
-                        device float *dx                  [[buffer(2)]],
+kernel void gd_relu_bwd(device const uchar *x             [[buffer(0)]],
+                        device const uchar *go            [[buffer(1)]],
+                        device uchar *dx                  [[buffer(2)]],
                         constant gd_metal_unary_params &p [[buffer(3)]],
                         uint gid                          [[thread_position_in_grid]])
 {
     if ((int)gid >= p.numel) {
         return;
     }
-    dx[gid] = x[gid] > 0.0f ? go[gid] : 0.0f;
+    float xv = gd_load_float(x, p.dtype, gid);
+    float gv = gd_load_float(go, p.dtype, gid);
+    gd_store_float(dx, p.dtype, gid, xv > 0.0f ? gv : 0.0f);
 }

@@ -248,18 +248,31 @@ gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, void *out,
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2,
-                              const float *x1, const float *x2, const float *go,
+gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, void *dx1, void *dx2,
+                              const void *x1, const void *x2, const void *go,
                               float m)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        float gate = powlu_gate(x2[i], m);
-        float grad = powlu_gate_grad(x2[i], m);
-        dx1[i] = go[i] * gate;
-        dx2[i] = go[i] * x1[i] * grad;
+        float v1 = 0.0F;
+        float v2 = 0.0F;
+        float g = 0.0F;
+        float gate = 0.0F;
+        float grad = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x1, i, &v1);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_load_float(desc, x2, i, &v2);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_load_float(desc, go, i, &g);
+        if (status != GD_OK) { return status; }
+        gate = powlu_gate(v2, m);
+        grad = powlu_gate_grad(v2, m);
+        status = _gd_cpu_store_float(desc, dx1, i, g * gate);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_store_float(desc, dx2, i, g * v1 * grad);
+        if (status != GD_OK) { return status; }
     }
     return GD_OK;
 }
@@ -592,8 +605,8 @@ gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, void *out, const void *x, i
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float *x,
-                             const float *go, int tanh_approx)
+gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, void *dx, const void *x,
+                             const void *go, int tanh_approx)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
@@ -601,21 +614,44 @@ gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float 
     if (tanh_approx) {
         const double c = 0.7978845608028654; /* sqrt(2/pi) */
         for (i = 0; i < total; ++i) {
-            double xv = (double)x[i];
-            double u = c * (xv + 0.044715 * xv * xv * xv);
-            double t = tanh(u);
-            double du = c * (1.0 + 3.0 * 0.044715 * xv * xv);
-            double g = 0.5 * (1.0 + t) + 0.5 * xv * (1.0 - t * t) * du;
-            dx[i] = (float)((double)go[i] * g);
+            float xf = 0.0F;
+            float gf = 0.0F;
+            double xv = 0.0;
+            double u = 0.0;
+            double t = 0.0;
+            double du = 0.0;
+            double grad = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, x, i, &xf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, go, i, &gf);
+            if (status != GD_OK) { return status; }
+            xv = (double)xf;
+            u = c * (xv + 0.044715 * xv * xv * xv);
+            t = tanh(u);
+            du = c * (1.0 + 3.0 * 0.044715 * xv * xv);
+            grad = 0.5 * (1.0 + t) + 0.5 * xv * (1.0 - t * t) * du;
+            status = _gd_cpu_store_float(desc, dx, i, (float)((double)gf * grad));
+            if (status != GD_OK) { return status; }
         }
     } else {
         const double inv_sqrt2 = 0.7071067811865476;
         const double inv_sqrt2pi = 0.3989422804014327;
         for (i = 0; i < total; ++i) {
-            double xv = (double)x[i];
-            double cdf = 0.5 * (1.0 + erf(xv * inv_sqrt2));
-            double pdf = inv_sqrt2pi * exp(-0.5 * xv * xv);
-            dx[i] = (float)((double)go[i] * (cdf + xv * pdf));
+            float xf = 0.0F;
+            float gf = 0.0F;
+            double xv = 0.0;
+            double cdf = 0.0;
+            double pdf = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, x, i, &xf);
+            if (status != GD_OK) { return status; }
+            status = _gd_cpu_load_float(desc, go, i, &gf);
+            if (status != GD_OK) { return status; }
+            xv = (double)xf;
+            cdf = 0.5 * (1.0 + erf(xv * inv_sqrt2));
+            pdf = inv_sqrt2pi * exp(-0.5 * xv * xv);
+            status = _gd_cpu_store_float(desc, dx, i,
+                                         (float)((double)gf * (cdf + xv * pdf)));
+            if (status != GD_OK) { return status; }
         }
     }
     return GD_OK;
@@ -657,31 +693,47 @@ gd_status _gd_cpu_k_transpose(const gd_tensor_desc *out_desc, void *out,
 }
 
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
-                             float *dx,
-                             const float *x,
-                             const float *go)
+                             void *dx,
+                             const void *x,
+                             const void *go)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        dx[i] = x[i] > 0.0F ? go[i] : 0.0F;
+        float xf = 0.0F;
+        float gf = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x, i, &xf);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_load_float(desc, go, i, &gf);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_store_float(desc, dx, i, xf > 0.0F ? gf : 0.0F);
+        if (status != GD_OK) { return status; }
     }
     return GD_OK;
 }
 
 gd_status _gd_cpu_k_silu_bwd(const gd_tensor_desc *desc,
-                             float *dx,
-                             const float *x,
-                             const float *go)
+                             void *dx,
+                             const void *x,
+                             const void *go)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        double s = 1.0 / (1.0 + exp(-(double)x[i]));
-        double grad = s * (1.0 + (double)x[i] * (1.0 - s));
-        dx[i] = (float)((double)go[i] * grad);
+        float xf = 0.0F;
+        float gf = 0.0F;
+        double s = 0.0;
+        double grad = 0.0;
+        gd_status status = _gd_cpu_load_float(desc, x, i, &xf);
+        if (status != GD_OK) { return status; }
+        status = _gd_cpu_load_float(desc, go, i, &gf);
+        if (status != GD_OK) { return status; }
+        s = 1.0 / (1.0 + exp(-(double)xf));
+        grad = s * (1.0 + (double)xf * (1.0 - s));
+        status = _gd_cpu_store_float(desc, dx, i, (float)((double)gf * grad));
+        if (status != GD_OK) { return status; }
     }
     return GD_OK;
 }

@@ -23,8 +23,8 @@ gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, void *out, const void *x);
 gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, void *out, const void *x);
 gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, void *out,
                           const void *x1, const void *x2, float m);
-gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2,
-                              const float *x1, const float *x2, const float *go,
+gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, void *dx1, void *dx2,
+                              const void *x1, const void *x2, const void *go,
                               float m);
 gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
                            void *out,
@@ -88,8 +88,8 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
 
 /* GELU (exact erf, or tanh approximation). */
 gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, void *out, const void *x, int tanh_approx);
-gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float *x,
-                             const float *go, int tanh_approx);
+gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, void *dx, const void *x,
+                             const void *go, int tanh_approx);
 
 /* Physical axis permutation into a contiguous result (any fixed-size dtype). */
 gd_status _gd_cpu_k_transpose(const gd_tensor_desc *out_desc, void *out,
@@ -126,13 +126,13 @@ gd_status _gd_cpu_k_sdpa_bwd(const gd_tensor_desc *q_desc, const float *q,
                              float *dq, float *dk, float *dv,
                              float scale, int causal, int window, int prefix_len);
 gd_status _gd_cpu_k_relu_bwd(const gd_tensor_desc *desc,
-                             float *dx,
-                             const float *x,
-                             const float *go);
+                             void *dx,
+                             const void *x,
+                             const void *go);
 gd_status _gd_cpu_k_silu_bwd(const gd_tensor_desc *desc,
-                             float *dx,
-                             const float *x,
-                             const float *go);
+                             void *dx,
+                             const void *x,
+                             const void *go);
 gd_status _gd_cpu_k_softmax_bwd(const gd_tensor_desc *desc,
                                 float *dx,
                                 const float *y,

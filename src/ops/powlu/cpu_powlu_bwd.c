@@ -33,9 +33,8 @@ static gd_status powlu_bwd_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(dx1_desc);
-    if (status != GD_OK) {
-        return status;
+    if (dx1_desc->dtype != GD_DTYPE_F32 && dx1_desc->dtype != GD_DTYPE_F16) {
+        return _gd_error(GD_ERR_DTYPE, "powlu_bwd output must be F32 or F16");
     }
     return _gd_cpu_k_powlu_bwd(dx1_desc, dx1_data, dx2_data, x1_data, x2_data, go_data,
                                node->attrs.powlu_m);

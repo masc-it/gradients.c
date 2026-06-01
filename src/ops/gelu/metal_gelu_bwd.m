@@ -15,6 +15,8 @@ static gd_status gelu_bwd_encode(_gd_metal_encode_ctx *ctx)
 
     p.numel = (int)numel;
     p.tanh_approx = node->attrs.gelu_tanh ? 1 : 0;
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &p.dtype);
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     idx = 1;
@@ -33,5 +35,6 @@ static gd_status gelu_bwd_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_gelu_bwd = {
     .kind = _GD_OP_GELU_BWD,
     .name = "gelu_bwd",
+    .support = _gd_metal_support_f32_f16_same_dtype,
     .encode = gelu_bwd_encode,
 };

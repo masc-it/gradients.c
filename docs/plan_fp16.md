@@ -329,7 +329,7 @@ Goal: production-safe F16 training loop.
   - [x] CPU path deterministic.
 - [ ] Integrate with optimizer:
   - [x] `gd_optimizer_step_amp()` wrapper.
-  - [ ] unscale before grad clipping.
+  - [x] unscale before grad clipping.
   - [x] if found_inf: skip AdamW, skip master->param cast, backoff scale.
   - [x] if finite: AdamW, refresh F16 params, maybe grow scale.
 - [ ] Tests:
@@ -357,7 +357,7 @@ Goal: GPT F16+AMP training runs fully on Metal without unsupported fallback.
   - [x] F32 stats and softmax math.
   - [ ] validate dk/dv effects through following projection dW remain F32 at leaf.
 - [x] lmCE backward typed F16 hidden + F32 weight grad.
-- [ ] `clip_grad_norm` consumes F32 grads and computes norm in F32.
+- [x] `clip_grad_norm` consumes F32 grads and computes norm in F32.
 - [ ] Add no-fallback GPT training test with small model.
 - [ ] Add toy overfit test:
   - [ ] F16+AMP loss decreases.

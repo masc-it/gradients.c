@@ -137,6 +137,7 @@ GD_REF(gd_optimizer_destroy, void, (gd_optimizer *));
 GD_REF(gd_optimizer_step, gd_status, (gd_context *, gd_optimizer *));
 GD_REF(gd_optimizer_step_lr, gd_status, (gd_context *, gd_optimizer *, gd_tensor *));
 GD_REF(gd_optimizer_step_amp, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *));
+GD_REF(gd_optimizer_step_amp_clip, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *, float, gd_tensor **));
 GD_REF(gd_optimizer_zero_grad, gd_status, (gd_context *, gd_optimizer *));
 GD_REF(gd_optimizer_save, gd_status, (gd_optimizer *, const char *));
 GD_REF(gd_optimizer_load, gd_status, (gd_optimizer *, const char *));

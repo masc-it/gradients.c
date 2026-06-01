@@ -76,6 +76,11 @@ gd_status gd_optimizer_step_lr(gd_context *ctx,
 gd_status gd_optimizer_step_amp(gd_context *ctx,
                                 gd_optimizer *optimizer,
                                 gd_amp_scaler *scaler);
+gd_status gd_optimizer_step_amp_clip(gd_context *ctx,
+                                     gd_optimizer *optimizer,
+                                     gd_amp_scaler *scaler,
+                                     float max_norm,
+                                     gd_tensor **norm_out);
 gd_status gd_optimizer_zero_grad(gd_context *ctx, gd_optimizer *optimizer);
 gd_status gd_optimizer_save(gd_optimizer *optimizer, const char *path);
 gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path);

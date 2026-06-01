@@ -490,9 +490,11 @@ gd_status gd_optimizer_step_lr(gd_context *ctx,
     return optimizer_step_impl(ctx, optimizer, lr_scalar);
 }
 
-gd_status gd_optimizer_step_amp(gd_context *ctx,
-                                gd_optimizer *optimizer,
-                                gd_amp_scaler *scaler)
+static gd_status optimizer_step_amp_impl(gd_context *ctx,
+                                        gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler,
+                                        float max_norm,
+                                        gd_tensor **norm_out)
 {
     gd_status status = GD_OK;
     gd_graph *graph = NULL;
@@ -503,6 +505,12 @@ gd_status gd_optimizer_step_amp(gd_context *ctx,
 
     if (ctx == NULL || optimizer == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp argument is NULL");
+    }
+    if (norm_out != NULL) {
+        *norm_out = NULL;
+    }
+    if (max_norm < 0.0F || !isfinite(max_norm)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "AMP grad clip max_norm must be nonnegative finite");
     }
     status = _gd_amp_scaler_validate(scaler);
     if (status != GD_OK) {
@@ -529,6 +537,26 @@ gd_status gd_optimizer_step_amp(gd_context *ctx,
         inputs[1] = scale;
         inputs[2] = found_inf;
         status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_UNSCALE_GRAD, inputs, 3, NULL);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+
+    if (max_norm > 0.0F) {
+        gd_tensor **params = NULL;
+
+        if (optimizer->n_slots > _GD_OP_MAX_INPUTS) {
+            return _gd_error(GD_ERR_INVALID_ARGUMENT, "AMP grad clipping supports at most 256 params");
+        }
+        params = (gd_tensor **)calloc((size_t)optimizer->n_slots, sizeof(gd_tensor *));
+        if (params == NULL) {
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate AMP clip param list");
+        }
+        for (i = 0; i < optimizer->n_slots; ++i) {
+            params[i] = optimizer->slots[i].param;
+        }
+        status = gd_clip_grad_norm(ctx, params, optimizer->n_slots, max_norm, norm_out);
+        free(params);
         if (status != GD_OK) {
             return status;
         }
@@ -578,6 +606,25 @@ gd_status gd_optimizer_step_amp(gd_context *ctx,
         }
     }
     return GD_OK;
+}
+
+gd_status gd_optimizer_step_amp(gd_context *ctx,
+                                gd_optimizer *optimizer,
+                                gd_amp_scaler *scaler)
+{
+    return optimizer_step_amp_impl(ctx, optimizer, scaler, 0.0F, NULL);
+}
+
+gd_status gd_optimizer_step_amp_clip(gd_context *ctx,
+                                     gd_optimizer *optimizer,
+                                     gd_amp_scaler *scaler,
+                                     float max_norm,
+                                     gd_tensor **norm_out)
+{
+    if (max_norm <= 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_clip max_norm must be positive");
+    }
+    return optimizer_step_amp_impl(ctx, optimizer, scaler, max_norm, norm_out);
 }
 
 gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,

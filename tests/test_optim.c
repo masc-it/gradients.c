@@ -227,6 +227,167 @@ static int test_adamw_lr_tensor(gd_context *ctx)
     return 0;
 }
 
+static int test_adamw_groups(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    float p_decay_init[1] = {1.0F};
+    float p_nodecay_init[1] = {1.0F};
+    float g_zero[1] = {0.0F};
+    gd_adamw_config cfg = {0};
+    gd_param_group groups[2];
+    gd_tensor *p_decay = NULL;
+    gd_tensor *p_nodecay = NULL;
+    gd_tensor *grad = NULL;
+    gd_optimizer *opt = NULL;
+    gd_graph *graph = NULL;
+    float got = 0.0F;
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.0F;
+
+    CHECK_OK(make_param(ctx, 1, p_decay_init, &p_decay));
+    CHECK_OK(make_param(ctx, 1, p_nodecay_init, &p_nodecay));
+    groups[0].params = &p_decay;
+    groups[0].n_params = 1;
+    groups[0].weight_decay = 0.1F;
+    groups[0].lr_scale = 1.0F;
+    groups[1].params = &p_nodecay;
+    groups[1].n_params = 1;
+    groups[1].weight_decay = 0.0F;
+    groups[1].lr_scale = 1.0F;
+    CHECK_OK(gd_adamw_create_groups(ctx, groups, 2, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(p_decay, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g_zero, sizeof(g_zero)));
+    CHECK_OK(gd_tensor_grad(p_nodecay, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g_zero, sizeof(g_zero)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_decay, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.99F));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_nodecay, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 1.0F));
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(p_nodecay);
+    gd_tensor_release(p_decay);
+    return 0;
+}
+
+static int test_adamw_group_lr_scale(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    float p_fast_init[1] = {1.0F};
+    float p_slow_init[1] = {1.0F};
+    float g[1] = {2.0F};
+    gd_adamw_config cfg = {0};
+    gd_param_group groups[2];
+    gd_tensor *p_fast = NULL;
+    gd_tensor *p_slow = NULL;
+    gd_tensor *grad = NULL;
+    gd_optimizer *opt = NULL;
+    gd_graph *graph = NULL;
+    float got = 0.0F;
+
+    cfg.lr = 0.1F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1.0F;
+    cfg.weight_decay = 0.0F;
+
+    CHECK_OK(make_param(ctx, 1, p_fast_init, &p_fast));
+    CHECK_OK(make_param(ctx, 1, p_slow_init, &p_slow));
+    groups[0].params = &p_fast;
+    groups[0].n_params = 1;
+    groups[0].weight_decay = 0.0F;
+    groups[0].lr_scale = 1.0F;
+    groups[1].params = &p_slow;
+    groups[1].n_params = 1;
+    groups[1].weight_decay = 0.0F;
+    groups[1].lr_scale = 0.5F;
+    CHECK_OK(gd_adamw_create_groups(ctx, groups, 2, &cfg, &opt));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(p_fast, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+    CHECK_OK(gd_tensor_grad(p_slow, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, g, sizeof(g)));
+
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_fast, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.93333334F));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_slow, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.96666664F));
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(p_slow);
+    gd_tensor_release(p_fast);
+    return 0;
+}
+
+static int test_gpt_parameter_groups(gd_context *ctx)
+{
+    gd_gpt_config gcfg = {0};
+    gd_gpt *gpt = NULL;
+    gd_param_group *groups = NULL;
+    gd_tensor **params = NULL;
+    gd_optimizer *opt = NULL;
+    gd_adamw_config ocfg = {0};
+    int n_groups = 0;
+    int n_params = 0;
+
+    gcfg.vocab_size = 16;
+    gcfg.d_model = 8;
+    gcfg.n_layers = 2;
+    gcfg.n_heads = 2;
+    gcfg.n_kv_heads = 1;
+    gcfg.head_dim = 4;
+    gcfg.d_ff = 16;
+    gcfg.max_seq_len = 8;
+    gcfg.mlp_kind = GD_GPT_MLP_POWLU;
+    gcfg.tie_embeddings = true;
+
+    ocfg.lr = 0.001F;
+    ocfg.beta1 = 0.9F;
+    ocfg.beta2 = 0.999F;
+    ocfg.eps = 1e-8F;
+    ocfg.weight_decay = 0.0F;
+
+    CHECK_OK(gd_gpt_create(ctx, &gcfg, 1234U, &gpt));
+    CHECK_OK(gd_gpt_parameters(gpt, &params, &n_params));
+    CHECK_OK(gd_gpt_parameter_groups(gpt, 0.1F, &groups, &n_groups));
+    CHECK_TRUE(n_groups == 2);
+    CHECK_TRUE(groups[0].n_params + groups[1].n_params == n_params);
+    CHECK_TRUE(groups[0].n_params == 15);
+    CHECK_TRUE(groups[1].n_params == 5);
+    CHECK_TRUE(close_to(groups[0].weight_decay, 0.1F));
+    CHECK_TRUE(close_to(groups[1].weight_decay, 0.0F));
+    CHECK_OK(gd_adamw_create_groups(ctx, groups, n_groups, &ocfg, &opt));
+
+    gd_optimizer_destroy(opt);
+    gd_gpt_parameter_groups_free(groups, n_groups);
+    gd_gpt_destroy(gpt);
+    return 0;
+}
+
 static int test_lr_scheduler_write(gd_context *ctx)
 {
     gd_lr_scheduler_config cfg;
@@ -405,6 +566,107 @@ static int test_clip_before_adamw(gd_context *ctx)
     return 0;
 }
 
+static int one_adamw_step(gd_context *ctx,
+                          gd_optimizer *opt,
+                          gd_tensor *param,
+                          const float *grad_data,
+                          size_t grad_nbytes)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor *grad = NULL;
+    gd_graph *graph = NULL;
+
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_TRUE(grad != NULL);
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, grad_data, grad_nbytes));
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step(ctx, opt));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_graph_run(graph));
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    return 0;
+}
+
+static int make_module_with_param(gd_context *ctx,
+                                  const float *init,
+                                  gd_module **module_out,
+                                  gd_tensor **param_out)
+{
+    gd_module *module = NULL;
+    gd_tensor *param = NULL;
+
+    CHECK_OK(gd_module_create(ctx, "single", &module));
+    CHECK_OK(make_param(ctx, 2, init, &param));
+    CHECK_OK(gd_module_param(module, "w", param));
+    *module_out = module;
+    *param_out = param;
+    return 0;
+}
+
+static int test_checkpoint_resume(gd_context *ctx)
+{
+    const char *model_path = "build/test_optim_model.gdmod";
+    const char *opt_path = "build/test_optim_opt.gdopt";
+    float init[2] = {1.0F, -2.0F};
+    float grad_data[2] = {0.25F, -0.5F};
+    gd_adamw_config cfg = {0};
+    gd_module *m_ref = NULL;
+    gd_module *m_save = NULL;
+    gd_module *m_load = NULL;
+    gd_tensor *p_ref = NULL;
+    gd_tensor *p_save = NULL;
+    gd_tensor *p_load = NULL;
+    gd_optimizer *o_ref = NULL;
+    gd_optimizer *o_save = NULL;
+    gd_optimizer *o_load = NULL;
+    float ref[2];
+    float got[2];
+    int i = 0;
+
+    cfg.lr = 0.05F;
+    cfg.beta1 = 0.9F;
+    cfg.beta2 = 0.999F;
+    cfg.eps = 1e-8F;
+    cfg.weight_decay = 0.01F;
+
+    CHECK_TRUE(make_module_with_param(ctx, init, &m_ref, &p_ref) == 0);
+    CHECK_OK(gd_adamw_create(ctx, &p_ref, 1, &cfg, &o_ref));
+    CHECK_TRUE(one_adamw_step(ctx, o_ref, p_ref, grad_data, sizeof(grad_data)) == 0);
+    CHECK_TRUE(one_adamw_step(ctx, o_ref, p_ref, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_ref, ref, sizeof(ref)));
+
+    CHECK_TRUE(make_module_with_param(ctx, init, &m_save, &p_save) == 0);
+    CHECK_OK(gd_adamw_create(ctx, &p_save, 1, &cfg, &o_save));
+    CHECK_TRUE(one_adamw_step(ctx, o_save, p_save, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_module_save(m_save, model_path));
+    CHECK_OK(gd_optimizer_save(o_save, opt_path));
+
+    CHECK_TRUE(make_module_with_param(ctx, init, &m_load, &p_load) == 0);
+    CHECK_OK(gd_adamw_create(ctx, &p_load, 1, &cfg, &o_load));
+    CHECK_OK(gd_module_load(m_load, model_path, true));
+    CHECK_OK(gd_optimizer_load(o_load, opt_path));
+    CHECK_TRUE(one_adamw_step(ctx, o_load, p_load, grad_data, sizeof(grad_data)) == 0);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, p_load, got, sizeof(got)));
+    for (i = 0; i < 2; ++i) {
+        CHECK_TRUE(close_to(got[i], ref[i]));
+    }
+
+    gd_optimizer_destroy(o_load);
+    gd_optimizer_destroy(o_save);
+    gd_optimizer_destroy(o_ref);
+    gd_tensor_release(p_load);
+    gd_tensor_release(p_save);
+    gd_tensor_release(p_ref);
+    gd_module_destroy(m_load);
+    gd_module_destroy(m_save);
+    gd_module_destroy(m_ref);
+    return 0;
+}
+
 static int test_tied_single_update(gd_context *ctx)
 {
     gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -468,9 +730,13 @@ int main(void)
     if (test_lr_scheduler_values() != 0 ||
         test_adamw_steps(ctx) != 0 ||
         test_adamw_lr_tensor(ctx) != 0 ||
+        test_adamw_groups(ctx) != 0 ||
+        test_adamw_group_lr_scale(ctx) != 0 ||
+        test_gpt_parameter_groups(ctx) != 0 ||
         test_lr_scheduler_write(ctx) != 0 ||
         test_clip_grad_norm(ctx) != 0 ||
         test_clip_before_adamw(ctx) != 0 ||
+        test_checkpoint_resume(ctx) != 0 ||
         test_tied_single_update(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;

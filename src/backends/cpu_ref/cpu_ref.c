@@ -390,7 +390,8 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
         return _gd_cpu_k_adamw(in_desc[0], in_data[0], in_data[1], in_data[2],
                                in_data[3], in_data[4],
                                node->n_inputs == 6 ? in_data[5] : NULL,
-                               node->attrs.lr, node->attrs.beta1, node->attrs.beta2,
+                               node->attrs.lr, node->attrs.scale,
+                               node->attrs.beta1, node->attrs.beta2,
                                node->attrs.eps, node->attrs.weight_decay);
     case _GD_OP_REDUCE_TO:
         status = require_f32(out_desc);

@@ -47,7 +47,7 @@ Not enough for real GPT training:
 - [x] LR scheduler without graph rebuilds
 - [x] global grad clipping
 - [ ] checkpoint/resume
-- [ ] parameter groups
+- [x] parameter groups
 - [ ] eval/generation loop
 - [ ] KV cache
 
@@ -624,7 +624,10 @@ Needed groups:
 - no_decay: RMSNorm weights, biases if added later
 - configurable: embeddings decay on/off
 
-API sketch:
+Implemented in `include/gradients/optim.h`, `include/gradients/nn.h`,
+`src/nn/optim.c`, `src/nn/nn.c`, CPU_REF, Metal, and `tests/test_optim.c`.
+
+API:
 
 ```c
 typedef struct gd_param_group {
@@ -641,12 +644,14 @@ gd_status gd_adamw_create_groups(gd_context *ctx,
                                  gd_optimizer **out);
 ```
 
-Need model parameter tagging from `gd_gpt_create()` or helper:
+GPT helper:
 
 ```c
 gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
+                                  float weight_decay,
                                   gd_param_group **groups_out,
                                   int *n_groups_out);
+void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups);
 ```
 
 ---
@@ -685,7 +690,18 @@ Hard requirements:
   within deterministic tolerance
 - versioned manifest
 
-Add optimizer state export/import APIs; optimizer internals are currently opaque.
+Implemented v1 tensor/state primitives:
+
+```c
+gd_status gd_module_save(gd_module *module, const char *path);
+gd_status gd_module_load(gd_module *module, const char *path, bool strict);
+gd_status gd_optimizer_save(gd_optimizer *optimizer, const char *path);
+gd_status gd_optimizer_load(gd_optimizer *optimizer, const char *path);
+```
+
+Current v1 writes versioned binary module tensors and AdamW state/step. Remaining
+full trainer checkpoint work: manifest, atomic temp-dir rename, checksums,
+scheduler state, and loader state.
 
 ---
 
@@ -964,9 +980,9 @@ Not required for first real training, but important later:
 
 ### P6 — Parameter groups + checkpoint/resume
 
-- [ ] no_decay group support.
+- [x] no_decay group support.
 - [ ] checkpoint manifest + tensors.
-- [ ] exact resume test.
+- [x] exact resume test.
 
 ### P7 — KV cache + generation
 

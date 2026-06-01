@@ -1330,6 +1330,7 @@ gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
                           const float *step,
                           const float *lr_tensor,
                           float lr,
+                          float lr_scale,
                           float beta1,
                           float beta2,
                           float eps,
@@ -1340,7 +1341,8 @@ gd_status _gd_cpu_k_adamw(const gd_tensor_desc *param_desc,
     double t = (double)step[0];
     double bc1 = 1.0 - pow((double)beta1, t);
     double bc2 = 1.0 - pow((double)beta2, t);
-    double step_lr = lr_tensor != NULL ? (double)lr_tensor[0] : (double)lr;
+    double step_lr = (lr_tensor != NULL ? (double)lr_tensor[0] : (double)lr) *
+                     (double)lr_scale;
 
     if (t < 1.0) {
         return _gd_error(GD_ERR_INVALID_STATE, "adamw step counter must be >= 1");

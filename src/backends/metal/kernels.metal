@@ -1223,7 +1223,7 @@ kernel void gd_adamw(device float *param                 [[buffer(0)]],
     if ((int)gid >= p.numel) {
         return;
     }
-    float lr = p.use_lr_tensor != 0 ? lr_tensor[0] : p.lr;
+    float lr = (p.use_lr_tensor != 0 ? lr_tensor[0] : p.lr) * p.lr_scale;
     float t = step[0];
     float bc1 = 1.0f - pow(p.beta1, t);
     float bc2 = 1.0f - pow(p.beta2, t);

@@ -1,5 +1,7 @@
 #include "gradients/module.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +21,7 @@ typedef struct module_child {
 } module_child;
 
 struct gd_module {
+    gd_context *ctx;
     char *type_name;
     module_param *params;
     int n_params;
@@ -59,6 +62,7 @@ gd_status gd_module_create(gd_context *ctx, const char *type_name, gd_module **o
     if (module == NULL) {
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module");
     }
+    module->ctx = ctx;
     module->type_name = dup_string(type_name);
     if (module->type_name == NULL) {
         free(module);
@@ -281,19 +285,329 @@ gd_status gd_module_zero_grad(gd_context *ctx, gd_module *module)
     return gd_zero_grad(ctx, params, n);
 }
 
+typedef struct named_param {
+    char *name;
+    gd_tensor *tensor;
+    int seen;
+} named_param;
+
+static const unsigned char module_magic[8] = {'G', 'D', 'M', 'O', 'D', '1', 0, 0};
+
+static gd_status write_all(FILE *f, const void *data, size_t nbytes)
+{
+    if (nbytes == 0U) {
+        return GD_OK;
+    }
+    if (fwrite(data, 1U, nbytes, f) != nbytes) {
+        return _gd_error(GD_ERR_IO, "failed to write module checkpoint");
+    }
+    return GD_OK;
+}
+
+static gd_status read_all(FILE *f, void *data, size_t nbytes)
+{
+    if (nbytes == 0U) {
+        return GD_OK;
+    }
+    if (fread(data, 1U, nbytes, f) != nbytes) {
+        return _gd_error(GD_ERR_IO, "failed to read module checkpoint");
+    }
+    return GD_OK;
+}
+
+static char *join_name(const char *prefix, const char *name)
+{
+    size_t prefix_len = prefix == NULL ? 0U : strlen(prefix);
+    size_t name_len = strlen(name);
+    size_t total = prefix_len + (prefix_len > 0U ? 1U : 0U) + name_len;
+    char *out = malloc(total + 1U);
+
+    if (out == NULL) {
+        return NULL;
+    }
+    if (prefix_len > 0U) {
+        memcpy(out, prefix, prefix_len);
+        out[prefix_len] = '.';
+        memcpy(out + prefix_len + 1U, name, name_len + 1U);
+    } else {
+        memcpy(out, name, name_len + 1U);
+    }
+    return out;
+}
+
+static gd_status named_push(named_param **arr,
+                            int *count,
+                            int *cap,
+                            char *name,
+                            gd_tensor *tensor)
+{
+    if (*count == *cap) {
+        int new_cap = *cap == 0 ? 16 : *cap * 2;
+        named_param *grown = realloc(*arr, (size_t)new_cap * sizeof(*grown));
+        if (grown == NULL) {
+            free(name);
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to grow named parameter list");
+        }
+        *arr = grown;
+        *cap = new_cap;
+    }
+    (*arr)[*count].name = name;
+    (*arr)[*count].tensor = tensor;
+    (*arr)[*count].seen = 0;
+    *count += 1;
+    return GD_OK;
+}
+
+static gd_status collect_named(gd_module *module,
+                               const char *prefix,
+                               named_param **arr,
+                               int *count,
+                               int *cap)
+{
+    int i = 0;
+
+    for (i = 0; i < module->n_params; ++i) {
+        char *full = join_name(prefix, module->params[i].name);
+        gd_status status;
+        if (full == NULL) {
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate parameter name");
+        }
+        status = named_push(arr, count, cap, full, module->params[i].tensor);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    for (i = 0; i < module->n_children; ++i) {
+        char *child_prefix = join_name(prefix, module->children[i].name);
+        gd_status status;
+        if (child_prefix == NULL) {
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate child prefix");
+        }
+        status = collect_named(module->children[i].module, child_prefix, arr, count, cap);
+        free(child_prefix);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    return GD_OK;
+}
+
+static void named_free(named_param *arr, int count)
+{
+    int i = 0;
+    for (i = 0; i < count; ++i) {
+        free(arr[i].name);
+    }
+    free(arr);
+}
+
+static named_param *find_named(named_param *arr, int count, const char *name)
+{
+    int i = 0;
+    for (i = 0; i < count; ++i) {
+        if (strcmp(arr[i].name, name) == 0) {
+            return &arr[i];
+        }
+    }
+    return NULL;
+}
+
 gd_status gd_module_save(gd_module *module, const char *path)
 {
+    gd_status status = GD_OK;
+    named_param *params = NULL;
+    int n_params = 0;
+    int cap = 0;
+    FILE *f = NULL;
+    uint32_t version = 1U;
+    uint32_t count32 = 0U;
+    int i = 0;
+
     if (module == NULL || path == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_save argument is NULL");
     }
-    return _gd_error(GD_ERR_UNSUPPORTED, "module save is not implemented yet");
+    status = collect_named(module, NULL, &params, &n_params, &cap);
+    if (status != GD_OK) {
+        named_free(params, n_params);
+        return status;
+    }
+    if (n_params < 0) {
+        named_free(params, n_params);
+        return _gd_error(GD_ERR_INVALID_STATE, "invalid module parameter count");
+    }
+    count32 = (uint32_t)n_params;
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        named_free(params, n_params);
+        return _gd_error(GD_ERR_IO, "failed to open module checkpoint for write");
+    }
+    status = write_all(f, module_magic, sizeof(module_magic));
+    if (status == GD_OK) {
+        status = write_all(f, &version, sizeof(version));
+    }
+    if (status == GD_OK) {
+        status = write_all(f, &count32, sizeof(count32));
+    }
+
+    for (i = 0; i < n_params && status == GD_OK; ++i) {
+        const gd_tensor_desc *desc = _gd_tensor_desc_ptr(params[i].tensor);
+        size_t nbytes = 0U;
+        uint64_t nbytes64 = 0U;
+        uint32_t name_len = (uint32_t)strlen(params[i].name);
+        uint32_t dtype = (uint32_t)desc->dtype;
+        int32_t ndim = (int32_t)desc->ndim;
+        void *buf = NULL;
+
+        status = gd_tensor_desc_nbytes(desc, &nbytes, NULL);
+        if (status != GD_OK) {
+            break;
+        }
+        nbytes64 = (uint64_t)nbytes;
+        buf = malloc(nbytes);
+        if (buf == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module save buffer");
+            break;
+        }
+        status = gd_tensor_copy_to_cpu(module->ctx, params[i].tensor, buf, nbytes);
+        if (status == GD_OK) { status = write_all(f, &name_len, sizeof(name_len)); }
+        if (status == GD_OK) { status = write_all(f, params[i].name, name_len); }
+        if (status == GD_OK) { status = write_all(f, &dtype, sizeof(dtype)); }
+        if (status == GD_OK) { status = write_all(f, &ndim, sizeof(ndim)); }
+        if (status == GD_OK) { status = write_all(f, desc->sizes, sizeof(desc->sizes)); }
+        if (status == GD_OK) { status = write_all(f, &nbytes64, sizeof(nbytes64)); }
+        if (status == GD_OK) { status = write_all(f, buf, nbytes); }
+        free(buf);
+    }
+
+    if (fclose(f) != 0 && status == GD_OK) {
+        status = _gd_error(GD_ERR_IO, "failed to close module checkpoint");
+    }
+    named_free(params, n_params);
+    return status;
 }
 
 gd_status gd_module_load(gd_module *module, const char *path, bool strict)
 {
+    gd_status status = GD_OK;
+    named_param *params = NULL;
+    int n_params = 0;
+    int cap = 0;
+    FILE *f = NULL;
+    unsigned char magic[8];
+    uint32_t version = 0U;
+    uint32_t file_count = 0U;
+    uint32_t entry = 0U;
+
     if (module == NULL || path == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_load argument is NULL");
     }
-    (void)strict;
-    return _gd_error(GD_ERR_UNSUPPORTED, "module load is not implemented yet");
+    status = collect_named(module, NULL, &params, &n_params, &cap);
+    if (status != GD_OK) {
+        named_free(params, n_params);
+        return status;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        named_free(params, n_params);
+        return _gd_error(GD_ERR_IO, "failed to open module checkpoint for read");
+    }
+    status = read_all(f, magic, sizeof(magic));
+    if (status == GD_OK && memcmp(magic, module_magic, sizeof(module_magic)) != 0) {
+        status = _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid module checkpoint magic");
+    }
+    if (status == GD_OK) { status = read_all(f, &version, sizeof(version)); }
+    if (status == GD_OK && version != 1U) {
+        status = _gd_error(GD_ERR_UNSUPPORTED, "unsupported module checkpoint version");
+    }
+    if (status == GD_OK) { status = read_all(f, &file_count, sizeof(file_count)); }
+
+    for (entry = 0U; entry < file_count && status == GD_OK; ++entry) {
+        uint32_t name_len = 0U;
+        char *name = NULL;
+        uint32_t dtype = 0U;
+        int32_t ndim = 0;
+        int64_t sizes[GD_MAX_DIMS];
+        uint64_t nbytes64 = 0U;
+        size_t nbytes = 0U;
+        void *buf = NULL;
+        named_param *target = NULL;
+
+        memset(sizes, 0, sizeof(sizes));
+        status = read_all(f, &name_len, sizeof(name_len));
+        if (status != GD_OK) { break; }
+        name = malloc((size_t)name_len + 1U);
+        if (name == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module entry name");
+            break;
+        }
+        status = read_all(f, name, name_len);
+        name[name_len] = '\0';
+        if (status == GD_OK) { status = read_all(f, &dtype, sizeof(dtype)); }
+        if (status == GD_OK) { status = read_all(f, &ndim, sizeof(ndim)); }
+        if (status == GD_OK) { status = read_all(f, sizes, sizeof(sizes)); }
+        if (status == GD_OK) { status = read_all(f, &nbytes64, sizeof(nbytes64)); }
+        if (status != GD_OK) {
+            free(name);
+            break;
+        }
+        if (nbytes64 > (uint64_t)SIZE_MAX) {
+            free(name);
+            status = _gd_error(GD_ERR_INVALID_ARGUMENT, "module tensor is too large");
+            break;
+        }
+        nbytes = (size_t)nbytes64;
+        buf = malloc(nbytes);
+        if (buf == NULL) {
+            free(name);
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module load buffer");
+            break;
+        }
+        status = read_all(f, buf, nbytes);
+        if (status == GD_OK) {
+            target = find_named(params, n_params, name);
+            if (target == NULL) {
+                if (strict) {
+                    status = _gd_error(GD_ERR_INVALID_ARGUMENT,
+                                       "module checkpoint contains unknown parameter");
+                }
+            } else {
+                const gd_tensor_desc *desc = _gd_tensor_desc_ptr(target->tensor);
+                size_t expected_nbytes = 0U;
+                int dim = 0;
+                status = gd_tensor_desc_nbytes(desc, &expected_nbytes, NULL);
+                if (status == GD_OK && ((uint32_t)desc->dtype != dtype ||
+                                        (int32_t)desc->ndim != ndim ||
+                                        expected_nbytes != nbytes)) {
+                    status = _gd_error(GD_ERR_SHAPE, "module checkpoint tensor metadata mismatch");
+                }
+                for (dim = 0; status == GD_OK && dim < desc->ndim; ++dim) {
+                    if (desc->sizes[dim] != sizes[dim]) {
+                        status = _gd_error(GD_ERR_SHAPE,
+                                           "module checkpoint tensor shape mismatch");
+                    }
+                }
+                if (status == GD_OK) {
+                    status = gd_tensor_copy_from_cpu(module->ctx, target->tensor, buf, nbytes);
+                    target->seen = 1;
+                }
+            }
+        }
+        free(buf);
+        free(name);
+    }
+    if (status == GD_OK && strict) {
+        int i = 0;
+        for (i = 0; i < n_params; ++i) {
+            if (!params[i].seen) {
+                status = _gd_error(GD_ERR_INVALID_ARGUMENT,
+                                   "module checkpoint missing parameter");
+                break;
+            }
+        }
+    }
+    if (fclose(f) != 0 && status == GD_OK) {
+        status = _gd_error(GD_ERR_IO, "failed to close module checkpoint");
+    }
+    named_free(params, n_params);
+    return status;
 }

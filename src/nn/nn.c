@@ -262,6 +262,90 @@ gd_status gd_gpt_parameters(gd_gpt *gpt, gd_tensor ***params_out, int *n_out)
     return gd_module_parameters(gpt->module, params_out, n_out);
 }
 
+gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
+                                  float weight_decay,
+                                  gd_param_group **groups_out,
+                                  int *n_groups_out)
+{
+    gd_param_group *groups = NULL;
+    int decay_count = 0;
+    int no_decay_count = 0;
+    int decay_i = 0;
+    int no_decay_i = 0;
+    int l = 0;
+
+    if (gpt == NULL || groups_out == NULL || n_groups_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_parameter_groups argument is NULL");
+    }
+    if (!isfinite(weight_decay) || weight_decay < 0.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT,
+                         "gpt parameter group weight_decay must be finite and nonnegative");
+    }
+    *groups_out = NULL;
+    *n_groups_out = 0;
+
+    decay_count = 1 + (gpt->w_head != NULL ? 1 : 0);
+    no_decay_count = 1;
+    for (l = 0; l < gpt->cfg.n_layers; ++l) {
+        decay_count += gpt->w_up[l] != NULL ? 7 : 6;
+        no_decay_count += 2;
+    }
+
+    groups = calloc(2U, sizeof(*groups));
+    if (groups == NULL) {
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate gpt parameter groups");
+    }
+    groups[0].params = calloc((size_t)decay_count, sizeof(*groups[0].params));
+    groups[1].params = calloc((size_t)no_decay_count, sizeof(*groups[1].params));
+    if (groups[0].params == NULL || groups[1].params == NULL) {
+        gd_gpt_parameter_groups_free(groups, 2);
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate gpt group params");
+    }
+
+    groups[0].weight_decay = weight_decay;
+    groups[0].lr_scale = 1.0F;
+    groups[1].weight_decay = 0.0F;
+    groups[1].lr_scale = 1.0F;
+
+    groups[0].params[decay_i++] = gpt->wte;
+    if (gpt->w_head != NULL) {
+        groups[0].params[decay_i++] = gpt->w_head;
+    }
+    groups[1].params[no_decay_i++] = gpt->ln_f;
+    for (l = 0; l < gpt->cfg.n_layers; ++l) {
+        groups[1].params[no_decay_i++] = gpt->ln1[l];
+        groups[0].params[decay_i++] = gpt->wq[l];
+        groups[0].params[decay_i++] = gpt->wk[l];
+        groups[0].params[decay_i++] = gpt->wv[l];
+        groups[0].params[decay_i++] = gpt->wo[l];
+        groups[1].params[no_decay_i++] = gpt->ln2[l];
+        groups[0].params[decay_i++] = gpt->w_gate[l];
+        if (gpt->w_up[l] != NULL) {
+            groups[0].params[decay_i++] = gpt->w_up[l];
+        }
+        groups[0].params[decay_i++] = gpt->w_down[l];
+    }
+    groups[0].n_params = decay_i;
+    groups[1].n_params = no_decay_i;
+
+    *groups_out = groups;
+    *n_groups_out = 2;
+    return GD_OK;
+}
+
+void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups)
+{
+    int i = 0;
+
+    if (groups == NULL) {
+        return;
+    }
+    for (i = 0; i < n_groups; ++i) {
+        free(groups[i].params);
+    }
+    free(groups);
+}
+
 /* x[B,T,d] -> x + attn(rms_norm(x)). Returns a new virtual tensor. */
 static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
                                  gd_tensor *x, gd_tensor *positions,

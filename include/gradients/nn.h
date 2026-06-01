@@ -7,6 +7,7 @@
 #include "gradients/context.h"
 #include "gradients/status.h"
 #include "gradients/tensor.h"
+#include "gradients/optim.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,11 @@ void gd_gpt_destroy(gd_gpt *gpt);
 
 /* Trainable parameters (owned by the model; valid until destroy). */
 gd_status gd_gpt_parameters(gd_gpt *gpt, gd_tensor ***params_out, int *n_out);
+gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
+                                  float weight_decay,
+                                  gd_param_group **groups_out,
+                                  int *n_groups_out);
+void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups);
 
 /* Records the forward pass into the active graph. `tokens` is int32 [B,T];
  * `positions` is int32 [B,T] (RoPE/causal positions). Produces logits[B,T,V]

@@ -2324,6 +2324,7 @@ static void encode_adamw(id<MTLComputeCommandEncoder> enc,
     p.numel = (int)numel;
     p.use_lr_tensor = node->n_inputs == 6 ? 1 : 0;
     p.lr = node->attrs.lr;
+    p.lr_scale = node->attrs.scale;
     p.beta1 = node->attrs.beta1;
     p.beta2 = node->attrs.beta2;
     p.eps = node->attrs.eps;

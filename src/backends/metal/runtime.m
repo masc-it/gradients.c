@@ -168,6 +168,8 @@ void _gd_metal_build_ew_params(gd_metal_ew_params *p,
     p->numel = (int)_gd_metal_desc_numel(out_desc);
     p->a_ndim = a_desc->ndim;
     p->b_ndim = b_desc->ndim;
+    p->dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &p->dtype);
     for (i = 0; i < out_desc->ndim; ++i) {
         p->out_sizes[i] = (int)out_desc->sizes[i];
     }

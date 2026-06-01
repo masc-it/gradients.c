@@ -73,9 +73,15 @@ static bool try_fuse_silu_mul(GDMetalState *st, const gd_graph *graph,
     if (value_min_consumer(graph, act_id) < head_idx) {
         return false;
     }
-    /* Equal shapes: the fused kernel is contiguous numel, no broadcast. */
+    /* Equal F32 shapes: the fused kernel is contiguous numel, no broadcast.
+     * F16 is kept on the unfused typed elementwise kernels until this fusion is
+     * explicitly typed. */
     out_d = &exe->graph->values[head->outputs[0]].desc;
     up_d = &exe->graph->values[head->inputs[1]].desc;
+    if (out_d->dtype != GD_DTYPE_F32 || up_d->dtype != GD_DTYPE_F32 ||
+        exe->graph->values[silu->inputs[0]].desc.dtype != GD_DTYPE_F32) {
+        return false;
+    }
     if (_gd_metal_desc_numel(out_d) != _gd_metal_desc_numel(up_d) ||
         _gd_metal_desc_numel(out_d) != _gd_metal_desc_numel(&exe->graph->values[silu->inputs[0]].desc)) {
         return false;
@@ -236,6 +242,7 @@ static void encode_fused_silu_mul(id<MTLComputeCommandEncoder> enc,
 
     params.numel = (int)numel;
     params.scale = 0.0F;
+    params.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, silu->inputs[0]) offset:0 atIndex:0];  /* gate */
     [enc setBuffer:_gd_metal_value_buffer(exe, head->inputs[1]) offset:0 atIndex:1];  /* up */

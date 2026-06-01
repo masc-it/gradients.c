@@ -62,6 +62,7 @@ static gd_status copy_encode(_gd_metal_encode_ctx *ctx)
     }
     p.numel = (int)nbytes;
     p.scale = 0.0F;
+    p.dtype = GD_METAL_DT_F32;
     [enc setComputePipelineState:ctx->pso];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->outputs[0]) offset:0 atIndex:1];

@@ -6,19 +6,23 @@
 
 #include "../../graph/graph_internal.h"
 
-/* Scalar F32 (and minimal int) reference kernels. All tensors are contiguous. */
+/* Scalar reference kernels. All tensors are contiguous. */
+gd_status _gd_cpu_load_float(const gd_tensor_desc *desc, const void *data,
+                             int64_t i, float *out);
+gd_status _gd_cpu_store_float(const gd_tensor_desc *desc, void *data,
+                              int64_t i, float value);
 gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
                                 const gd_tensor_desc *out_desc,
-                                float *out,
+                                void *out,
                                 const gd_tensor_desc *a_desc,
-                                const float *a,
+                                const void *a,
                                 const gd_tensor_desc *b_desc,
-                                const float *b);
-gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, float *out, const float *x, float scale);
-gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, float *out, const float *x);
-gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, float *out, const float *x);
-gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, float *out,
-                          const float *x1, const float *x2, float m);
+                                const void *b);
+gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, void *out, const void *x, float scale);
+gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, void *out, const void *x);
+gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, void *out, const void *x);
+gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, void *out,
+                          const void *x1, const void *x2, float m);
 gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, float *dx1, float *dx2,
                               const float *x1, const float *x2, const float *go,
                               float m);
@@ -83,7 +87,7 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
                          const void *in);
 
 /* GELU (exact erf, or tanh approximation). */
-gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, float *out, const float *x, int tanh_approx);
+gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, void *out, const void *x, int tanh_approx);
 gd_status _gd_cpu_k_gelu_bwd(const gd_tensor_desc *desc, float *dx, const float *x,
                              const float *go, int tanh_approx);
 

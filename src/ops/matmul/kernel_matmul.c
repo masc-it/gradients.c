@@ -1,9 +1,5 @@
 #include "../../backends/cpu_ref/cpu_backend.h"
 
-#include "../../core/internal.h"
-
-#include <stdint.h>
-
 static int64_t desc_numel(const gd_tensor_desc *desc)
 {
     int64_t numel = 1;
@@ -13,36 +9,6 @@ static int64_t desc_numel(const gd_tensor_desc *desc)
         numel *= desc->sizes[i];
     }
     return numel;
-}
-
-static gd_status load_float(const gd_tensor_desc *desc, const void *data,
-                            int64_t i, float *out)
-{
-    switch (desc->dtype) {
-    case GD_DTYPE_F32:
-        *out = ((const float *)data)[i];
-        return GD_OK;
-    case GD_DTYPE_F16:
-        *out = _gd_f16_bits_to_f32(((const uint16_t *)data)[i]);
-        return GD_OK;
-    default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF matmul supports F32/F16 only");
-    }
-}
-
-static gd_status store_float(const gd_tensor_desc *desc, void *data,
-                             int64_t i, float value)
-{
-    switch (desc->dtype) {
-    case GD_DTYPE_F32:
-        ((float *)data)[i] = value;
-        return GD_OK;
-    case GD_DTYPE_F16:
-        ((uint16_t *)data)[i] = _gd_f32_to_f16_bits(value);
-        return GD_OK;
-    default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF matmul supports F32/F16 only");
-    }
 }
 
 gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
@@ -111,11 +77,11 @@ gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
                     int64_t b_off = trans_b ? (col * b_cols + kk) : (kk * b_cols + col);
                     float av = 0.0F;
                     float bv = 0.0F;
-                    gd_status status = load_float(a_desc, a, a_base + a_off, &av);
+                    gd_status status = _gd_cpu_load_float(a_desc, a, a_base + a_off, &av);
                     if (status != GD_OK) {
                         return status;
                     }
-                    status = load_float(b_desc, b, b_base + b_off, &bv);
+                    status = _gd_cpu_load_float(b_desc, b, b_base + b_off, &bv);
                     if (status != GD_OK) {
                         return status;
                     }
@@ -123,7 +89,7 @@ gd_status _gd_cpu_k_matmul(const gd_tensor_desc *out_desc,
                 }
                 {
                     int64_t out_off = batch_lin * out_mat + row * n + col;
-                    gd_status status = store_float(out_desc, out, out_off, (float)acc);
+                    gd_status status = _gd_cpu_store_float(out_desc, out, out_off, (float)acc);
                     if (status != GD_OK) {
                         return status;
                     }
@@ -156,7 +122,7 @@ gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
             int64_t kk = 0;
             if (bias != NULL) {
                 float bv = 0.0F;
-                gd_status status = load_float(out_desc, bias, o, &bv);
+                gd_status status = _gd_cpu_load_float(out_desc, bias, o, &bv);
                 if (status != GD_OK) {
                     return status;
                 }
@@ -166,18 +132,18 @@ gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
                 int64_t w_off = trans_w ? (o * in_features + kk) : (kk * out_features + o);
                 float xv = 0.0F;
                 float wv = 0.0F;
-                gd_status status = load_float(x_desc, x, r * in_features + kk, &xv);
+                gd_status status = _gd_cpu_load_float(x_desc, x, r * in_features + kk, &xv);
                 if (status != GD_OK) {
                     return status;
                 }
-                status = load_float(w_desc, w, w_off, &wv);
+                status = _gd_cpu_load_float(w_desc, w, w_off, &wv);
                 if (status != GD_OK) {
                     return status;
                 }
                 acc += (double)xv * (double)wv;
             }
             {
-                gd_status status = store_float(out_desc, out, r * out_features + o, (float)acc);
+                gd_status status = _gd_cpu_store_float(out_desc, out, r * out_features + o, (float)acc);
                 if (status != GD_OK) {
                     return status;
                 }

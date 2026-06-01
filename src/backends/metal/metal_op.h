@@ -40,6 +40,7 @@ typedef struct _gd_metal_op {
 
 const _gd_metal_op *_gd_metal_op_for(_gd_op_kind kind);
 gd_status _gd_metal_support_default(const _gd_metal_plan_ctx *ctx);
+gd_status _gd_metal_support_f32_f16_same_dtype(const _gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_plan_default(_gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_support_node(_gd_backend *self, const _gd_node *node);

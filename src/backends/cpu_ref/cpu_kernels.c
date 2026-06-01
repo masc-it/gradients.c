@@ -47,13 +47,49 @@ static int64_t broadcast_offset(const int64_t *out_index,
     return offset;
 }
 
+gd_status _gd_cpu_load_float(const gd_tensor_desc *desc, const void *data,
+                             int64_t i, float *out)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        *out = ((const float *)data)[i];
+        return GD_OK;
+    case GD_DTYPE_F16:
+        *out = _gd_f16_bits_to_f32(((const uint16_t *)data)[i]);
+        return GD_OK;
+    case GD_DTYPE_I32:
+        *out = (float)((const int32_t *)data)[i];
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF float load dtype is not implemented");
+    }
+}
+
+gd_status _gd_cpu_store_float(const gd_tensor_desc *desc, void *data,
+                              int64_t i, float value)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        ((float *)data)[i] = value;
+        return GD_OK;
+    case GD_DTYPE_F16:
+        ((uint16_t *)data)[i] = _gd_f32_to_f16_bits(value);
+        return GD_OK;
+    case GD_DTYPE_I32:
+        ((int32_t *)data)[i] = (int32_t)value;
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "CPU_REF float store dtype is not implemented");
+    }
+}
+
 gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
                                 const gd_tensor_desc *out_desc,
-                                float *out,
+                                void *out,
                                 const gd_tensor_desc *a_desc,
-                                const float *a,
+                                const void *a,
                                 const gd_tensor_desc *b_desc,
-                                const float *b)
+                                const void *b)
 {
     int64_t total = desc_numel(out_desc);
     int64_t lin = 0;
@@ -62,48 +98,84 @@ gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
     for (lin = 0; lin < total; ++lin) {
         int64_t ao = 0;
         int64_t bo = 0;
+        float av = 0.0F;
+        float bv = 0.0F;
+        float y = 0.0F;
+        gd_status status = GD_OK;
 
         unravel(lin, out_desc, index);
         ao = broadcast_offset(index, out_desc->ndim, a_desc);
         bo = broadcast_offset(index, out_desc->ndim, b_desc);
-        if (op == _GD_OP_ADD) {
-            out[lin] = a[ao] + b[bo];
-        } else {
-            out[lin] = a[ao] * b[bo];
+        status = _gd_cpu_load_float(a_desc, a, ao, &av);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_load_float(b_desc, b, bo, &bv);
+        if (status != GD_OK) {
+            return status;
+        }
+        y = (op == _GD_OP_ADD) ? (av + bv) : (av * bv);
+        status = _gd_cpu_store_float(out_desc, out, lin, y);
+        if (status != GD_OK) {
+            return status;
         }
     }
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, float *out, const float *x, float scale)
+gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, void *out, const void *x, float scale)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        out[i] = x[i] * scale;
+        float v = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x, i, &v);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_store_float(desc, out, i, v * scale);
+        if (status != GD_OK) {
+            return status;
+        }
     }
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, float *out, const float *x)
+gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, void *out, const void *x)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        out[i] = x[i] > 0.0F ? x[i] : 0.0F;
+        float v = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x, i, &v);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_store_float(desc, out, i, v > 0.0F ? v : 0.0F);
+        if (status != GD_OK) {
+            return status;
+        }
     }
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, float *out, const float *x)
+gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, void *out, const void *x)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        out[i] = x[i] / (1.0F + expf(-x[i]));
+        float v = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x, i, &v);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_store_float(desc, out, i, v / (1.0F + expf(-v)));
+        if (status != GD_OK) {
+            return status;
+        }
     }
     return GD_OK;
 }
@@ -150,14 +222,27 @@ static float powlu_gate_grad(float z, float m)
     }
 }
 
-gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, float *out,
-                          const float *x1, const float *x2, float m)
+gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, void *out,
+                          const void *x1, const void *x2, float m)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
 
     for (i = 0; i < total; ++i) {
-        out[i] = x1[i] * powlu_gate(x2[i], m);
+        float v1 = 0.0F;
+        float v2 = 0.0F;
+        gd_status status = _gd_cpu_load_float(desc, x1, i, &v1);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_load_float(desc, x2, i, &v2);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = _gd_cpu_store_float(desc, out, i, v1 * powlu_gate(v2, m));
+        if (status != GD_OK) {
+            return status;
+        }
     }
     return GD_OK;
 }
@@ -345,46 +430,6 @@ gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
     return GD_OK;
 }
 
-static gd_status cpu_cast_load_float(const gd_tensor_desc *desc,
-                                     const void *data,
-                                     int64_t i,
-                                     float *out)
-{
-    switch (desc->dtype) {
-    case GD_DTYPE_F32:
-        *out = ((const float *)data)[i];
-        return GD_OK;
-    case GD_DTYPE_F16:
-        *out = _gd_f16_bits_to_f32(((const uint16_t *)data)[i]);
-        return GD_OK;
-    case GD_DTYPE_I32:
-        *out = (float)((const int32_t *)data)[i];
-        return GD_OK;
-    default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "cast source dtype is not implemented in CPU_REF");
-    }
-}
-
-static gd_status cpu_cast_store_float(const gd_tensor_desc *desc,
-                                      void *data,
-                                      int64_t i,
-                                      float value)
-{
-    switch (desc->dtype) {
-    case GD_DTYPE_F32:
-        ((float *)data)[i] = value;
-        return GD_OK;
-    case GD_DTYPE_F16:
-        ((uint16_t *)data)[i] = _gd_f32_to_f16_bits(value);
-        return GD_OK;
-    case GD_DTYPE_I32:
-        ((int32_t *)data)[i] = (int32_t)value;
-        return GD_OK;
-    default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "cast destination dtype is not implemented in CPU_REF");
-    }
-}
-
 gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
                          void *out,
                          const gd_tensor_desc *x_desc,
@@ -406,11 +451,11 @@ gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
     }
     for (i = 0; i < total; ++i) {
         float value = 0.0F;
-        gd_status status = cpu_cast_load_float(x_desc, x, i, &value);
+        gd_status status = _gd_cpu_load_float(x_desc, x, i, &value);
         if (status != GD_OK) {
             return status;
         }
-        status = cpu_cast_store_float(out_desc, out, i, value);
+        status = _gd_cpu_store_float(out_desc, out, i, value);
         if (status != GD_OK) {
             return status;
         }
@@ -439,7 +484,7 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
     return GD_OK;
 }
 
-gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, float *out, const float *x, int tanh_approx)
+gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, void *out, const void *x, int tanh_approx)
 {
     int64_t total = desc_numel(desc);
     int64_t i = 0;
@@ -447,15 +492,36 @@ gd_status _gd_cpu_k_gelu(const gd_tensor_desc *desc, float *out, const float *x,
     if (tanh_approx) {
         const double c = 0.7978845608028654; /* sqrt(2/pi) */
         for (i = 0; i < total; ++i) {
-            double xv = (double)x[i];
-            double inner = c * (xv + 0.044715 * xv * xv * xv);
-            out[i] = (float)(0.5 * xv * (1.0 + tanh(inner)));
+            float f = 0.0F;
+            double xv = 0.0;
+            double inner = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, x, i, &f);
+            if (status != GD_OK) {
+                return status;
+            }
+            xv = (double)f;
+            inner = c * (xv + 0.044715 * xv * xv * xv);
+            status = _gd_cpu_store_float(desc, out, i,
+                                         (float)(0.5 * xv * (1.0 + tanh(inner))));
+            if (status != GD_OK) {
+                return status;
+            }
         }
     } else {
         const double inv_sqrt2 = 0.7071067811865476;
         for (i = 0; i < total; ++i) {
-            double xv = (double)x[i];
-            out[i] = (float)(0.5 * xv * (1.0 + erf(xv * inv_sqrt2)));
+            float f = 0.0F;
+            double xv = 0.0;
+            gd_status status = _gd_cpu_load_float(desc, x, i, &f);
+            if (status != GD_OK) {
+                return status;
+            }
+            xv = (double)f;
+            status = _gd_cpu_store_float(desc, out, i,
+                                         (float)(0.5 * xv * (1.0 + erf(xv * inv_sqrt2))));
+            if (status != GD_OK) {
+                return status;
+            }
         }
     }
     return GD_OK;

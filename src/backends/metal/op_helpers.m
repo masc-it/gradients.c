@@ -1,5 +1,54 @@
 #import "metal_op.h"
 
+static bool metal_support_dtype_f32_f16(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F32 || dtype == GD_DTYPE_F16;
+}
+
+gd_status _gd_metal_support_f32_f16_same_dtype(const _gd_metal_plan_ctx *ctx)
+{
+    gd_status status = GD_OK;
+    gd_dtype dtype = GD_DTYPE_INVALID;
+    int i = 0;
+
+    if (ctx == NULL || ctx->node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "Metal support ctx is NULL");
+    }
+    status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
+                                   ctx->node->n_outputs);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (ctx->state != nil && _gd_metal_pipeline_for(ctx->state, ctx->node->op) == nil) {
+        char msg[96];
+        (void)snprintf(msg, sizeof(msg), "metal has no kernel for op '%s'",
+                       _gd_op_kind_name(ctx->node->op));
+        return _gd_error(GD_ERR_UNSUPPORTED, msg);
+    }
+    if (ctx->graph == NULL) {
+        return GD_OK;
+    }
+    if (ctx->node->n_outputs > 0) {
+        dtype = ctx->graph->values[ctx->node->outputs[0]].desc.dtype;
+    } else if (ctx->node->n_inputs > 0) {
+        dtype = ctx->graph->values[ctx->node->inputs[0]].desc.dtype;
+    }
+    if (!metal_support_dtype_f32_f16(dtype)) {
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal op supports F32/F16 floating tensors only");
+    }
+    for (i = 0; i < ctx->node->n_inputs; ++i) {
+        if (ctx->graph->values[ctx->node->inputs[i]].desc.dtype != dtype) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal op requires matching F32/F16 dtypes");
+        }
+    }
+    for (i = 0; i < ctx->node->n_outputs; ++i) {
+        if (ctx->graph->values[ctx->node->outputs[i]].desc.dtype != dtype) {
+            return _gd_error(GD_ERR_UNSUPPORTED, "metal op requires matching F32/F16 dtypes");
+        }
+    }
+    return GD_OK;
+}
+
 void _gd_metal_split_around_dim(const gd_tensor_desc *desc, int dim,
                                 int *outer, int *d, int *inner)
 {
@@ -48,6 +97,8 @@ gd_status _gd_metal_encode_unary(_gd_metal_encode_ctx *ctx, float scale)
 
     params.numel = (int)numel;
     params.scale = scale;
+    params.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &params.dtype);
     [enc setComputePipelineState:ctx->pso];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->outputs[0]) offset:0 atIndex:1];
@@ -68,6 +119,8 @@ gd_status _gd_metal_encode_unary_bwd(_gd_metal_encode_ctx *ctx)
 
     p.numel = (int)numel;
     p.scale = 0.0F;
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &p.dtype);
     [enc setComputePipelineState:ctx->pso];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(ctx->exe, node->inputs[1]) offset:0 atIndex:1];

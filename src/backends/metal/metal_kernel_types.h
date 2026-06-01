@@ -78,6 +78,7 @@ typedef struct gd_metal_ew_params {
     int a_ndim;
     int b_ndim;
     int same_shape;                    /* a,b,out all same contiguous shape */
+    int dtype;                         /* GD_METAL_DT_*; a,b,out share dtype */
     int out_sizes[GD_METAL_MAX_DIMS];
     int a_sizes[GD_METAL_MAX_DIMS];
     int b_sizes[GD_METAL_MAX_DIMS];
@@ -88,11 +89,13 @@ typedef struct gd_metal_ew_params {
 typedef struct gd_metal_unary_params {
     int numel;
     float scale;
+    int dtype;                         /* GD_METAL_DT_*; input/output share dtype */
 } gd_metal_unary_params;
 
 typedef struct gd_metal_powlu_params {
     int numel;
     float m;
+    int dtype;                         /* GD_METAL_DT_*; inputs/output share dtype */
 } gd_metal_powlu_params;
 
 /* dtype codes shared with the cast kernel (a small closed set, not the full
@@ -211,6 +214,7 @@ typedef struct gd_metal_adamw_params {
 typedef struct gd_metal_gelu_params {
     int numel;
     int tanh_approx;
+    int dtype;                         /* GD_METAL_DT_*; input/output share dtype */
 } gd_metal_gelu_params;
 
 /* Physical permute of contiguous 4-byte elements. in_strides are element

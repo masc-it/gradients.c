@@ -139,8 +139,8 @@ understand.
   - [x] deterministic round-to-nearest-even behavior.
   - [ ] NaN/Inf/subnormal tests.
 - [ ] Extend CPU_REF typed load/store helpers:
-  - [ ] F32 load/store.
-  - [ ] F16 load/store through F32 compute.
+  - [x] F32 load/store.
+  - [x] F16 load/store through F32 compute.
   - [ ] BF16 helpers may exist but stay non-default.
 - [x] Implement CPU `gd_cast` for F32<->F16 and F16<->F16.
 - [x] Implement Metal `gd_cast` for F32<->F16 and F16<->F16.
@@ -201,10 +201,10 @@ Goal: unlock main FLOPS path first.
 Goal: GPT inference graph runs fully on Metal with F16 params/activations and no
 CPU fallback.
 
-- [ ] Elementwise kernels typed for F16:
-  - [ ] add/mul/scale.
-  - [ ] copy.
-  - [ ] SiLU/GELU/PowLU forward.
+- [x] Elementwise kernels typed for F16:
+  - [x] add/mul/scale.
+  - [x] copy.
+  - [x] ReLU/SiLU/GELU/PowLU forward.
 - [ ] Shape/data movement kernels typed for F16:
   - [ ] transpose.
   - [ ] reduce_to where needed.
@@ -225,7 +225,7 @@ CPU fallback.
   - [ ] generic bias/prefix path either F16-supported or rejected clearly.
   - [ ] scores/stats/online softmax in F32.
   - [ ] output F16.
-- [ ] Fused residual+RMSNorm path typed for F16 or disabled safely for F16.
+- [x] Fused residual+RMSNorm path typed for F16 or disabled safely for F16.
 - [ ] Fused lmCE forward supports F16 hidden/weight with F32 stats/loss.
 - [ ] Add GPT inference/forward-only harness if missing:
   - [ ] `GD_BENCH_MODE=infer|forward|train`.

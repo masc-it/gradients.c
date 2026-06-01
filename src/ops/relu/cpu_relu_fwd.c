@@ -15,10 +15,6 @@ static gd_status relu_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_relu(out_desc, out_data, x_data);
 }
 

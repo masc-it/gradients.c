@@ -487,6 +487,107 @@ static int test_f16_cast_cpu(gd_context *ctx)
     return 0;
 }
 
+static float test_sigmoid(float x)
+{
+    if (x >= 0.0F) {
+        float e = expf(-x);
+        return 1.0F / (1.0F + e);
+    }
+    {
+        float e = expf(x);
+        return e / (1.0F + e);
+    }
+}
+
+static float test_powlu(float x1, float x2)
+{
+    float s = test_sigmoid(x2);
+    if (x2 <= 0.0F) {
+        return x1 * x2 * s;
+    }
+    return x1 * powf(x2, 3.0F / (sqrtf(x2) + 1.0F)) * s;
+}
+
+static float test_gelu_tanh(float x)
+{
+    const float c = 0.7978845608028654F;
+    float u = c * (x + 0.044715F * x * x * x);
+    return 0.5F * x * (1.0F + tanhf(u));
+}
+
+static int test_f16_elementwise_cpu(gd_context *ctx)
+{
+    int64_t s4[1] = {4};
+    float xdata[4] = {-2.0F, -0.5F, 0.5F, 2.0F};
+    float ydata[4] = {0.25F, -1.0F, 3.0F, -0.5F};
+    float got_add[4] = {0};
+    float got_mul[4] = {0};
+    float got_scale[4] = {0};
+    float got_relu[4] = {0};
+    float got_silu[4] = {0};
+    float got_gelu[4] = {0};
+    float got_powlu[4] = {0};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor *x = NULL, *y = NULL, *xh = NULL, *yh = NULL;
+    gd_tensor *addh = NULL, *mulh = NULL, *scaleh = NULL, *reluh = NULL;
+    gd_tensor *siluh = NULL, *geluh = NULL, *powluh = NULL;
+    gd_tensor *add = NULL, *mul = NULL, *scale = NULL, *relu = NULL;
+    gd_tensor *silu = NULL, *gelu = NULL, *powlu = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 1, s4, &x));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 1, s4, &y));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xdata, sizeof(xdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, y, ydata, sizeof(ydata)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &xh));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F16, &yh));
+    CHECK_OK(gd_add(ctx, xh, yh, &addh));
+    CHECK_OK(gd_mul(ctx, xh, yh, &mulh));
+    CHECK_OK(gd_scale(ctx, xh, 0.5F, &scaleh));
+    CHECK_OK(gd_relu(ctx, xh, &reluh));
+    CHECK_OK(gd_silu(ctx, xh, &siluh));
+    CHECK_OK(gd_gelu(ctx, xh, true, &geluh));
+    CHECK_OK(gd_powlu(ctx, xh, yh, 3.0F, &powluh));
+    CHECK_OK(gd_cast(ctx, addh, GD_DTYPE_F32, &add));
+    CHECK_OK(gd_cast(ctx, mulh, GD_DTYPE_F32, &mul));
+    CHECK_OK(gd_cast(ctx, scaleh, GD_DTYPE_F32, &scale));
+    CHECK_OK(gd_cast(ctx, reluh, GD_DTYPE_F32, &relu));
+    CHECK_OK(gd_cast(ctx, siluh, GD_DTYPE_F32, &silu));
+    CHECK_OK(gd_cast(ctx, geluh, GD_DTYPE_F32, &gelu));
+    CHECK_OK(gd_cast(ctx, powluh, GD_DTYPE_F32, &powlu));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, add, got_add, sizeof(got_add)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, mul, got_mul, sizeof(got_mul)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, scale, got_scale, sizeof(got_scale)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, relu, got_relu, sizeof(got_relu)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, silu, got_silu, sizeof(got_silu)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, gelu, got_gelu, sizeof(got_gelu)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, powlu, got_powlu, sizeof(got_powlu)));
+    for (i = 0; i < 4; ++i) {
+        CHECK_TRUE(fabsf(got_add[i] - (xdata[i] + ydata[i])) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_mul[i] - (xdata[i] * ydata[i])) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_scale[i] - (0.5F * xdata[i])) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_relu[i] - (xdata[i] > 0.0F ? xdata[i] : 0.0F)) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_silu[i] - (xdata[i] * test_sigmoid(xdata[i]))) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_gelu[i] - test_gelu_tanh(xdata[i])) <= 2.0e-2F);
+        CHECK_TRUE(fabsf(got_powlu[i] - test_powlu(xdata[i], ydata[i])) <= 2.0e-2F);
+    }
+    gd_tensor_release(powlu); gd_tensor_release(gelu); gd_tensor_release(silu);
+    gd_tensor_release(relu); gd_tensor_release(scale); gd_tensor_release(mul); gd_tensor_release(add);
+    gd_tensor_release(powluh); gd_tensor_release(geluh); gd_tensor_release(siluh);
+    gd_tensor_release(reluh); gd_tensor_release(scaleh); gd_tensor_release(mulh); gd_tensor_release(addh);
+    gd_tensor_release(yh); gd_tensor_release(xh);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(y); gd_tensor_release(x);
+    return 0;
+}
+
 static int test_f16_matmul_linear_cpu(gd_context *ctx)
 {
     int64_t xshape[2] = {2, 3};
@@ -592,8 +693,8 @@ int main(void)
     if (test_elementwise(ctx) != 0 || test_powlu_schema(ctx) != 0 ||
         test_matmul(ctx) != 0 || test_sdpa_prefix_schema(ctx) != 0 ||
         test_linear(ctx) != 0 || test_reduce_softmax_ce_cast(ctx) != 0 ||
-        test_f16_cast_cpu(ctx) != 0 || test_f16_matmul_linear_cpu(ctx) != 0 ||
-        test_chain_dump(ctx) != 0) {
+        test_f16_cast_cpu(ctx) != 0 || test_f16_elementwise_cpu(ctx) != 0 ||
+        test_f16_matmul_linear_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

@@ -13,6 +13,8 @@ static gd_status powlu_encode(_gd_metal_encode_ctx *ctx)
 
     p.numel = (int)numel;
     p.m = node->attrs.powlu_m;
+    p.dtype = GD_METAL_DT_F32;
+    (void)_gd_metal_dtype_code(out_desc->dtype, &p.dtype);
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
@@ -27,5 +29,6 @@ static gd_status powlu_encode(_gd_metal_encode_ctx *ctx)
 const _gd_metal_op _gd_metal_op_powlu = {
     .kind = _GD_OP_POWLU,
     .name = "powlu",
+    .support = _gd_metal_support_f32_f16_same_dtype,
     .encode = powlu_encode,
 };

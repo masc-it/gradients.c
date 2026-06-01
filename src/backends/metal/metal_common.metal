@@ -38,9 +38,31 @@ static __attribute__((unused)) int gd_broadcast_offset(thread const int *out_ind
     return offset;
 }
 
-static inline __attribute__((unused)) void gd_binary(device const float *a,
-                                                     device const float *b,
-                                                     device float *out,
+static inline __attribute__((unused)) float gd_load_float(device const uchar *x,
+                                                           int dtype,
+                                                           uint idx)
+{
+    if (dtype == GD_METAL_DT_F16) {
+        return (float)((device const half *)x)[idx];
+    }
+    return ((device const float *)x)[idx];
+}
+
+static inline __attribute__((unused)) void gd_store_float(device uchar *out,
+                                                          int dtype,
+                                                          uint idx,
+                                                          float value)
+{
+    if (dtype == GD_METAL_DT_F16) {
+        ((device half *)out)[idx] = (half)value;
+    } else {
+        ((device float *)out)[idx] = value;
+    }
+}
+
+static inline __attribute__((unused)) void gd_binary(device const uchar *a,
+                                                     device const uchar *b,
+                                                     device uchar *out,
                                                      constant gd_metal_ew_params &p,
                                                      uint gid,
                                                      int op)
@@ -49,7 +71,9 @@ static inline __attribute__((unused)) void gd_binary(device const float *a,
         return;
     }
     if (p.same_shape) {
-        out[gid] = (op == 0) ? (a[gid] + b[gid]) : (a[gid] * b[gid]);
+        float av = gd_load_float(a, p.dtype, gid);
+        float bv = gd_load_float(b, p.dtype, gid);
+        gd_store_float(out, p.dtype, gid, (op == 0) ? (av + bv) : (av * bv));
         return;
     }
     int index[GD_METAL_MAX_DIMS];
@@ -60,7 +84,9 @@ static inline __attribute__((unused)) void gd_binary(device const float *a,
     }
     int ao = gd_broadcast_offset(index, p.ndim, p.a_sizes, p.a_ndim);
     int bo = gd_broadcast_offset(index, p.ndim, p.b_sizes, p.b_ndim);
-    out[gid] = (op == 0) ? (a[ao] + b[bo]) : (a[ao] * b[bo]);
+    float av = gd_load_float(a, p.dtype, (uint)ao);
+    float bv = gd_load_float(b, p.dtype, (uint)bo);
+    gd_store_float(out, p.dtype, gid, (op == 0) ? (av + bv) : (av * bv));
 }
 
 static inline __attribute__((unused)) float gd_sigmoid_stable(float x)

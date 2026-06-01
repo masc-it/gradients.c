@@ -22,10 +22,6 @@ static gd_status add_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_cpu_require_f32(out_desc);
-    if (status != GD_OK) {
-        return status;
-    }
     return _gd_cpu_k_elementwise(_GD_OP_ADD, out_desc, out_data, a_desc, a_data, b_desc, b_data);
 }
 

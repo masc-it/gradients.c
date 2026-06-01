@@ -13,6 +13,8 @@
 #include "../core/tensor_internal.h"
 #include "../graph/graph_internal.h"
 
+#include "amp_internal.h"
+
 typedef struct adamw_slot {
     gd_tensor *param;  /* retained */
     gd_tensor *master; /* owned F32 update target for F16 params, optional */
@@ -486,6 +488,96 @@ gd_status gd_optimizer_step_lr(gd_context *ctx,
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_lr lr_scalar is NULL");
     }
     return optimizer_step_impl(ctx, optimizer, lr_scalar);
+}
+
+gd_status gd_optimizer_step_amp(gd_context *ctx,
+                                gd_optimizer *optimizer,
+                                gd_amp_scaler *scaler)
+{
+    gd_status status = GD_OK;
+    gd_graph *graph = NULL;
+    gd_tensor *scale = NULL;
+    gd_tensor *found_inf = NULL;
+    _gd_op_attrs attrs = {0};
+    int i = 0;
+
+    if (ctx == NULL || optimizer == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp argument is NULL");
+    }
+    status = _gd_amp_scaler_validate(scaler);
+    if (status != GD_OK) {
+        return status;
+    }
+    graph = _gd_context_active_graph(ctx);
+    if (graph == NULL) {
+        return _gd_error(GD_ERR_INVALID_STATE, "gd_optimizer_step_amp requires an active graph");
+    }
+    scale = _gd_amp_scaler_scale_tensor(scaler);
+    found_inf = _gd_amp_scaler_found_inf_tensor(scaler);
+    for (i = 0; i < optimizer->n_slots; ++i) {
+        gd_tensor *grad = NULL;
+        gd_tensor *inputs[3];
+
+        status = _gd_tensor_ensure_grad(ctx, optimizer->slots[i].param, &grad);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (gd_tensor_dtype(grad) != GD_DTYPE_F32) {
+            return _gd_error(GD_ERR_DTYPE, "adamw AMP requires F32 gradients");
+        }
+        inputs[0] = grad;
+        inputs[1] = scale;
+        inputs[2] = found_inf;
+        status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_UNSCALE_GRAD, inputs, 3, NULL);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+
+    {
+        gd_tensor *step_inputs[2] = {optimizer->step, found_inf};
+        status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_STEP_INC, step_inputs, 2, NULL);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+
+    attrs.lr = optimizer->config.lr;
+    attrs.beta1 = optimizer->config.beta1;
+    attrs.beta2 = optimizer->config.beta2;
+    attrs.eps = optimizer->config.eps;
+    for (i = 0; i < optimizer->n_slots; ++i) {
+        adamw_slot *slot = &optimizer->slots[i];
+        gd_tensor *grad = NULL;
+        gd_tensor *update_param = slot->master != NULL ? slot->master : slot->param;
+        gd_tensor *inputs[6];
+
+        status = _gd_tensor_ensure_grad(ctx, slot->param, &grad);
+        if (status != GD_OK) {
+            return status;
+        }
+        attrs.weight_decay = slot->weight_decay;
+        attrs.scale = slot->lr_scale;
+        inputs[0] = update_param;
+        inputs[1] = grad;
+        inputs[2] = slot->m;
+        inputs[3] = slot->v;
+        inputs[4] = optimizer->step;
+        inputs[5] = found_inf;
+        status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP_AMP, inputs, 6, &attrs);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (slot->master != NULL) {
+            gd_tensor *refresh_inputs[3] = {slot->param, slot->master, found_inf};
+            status = _gd_graph_emit_inplace(graph, _GD_OP_AMP_REFRESH_PARAM,
+                                            refresh_inputs, 3, NULL);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+    }
+    return GD_OK;
 }
 
 gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,

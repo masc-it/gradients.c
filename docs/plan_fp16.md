@@ -44,7 +44,7 @@ default path.
 - [ ] Backward activation grads: F16 allowed for internal flow.
 - [x] Parameter gradients: F32 before accumulation into leaf grad slots.
 - [ ] Reductions, norms, softmax, SDPA stats, CE/lmCE: F32 math.
-- [ ] Loss scaling: dynamic scaler scales F32 loss, unscales F32 grads, checks
+- [x] Loss scaling: dynamic scaler scales F32 loss, unscales F32 grads, checks
       finite, skips optimizer step on NaN/Inf.
 - [x] Optimizer step updates F32 master, then casts master -> F16 model param.
 
@@ -84,7 +84,7 @@ typedef enum gd_master_param_policy {
 } gd_master_param_policy;
 ```
 
-- [ ] Add AMP scaler API, likely in `optim.h` or a new `amp.h`:
+- [x] Add AMP scaler API in `optim.h`:
 
 ```c
 typedef struct gd_amp_scaler gd_amp_scaler;
@@ -314,29 +314,29 @@ Goal: optimizer updates stable F32 master weights and refreshes F16 model params
 
 Goal: production-safe F16 training loop.
 
-- [ ] Implement `gd_amp_scaler` with defaults:
-  - [ ] initial scale `2^15` or `2^16`.
-  - [ ] growth factor `2.0`.
-  - [ ] backoff factor `0.5`.
-  - [ ] growth interval `1000` or `2000` finite steps.
-  - [ ] min scale `1.0`.
-- [ ] Implement `gd_amp_scale_loss()` using F32 loss.
-- [ ] Implement unscale + finite-check:
-  - [ ] in-place `grad *= 1 / scale` for F32 grads.
-  - [ ] detect NaN/Inf across all optimizer grads.
-  - [ ] Metal path reduces to per-tensor flag, then one host read or GPU flag.
-  - [ ] CPU path deterministic.
+- [x] Implement `gd_amp_scaler` with defaults:
+  - [x] initial scale `2^15` or `2^16`.
+  - [x] growth factor `2.0`.
+  - [x] backoff factor `0.5`.
+  - [x] growth interval `1000` or `2000` finite steps.
+  - [x] min scale `1.0`.
+- [x] Implement `gd_amp_scaler_scale_loss()` using F32 loss.
+- [x] Implement unscale + finite-check:
+  - [x] in-place `grad *= 1 / scale` for F32 grads.
+  - [x] detect NaN/Inf across all optimizer grads.
+  - [x] Metal path reduces to GPU flag with one host read.
+  - [x] CPU path deterministic.
 - [ ] Integrate with optimizer:
-  - [ ] `gd_optimizer_step_amp()` or equivalent wrapper.
+  - [x] `gd_optimizer_step_amp()` wrapper.
   - [ ] unscale before grad clipping.
-  - [ ] if found_inf: skip AdamW, skip master->param cast, backoff scale.
-  - [ ] if finite: optional grad clip, AdamW, refresh F16 params, maybe grow scale.
+  - [x] if found_inf: skip AdamW, skip master->param cast, backoff scale.
+  - [x] if finite: AdamW, refresh F16 params, maybe grow scale.
 - [ ] Tests:
-  - [ ] finite grads unscale correctly.
+  - [x] finite grads unscale correctly.
   - [ ] injected NaN skips step and backs off.
-  - [ ] injected Inf skips step and backs off.
-  - [ ] finite interval grows scale.
-  - [ ] zero grads after skipped step still works.
+  - [x] injected Inf skips step and backs off.
+  - [x] finite interval grows scale.
+  - [x] zero grads after skipped step still works.
 
 ## Phase 8: F16 backward kernel coverage for GPT training
 

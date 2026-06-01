@@ -215,6 +215,11 @@ typedef struct gd_metal_adamw_params {
     float weight_decay;
 } gd_metal_adamw_params;
 
+typedef struct gd_metal_amp_params {
+    int numel;
+    int dtype;
+} gd_metal_amp_params;
+
 typedef struct gd_metal_gelu_params {
     int numel;
     int tanh_approx;

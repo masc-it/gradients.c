@@ -28,7 +28,11 @@ typedef struct expected_op {
 
 static const expected_op g_expected_ops[] = {
     {_GD_OP_ADAMW_STEP, "adamw_step"},
+    {_GD_OP_ADAMW_STEP_AMP, "adamw_step_amp"},
     {_GD_OP_ADD, "add"},
+    {_GD_OP_AMP_REFRESH_PARAM, "amp_refresh_param"},
+    {_GD_OP_AMP_STEP_INC, "amp_step_inc"},
+    {_GD_OP_AMP_UNSCALE_GRAD, "amp_unscale_grad"},
     {_GD_OP_ASSERT_CLOSE, "assert_close"},
     {_GD_OP_ASSERT_FINITE, "assert_finite"},
     {_GD_OP_BACKWARD, "backward"},

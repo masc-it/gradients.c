@@ -1005,10 +1005,10 @@ Not required for first real training, but important later:
 
 A first production-ready text GPT training run is accepted when:
 
-- [ ] tokenizer trains on real corpus and encodes it with special tokens and separate digits.
+- [x] tokenizer trains on real corpus and encodes it with special tokens and separate digits.
 - [x] dataset builder creates separate train/val 512-token packed shards and reports dropped tail.
 - [x] loader double buffers and reports wait metrics; zero-wait target depends on trainer prefetch cadence.
-- [ ] train graph uses mutable LR scheduler and global grad clipping.
+- [x] train graph uses mutable LR scheduler and global grad clipping.
 - [ ] checkpoint/resume reproduces deterministic training continuation.
 - [ ] validation perplexity and sample generation run periodically.
 - [ ] KV-cache generation matches full-forward logits on a short prompt.

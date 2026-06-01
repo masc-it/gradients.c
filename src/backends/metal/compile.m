@@ -1,4 +1,4 @@
-#import "metal_internal.h"
+#import "metal_op.h"
 
 void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
 {
@@ -245,268 +245,35 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
         memset(exe->node_fused_src, 0xFF, (size_t)graph->n_nodes * sizeof(*exe->node_fused_src)); /* -1 */
         for (j = 0; j < graph->n_nodes; ++j) {
             const _gd_node *node = &graph->nodes[j];
-            _gd_op_kind op = node->op;
-            exe->node_pso[j] = (__bridge void *)_gd_metal_pipeline_for(st, op);
-            if (st.useMPS && (op == _GD_OP_LINEAR || op == _GD_OP_MATMUL)) {
-                const gd_tensor_desc *a_desc = &graph->values[node->inputs[0]].desc;
-                const gd_tensor_desc *b_desc = &graph->values[node->inputs[1]].desc;
-                const gd_tensor_desc *out_desc = &graph->values[node->outputs[0]].desc;
-                if (a_desc->dtype == GD_DTYPE_F32 && b_desc->dtype == GD_DTYPE_F32 &&
-                    out_desc->dtype == GD_DTYPE_F32 && a_desc->layout == GD_LAYOUT_CONTIGUOUS &&
-                    b_desc->layout == GD_LAYOUT_CONTIGUOUS &&
-                    out_desc->layout == GD_LAYOUT_CONTIGUOUS &&
-                    a_desc->storage_offset_bytes == 0 && b_desc->storage_offset_bytes == 0 &&
-                    out_desc->storage_offset_bytes == 0) {
-                    bool ok = false;
-                    bool trans_left = false;
-                    bool trans_right = node->attrs.trans_b ? true : false;
-                    int result_rows = 0;
-                    int result_cols = 0;
-                    int inner = 0;
-                    NSUInteger batch = 1U;
-                    NSUInteger a_rows_desc = 0U;
-                    NSUInteger a_cols_desc = 0U;
-                    NSUInteger b_rows_desc = 0U;
-                    NSUInteger b_cols_desc = 0U;
-                    NSUInteger out_rows_desc = 0U;
-                    NSUInteger out_cols_desc = 0U;
-                    if (op == _GD_OP_LINEAR && !node->attrs.has_bias) {
-                        inner = (int)a_desc->sizes[a_desc->ndim - 1];
-                        result_cols = (int)out_desc->sizes[out_desc->ndim - 1];
-                        result_rows = inner > 0 ? (int)(_gd_metal_desc_numel(a_desc) / inner) : 0;
-                        a_rows_desc = (NSUInteger)result_rows;
-                        a_cols_desc = (NSUInteger)inner;
-                        b_rows_desc = (NSUInteger)b_desc->sizes[0];
-                        b_cols_desc = (NSUInteger)b_desc->sizes[1];
-                        out_rows_desc = (NSUInteger)result_rows;
-                        out_cols_desc = (NSUInteger)result_cols;
-                        ok = true;
-                    } else if (op == _GD_OP_MATMUL && !node->attrs.trans_a && b_desc->ndim == 2) {
-                        int a_cols_i = (int)a_desc->sizes[a_desc->ndim - 1];
-                        int b_rows_i = (int)b_desc->sizes[0];
-                        int b_cols_i = (int)b_desc->sizes[1];
-                        inner = a_cols_i;
-                        result_cols = trans_right ? b_rows_i : b_cols_i;
-                        result_rows = inner > 0 ? (int)(_gd_metal_desc_numel(a_desc) / inner) : 0;
-                        a_rows_desc = (NSUInteger)result_rows;
-                        a_cols_desc = (NSUInteger)inner;
-                        b_rows_desc = (NSUInteger)b_rows_i;
-                        b_cols_desc = (NSUInteger)b_cols_i;
-                        out_rows_desc = (NSUInteger)result_rows;
-                        out_cols_desc = (NSUInteger)result_cols;
-                        ok = (out_desc->sizes[out_desc->ndim - 1] == result_cols);
-                    } else if (op == _GD_OP_MATMUL && out_desc->ndim >= 3 &&
-                               a_desc->ndim == out_desc->ndim &&
-                               b_desc->ndim == out_desc->ndim) {
-                        bool same_batch = true;
-                        int batch_ndim = out_desc->ndim - 2;
-                        int a_rows_i = (int)a_desc->sizes[a_desc->ndim - 2];
-                        int a_cols_i = (int)a_desc->sizes[a_desc->ndim - 1];
-                        int b_rows_i = (int)b_desc->sizes[b_desc->ndim - 2];
-                        int b_cols_i = (int)b_desc->sizes[b_desc->ndim - 1];
-                        int i_batch = 0;
-                        for (i_batch = 0; i_batch < batch_ndim; ++i_batch) {
-                            if (a_desc->sizes[i_batch] != out_desc->sizes[i_batch] ||
-                                b_desc->sizes[i_batch] != out_desc->sizes[i_batch]) {
-                                same_batch = false;
-                                break;
-                            }
-                            batch *= (NSUInteger)out_desc->sizes[i_batch];
-                        }
-                        trans_left = node->attrs.trans_a ? true : false;
-                        inner = trans_left ? a_rows_i : a_cols_i;
-                        result_rows = trans_left ? a_cols_i : a_rows_i;
-                        result_cols = trans_right ? b_rows_i : b_cols_i;
-                        a_rows_desc = (NSUInteger)a_rows_i;
-                        a_cols_desc = (NSUInteger)a_cols_i;
-                        b_rows_desc = (NSUInteger)b_rows_i;
-                        b_cols_desc = (NSUInteger)b_cols_i;
-                        out_rows_desc = (NSUInteger)out_desc->sizes[out_desc->ndim - 2];
-                        out_cols_desc = (NSUInteger)out_desc->sizes[out_desc->ndim - 1];
-                        ok = same_batch && inner == (trans_right ? b_cols_i : b_rows_i) &&
-                             out_desc->sizes[out_desc->ndim - 2] == result_rows &&
-                             out_desc->sizes[out_desc->ndim - 1] == result_cols;
-                    }
-                    if (ok && result_rows > 0 && result_cols > 0 && inner > 0 && batch > 0U) {
-                        NSUInteger a_row_bytes = a_cols_desc * sizeof(float);
-                        NSUInteger b_row_bytes = b_cols_desc * sizeof(float);
-                        NSUInteger out_row_bytes = out_cols_desc * sizeof(float);
-                        MPSMatrixDescriptor *ad = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:a_rows_desc
-                                             columns:a_cols_desc
-                                            matrices:batch
-                                            rowBytes:a_row_bytes
-                                         matrixBytes:a_rows_desc * a_row_bytes
-                                            dataType:MPSDataTypeFloat32];
-                        MPSMatrixDescriptor *bd = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:b_rows_desc
-                                             columns:b_cols_desc
-                                            matrices:batch
-                                            rowBytes:b_row_bytes
-                                         matrixBytes:b_rows_desc * b_row_bytes
-                                            dataType:MPSDataTypeFloat32];
-                        MPSMatrixDescriptor *od = [MPSMatrixDescriptor
-                            matrixDescriptorWithRows:out_rows_desc
-                                             columns:out_cols_desc
-                                            matrices:batch
-                                            rowBytes:out_row_bytes
-                                         matrixBytes:out_rows_desc * out_row_bytes
-                                            dataType:MPSDataTypeFloat32];
-                        GDMPSGemmPlan *plan = [GDMPSGemmPlan new];
-                        plan.kernel = [[MPSMatrixMultiplication alloc]
-                            initWithDevice:st.device
-                            transposeLeft:trans_left
-                            transposeRight:trans_right
-                            resultRows:(NSUInteger)result_rows
-                            resultColumns:(NSUInteger)result_cols
-                            interiorColumns:(NSUInteger)inner
-                            alpha:1.0
-                            beta:0.0];
-                        plan.kernel.batchStart = 0U;
-                        plan.kernel.batchSize = batch;
-                        plan.left = [[MPSMatrix alloc]
-                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[0]].storage)
-                                    offset:0
-                                descriptor:ad];
-                        plan.right = [[MPSMatrix alloc]
-                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[1]].storage)
-                                    offset:0
-                                descriptor:bd];
-                        plan.result = [[MPSMatrix alloc]
-                            initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->outputs[0]].storage)
-                                    offset:0
-                                descriptor:od];
-                        if (plan.kernel != nil && plan.left != nil && plan.right != nil &&
-                            plan.result != nil) {
-                            exe->node_mps[j] = (void *)CFBridgingRetain(plan);
-                        }
-                    }
-                }
+            const _gd_metal_op *op = _gd_metal_op_for(node->op);
+            _gd_metal_plan_ctx plan_ctx;
+
+            if (op == NULL || op->encode == NULL) {
+                char msg[112];
+                (void)snprintf(msg, sizeof(msg), "metal has no host entry for op '%s'",
+                               _gd_op_kind_name(node->op));
+                status = _gd_error(GD_ERR_UNSUPPORTED, msg);
+                goto fail;
             }
-            if (op == _GD_OP_CLIP_GRAD_NORM) {
-                int in_i = 0;
-                int64_t total_groups = 0;
-                int64_t reduce_groups = 0;
-                exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_clip_norm_reduce");
-                exe->node_pso3[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_clip_norm_scale");
-                if (exe->node_pso2[j] == NULL || exe->node_pso3[j] == NULL) {
-                    status = _gd_error(GD_ERR_BACKEND, "metal clip_grad_norm kernels missing");
-                    goto fail;
-                }
-                for (in_i = 0; in_i < node->n_inputs; ++in_i) {
-                    const gd_tensor_desc *gd = &graph->values[node->inputs[in_i]].desc;
-                    int64_t numel = _gd_metal_desc_numel(gd);
-                    total_groups += (numel + GD_METAL_CLIP_NORM_CHUNK - 1) /
-                                    GD_METAL_CLIP_NORM_CHUNK;
-                }
-                if (total_groups <= 0) {
-                    status = _gd_error(GD_ERR_SHAPE, "clip_grad_norm has no elements");
-                    goto fail;
-                }
-                reduce_groups = (total_groups + GD_METAL_CLIP_NORM_TG - 1) /
-                                GD_METAL_CLIP_NORM_TG;
-                exe->node_scratch_bytes[j] = (size_t)(total_groups + reduce_groups + 1) *
-                                             sizeof(float);
-                if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                    scratch_max_bytes = exe->node_scratch_bytes[j];
-                }
-            } else if (op == _GD_OP_RMS_NORM_WBWD) {
-                const gd_tensor_desc *x_desc = &graph->values[node->inputs[0]].desc;
-                int last = (int)x_desc->sizes[x_desc->ndim - 1];
-                int rows = last > 0 ? (int)(_gd_metal_desc_numel(x_desc) / last) : 0;
-                int row_blocks = (rows + GD_METAL_RMS_TG - 1) / GD_METAL_RMS_TG;
-                exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_rms_norm_wbwd_reduce");
-                if (row_blocks > 0 && last > 0) {
-                    exe->node_scratch_bytes[j] = (size_t)row_blocks * (size_t)last *
-                                                 sizeof(float);
-                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                        scratch_max_bytes = exe->node_scratch_bytes[j];
-                    }
-                }
-            } else if (op == _GD_OP_EMBEDDING_BWD) {
-                exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_embedding_bwd_scatter");
-            } else if (op == _GD_OP_CROSS_ENTROPY) {
-                const gd_tensor_desc *logits = &graph->values[node->inputs[0]].desc;
-                int dim = node->attrs.dim;
-                int64_t positions = 0;
-                if (dim < 0) {
-                    dim += logits->ndim;
-                }
-                if (dim >= 0 && dim < logits->ndim && logits->sizes[dim] > 0) {
-                    positions = _gd_metal_desc_numel(logits) / logits->sizes[dim];
-                }
-                exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_cross_entropy_reduce");
-                if (positions > 0) {
-                    exe->node_scratch_bytes[j] = (size_t)positions * sizeof(float);
-                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                        scratch_max_bytes = exe->node_scratch_bytes[j];
-                    }
-                }
-            } else if (op == _GD_OP_LM_CROSS_ENTROPY ||
-                       op == _GD_OP_LM_CROSS_ENTROPY_BWD) {
-                const gd_tensor_desc *x_desc = &graph->values[node->inputs[0]].desc;
-                const gd_tensor_desc *w_desc = &graph->values[node->inputs[1]].desc;
-                int D = (int)x_desc->sizes[x_desc->ndim - 1];
-                int V = (int)w_desc->sizes[0];
-                int rows = D > 0 ? (int)(_gd_metal_desc_numel(x_desc) / D) : 0;
-                int chunk = V < GD_METAL_LMCE_CHUNK ? V : GD_METAL_LMCE_CHUNK;
-                if (rows > 0 && chunk > 0) {
-                    if (op == _GD_OP_LM_CROSS_ENTROPY) {
-                        exe->node_scratch_bytes[j] = _gd_metal_lmce_fwd_scratch_layout_for(rows, chunk).total;
-                    } else {
-                        exe->node_scratch_bytes[j] = _gd_metal_lmce_bwd_scratch_bytes_for(rows, chunk);
-                    }
-                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                        scratch_max_bytes = exe->node_scratch_bytes[j];
-                    }
-                }
-            } else if (op == _GD_OP_SDPA) {
-                /* Long-context forward uses split-K: scratch holds per-split
-                 * partial (acc[Dh], m, l) for each (b, hq, query). Only allocated
-                 * when the tiled path is eligible (Dh <= DHT) and >1 split. */
-                const gd_tensor_desc *qd = &graph->values[node->inputs[0]].desc;
-                const gd_tensor_desc *kd = &graph->values[node->inputs[1]].desc;
-                int Dh = (int)qd->sizes[3];
-                int Tk = (int)kd->sizes[1];
-                int nsplit = _gd_metal_sdpa_num_splits(Tk);
-                if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
-                    int64_t npart = qd->sizes[0] * qd->sizes[2] * qd->sizes[1]
-                                    * nsplit * (Dh + 2);
-                    exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_sdpa_splitk");
-                    exe->node_pso3[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_sdpa_combine");
-                    exe->node_scratch_bytes[j] = (size_t)npart * sizeof(float);
-                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                        scratch_max_bytes = exe->node_scratch_bytes[j];
-                    }
-                }
-            } else if (op == _GD_OP_SDPA_BWD) {
-                exe->node_pso2[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv");
-                exe->node_pso3[j] = (__bridge void *)_gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats");
-                /* Scratch holds the per-query stats [m, l, D] (B*Hq*Tq*3). For
-                 * long context the split-K path additionally carves per-split
-                 * partial regions out of the same buffer; size it accordingly.
-                 * q is input 1: [B, Tq, Hq, Dh]; k is input 2: [B, Tk, Hkv, Dh]. */
-                {
-                    const gd_tensor_desc *qd = &graph->values[node->inputs[1]].desc;
-                    const gd_tensor_desc *kd = &graph->values[node->inputs[2]].desc;
-                    int B = (int)qd->sizes[0];
-                    int Tq = (int)qd->sizes[1];
-                    int Hq = (int)qd->sizes[2];
-                    int Dh = (int)qd->sizes[3];
-                    int Tk = (int)kd->sizes[1];
-                    int Hkv = (int)kd->sizes[2];
-                    int nsplit = _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
-                    int64_t nfloats;
-                    if (Dh <= GD_METAL_SDPA_DHT && nsplit > 1) {
-                        nfloats = _gd_metal_sdpa_bwd_scratch_layout(B, Hq, Hkv, Tq, Tk, Dh, nsplit).total;
-                    } else {
-                        nfloats = (int64_t)B * Hq * Tq * 3;
-                    }
-                    exe->node_scratch_bytes[j] = (size_t)nfloats * sizeof(float);
-                    if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                        scratch_max_bytes = exe->node_scratch_bytes[j];
-                    }
-                }
+            plan_ctx = (_gd_metal_plan_ctx){
+                .backend = self,
+                .state = st,
+                .graph = graph,
+                .exe = exe,
+                .node = node,
+                .node_id = j,
+            };
+            status = op->support != NULL ? op->support(&plan_ctx)
+                                         : _gd_metal_support_default(&plan_ctx);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            status = op->plan != NULL ? op->plan(&plan_ctx) : _gd_metal_plan_default(&plan_ctx);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                scratch_max_bytes = exe->node_scratch_bytes[j];
             }
         }
         if (scratch_max_bytes > 0U) {

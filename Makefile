@@ -55,7 +55,8 @@ METALLIB :=
 # ----- Source discovery -----------------------------------------------------
 ifeq ($(GD_ENABLE_METAL),1)
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' 2>/dev/null | sort)
-MSRC := $(shell find $(METAL_DIR) -type f -name '*.m' 2>/dev/null | sort)
+MSRC := $(shell { find $(METAL_DIR) -type f -name '*.m' 2>/dev/null; \
+                 find $(SRC_DIR)/ops -type f -name 'metal_*.m' 2>/dev/null; } | sort)
 METAL_SHADERS := $(shell find $(METAL_DIR) -type f -name '*.metal' 2>/dev/null | sort)
 # Let C/Obj-C sources conditionally compile the Metal registration path.
 CPPFLAGS += -DGD_ENABLE_METAL=1
@@ -88,6 +89,7 @@ METAL_OP_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.m))
 METAL_OP_SHADER_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.metal))
 
 GENERATED_DIR := $(BUILD_DIR)/generated
+CONFIG_STAMP := $(BUILD_DIR)/.build-config
 GEN_OPS_BIN := $(BUILD_DIR)/tools/gen_ops
 GEN_OPS_STAMP := $(GENERATED_DIR)/.gen_ops.stamp
 GENERATED_FILES := \
@@ -118,7 +120,7 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list
+.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -285,7 +287,19 @@ $(GEN_OPS_STAMP): $(GEN_OPS_BIN) $(OP_CORE_FILES) $(OP_GRAD_FILES) $(CPU_OP_FILE
 $(GENERATED_FILES): $(GEN_OPS_STAMP)
 	@test -f $@
 
-$(LIB): $(OBJ)
+FORCE:
+
+$(CONFIG_STAMP): FORCE
+	@mkdir -p $(@D)
+	@tmp="$@.tmp"; \
+	printf 'GD_ENABLE_METAL=%s\n' '$(GD_ENABLE_METAL)' > "$$tmp"; \
+	if ! test -f "$@" || ! cmp -s "$$tmp" "$@"; then \
+		mv "$$tmp" "$@"; \
+	else \
+		rm "$$tmp"; \
+	fi
+
+$(LIB): $(CONFIG_STAMP) $(OBJ)
 	@mkdir -p $(@D)
 	@$(RM) $@
 ifeq ($(strip $(OBJ)),)
@@ -295,11 +309,11 @@ else
 	$(AR) rcs $@ $(OBJ)
 endif
 
-$(BUILD_DIR)/%.o: %.c $(GEN_OPS_STAMP)
+$(BUILD_DIR)/%.o: %.c $(GEN_OPS_STAMP) $(CONFIG_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: %.m $(GEN_OPS_STAMP)
+$(BUILD_DIR)/%.o: %.m $(GEN_OPS_STAMP) $(CONFIG_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 

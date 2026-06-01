@@ -202,7 +202,7 @@ void _gd_metal_dispatch_reduce_groups(id<MTLComputeCommandEncoder> enc, NSUInteg
 }
 
 gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
-                                 id<MTLComputeCommandEncoder> *enc,
+                                 __strong id<MTLComputeCommandEncoder> *enc,
                                  GDMPSGemmPlan *plan)
 {
     if (cmd == nil || enc == NULL || *enc == nil || plan == nil || plan.kernel == nil ||
@@ -236,7 +236,7 @@ MPSMatrix *_gd_metal_mps_matrix(id<MTLBuffer> buffer,
 }
 
 gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,
-                               id<MTLComputeCommandEncoder> *enc,
+                               __strong id<MTLComputeCommandEncoder> *enc,
                                id<MTLDevice> device,
                                MPSMatrix *left,
                                MPSMatrix *right,

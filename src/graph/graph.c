@@ -766,6 +766,7 @@ static gd_status select_exec_backend(gd_graph *graph,
                                      _gd_backend **out)
 {
     int bad_node = -1;
+    const char *bad_reason = NULL;
     int i = 0;
 
     *out = target_backend;
@@ -775,6 +776,10 @@ static gd_status select_exec_backend(gd_graph *graph,
     for (i = 0; i < graph->n_nodes; ++i) {
         if (!target_backend->vt->supports_node(target_backend, &graph->nodes[i])) {
             bad_node = i;
+            bad_reason = gd_last_error();
+            if (bad_reason != NULL && strcmp(bad_reason, "ok") == 0) {
+                bad_reason = NULL;
+            }
             break;
         }
     }
@@ -783,12 +788,21 @@ static gd_status select_exec_backend(gd_graph *graph,
     }
 
     if (gd_context_fallback_policy(graph->ctx) != GD_FALLBACK_CPU_REF) {
-        char msg[128];
-        (void)snprintf(msg, sizeof(msg),
-                       "backend '%s' does not support op '%s' (node %d); enable CPU_REF fallback",
-                       target_backend->vt->name,
-                       _gd_op_kind_name(graph->nodes[bad_node].op),
-                       bad_node);
+        char msg[256];
+        if (bad_reason != NULL && bad_reason[0] != '\0') {
+            (void)snprintf(msg, sizeof(msg),
+                           "backend '%s' does not support op '%s' (node %d): %s; enable CPU_REF fallback",
+                           target_backend->vt->name,
+                           _gd_op_kind_name(graph->nodes[bad_node].op),
+                           bad_node,
+                           bad_reason);
+        } else {
+            (void)snprintf(msg, sizeof(msg),
+                           "backend '%s' does not support op '%s' (node %d); enable CPU_REF fallback",
+                           target_backend->vt->name,
+                           _gd_op_kind_name(graph->nodes[bad_node].op),
+                           bad_node);
+        }
         return _gd_error(GD_ERR_UNSUPPORTED, msg);
     }
 

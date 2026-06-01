@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "../backend.h"
@@ -15,6 +16,7 @@
 #include "../../core/storage_internal.h"
 #include "../../core/tensor_internal.h"
 #include "../../graph/graph_internal.h"
+#include "../../ops/op_impl.h"
 #include "metal_kernel_types.h"
 
 @interface GDMetalState : NSObject
@@ -122,7 +124,7 @@ MPSMatrix *_gd_metal_mps_matrix(id<MTLBuffer> buffer,
                                 NSUInteger cols,
                                 NSUInteger row_bytes);
 gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,
-                                  id<MTLComputeCommandEncoder> *enc,
+                                  __strong id<MTLComputeCommandEncoder> *enc,
                                   id<MTLDevice> device,
                                   MPSMatrix *left,
                                   MPSMatrix *right,
@@ -134,7 +136,7 @@ gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,
                                   NSUInteger inner,
                                   double beta);
 gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
-                                    id<MTLComputeCommandEncoder> *enc,
+                                    __strong id<MTLComputeCommandEncoder> *enc,
                                     GDMPSGemmPlan *plan);
 
 gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc,
@@ -166,59 +168,5 @@ gd_status _gd_metal_encode_fused_head(id<MTLComputeCommandEncoder> enc,
                                       _gd_executable *exe,
                                       const _gd_node *head,
                                       const _gd_node *src);
-
-gd_status _gd_metal_encode_node(_gd_backend *self,
-                                id<MTLComputeCommandEncoder> enc,
-                                _gd_executable *exe,
-                                const _gd_node *node,
-                                id<MTLComputePipelineState> pso,
-                                id<MTLComputePipelineState> pso2,
-                                id<MTLComputePipelineState> pso3,
-                                id<MTLBuffer> scratch);
-bool _gd_metal_encode_core_node(_gd_backend *self,
-                                id<MTLComputeCommandEncoder> enc,
-                                _gd_executable *exe,
-                                const _gd_node *node,
-                                id<MTLComputePipelineState> pso,
-                                id<MTLComputePipelineState> pso2,
-                                id<MTLBuffer> scratch,
-                                gd_status *status_out);
-bool _gd_metal_encode_misc_node(_gd_backend *self,
-                                id<MTLComputeCommandEncoder> enc,
-                                _gd_executable *exe,
-                                const _gd_node *node,
-                                id<MTLComputePipelineState> pso,
-                                id<MTLComputePipelineState> pso2,
-                                id<MTLComputePipelineState> pso3,
-                                id<MTLBuffer> scratch,
-                                gd_status *status_out);
-gd_status _gd_metal_encode_lm_cross_entropy(_gd_backend *self,
-                                            id<MTLCommandBuffer> cmd,
-                                            id<MTLComputeCommandEncoder> *enc,
-                                            id<MTLBuffer> scratch,
-                                            _gd_executable *exe,
-                                            const _gd_node *node);
-gd_status _gd_metal_encode_lm_cross_entropy_bwd(_gd_backend *self,
-                                                id<MTLCommandBuffer> cmd,
-                                                id<MTLComputeCommandEncoder> *enc,
-                                                id<MTLBuffer> scratch,
-                                                _gd_executable *exe,
-                                                const _gd_node *node);
-void _gd_metal_encode_sdpa(_gd_backend *self,
-                           id<MTLComputeCommandEncoder> enc,
-                           id<MTLComputePipelineState> pso,
-                           id<MTLComputePipelineState> splitk_pso,
-                           id<MTLComputePipelineState> combine_pso,
-                           id<MTLBuffer> scratch,
-                           _gd_executable *exe,
-                           const _gd_node *node);
-gd_status _gd_metal_encode_sdpa_bwd(_gd_backend *self,
-                                    id<MTLComputeCommandEncoder> enc,
-                                    id<MTLComputePipelineState> dq_pso,
-                                    id<MTLComputePipelineState> dkv_pso,
-                                    id<MTLComputePipelineState> stats_pso,
-                                    id<MTLBuffer> stats_buf,
-                                    _gd_executable *exe,
-                                    const _gd_node *node);
 
 #endif /* GD_METAL_INTERNAL_H */

@@ -1154,16 +1154,16 @@ Current codebase inventory used to ground this plan:
 
 ### 24.8 Move Metal op host entries into capsules
 
-- [ ] Add `src/backends/metal/metal_op.h` with `_gd_metal_op`, support fn, plan fn, encode fn, plan ctx, encode ctx.
-- [ ] Generate `metal_registry.inc` from `metal_<op>_<role>.m` files.
-- [ ] Replace Metal `supports_node` bool-style path with `gd_status` support checks that include concrete unsupported reason.
-- [ ] Move simple host encoders into capsules: elementwise/unary/copy/cast.
-- [ ] Move linalg host encoders: `matmul`, `linear`, MPS optional paths.
-- [ ] Move reduction/norm/loss/embedding/rope host encoders.
-- [ ] Move `sdpa` and `sdpa_bwd` host planning/encoding into their own op capsule files; split further inside `src/ops/sdpa/` if near 800 LOC.
-- [ ] Move optimizer/debug host encoders: `step_inc`, `adamw_step`, `assert_finite`, `assert_close`.
-- [ ] Delete old central `encode_node()` switch after all host entries move.
-- [ ] Validate Metal fallback and unsupported messages with `tests/test_fallback` and Metal tests.
+- [x] Add `src/backends/metal/metal_op.h` with `_gd_metal_op`, support fn, plan fn, encode fn, plan ctx, encode ctx.
+- [x] Generate `metal_registry.inc` from `metal_<op>_<role>.m` files.
+- [x] Replace Metal `supports_node` bool-style path with `gd_status` support checks that include concrete unsupported reason.
+- [x] Move simple host encoders into capsules: elementwise/unary/copy/cast.
+- [x] Move linalg host encoders: `matmul`, `linear`, MPS optional paths.
+- [x] Move reduction/norm/loss/embedding/rope host encoders.
+- [x] Move `sdpa` and `sdpa_bwd` host planning/encoding into their own op capsule files; split further inside `src/ops/sdpa/` if near 800 LOC.
+- [x] Move optimizer/debug host encoders: `step_inc`, `adamw_step`, `assert_finite`, `assert_close`.
+- [x] Delete old central `encode_node()` switch after all host entries move.
+- [x] Validate Metal fallback and unsupported messages with `tests/test_fallback` and Metal tests.
 
 ### 24.9 Split Metal shaders into op capsules
 

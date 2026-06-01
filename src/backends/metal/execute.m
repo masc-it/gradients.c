@@ -1,4 +1,4 @@
-#import "metal_internal.h"
+#import "metal_op.h"
 
 static bool metal_needs_stage_now(const _gd_executable *exe)
 {
@@ -64,6 +64,50 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
     return GD_OK;
 }
 
+static gd_status encode_planned_node(_gd_backend *self,
+                                     GDMetalState *st,
+                                     id<MTLCommandBuffer> cmd,
+                                     __strong id<MTLComputeCommandEncoder> *enc,
+                                     _gd_executable *exe,
+                                     int node_id,
+                                     id<MTLComputePipelineState> pso,
+                                     id<MTLComputePipelineState> pso2,
+                                     id<MTLComputePipelineState> pso3,
+                                     id<MTLBuffer> scratch)
+{
+    const _gd_node *node = &exe->graph->nodes[node_id];
+    const _gd_metal_op *op = NULL;
+    _gd_metal_encode_ctx ctx;
+
+    if (exe->node_fused_src[node_id] >= 0) {
+        return _gd_metal_encode_fused_head(*enc, pso2, exe, node,
+                                           &exe->graph->nodes[exe->node_fused_src[node_id]]);
+    }
+
+    op = _gd_metal_op_for(node->op);
+    if (op == NULL || op->encode == NULL) {
+        char msg[112];
+        (void)snprintf(msg, sizeof(msg), "metal has no host entry for op '%s'",
+                       _gd_op_kind_name(node->op));
+        return _gd_error(GD_ERR_UNSUPPORTED, msg);
+    }
+    ctx = (_gd_metal_encode_ctx){
+        .backend = self,
+        .state = st,
+        .command_buffer = cmd,
+        .encoder = enc,
+        .exe = exe,
+        .node = node,
+        .node_id = node_id,
+        .pso = pso,
+        .pso2 = pso2,
+        .pso3 = pso3,
+        .scratch = scratch,
+    };
+    return op->encode(&ctx);
+}
+
+
 static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int last_node)
 {
     GDMetalState *st = _gd_metal_state(self);
@@ -117,20 +161,8 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             @autoreleasepool {
                 id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (exe->node_fused_src[i] >= 0) {
-                    status = _gd_metal_encode_fused_head(enc, pso2, exe, node,
-                                               &exe->graph->nodes[exe->node_fused_src[i]]);
-                } else if (node->op == _GD_OP_LM_CROSS_ENTROPY) {
-                    status = _gd_metal_encode_lm_cross_entropy(self, cmd, &enc, scratch, exe, node);
-                } else if (node->op == _GD_OP_LM_CROSS_ENTROPY_BWD) {
-                    status = _gd_metal_encode_lm_cross_entropy_bwd(self, cmd, &enc, scratch, exe, node);
-                } else if (exe->node_mps[i] != NULL &&
-                           (node->op == _GD_OP_LINEAR || node->op == _GD_OP_MATMUL)) {
-                    status = _gd_metal_encode_mps_gemm(cmd, &enc,
-                                             (__bridge GDMPSGemmPlan *)exe->node_mps[i]);
-                } else {
-                    status = _gd_metal_encode_node(self, enc, exe, node, pso, pso2, pso3, scratch);
-                }
+                status = encode_planned_node(self, st, cmd, &enc, exe, i, pso, pso2, pso3,
+                                             scratch);
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;
@@ -177,23 +209,8 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                     }
                     scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
                 }
-                if (exe->node_fused_src[i] >= 0) {
-                    status = _gd_metal_encode_fused_head(enc, pso2, exe, &exe->graph->nodes[i],
-                                               &exe->graph->nodes[exe->node_fused_src[i]]);
-                } else if (exe->graph->nodes[i].op == _GD_OP_LM_CROSS_ENTROPY) {
-                    status = _gd_metal_encode_lm_cross_entropy(self, cmd, &enc, scratch, exe,
-                                                     &exe->graph->nodes[i]);
-                } else if (exe->graph->nodes[i].op == _GD_OP_LM_CROSS_ENTROPY_BWD) {
-                    status = _gd_metal_encode_lm_cross_entropy_bwd(self, cmd, &enc, scratch, exe,
-                                                         &exe->graph->nodes[i]);
-                } else if (exe->node_mps[i] != NULL &&
-                           (exe->graph->nodes[i].op == _GD_OP_LINEAR ||
-                            exe->graph->nodes[i].op == _GD_OP_MATMUL)) {
-                    status = _gd_metal_encode_mps_gemm(cmd, &enc,
-                                             (__bridge GDMPSGemmPlan *)exe->node_mps[i]);
-                } else {
-                    status = _gd_metal_encode_node(self, enc, exe, &exe->graph->nodes[i], pso, pso2, pso3, scratch);
-                }
+                status = encode_planned_node(self, st, cmd, &enc, exe, i, pso, pso2, pso3,
+                                             scratch);
                 if (status != GD_OK) {
                     [enc endEncoding];
                     return status;
@@ -253,12 +270,5 @@ gd_status _gd_metal_value_storage(_gd_backend *self, _gd_executable *exe, int va
 
 bool _gd_metal_supports_node(_gd_backend *self, const _gd_node *node)
 {
-    GDMetalState *st = _gd_metal_state(self);
-    if (node->op == _GD_OP_LM_CROSS_ENTROPY ||
-        node->op == _GD_OP_LM_CROSS_ENTROPY_BWD) {
-        /* Metal LMCE v1 is chunked around MPS GEMMs, so keep it behind the
-         * same opt-in gate as generic MPS GEMM. */
-        return st.useMPS;
-    }
-    return _gd_metal_pipeline_for(st, node->op) != nil;
+    return _gd_metal_support_node(self, node) == GD_OK;
 }

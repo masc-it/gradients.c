@@ -186,25 +186,31 @@ static int test_metal_unary_parity(gd_context *ctx)
     return 0;
 }
 
-/* Cast parity (byte-exact for integer outputs): F32->I32 and F32->F32. */
+/* Cast parity: F32->I32, F32 identity, F32->F16, and F16->F32. */
 static int test_metal_cast_parity(gd_context *ctx)
 {
-    int64_t s5[1] = {5};
-    float a[5] = {1.9F, -2.4F, 3.5F, -4.6F, 0.0F};
+    int64_t s6[1] = {6};
+    float a[6] = {1.9F, -2.4F, 3.5F, -4.6F, 0.0F, 1.0F / 3.0F};
     gd_tensor *ta = NULL;
     gd_tensor *ci = NULL;
     gd_tensor *cf = NULL;
+    gd_tensor *ch = NULL;
+    gd_tensor *chf = NULL;
     gd_graph *g = NULL;
     gd_compare_options opts = {0.0, 0.0, false};
 
-    CHECK_OK(make_f32(ctx, 1, s5, a, &ta));
+    CHECK_OK(make_f32(ctx, 1, s6, a, &ta));
     CHECK_OK(gd_graph_create(ctx, &g));
     CHECK_OK(gd_graph_begin(ctx, g));
     CHECK_OK(gd_cast(ctx, ta, GD_DTYPE_I32, &ci));   /* truncation toward zero */
     CHECK_OK(gd_cast(ctx, ta, GD_DTYPE_F32, &cf));   /* identity */
+    CHECK_OK(gd_cast(ctx, ta, GD_DTYPE_F16, &ch));
+    CHECK_OK(gd_cast(ctx, ch, GD_DTYPE_F32, &chf));
     CHECK_OK(gd_graph_end(ctx));
     gd_tensor_release(ci);
     gd_tensor_release(cf);
+    gd_tensor_release(ch);
+    gd_tensor_release(chf);
 
     CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
 

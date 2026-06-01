@@ -108,8 +108,11 @@ gd_status _gd_metal_dtype_code(gd_dtype dtype, int *out)
     case GD_DTYPE_I32:
         *out = GD_METAL_DT_I32;
         return GD_OK;
+    case GD_DTYPE_F16:
+        *out = GD_METAL_DT_F16;
+        return GD_OK;
     default:
-        return _gd_error(GD_ERR_UNSUPPORTED, "metal cast supports F32/I32 only in v1");
+        return _gd_error(GD_ERR_UNSUPPORTED, "metal cast supports F32/F16/I32 only in v1");
     }
 }
 

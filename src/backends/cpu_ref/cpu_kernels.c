@@ -345,6 +345,46 @@ gd_status _gd_cpu_k_rms_norm_wbwd(const gd_tensor_desc *x_desc, float *dweight,
     return GD_OK;
 }
 
+static gd_status cpu_cast_load_float(const gd_tensor_desc *desc,
+                                     const void *data,
+                                     int64_t i,
+                                     float *out)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        *out = ((const float *)data)[i];
+        return GD_OK;
+    case GD_DTYPE_F16:
+        *out = _gd_f16_bits_to_f32(((const uint16_t *)data)[i]);
+        return GD_OK;
+    case GD_DTYPE_I32:
+        *out = (float)((const int32_t *)data)[i];
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "cast source dtype is not implemented in CPU_REF");
+    }
+}
+
+static gd_status cpu_cast_store_float(const gd_tensor_desc *desc,
+                                      void *data,
+                                      int64_t i,
+                                      float value)
+{
+    switch (desc->dtype) {
+    case GD_DTYPE_F32:
+        ((float *)data)[i] = value;
+        return GD_OK;
+    case GD_DTYPE_F16:
+        ((uint16_t *)data)[i] = _gd_f32_to_f16_bits(value);
+        return GD_OK;
+    case GD_DTYPE_I32:
+        ((int32_t *)data)[i] = (int32_t)value;
+        return GD_OK;
+    default:
+        return _gd_error(GD_ERR_UNSUPPORTED, "cast destination dtype is not implemented in CPU_REF");
+    }
+}
+
 gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
                          void *out,
                          const gd_tensor_desc *x_desc,
@@ -352,27 +392,28 @@ gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
 {
     int64_t total = desc_numel(out_desc);
     int64_t i = 0;
-    gd_dtype src = x_desc->dtype;
-    gd_dtype dst = out_desc->dtype;
 
-    if (src == GD_DTYPE_F32 && dst == GD_DTYPE_F32) {
-        for (i = 0; i < total; ++i) {
-            ((float *)out)[i] = ((const float *)x)[i];
+    if (desc_numel(x_desc) != total) {
+        return _gd_error(GD_ERR_SHAPE, "cast requires equal element counts");
+    }
+    if (x_desc->dtype == out_desc->dtype) {
+        size_t elem = gd_dtype_sizeof(out_desc->dtype);
+        if (elem == 0U) {
+            return _gd_error(GD_ERR_DTYPE, "cast requires a fixed-size dtype");
         }
-    } else if (src == GD_DTYPE_F32 && dst == GD_DTYPE_I32) {
-        for (i = 0; i < total; ++i) {
-            ((int32_t *)out)[i] = (int32_t)((const float *)x)[i];
+        memcpy(out, x, (size_t)total * elem);
+        return GD_OK;
+    }
+    for (i = 0; i < total; ++i) {
+        float value = 0.0F;
+        gd_status status = cpu_cast_load_float(x_desc, x, i, &value);
+        if (status != GD_OK) {
+            return status;
         }
-    } else if (src == GD_DTYPE_I32 && dst == GD_DTYPE_F32) {
-        for (i = 0; i < total; ++i) {
-            ((float *)out)[i] = (float)((const int32_t *)x)[i];
+        status = cpu_cast_store_float(out_desc, out, i, value);
+        if (status != GD_OK) {
+            return status;
         }
-    } else if (src == GD_DTYPE_I32 && dst == GD_DTYPE_I32) {
-        for (i = 0; i < total; ++i) {
-            ((int32_t *)out)[i] = ((const int32_t *)x)[i];
-        }
-    } else {
-        return _gd_error(GD_ERR_UNSUPPORTED, "cast dtype pair is not implemented in CPU_REF");
     }
     return GD_OK;
 }
@@ -387,6 +428,9 @@ gd_status _gd_cpu_k_copy(const gd_tensor_desc *out_desc,
 
     if (elem == 0U) {
         return _gd_error(GD_ERR_DTYPE, "copy requires a fixed-size dtype");
+    }
+    if (out_desc->dtype != in_desc->dtype) {
+        return _gd_error(GD_ERR_DTYPE, "copy requires matching dtypes");
     }
     if (desc_numel(in_desc) != total) {
         return _gd_error(GD_ERR_SHAPE, "copy requires equal element counts");

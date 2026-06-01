@@ -28,6 +28,9 @@ gd_status _gd_error(gd_status status, const char *message);
 
 gd_status _gd_device_validate_available(const gd_context *ctx, gd_device device);
 
+uint16_t _gd_f32_to_f16_bits(float value);
+float _gd_f16_bits_to_f32(uint16_t bits);
+
 gd_graph *_gd_context_active_graph(const gd_context *ctx);
 gd_status _gd_context_set_active_graph(gd_context *ctx, gd_graph *graph);
 

@@ -133,23 +133,23 @@ Must finish before broad kernel work.
 Goal: F16 tensors are real tensors, not raw buffers that only some Metal kernels
 understand.
 
-- [ ] Add internal IEEE binary16 conversion helpers:
-  - [ ] `_gd_f32_to_f16_bits(float)`.
-  - [ ] `_gd_f16_bits_to_f32(uint16_t)`.
-  - [ ] deterministic round-to-nearest-even behavior.
+- [x] Add internal IEEE binary16 conversion helpers:
+  - [x] `_gd_f32_to_f16_bits(float)`.
+  - [x] `_gd_f16_bits_to_f32(uint16_t)`.
+  - [x] deterministic round-to-nearest-even behavior.
   - [ ] NaN/Inf/subnormal tests.
 - [ ] Extend CPU_REF typed load/store helpers:
   - [ ] F32 load/store.
   - [ ] F16 load/store through F32 compute.
   - [ ] BF16 helpers may exist but stay non-default.
-- [ ] Implement CPU `gd_cast` for F32<->F16 and F16<->F16.
-- [ ] Implement Metal `gd_cast` for F32<->F16 and F16<->F16.
-- [ ] Fix `gd_copy` for dtype-sized copies, not fixed 32-bit raw copies.
-- [ ] Add tensor materialization tests:
-  - [ ] F16 tensor storage size is 2 bytes/elem.
-  - [ ] F32 -> F16 -> F32 tolerance.
-  - [ ] CPU/Metal cast parity.
-  - [ ] materialize virtual F16 tensor to CPU.
+- [x] Implement CPU `gd_cast` for F32<->F16 and F16<->F16.
+- [x] Implement Metal `gd_cast` for F32<->F16 and F16<->F16.
+- [x] Fix `gd_copy` for dtype-sized copies, not fixed 32-bit raw copies.
+- [x] Add tensor materialization tests:
+  - [x] F16 tensor storage size is 2 bytes/elem.
+  - [x] F32 -> F16 -> F32 tolerance.
+  - [x] CPU/Metal cast parity.
+  - [x] materialize virtual F16 tensor to CPU.
 - [ ] Add raw-copy docs: `gd_tensor_copy_from_cpu()` remains raw bytes; typed
       conversion uses `gd_cast` or new helper if added.
 

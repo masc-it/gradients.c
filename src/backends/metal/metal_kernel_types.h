@@ -99,6 +99,7 @@ typedef struct gd_metal_powlu_params {
  * gd_dtype enum, so the host maps explicitly). */
 #define GD_METAL_DT_F32 0
 #define GD_METAL_DT_I32 1
+#define GD_METAL_DT_F16 2
 
 typedef struct gd_metal_cast_params {
     int numel;

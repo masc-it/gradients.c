@@ -1,21 +1,42 @@
 #include "metal_common.metal"
 
-kernel void gd_cast(device const uint *x              [[buffer(0)]],
-                    device uint *out                  [[buffer(1)]],
-                    constant gd_metal_cast_params &p   [[buffer(2)]],
-                    uint gid                           [[thread_position_in_grid]])
+static inline float gd_cast_load(device const uchar *x, int dtype, uint gid)
+{
+    if (dtype == GD_METAL_DT_F32) {
+        return ((device const float *)x)[gid];
+    }
+    if (dtype == GD_METAL_DT_F16) {
+        return (float)((device const half *)x)[gid];
+    }
+    return (float)((device const int *)x)[gid];
+}
+
+static inline void gd_cast_store(device uchar *out, int dtype, uint gid, float value)
+{
+    if (dtype == GD_METAL_DT_F32) {
+        ((device float *)out)[gid] = value;
+    } else if (dtype == GD_METAL_DT_F16) {
+        ((device half *)out)[gid] = (half)value;
+    } else {
+        ((device int *)out)[gid] = (int)value;
+    }
+}
+
+kernel void gd_cast(device const uchar *x            [[buffer(0)]],
+                    device uchar *out                [[buffer(1)]],
+                    constant gd_metal_cast_params &p [[buffer(2)]],
+                    uint gid                         [[thread_position_in_grid]])
 {
     if ((int)gid >= p.numel) {
         return;
     }
-    uint raw = x[gid];
     if (p.src_dtype == p.dst_dtype) {
-        out[gid] = raw;
-    } else if (p.src_dtype == GD_METAL_DT_F32 && p.dst_dtype == GD_METAL_DT_I32) {
-        int v = (int)as_type<float>(raw);
-        out[gid] = as_type<uint>(v);
-    } else { /* I32 -> F32 */
-        float f = (float)as_type<int>(raw);
-        out[gid] = as_type<uint>(f);
+        if (p.src_dtype == GD_METAL_DT_F32 || p.src_dtype == GD_METAL_DT_I32) {
+            ((device uint *)out)[gid] = ((device const uint *)x)[gid];
+        } else {
+            ((device ushort *)out)[gid] = ((device const ushort *)x)[gid];
+        }
+        return;
     }
+    gd_cast_store(out, p.dst_dtype, gid, gd_cast_load(x, p.src_dtype, gid));
 }

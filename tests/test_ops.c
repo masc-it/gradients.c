@@ -1,6 +1,7 @@
 #include "gradients/gradients.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -418,6 +419,52 @@ static int test_reduce_softmax_ce_cast(gd_context *ctx)
     return 0;
 }
 
+static int test_f16_cast_cpu(gd_context *ctx)
+{
+    int64_t s6[1] = {6};
+    float data[6] = {0.0F, 1.0F, -2.5F, 1.0F / 3.0F, 65504.0F, 1.0e-8F};
+    float roundtrip[6] = {0};
+    uint16_t half_bits[6] = {0};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor_desc f16_desc;
+    gd_tensor *x = NULL;
+    gd_tensor *h = NULL;
+    gd_tensor *y = NULL;
+    gd_graph *g = NULL;
+    size_t nbytes = 0U;
+    size_t alignment = 0U;
+    int i = 0;
+
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s6, &f16_desc));
+    CHECK_OK(gd_tensor_desc_nbytes(&f16_desc, &nbytes, &alignment));
+    CHECK_TRUE(nbytes == sizeof(half_bits));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 1, s6, &x));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, data, sizeof(data)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, x, GD_DTYPE_F16, &h));
+    CHECK_TRUE(gd_tensor_dtype(h) == GD_DTYPE_F16);
+    CHECK_OK(gd_cast(ctx, h, GD_DTYPE_F32, &y));
+    CHECK_TRUE(gd_tensor_dtype(y) == GD_DTYPE_F32);
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, h, half_bits, sizeof(half_bits)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y, roundtrip, sizeof(roundtrip)));
+    CHECK_TRUE(half_bits[1] == 0x3c00U);
+    CHECK_TRUE(half_bits[2] == 0xc100U);
+    for (i = 0; i < 6; ++i) {
+        float tol = 1.0e-3F * (fabsf(data[i]) > 1.0F ? fabsf(data[i]) : 1.0F);
+        CHECK_TRUE(fabsf(roundtrip[i] - data[i]) <= tol);
+    }
+    gd_tensor_release(y);
+    gd_tensor_release(h);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(x);
+    return 0;
+}
+
 static int test_chain_dump(gd_context *ctx)
 {
     int64_t xs[2] = {2, 3};
@@ -468,7 +515,7 @@ int main(void)
     if (test_elementwise(ctx) != 0 || test_powlu_schema(ctx) != 0 ||
         test_matmul(ctx) != 0 || test_sdpa_prefix_schema(ctx) != 0 ||
         test_linear(ctx) != 0 || test_reduce_softmax_ce_cast(ctx) != 0 ||
-        test_chain_dump(ctx) != 0) {
+        test_f16_cast_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

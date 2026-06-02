@@ -588,6 +588,269 @@ static int test_metal_f16_lm_cross_entropy_backward(gd_context *ctx)
     return 0;
 }
 
+static int test_metal_sdpa_varlen(gd_context *ctx)
+{
+    int64_t xshape[3] = {5, 1, 2};
+    int64_t cshape[1] = {3};
+    int64_t flat[1] = {10};
+    float qdata[10] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F};
+    float kdata[10] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F};
+    float vdata[10] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F};
+    int32_t cu_data[3] = {0, 3, 5};
+    gd_sdpa_varlen_config cfg = {0.0F, true, 2, 1, 3};
+    gd_compare_options opts = {1.0e-4, 1.0e-4, false};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *cu = NULL;
+    gd_tensor *y = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(make_f32(ctx, 3, xshape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 3, xshape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 3, xshape, vdata, &v));
+    CHECK_OK(make_i32(ctx, 1, cshape, cu_data, &cu));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa_varlen(ctx, q, k, v, cu, &cfg, &y));
+    CHECK_OK(gd_gelu(ctx, y, false, &gel));
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(loss); gd_tensor_release(fl); gd_tensor_release(gel); gd_tensor_release(y);
+
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(cu); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
+static int run_f16_sdpa_varlen_backward(gd_context *ctx, gd_device dev,
+                                          float *loss_out,
+                                          float *gq, float *gk, float *gv)
+{
+    int64_t xshape[3] = {5, 1, 2};
+    int64_t cshape[1] = {3};
+    int64_t flat[1] = {10};
+    float qdata[10] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F};
+    float kdata[10] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F};
+    float vdata[10] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F};
+    int32_t cu_data[3] = {0, 3, 5};
+    gd_sdpa_varlen_config cfg = {0.0F, true, 2, 1, 3};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *cu = NULL;
+    gd_tensor *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y = NULL, *yf = NULL, *fl = NULL, *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(make_f32(ctx, 3, xshape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 3, xshape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 3, xshape, vdata, &v));
+    CHECK_OK(make_i32(ctx, 1, cshape, cu_data, &cu));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa_varlen(ctx, qh, kh, vh, cu, &cfg, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_tensor_reshape(yf, 1, flat, &fl));
+    CHECK_OK(gd_mean(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(fl); gd_tensor_release(yf); gd_tensor_release(y);
+    gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+
+    CHECK_OK(gd_graph_compile(g, dev));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, dev));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, loss_out, sizeof(*loss_out)));
+    CHECK_OK(gd_tensor_grad(q, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gq, 10 * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(k, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gk, 10 * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(v, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gv, 10 * sizeof(float)));
+
+    gd_tensor_release(loss);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(cu); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
+static int test_metal_f16_sdpa_varlen(gd_context *ctx)
+{
+    float loss_cpu = 0.0F;
+    float loss_metal = 0.0F;
+    float gq_cpu[10] = {0};
+    float gk_cpu[10] = {0};
+    float gv_cpu[10] = {0};
+    float gq_metal[10] = {0};
+    float gk_metal[10] = {0};
+    float gv_metal[10] = {0};
+
+    CHECK_TRUE(run_f16_sdpa_varlen_backward(ctx, CPU, &loss_cpu, gq_cpu, gk_cpu, gv_cpu) == 0);
+    CHECK_TRUE(run_f16_sdpa_varlen_backward(ctx, METAL, &loss_metal, gq_metal, gk_metal, gv_metal) == 0);
+    CHECK_TRUE(fabsf(loss_cpu - loss_metal) <= 3.0e-2F);
+    CHECK_TRUE(arrays_close_tol("f16_sdpa_varlen_gq", gq_cpu, gq_metal, 10, 3.0e-2F, 3.0e-2F));
+    CHECK_TRUE(arrays_close_tol("f16_sdpa_varlen_gk", gk_cpu, gk_metal, 10, 3.0e-2F, 3.0e-2F));
+    CHECK_TRUE(arrays_close_tol("f16_sdpa_varlen_gv", gv_cpu, gv_metal, 10, 3.0e-2F, 3.0e-2F));
+    return 0;
+}
+
+static int run_f16_sdpa_varlen_dh64_backward(gd_context *ctx, gd_device dev,
+                                               int seq0, int seq1,
+                                               int prefix_len, int window,
+                                               int max_seqlen,
+                                               float *loss_out,
+                                               float *gq, float *gk, float *gv)
+{
+    enum { DH = 64 };
+    int tokens = seq0 + seq1;
+    int n = tokens * DH;
+    int64_t xshape[3] = {tokens, 1, DH};
+    int64_t cshape[1] = {3};
+    int64_t flat[1] = {n};
+    int32_t cu_data[3] = {0, seq0, seq0 + seq1};
+    gd_sdpa_varlen_config cfg = {0.0F, true, window, prefix_len, max_seqlen};
+    float *qdata = NULL;
+    float *kdata = NULL;
+    float *vdata = NULL;
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *cu = NULL;
+    gd_tensor *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y = NULL, *yf = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    qdata = malloc((size_t)n * sizeof(float));
+    kdata = malloc((size_t)n * sizeof(float));
+    vdata = malloc((size_t)n * sizeof(float));
+    CHECK_TRUE(qdata != NULL && kdata != NULL && vdata != NULL);
+    for (i = 0; i < n; ++i) {
+        qdata[i] = 0.015F * (float)((i % 17) - 8);
+        kdata[i] = 0.013F * (float)(((i * 3) % 19) - 9);
+        vdata[i] = 0.011F * (float)(((i * 5) % 23) - 11);
+    }
+
+    CHECK_OK(make_f32(ctx, 3, xshape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 3, xshape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 3, xshape, vdata, &v));
+    CHECK_OK(make_i32(ctx, 1, cshape, cu_data, &cu));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa_varlen(ctx, qh, kh, vh, cu, &cfg, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_gelu(ctx, yf, false, &gel));
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_sum(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(fl); gd_tensor_release(gel); gd_tensor_release(yf); gd_tensor_release(y);
+    gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+
+    CHECK_OK(gd_graph_compile(g, dev));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, dev));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, loss_out, sizeof(*loss_out)));
+    CHECK_OK(gd_tensor_grad(q, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gq, (size_t)n * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(k, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gk, (size_t)n * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(v, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gv, (size_t)n * sizeof(float)));
+
+    gd_tensor_release(loss);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(cu); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    free(vdata); free(kdata); free(qdata);
+    return 0;
+}
+
+static int test_metal_f16_sdpa_varlen_dh64(gd_context *ctx)
+{
+    enum { TOKENS = 137, DH = 64, N = TOKENS * DH };
+    float loss_cpu = 0.0F;
+    float loss_metal = 0.0F;
+    float *gq_cpu = calloc((size_t)N, sizeof(float));
+    float *gk_cpu = calloc((size_t)N, sizeof(float));
+    float *gv_cpu = calloc((size_t)N, sizeof(float));
+    float *gq_metal = calloc((size_t)N, sizeof(float));
+    float *gk_metal = calloc((size_t)N, sizeof(float));
+    float *gv_metal = calloc((size_t)N, sizeof(float));
+    int ok = 1;
+
+    CHECK_TRUE(gq_cpu != NULL && gk_cpu != NULL && gv_cpu != NULL &&
+               gq_metal != NULL && gk_metal != NULL && gv_metal != NULL);
+    CHECK_TRUE(run_f16_sdpa_varlen_dh64_backward(ctx, CPU, 80, 57, 16, 32, 80,
+                                                 &loss_cpu, gq_cpu, gk_cpu, gv_cpu) == 0);
+    CHECK_TRUE(run_f16_sdpa_varlen_dh64_backward(ctx, METAL, 80, 57, 16, 32, 80,
+                                                 &loss_metal, gq_metal, gk_metal, gv_metal) == 0);
+    ok = ok && fabsf(loss_cpu - loss_metal) <= 8.0e-2F;
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_gq", gq_cpu, gq_metal, N, 8.0e-2F, 8.0e-2F);
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_gk", gk_cpu, gk_metal, N, 8.0e-2F, 8.0e-2F);
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_gv", gv_cpu, gv_metal, N, 8.0e-2F, 8.0e-2F);
+    free(gv_metal); free(gk_metal); free(gq_metal);
+    free(gv_cpu); free(gk_cpu); free(gq_cpu);
+    CHECK_TRUE(ok);
+    return 0;
+}
+
+static int test_metal_f16_sdpa_varlen_dh64_split(gd_context *ctx)
+{
+    enum { SEQ0 = 224, SEQ1 = 211, DH = 64, N = (SEQ0 + SEQ1) * DH };
+    float loss_cpu = 0.0F;
+    float loss_metal = 0.0F;
+    float *gq_cpu = calloc((size_t)N, sizeof(float));
+    float *gk_cpu = calloc((size_t)N, sizeof(float));
+    float *gv_cpu = calloc((size_t)N, sizeof(float));
+    float *gq_metal = calloc((size_t)N, sizeof(float));
+    float *gk_metal = calloc((size_t)N, sizeof(float));
+    float *gv_metal = calloc((size_t)N, sizeof(float));
+    int ok = 1;
+
+    CHECK_TRUE(gq_cpu != NULL && gk_cpu != NULL && gv_cpu != NULL &&
+               gq_metal != NULL && gk_metal != NULL && gv_metal != NULL);
+    CHECK_TRUE(run_f16_sdpa_varlen_dh64_backward(ctx, CPU, SEQ0, SEQ1, 196, 48, SEQ0,
+                                                 &loss_cpu, gq_cpu, gk_cpu, gv_cpu) == 0);
+    CHECK_TRUE(run_f16_sdpa_varlen_dh64_backward(ctx, METAL, SEQ0, SEQ1, 196, 48, SEQ0,
+                                                 &loss_metal, gq_metal, gk_metal, gv_metal) == 0);
+    ok = ok && fabsf(loss_cpu - loss_metal) <= 2.5e-1F;
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_split_gq", gq_cpu, gq_metal,
+                                N, 1.0e-1F, 1.0e-1F);
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_split_gk", gk_cpu, gk_metal,
+                                N, 1.0e-1F, 1.0e-1F);
+    ok = ok && arrays_close_tol("f16_sdpa_varlen_dh64_split_gv", gv_cpu, gv_metal,
+                                N, 1.0e-1F, 1.0e-1F);
+    free(gv_metal); free(gk_metal); free(gq_metal);
+    free(gv_cpu); free(gk_cpu); free(gq_cpu);
+    CHECK_TRUE(ok);
+    return 0;
+}
+
 static int test_metal_f16_sdpa(gd_context *ctx)
 {
     int64_t shape[4] = {1, 3, 1, 4};
@@ -1298,6 +1561,32 @@ static int build_ce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **los
     return 0;
 }
 
+/* cross_entropy(ignore_index) -> backward: masked rows have zero grad. */
+static int build_ce_ignore(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sl[2] = {3, 5};
+    int64_t st[1] = {3};
+    float ld[15] = {2.0F, 1.0F, 0.1F, -1.0F, 0.5F,
+                    0.2F, 3.0F, -0.5F, 1.5F, 0.0F,
+                    -1.0F, 0.3F, 2.2F, 0.7F, 1.1F};
+    int32_t td[3] = {0, -100, 2};
+    gd_cross_entropy_desc desc;
+    gd_tensor *logits = NULL, *targets = NULL, *loss = NULL;
+
+    desc.class_dim = 1;
+    desc.has_ignore_index = true;
+    desc.ignore_index = -100;
+    CHECK_OK(make_f32(ctx, 2, sl, ld, &logits));
+    CHECK_OK(make_i32(ctx, 1, st, td, &targets));
+    CHECK_OK(gd_tensor_set_requires_grad(logits, true));
+    CHECK_OK(gd_cross_entropy_ex(ctx, &desc, logits, targets, &loss));
+    gd_tensor_release(targets); /* graph retains it */
+    inputs[0] = logits;
+    *n = 1;
+    *loss_out = loss;
+    return 0;
+}
+
 /* lm_cross_entropy -> backward: fused d_hidden,d_weight. */
 static int build_lmce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
 {
@@ -1328,6 +1617,39 @@ static int build_lmce(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **l
     return 0;
 }
 
+/* lm_cross_entropy(ignore_index) -> backward: fused masked d_hidden,d_weight. */
+static int build_lmce_ignore(gd_context *ctx, gd_tensor **inputs, int *n, gd_tensor **loss_out)
+{
+    int64_t sh[2] = {3, 4};
+    int64_t sw[2] = {5, 4};
+    int64_t st[1] = {3};
+    float hd[12] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                    0.7F, -0.8F, 0.9F, -1.0F, 1.1F, -1.2F};
+    float wd[20];
+    int32_t td[3] = {0, -100, 4};
+    gd_lm_cross_entropy_desc desc;
+    gd_tensor *h = NULL, *w = NULL, *targets = NULL, *loss = NULL;
+    int i = 0;
+
+    desc.has_ignore_index = true;
+    desc.ignore_index = -100;
+    for (i = 0; i < 20; ++i) {
+        wd[i] = 0.03F * (float)(i - 7);
+    }
+    CHECK_OK(make_f32(ctx, 2, sh, hd, &h));
+    CHECK_OK(make_f32(ctx, 2, sw, wd, &w));
+    CHECK_OK(make_i32(ctx, 1, st, td, &targets));
+    CHECK_OK(gd_tensor_set_requires_grad(h, true));
+    CHECK_OK(gd_tensor_set_requires_grad(w, true));
+    CHECK_OK(gd_lm_cross_entropy_ex(ctx, &desc, h, w, targets, &loss));
+    gd_tensor_release(targets); /* graph retains it */
+    inputs[0] = h;
+    inputs[1] = w;
+    *n = 2;
+    *loss_out = loss;
+    return 0;
+}
+
 static int test_metal_backward_parity(gd_context *ctx, int mps_enabled)
 {
     if (backward_parity(ctx, build_mlp, "mlp") != 0) return 1;
@@ -1335,7 +1657,9 @@ static int test_metal_backward_parity(gd_context *ctx, int mps_enabled)
     if (backward_parity(ctx, build_silu, "silu") != 0) return 1;
     if (backward_parity(ctx, build_powlu, "powlu") != 0) return 1;
     if (backward_parity(ctx, build_ce, "cross_entropy") != 0) return 1;
+    if (backward_parity(ctx, build_ce_ignore, "cross_entropy_ignore") != 0) return 1;
     if (mps_enabled && backward_parity(ctx, build_lmce, "lm_cross_entropy") != 0) return 1;
+    if (mps_enabled && backward_parity(ctx, build_lmce_ignore, "lm_cross_entropy_ignore") != 0) return 1;
     return 0;
 }
 
@@ -1723,6 +2047,10 @@ int main(void)
     rc |= test_metal_f16_elementwise(ctx);
     rc |= test_metal_f16_embedding_transpose(ctx);
     rc |= test_metal_f16_cross_entropy(ctx);
+    rc |= test_metal_sdpa_varlen(ctx);
+    rc |= test_metal_f16_sdpa_varlen(ctx);
+    rc |= test_metal_f16_sdpa_varlen_dh64(ctx);
+    rc |= test_metal_f16_sdpa_varlen_dh64_split(ctx);
     rc |= test_metal_f16_sdpa(ctx);
     rc |= test_metal_f16_sdpa_backward(ctx);
     rc |= test_metal_f16_sdpa_prefix_window_dh64_backward(ctx);

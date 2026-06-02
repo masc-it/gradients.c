@@ -81,6 +81,8 @@ static gd_status cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     p.classes = (int)logits->sizes[node->attrs.dim];
     p.positions = p.outer * p.inner;
     p.dtype = GD_METAL_DT_F32;
+    p.has_ignore_index = node->attrs.has_ignore_index ? 1 : 0;
+    p.ignore_index = node->attrs.ignore_index;
     (void)_gd_metal_dtype_code(logits->dtype, &p.dtype);
     if (reduce_pso == nil || scratch == nil) {
         return _gd_error(GD_ERR_BACKEND, "metal cross_entropy scratch/pipeline missing");
@@ -107,8 +109,9 @@ static gd_status cross_entropy_encode(_gd_metal_encode_ctx *ctx)
 
     [enc setComputePipelineState:reduce_pso];
     [enc setBuffer:scratch offset:0 atIndex:0];
-    [enc setBuffer:_gd_metal_value_buffer(exe, node->outputs[0]) offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
+    [enc setBuffer:_gd_metal_value_buffer(exe, node->outputs[0]) offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
     {
         NSUInteger tg = reduce_pso.maxTotalThreadsPerThreadgroup;
         NSUInteger w = 256;

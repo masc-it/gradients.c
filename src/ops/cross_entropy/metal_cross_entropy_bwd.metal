@@ -5,6 +5,7 @@ kernel void gd_cross_entropy_bwd(device const float *logits     [[buffer(0)]],
                                  device const float *go_scalar  [[buffer(2)]],
                                  device float *dlogits          [[buffer(3)]],
                                  constant gd_metal_ce_params &p  [[buffer(4)]],
+                                 device const float *valid_count [[buffer(5)]],
                                  uint gid  [[threadgroup_position_in_grid]],
                                  uint tid  [[thread_index_in_threadgroup]],
                                  uint tgsz [[threads_per_threadgroup]])
@@ -18,7 +19,16 @@ kernel void gd_cross_entropy_bwd(device const float *logits     [[buffer(0)]],
     int o = pos / p.inner;
     int in = pos % p.inner;
     int target = targets[pos];
-    float scale = go_scalar[0] / (float)p.positions;
+    bool ignored = (p.has_ignore_index != 0 && target == p.ignore_index);
+    float denom = p.has_ignore_index != 0 ? valid_count[0] : (float)p.positions;
+    float scale = denom > 0.0f ? go_scalar[0] / denom : 0.0f;
+
+    if (ignored || target < 0 || target >= p.classes || denom <= 0.0f) {
+        for (int c = (int)tid; c < p.classes; c += (int)tgsz) {
+            dlogits[(o * p.classes + c) * p.inner + in] = 0.0f;
+        }
+        return;
+    }
 
     float lmax = -INFINITY;
     for (int c = (int)tid; c < p.classes; c += (int)tgsz) {

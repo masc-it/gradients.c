@@ -39,13 +39,29 @@ gd_status gd_cross_entropy(gd_context *ctx,
                            int class_dim,
                            gd_tensor **loss)
 {
+    gd_cross_entropy_desc desc;
+
+    desc.class_dim = class_dim;
+    desc.has_ignore_index = false;
+    desc.ignore_index = 0;
+    return gd_cross_entropy_ex(ctx, &desc, logits, targets, loss);
+}
+
+gd_status gd_cross_entropy_ex(gd_context *ctx,
+                              const gd_cross_entropy_desc *desc,
+                              gd_tensor *logits,
+                              gd_tensor *targets,
+                              gd_tensor **loss)
+{
     gd_tensor *inputs[2] = {logits, targets};
     _gd_op_attrs attrs = {0};
 
-    if (logits == NULL || targets == NULL || loss == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_cross_entropy argument is NULL");
+    if (desc == NULL || logits == NULL || targets == NULL || loss == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_cross_entropy_ex argument is NULL");
     }
     *loss = NULL;
-    attrs.dim = class_dim;
+    attrs.dim = desc->class_dim;
+    attrs.has_ignore_index = desc->has_ignore_index;
+    attrs.ignore_index = desc->ignore_index;
     return _gd_emit_checked(ctx, _GD_OP_CROSS_ENTROPY, inputs, 2, &attrs, loss, 1);
 }

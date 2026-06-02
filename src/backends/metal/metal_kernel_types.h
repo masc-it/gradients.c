@@ -181,6 +181,8 @@ typedef struct gd_metal_ce_params {
     int classes;
     int positions;     /* outer*inner */
     int dtype;         /* GD_METAL_DT_* logits dtype for forward */
+    int has_ignore_index;
+    int ignore_index;
 } gd_metal_ce_params;
 
 typedef struct gd_metal_lmce_params {
@@ -190,6 +192,8 @@ typedef struct gd_metal_lmce_params {
     int chunk_start;
     int chunk_size;
     int first_chunk;
+    int has_ignore_index;
+    int ignore_index;
 } gd_metal_lmce_params;
 
 /* reduce_to: sum `go` (broadcast shape) down into the target shape. */
@@ -249,6 +253,22 @@ typedef struct gd_metal_transpose_params {
     int perm[GD_METAL_MAX_DIMS];
 } gd_metal_transpose_params;
 
+/* Compact slice copy and its backward scatter. Sizes/strides are element units;
+ * elem_size is bytes. Forward maps contiguous output coordinates to input
+ * coordinates with `coord[dim] += start`. Backward maps full input-gradient
+ * coordinates to the compact grad when inside [start, start+len), else zero. */
+typedef struct gd_metal_slice_params {
+    int ndim;
+    int numel;
+    int elem_size;
+    int dim;
+    int start;
+    int len;
+    int full_sizes[GD_METAL_MAX_DIMS];
+    int slice_sizes[GD_METAL_MAX_DIMS];
+    int in_strides[GD_METAL_MAX_DIMS];
+} gd_metal_slice_params;
+
 typedef struct gd_metal_embedding_params {
     int n;     /* number of ids */
     int dim;   /* embedding dimension */
@@ -257,6 +277,22 @@ typedef struct gd_metal_embedding_params {
 } gd_metal_embedding_params;
 
 /* Scaled dot-product attention. Head-major q[B,Tq,Hq,Dh], k/v[B,Tk,Hkv,Dh]. */
+typedef struct gd_metal_sdpa_varlen_params {
+    int total_tokens;
+    int B;
+    int Hq;
+    int Hkv;
+    int Dh;
+    int max_seqlen;
+    int n_qb_max;
+    float scale;
+    int causal;
+    int window;
+    int prefix_len;
+    int dtype;
+    int n_splits;   /* backward dK/dV query-range split count */
+} gd_metal_sdpa_varlen_params;
+
 typedef struct gd_metal_sdpa_params {
     int B;
     int Tq;

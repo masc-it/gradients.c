@@ -49,15 +49,32 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                               gd_tensor *targets,
                               gd_tensor **loss)
 {
+    gd_lm_cross_entropy_desc desc;
+
+    desc.has_ignore_index = false;
+    desc.ignore_index = 0;
+    return gd_lm_cross_entropy_ex(ctx, &desc, hidden, weight, targets, loss);
+}
+
+gd_status gd_lm_cross_entropy_ex(gd_context *ctx,
+                                 const gd_lm_cross_entropy_desc *desc,
+                                 gd_tensor *hidden,
+                                 gd_tensor *weight,
+                                 gd_tensor *targets,
+                                 gd_tensor **loss)
+{
     gd_status status = GD_OK;
     gd_tensor *inputs[3] = {hidden, weight, targets};
     gd_tensor *outs[3] = {NULL, NULL, NULL};
+    _gd_op_attrs attrs = {0};
 
-    if (hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_lm_cross_entropy argument is NULL");
+    if (desc == NULL || hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_lm_cross_entropy_ex argument is NULL");
     }
     *loss = NULL;
-    status = _gd_emit_checked(ctx, _GD_OP_LM_CROSS_ENTROPY, inputs, 3, NULL, outs, 3);
+    attrs.has_ignore_index = desc->has_ignore_index;
+    attrs.ignore_index = desc->ignore_index;
+    status = _gd_emit_checked(ctx, _GD_OP_LM_CROSS_ENTROPY, inputs, 3, &attrs, outs, 3);
     if (status != GD_OK) {
         return status;
     }

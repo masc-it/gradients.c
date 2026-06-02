@@ -59,7 +59,9 @@ static gd_status lm_cross_entropy_bwd_run(_gd_cpu_exec *exec, const _gd_node *no
     return _gd_cpu_k_lm_cross_entropy_bwd(hidden_desc, dhidden_desc, dhidden_data, hidden_data,
                                           weight_desc, dweight_desc, dweight_data, weight_data,
                                           targets_desc, targets_data, go_data,
-                                          row_max_data, row_sum_data);
+                                          row_max_data, row_sum_data,
+                                          node->attrs.has_ignore_index,
+                                          node->attrs.ignore_index);
 }
 
 const _gd_cpu_op _gd_cpu_op_lm_cross_entropy_bwd = {

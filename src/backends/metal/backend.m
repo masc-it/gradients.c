@@ -43,12 +43,24 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_SDPA_BWD, "gd_sdpa_bwd_dq"},
     {_GD_OP_RMS_NORM_BWD, "gd_rms_norm_bwd"},
     {_GD_OP_RMS_NORM_WBWD, "gd_rms_norm_wbwd"},
+    {_GD_OP_SDPA_VARLEN, "gd_sdpa_varlen"},
+    {_GD_OP_SDPA_VARLEN_BWD, "gd_sdpa_varlen_bwd"},
+    {_GD_OP_SLICE, "gd_slice"},
+    {_GD_OP_SLICE_BWD, "gd_slice_bwd"},
+    {_GD_OP_CONCAT, "gd_concat"},
 };
 
 /* Kernels not mapped 1:1 to an op (looked up by name during encode). */
 static const char *const g_metal_extra_kernels[] = {
     "gd_sdpa_bwd_dkv",
     "gd_sdpa_bwd_stats",
+    "gd_sdpa_varlen_bwd_dkv",
+    "gd_sdpa_varlen_bwd_stats",
+    "gd_sdpa_varlen_prefix_window_lane8_dh64_f16",
+    "gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16",
+    "gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16",
+    "gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16",
+    "gd_sdpa_varlen_bwd_dkv_reduce_f16",
     "gd_sdpa", /* reference forward; fallback when head_dim > GD_METAL_SDPA_DHT */
     "gd_sdpa_tiled_causal", /* GPT-style causal/no-bias forward */
     "gd_sdpa_splitk",  /* split-K forward (long context) */
@@ -86,6 +98,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_rms_norm_bwd_f16", /* F16 RMSNorm backward */
     "gd_rms_norm_bwd_add", /* F4: RMSNorm backward + residual grad add */
     "gd_cross_entropy_reduce",
+    "gd_cross_entropy_count_valid",
     "gd_clip_norm_reduce",
     "gd_clip_norm_scale",
     "gd_amp_clip_norm_reduce",

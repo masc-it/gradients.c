@@ -72,6 +72,8 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     id<MTLComputePipelineState> fwd_pso = _gd_metal_pipeline_named(st, "gd_lmce_fwd_chunk");
     id<MTLComputePipelineState> loss_pso = _gd_metal_pipeline_named(st, "gd_lmce_loss_rows");
     id<MTLComputePipelineState> reduce_pso = _gd_metal_pipeline_named(st, "gd_cross_entropy_reduce");
+    int has_ignore_index = node->attrs.has_ignore_index ? 1 : 0;
+    int ignore_index = node->attrs.ignore_index;
 
     if (!st.useMPS) {
         return _gd_error(GD_ERR_UNSUPPORTED, "metal lm_cross_entropy needs GD_METAL_MPS=1");
@@ -108,7 +110,8 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
         if (status != GD_OK) {
             return status;
         }
-        gd_metal_lmce_params p = {rows, D, V, c0, csz, c0 == 0 ? 1 : 0};
+        gd_metal_lmce_params p = {rows, D, V, c0, csz, c0 == 0 ? 1 : 0,
+                                  has_ignore_index, ignore_index};
         [*enc setComputePipelineState:fwd_pso];
         [*enc setBuffer:scratch offset:L.logits_off atIndex:0];
         [*enc setBuffer:t_b offset:0 atIndex:1];
@@ -120,20 +123,24 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     }
 
     {
-        gd_metal_lmce_params p = {rows, D, V, 0, chunk_max, 0};
-        gd_metal_ce_params rp = {1, 1, V, rows, GD_METAL_DT_F32};
+        gd_metal_lmce_params p = {rows, D, V, 0, chunk_max, 0,
+                                  has_ignore_index, ignore_index};
+        gd_metal_ce_params rp = {1, 1, V, rows, GD_METAL_DT_F32,
+                                 has_ignore_index, ignore_index};
         [*enc setComputePipelineState:loss_pso];
         [*enc setBuffer:m_b offset:0 atIndex:0];
         [*enc setBuffer:l_b offset:0 atIndex:1];
         [*enc setBuffer:scratch offset:L.target_logit_off atIndex:2];
         [*enc setBuffer:scratch offset:L.losses_off atIndex:3];
-        [*enc setBytes:&p length:sizeof(p) atIndex:4];
+        [*enc setBuffer:t_b offset:0 atIndex:4];
+        [*enc setBytes:&p length:sizeof(p) atIndex:5];
         _gd_metal_dispatch_1d(*enc, loss_pso, (NSUInteger)rows);
 
         [*enc setComputePipelineState:reduce_pso];
         [*enc setBuffer:scratch offset:L.losses_off atIndex:0];
-        [*enc setBuffer:out_b offset:0 atIndex:1];
-        [*enc setBytes:&rp length:sizeof(rp) atIndex:2];
+        [*enc setBuffer:t_b offset:0 atIndex:1];
+        [*enc setBuffer:out_b offset:0 atIndex:2];
+        [*enc setBytes:&rp length:sizeof(rp) atIndex:3];
         [*enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }

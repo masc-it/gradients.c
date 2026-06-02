@@ -829,6 +829,141 @@ static int test_f16_sdpa_cpu(gd_context *ctx)
     return 0;
 }
 
+static int varlen_allowed_ref(int i, int j, int causal, int window, int prefix_len)
+{
+    if (causal) {
+        if (prefix_len > 0) {
+            if (i < prefix_len) {
+                if (j >= prefix_len) {
+                    return 0;
+                }
+            } else if (j > i) {
+                return 0;
+            }
+        } else if (j > i) {
+            return 0;
+        }
+    }
+    if (window > 0) {
+        if (prefix_len > 0) {
+            if (i >= prefix_len && j >= prefix_len && (i - j) >= window) {
+                return 0;
+            }
+        } else if ((i - j) >= window) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void ref_sdpa_varlen_h1d2(const float *q,
+                                 const float *k,
+                                 const float *v,
+                                 const int32_t *cu,
+                                 int B,
+                                 const gd_sdpa_varlen_config *cfg,
+                                 float *out)
+{
+    double scale = cfg->scale > 0.0F ? (double)cfg->scale : 1.0 / sqrt(2.0);
+    int N = cu[B];
+    int idx = 0;
+
+    for (idx = 0; idx < N * 2; ++idx) {
+        out[idx] = 0.0F;
+    }
+    for (int b = 0; b < B; ++b) {
+        int start = cu[b];
+        int T = cu[b + 1] - start;
+        for (int i = 0; i < T; ++i) {
+            double m = -HUGE_VAL;
+            double l = 0.0;
+            int qg = start + i;
+            for (int j = 0; j < T; ++j) {
+                int kg = start + j;
+                double s = 0.0;
+                if (!varlen_allowed_ref(i, j, cfg->causal ? 1 : 0,
+                                         cfg->sliding_window, cfg->prefix_len)) {
+                    continue;
+                }
+                s = scale * ((double)q[qg * 2 + 0] * (double)k[kg * 2 + 0] +
+                             (double)q[qg * 2 + 1] * (double)k[kg * 2 + 1]);
+                if (s > m) {
+                    m = s;
+                }
+            }
+            for (int j = 0; j < T; ++j) {
+                int kg = start + j;
+                double s = 0.0;
+                if (!varlen_allowed_ref(i, j, cfg->causal ? 1 : 0,
+                                         cfg->sliding_window, cfg->prefix_len)) {
+                    continue;
+                }
+                s = scale * ((double)q[qg * 2 + 0] * (double)k[kg * 2 + 0] +
+                             (double)q[qg * 2 + 1] * (double)k[kg * 2 + 1]);
+                l += exp(s - m);
+            }
+            for (int j = 0; j < T; ++j) {
+                int kg = start + j;
+                double s = 0.0;
+                double p = 0.0;
+                if (!varlen_allowed_ref(i, j, cfg->causal ? 1 : 0,
+                                         cfg->sliding_window, cfg->prefix_len)) {
+                    continue;
+                }
+                s = scale * ((double)q[qg * 2 + 0] * (double)k[kg * 2 + 0] +
+                             (double)q[qg * 2 + 1] * (double)k[kg * 2 + 1]);
+                p = exp(s - m) / l;
+                out[qg * 2 + 0] += (float)(p * (double)v[kg * 2 + 0]);
+                out[qg * 2 + 1] += (float)(p * (double)v[kg * 2 + 1]);
+            }
+        }
+    }
+}
+
+static int test_sdpa_varlen_cpu(gd_context *ctx)
+{
+    int64_t xshape[3] = {5, 1, 2};
+    int64_t cshape[1] = {3};
+    float qdata[10] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                       0.7F, -0.8F, 0.9F, 1.0F};
+    float kdata[10] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                       0.8F, -0.7F, 0.9F, -1.0F};
+    float vdata[10] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                       0.7F, 0.9F, -0.8F, 1.0F};
+    int32_t cu_data[3] = {0, 3, 5};
+    float got[10] = {0};
+    float expect[10] = {0};
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_sdpa_varlen_config cfg = {0.0F, true, 2, 1, 3};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *cu = NULL, *y = NULL;
+    gd_graph *g = NULL;
+
+    ref_sdpa_varlen_h1d2(qdata, kdata, vdata, cu_data, 2, &cfg, expect);
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, xshape, &q));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, xshape, &k));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, xshape, &v));
+    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 1, cshape, &cu));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, q, qdata, sizeof(qdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, k, kdata, sizeof(kdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, v, vdata, sizeof(vdata)));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, cu, cu_data, sizeof(cu_data)));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa_varlen(ctx, q, k, v, cu, &cfg, &y));
+    CHECK_TRUE(check_shape(y, 3, xshape) == 0);
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y, got, sizeof(got)));
+    for (int i = 0; i < 10; ++i) {
+        CHECK_TRUE(fabsf(got[i] - expect[i]) <= 1.0e-5F);
+    }
+    gd_tensor_release(y);
+    CHECK_OK(gd_graph_reset(g)); CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(cu); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
 static int test_f16_rope_cpu(gd_context *ctx)
 {
     int64_t xshape[4] = {1, 2, 1, 4};
@@ -982,7 +1117,8 @@ int main(void)
         test_f16_cast_cpu(ctx) != 0 || test_f16_elementwise_cpu(ctx) != 0 ||
         test_f16_embedding_transpose_cpu(ctx) != 0 ||
         test_f16_cross_entropy_cpu(ctx) != 0 || test_f16_lm_cross_entropy_cpu(ctx) != 0 ||
-        test_f16_sdpa_cpu(ctx) != 0 || test_f16_rope_cpu(ctx) != 0 ||
+        test_f16_sdpa_cpu(ctx) != 0 || test_sdpa_varlen_cpu(ctx) != 0 ||
+        test_f16_rope_cpu(ctx) != 0 ||
         test_f16_matmul_linear_cpu(ctx) != 0 || test_chain_dump(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;

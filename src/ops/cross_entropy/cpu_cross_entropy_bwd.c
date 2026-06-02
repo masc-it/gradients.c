@@ -33,7 +33,8 @@ static gd_status cross_entropy_bwd_run(_gd_cpu_exec *exec, const _gd_node *node)
     }
     return _gd_cpu_k_cross_entropy_bwd(logits_desc, out_data, logits_data,
                                        targets_desc, targets_data, go_data,
-                                       node->attrs.dim);
+                                       node->attrs.dim,
+                                       node->attrs.has_ignore_index, node->attrs.ignore_index);
 }
 
 const _gd_cpu_op _gd_cpu_op_cross_entropy_bwd = {

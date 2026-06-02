@@ -19,6 +19,7 @@ kernel void gd_lmce_dlogits_chunk(device float *logits               [[buffer(0)
                                   device const float *m              [[buffer(3)]],
                                   device const float *l              [[buffer(4)]],
                                   constant gd_metal_lmce_params &p    [[buffer(5)]],
+                                  device const float *valid_count     [[buffer(6)]],
                                   uint gid                           [[thread_position_in_grid]])
 {
     int idx = (int)gid;
@@ -29,7 +30,14 @@ kernel void gd_lmce_dlogits_chunk(device float *logits               [[buffer(0)
     int row = idx / p.chunk_size;
     int c = idx - row * p.chunk_size;
     int cls = p.chunk_start + c;
+    int target = targets[row];
+    bool ignored = (p.has_ignore_index != 0 && target == p.ignore_index);
+    float denom = p.has_ignore_index != 0 ? valid_count[0] : (float)p.rows;
+    if (ignored || target < 0 || target >= p.vocab || denom <= 0.0f) {
+        logits[idx] = 0.0f;
+        return;
+    }
     float prob = exp(logits[idx] - m[row]) / l[row];
-    float onehot = (cls == targets[row]) ? 1.0f : 0.0f;
-    logits[idx] = (go_scalar[0] / (float)p.rows) * (prob - onehot);
+    float onehot = (cls == target) ? 1.0f : 0.0f;
+    logits[idx] = (go_scalar[0] / denom) * (prob - onehot);
 }

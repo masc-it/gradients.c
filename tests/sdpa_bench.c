@@ -20,6 +20,8 @@
  *   GD_BENCH_PATCH=N                square patch size in pixels (default 16)
  *   GD_BENCH_IMAGE_EXTRA_TOKENS=N   optional CLS/register tokens added to patches (default 0)
  *   GD_BENCH_TEXT=N                 text/suffix length; when set and T unset, T=prefix+text
+ *   GD_BENCH_VARLEN=1               use packed [N,H,Dh] + cu_seqlens[B+1]
+ *   GD_BENCH_RAGGED_MIN_TEXT=N      varlen: shortest text suffix (default = text, uniform)
  */
 
 #include "gradients/gradients.h"
@@ -103,16 +105,17 @@ static int64_t numel4(int a, int b, int c, int d)
     return (int64_t)a * (int64_t)b * (int64_t)c * (int64_t)d;
 }
 
-static gd_status make_tensor(gd_context *ctx,
-                             gd_device device,
-                             gd_dtype dtype,
-                             const int64_t *shape,
-                             const float *data,
-                             int64_t n,
-                             gd_tensor **out)
+static gd_status make_tensor_nd(gd_context *ctx,
+                                gd_device device,
+                                gd_dtype dtype,
+                                int ndim,
+                                const int64_t *shape,
+                                const float *data,
+                                int64_t n,
+                                gd_tensor **out)
 {
     gd_tensor_desc desc;
-    gd_status status = gd_tensor_desc_contiguous(dtype, device, 4, shape, &desc);
+    gd_status status = gd_tensor_desc_contiguous(dtype, device, ndim, shape, &desc);
 
     if (status != GD_OK) {
         return status;
@@ -138,6 +141,37 @@ static gd_status make_tensor(gd_context *ctx,
         return status;
     }
     return GD_ERR_DTYPE;
+}
+
+static gd_status make_tensor(gd_context *ctx,
+                             gd_device device,
+                             gd_dtype dtype,
+                             const int64_t *shape,
+                             const float *data,
+                             int64_t n,
+                             gd_tensor **out)
+{
+    return make_tensor_nd(ctx, device, dtype, 4, shape, data, n, out);
+}
+
+static gd_status make_i32_tensor(gd_context *ctx,
+                                 gd_device device,
+                                 const int64_t *shape,
+                                 const int32_t *data,
+                                 int64_t n,
+                                 gd_tensor **out)
+{
+    gd_tensor_desc desc;
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_I32, device, 1, shape, &desc);
+
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_empty(ctx, &desc, out);
+    if (status != GD_OK) {
+        return status;
+    }
+    return gd_tensor_copy_from_cpu(ctx, *out, data, (size_t)n * sizeof(int32_t));
 }
 
 static void fill_data(float *x, int64_t n, int seed)
@@ -193,6 +227,7 @@ int main(void)
     const char *mask = mask_env != NULL && mask_env[0] != '\0' ? mask_env : "prefix_window";
     bool train_mode = mode_env != NULL && strcmp(mode_env, "train") == 0;
     gd_dtype dtype = GD_DTYPE_F32;
+    bool varlen = env_int("GD_BENCH_VARLEN", 0) != 0;
 
     int image_size = env_int("GD_BENCH_IMAGE_SIZE", 224);
     int patch = env_int("GD_BENCH_PATCH", 16);
@@ -211,6 +246,9 @@ int main(void)
     int warmup = env_int("GD_BENCH_WARMUP", 3);
     int64_t qshape[4];
     int64_t kshape[4];
+    int64_t qshape3[3];
+    int64_t kshape3[3];
+    int64_t cushape[1];
     int64_t flat_shape[1];
     int64_t qn = 0;
     int64_t kn = 0;
@@ -220,16 +258,21 @@ int main(void)
     gd_tensor *q = NULL;
     gd_tensor *k = NULL;
     gd_tensor *v = NULL;
+    gd_tensor *cu = NULL;
     gd_tensor *y = NULL;
     gd_tensor *y_f32 = NULL;
     gd_tensor *flat = NULL;
     gd_tensor *loss = NULL;
     gd_graph *g = NULL;
     gd_sdpa_config cfg = {0};
+    gd_sdpa_varlen_config vcfg = {0};
     gd_tensor *params[3];
     long long pairs = 0;
     long long dense_pairs = 0;
     long long causal_pairs = 0;
+    int32_t *cu_data = NULL;
+    int total_tokens = 0;
+    int min_text = 0;
     double fwd_gflop = 0.0;
     double work_gflop = 0.0;
     double ms_mean = 0.0;
@@ -294,6 +337,29 @@ int main(void)
         gd_context_destroy(ctx);
         return 1;
     }
+    min_text = env_int("GD_BENCH_RAGGED_MIN_TEXT", text);
+    if (!varlen) {
+        min_text = text;
+    }
+    if (min_text < 0 || min_text > text) {
+        fprintf(stderr, "config error: require 0<=GD_BENCH_RAGGED_MIN_TEXT<=text\n");
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    cu_data = calloc((size_t)B + 1U, sizeof(int32_t));
+    if (cu_data == NULL) {
+        fprintf(stderr, "alloc failed\n");
+        gd_context_destroy(ctx);
+        return 1;
+    }
+    for (i = 0; i < B; ++i) {
+        int tb = text;
+        if (varlen && B > 1 && text > min_text) {
+            tb = min_text + (int)(((long long)(text - min_text) * (long long)i) / (long long)(B - 1));
+        }
+        cu_data[i + 1] = cu_data[i] + prefix + tb;
+    }
+    total_tokens = cu_data[B];
 
     qshape[0] = B;
     qshape[1] = T;
@@ -303,8 +369,15 @@ int main(void)
     kshape[1] = T;
     kshape[2] = Hkv;
     kshape[3] = Dh;
-    qn = numel4(B, T, H, Dh);
-    kn = numel4(B, T, Hkv, Dh);
+    qshape3[0] = total_tokens;
+    qshape3[1] = H;
+    qshape3[2] = Dh;
+    kshape3[0] = total_tokens;
+    kshape3[1] = Hkv;
+    kshape3[2] = Dh;
+    cushape[0] = B + 1;
+    qn = varlen ? (int64_t)total_tokens * H * Dh : numel4(B, T, H, Dh);
+    kn = varlen ? (int64_t)total_tokens * Hkv * Dh : numel4(B, T, Hkv, Dh);
     flat_shape[0] = qn;
 
     qd = malloc((size_t)qn * sizeof(float));
@@ -315,6 +388,7 @@ int main(void)
         free(qd);
         free(kd);
         free(vd);
+        free(cu_data);
         gd_context_destroy(ctx);
         return 1;
     }
@@ -322,9 +396,16 @@ int main(void)
     fill_data(kd, kn, 2);
     fill_data(vd, kn, 3);
 
-    CHECK(make_tensor(ctx, target, dtype, qshape, qd, qn, &q));
-    CHECK(make_tensor(ctx, target, dtype, kshape, kd, kn, &k));
-    CHECK(make_tensor(ctx, target, dtype, kshape, vd, kn, &v));
+    if (varlen) {
+        CHECK(make_tensor_nd(ctx, target, dtype, 3, qshape3, qd, qn, &q));
+        CHECK(make_tensor_nd(ctx, target, dtype, 3, kshape3, kd, kn, &k));
+        CHECK(make_tensor_nd(ctx, target, dtype, 3, kshape3, vd, kn, &v));
+        CHECK(make_i32_tensor(ctx, target, cushape, cu_data, B + 1, &cu));
+    } else {
+        CHECK(make_tensor(ctx, target, dtype, qshape, qd, qn, &q));
+        CHECK(make_tensor(ctx, target, dtype, kshape, kd, kn, &k));
+        CHECK(make_tensor(ctx, target, dtype, kshape, vd, kn, &v));
+    }
     free(qd);
     free(kd);
     free(vd);
@@ -343,6 +424,11 @@ int main(void)
     if (strcmp(mask, "prefix") == 0 || strcmp(mask, "prefix_window") == 0) {
         cfg.prefix_len = prefix;
     }
+    vcfg.scale = cfg.scale;
+    vcfg.causal = cfg.causal;
+    vcfg.sliding_window = cfg.sliding_window;
+    vcfg.prefix_len = cfg.prefix_len;
+    vcfg.max_seqlen = T;
 
     if (train_mode) {
         CHECK(gd_tensor_set_requires_grad(q, true));
@@ -350,20 +436,41 @@ int main(void)
         CHECK(gd_tensor_set_requires_grad(v, true));
     }
 
-    dense_pairs = mask_pairs("dense", T, prefix, window);
-    causal_pairs = mask_pairs("causal", T, prefix, window);
-    pairs = mask_pairs(mask, T, prefix, window);
-    fwd_gflop = 4.0 * (double)B * (double)H * (double)pairs * (double)Dh / 1e9;
+    if (varlen) {
+        dense_pairs = 0;
+        causal_pairs = 0;
+        pairs = 0;
+        for (i = 0; i < B; ++i) {
+            int Tb = cu_data[i + 1] - cu_data[i];
+            dense_pairs += mask_pairs("dense", Tb, prefix, window);
+            causal_pairs += mask_pairs("causal", Tb, prefix, window);
+            pairs += mask_pairs(mask, Tb, prefix, window);
+        }
+    } else {
+        dense_pairs = (long long)B * mask_pairs("dense", T, prefix, window);
+        causal_pairs = (long long)B * mask_pairs("causal", T, prefix, window);
+        pairs = (long long)B * mask_pairs(mask, T, prefix, window);
+    }
+    fwd_gflop = 4.0 * (double)H * (double)pairs * (double)Dh / 1e9;
     work_gflop = train_mode ? 3.0 * fwd_gflop : fwd_gflop;
 
     printf("sdpa_bench\n");
     printf("  device      : %s\n", target.type == GD_DEVICE_METAL ? "metal" : "cpu");
     printf("  mode        : %s\n", train_mode ? "train (fwd+bwd q/k/v)" : "forward");
     printf("  dtype       : %s\n", gd_dtype_name(dtype));
-    printf("  shape       : B=%d T=%d H=%d Hkv=%d Dh=%d\n", B, T, H, Hkv, Dh);
+    if (varlen) {
+        printf("  shape       : varlen B=%d Tmax=%d tokens=%d H=%d Hkv=%d Dh=%d\n",
+               B, T, total_tokens, H, Hkv, Dh);
+    } else {
+        printf("  shape       : B=%d T=%d H=%d Hkv=%d Dh=%d\n", B, T, H, Hkv, Dh);
+    }
     printf("  image math  : %d/%d = %d patches per side => %d tokens%s\n",
            image_size, patch, grid, grid * grid, extra != 0 ? " + extra" : "");
-    printf("  prefix/text : P=%d N=%d\n", prefix, text);
+    printf("  prefix/text : P=%d N=%d", prefix, text);
+    if (varlen && min_text != text) {
+        printf(" (ragged text %d..%d)", min_text, text);
+    }
+    printf("\n");
     printf("  mask        : %s", mask);
     if (cfg.sliding_window > 0) {
         printf(" window=%d", cfg.sliding_window);
@@ -377,7 +484,11 @@ int main(void)
 
     CHECK(gd_graph_create(ctx, &g));
     CHECK(gd_graph_begin(ctx, g));
-    CHECK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &y));
+    if (varlen) {
+        CHECK(gd_sdpa_varlen(ctx, q, k, v, cu, &vcfg, &y));
+    } else {
+        CHECK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &y));
+    }
     if (train_mode) {
         if (dtype == GD_DTYPE_F32) {
             y_f32 = y;
@@ -432,7 +543,7 @@ int main(void)
             printf("  throughput  : %.1f attn-GFLOP/s (mean)  %.1f (best)\n",
                    work_gflop / (ms_mean / 1000.0), work_gflop / (best_ms / 1000.0));
             printf("  tokens/s    : %.1f (best)\n",
-                   (double)B * (double)T / (best_ms / 1000.0));
+                   (double)(varlen ? total_tokens : B * T) / (best_ms / 1000.0));
         }
     }
 
@@ -443,9 +554,11 @@ int main(void)
     }
     gd_tensor_release(y);
     CHECK(gd_graph_destroy(g));
+    gd_tensor_release(cu);
     gd_tensor_release(q);
     gd_tensor_release(k);
     gd_tensor_release(v);
+    free(cu_data);
     gd_context_destroy(ctx);
     return 0;
 }

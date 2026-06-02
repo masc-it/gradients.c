@@ -21,7 +21,11 @@ typedef enum _gd_graph_state {
 
 typedef struct _gd_op_attrs {
     float scale;                 /* SCALE / CLIP_GRAD_NORM max_norm */
-    int dim;                     /* SUM / MEAN / SOFTMAX / CROSS_ENTROPY class dim */
+    int dim;                     /* SUM / MEAN / SOFTMAX / CROSS_ENTROPY / SLICE dim */
+    int64_t slice_start;          /* SLICE: start index along dim */
+    int64_t slice_len;            /* SLICE: length along dim */
+    bool has_ignore_index;       /* CROSS_ENTROPY / LM_CROSS_ENTROPY */
+    int ignore_index;            /* CROSS_ENTROPY / LM_CROSS_ENTROPY target to skip */
     bool keepdim;                /* SUM / MEAN */
     bool trans_a;                /* MATMUL */
     bool trans_b;                /* MATMUL / LINEAR (trans_w) */
@@ -43,6 +47,7 @@ typedef struct _gd_op_attrs {
     int causal;                 /* SDPA: causal masking */
     int sliding_window;         /* SDPA: window size (0 = none) */
     int prefix_len;             /* SDPA: bidirectional prefix length for causal mask */
+    int max_seqlen;             /* SDPA_VARLEN: max tokens per packed sequence */
     gd_compute_policy compute;   /* MATMUL / LINEAR */
     float lr;                    /* ADAMW */
     float beta1;                 /* ADAMW */

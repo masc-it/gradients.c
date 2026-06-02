@@ -75,6 +75,11 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_SUM, "sum"},
     {_GD_OP_TRANSPOSE, "transpose"},
     {_GD_OP_ZERO_GRAD, "zero_grad"},
+    {_GD_OP_SDPA_VARLEN, "sdpa_varlen"},
+    {_GD_OP_SDPA_VARLEN_BWD, "sdpa_varlen_bwd"},
+    {_GD_OP_SLICE, "slice"},
+    {_GD_OP_SLICE_BWD, "slice_bwd"},
+    {_GD_OP_CONCAT, "concat"},
 };
 
 static int test_registry_contents(void)

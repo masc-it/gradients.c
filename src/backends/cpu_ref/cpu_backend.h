@@ -87,7 +87,9 @@ gd_status _gd_cpu_k_cross_entropy(float *out,
                                   const void *logits,
                                   const gd_tensor_desc *targets_desc,
                                   const void *targets,
-                                  int class_dim);
+                                  int class_dim,
+                                  bool has_ignore_index,
+                                  int ignore_index);
 gd_status _gd_cpu_k_lm_cross_entropy(float *out,
                                      float *row_max,
                                      float *row_sum,
@@ -96,7 +98,9 @@ gd_status _gd_cpu_k_lm_cross_entropy(float *out,
                                      const gd_tensor_desc *weight_desc,
                                      const void *weight,
                                      const gd_tensor_desc *targets_desc,
-                                     const void *targets);
+                                     const void *targets,
+                                     bool has_ignore_index,
+                                     int ignore_index);
 gd_status _gd_cpu_k_cast(const gd_tensor_desc *out_desc,
                          void *out,
                          const gd_tensor_desc *x_desc,
@@ -180,7 +184,9 @@ gd_status _gd_cpu_k_cross_entropy_bwd(const gd_tensor_desc *logits_desc,
                                       const gd_tensor_desc *targets_desc,
                                       const void *targets,
                                       const float *go_scalar,
-                                      int class_dim);
+                                      int class_dim,
+                                      bool has_ignore_index,
+                                      int ignore_index);
 gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
                                          const gd_tensor_desc *dhidden_desc,
                                          void *dhidden,
@@ -193,7 +199,9 @@ gd_status _gd_cpu_k_lm_cross_entropy_bwd(const gd_tensor_desc *hidden_desc,
                                          const void *targets,
                                          const float *go_scalar,
                                          const float *row_max,
-                                         const float *row_sum);
+                                         const float *row_sum,
+                                         bool has_ignore_index,
+                                         int ignore_index);
 
 /* Sums `go` (broadcasted output shape) down into `out` (target shape). */
 gd_status _gd_cpu_k_reduce_to(const gd_tensor_desc *target_desc,

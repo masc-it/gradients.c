@@ -330,6 +330,17 @@ typedef struct sdpa_in {
     int sliding_window;
 } sdpa_in;
 
+typedef struct sdpa_varlen_in {
+    gd_tensor *q;
+    gd_tensor *k;
+    gd_tensor *v;
+    gd_tensor *cu;
+    bool causal;
+    int prefix_len;
+    int sliding_window;
+    int max_seqlen;
+} sdpa_varlen_in;
+
 static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     sdpa_in *s = user; /* q[1,3,2,4], k/v[1,3,1,4] (GQA) -> sdpa -> reshape -> mean */
@@ -343,6 +354,33 @@ static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_ou
     cfg.prefix_len = s->prefix_len;
     cfg.sliding_window = s->sliding_window;
     status = gd_sdpa(ctx, s->q, s->k, s->v, s->bias, &cfg, &y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tensor_reshape(y, 1, flat, &fl);
+    gd_tensor_release(y);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_mean(ctx, fl, 0, false, loss_out);
+    gd_tensor_release(fl);
+    return status;
+}
+
+static gd_status build_sdpa_varlen_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+{
+    sdpa_varlen_in *s = user;
+    gd_sdpa_varlen_config cfg = {0};
+    gd_tensor *y = NULL;
+    gd_tensor *fl = NULL;
+    int64_t flat[1] = {10};
+    gd_status status = GD_OK;
+
+    cfg.causal = s->causal;
+    cfg.prefix_len = s->prefix_len;
+    cfg.sliding_window = s->sliding_window;
+    cfg.max_seqlen = s->max_seqlen;
+    status = gd_sdpa_varlen(ctx, s->q, s->k, s->v, s->cu, &cfg, &y);
     if (status != GD_OK) {
         return status;
     }
@@ -513,11 +551,20 @@ static gd_status build_linear_sum(gd_context *ctx, void *user, gd_tensor **loss_
 typedef struct ce_in {
     gd_tensor *logits;
     gd_tensor *targets;
+    bool has_ignore_index;
+    int ignore_index;
 } ce_in;
 
 static gd_status build_ce(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     ce_in *t = user;
+    if (t->has_ignore_index) {
+        gd_cross_entropy_desc desc;
+        desc.class_dim = 1;
+        desc.has_ignore_index = true;
+        desc.ignore_index = t->ignore_index;
+        return gd_cross_entropy_ex(ctx, &desc, t->logits, t->targets, loss_out);
+    }
     return gd_cross_entropy(ctx, t->logits, t->targets, 1, loss_out);
 }
 
@@ -525,11 +572,19 @@ typedef struct lmce_in {
     gd_tensor *hidden;
     gd_tensor *weight;
     gd_tensor *targets;
+    bool has_ignore_index;
+    int ignore_index;
 } lmce_in;
 
 static gd_status build_lmce(gd_context *ctx, void *user, gd_tensor **loss_out)
 {
     lmce_in *t = user;
+    if (t->has_ignore_index) {
+        gd_lm_cross_entropy_desc desc;
+        desc.has_ignore_index = true;
+        desc.ignore_index = t->ignore_index;
+        return gd_lm_cross_entropy_ex(ctx, &desc, t->hidden, t->weight, t->targets, loss_out);
+    }
     return gd_lm_cross_entropy(ctx, t->hidden, t->weight, t->targets, loss_out);
 }
 
@@ -1123,6 +1178,41 @@ int main(void)
     }
 
     {
+        /* packed sdpa_varlen: two sequences, lengths 3 and 2, prefix+window. */
+        sdpa_varlen_in s = {0};
+        gd_tensor *in[3];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc cdesc;
+        int64_t xs[3] = {5, 1, 2};
+        int64_t cs[1] = {3};
+        float qd[10] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
+                        0.7F, -0.8F, 0.9F, 1.0F};
+        float kd[10] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
+                        0.8F, -0.7F, 0.9F, -1.0F};
+        float vd[10] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
+                        0.7F, 0.9F, -0.8F, 1.0F};
+        int32_t cu[3] = {0, 3, 5};
+        CHECK_OK(make_grad_input(ctx, 3, xs, qd, &s.q));
+        CHECK_OK(make_grad_input(ctx, 3, xs, kd, &s.k));
+        CHECK_OK(make_grad_input(ctx, 3, xs, vd, &s.v));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, cs, &cdesc));
+        CHECK_OK(gd_tensor_empty(ctx, &cdesc, &s.cu));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, s.cu, cu, sizeof(cu)));
+        in[0] = s.q;
+        in[1] = s.k;
+        in[2] = s.v;
+        s.causal = true;
+        s.prefix_len = 1;
+        s.sliding_window = 2;
+        s.max_seqlen = 3;
+        CHECK_TRUE(gradcheck(ctx, build_sdpa_varlen_sum, &s, in, 3, "sdpa_varlen") == 0);
+        gd_tensor_release(s.cu);
+        gd_tensor_release(s.q);
+        gd_tensor_release(s.k);
+        gd_tensor_release(s.v);
+    }
+
+    {
         two_in t = {0};
         gd_tensor *in[2];
         CHECK_OK(make_grad_input(ctx, 2, a2, ma, &t.a));
@@ -1241,6 +1331,24 @@ int main(void)
     }
 
     {
+        ce_in t = {0};
+        gd_tensor *in[1];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc tdesc;
+        int32_t targets[2] = {2, -100};
+        CHECK_OK(make_grad_input(ctx, 2, l2, logits, &t.logits));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
+        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
+        t.has_ignore_index = true;
+        t.ignore_index = -100;
+        in[0] = t.logits;
+        CHECK_TRUE(gradcheck(ctx, build_ce, &t, in, 1, "cross_entropy_ignore") == 0);
+        gd_tensor_release(t.logits);
+        gd_tensor_release(t.targets);
+    }
+
+    {
         lmce_in t = {0};
         gd_tensor *in[2];
         gd_device cpu = {GD_DEVICE_CPU, 0};
@@ -1259,6 +1367,32 @@ int main(void)
         in[0] = t.hidden;
         in[1] = t.weight;
         CHECK_TRUE(gradcheck(ctx, build_lmce, &t, in, 2, "lm_cross_entropy") == 0);
+        gd_tensor_release(t.hidden);
+        gd_tensor_release(t.weight);
+        gd_tensor_release(t.targets);
+    }
+
+    {
+        lmce_in t = {0};
+        gd_tensor *in[2];
+        gd_device cpu = {GD_DEVICE_CPU, 0};
+        gd_tensor_desc tdesc;
+        int64_t hs[2] = {2, 3};
+        int64_t ws[2] = {4, 3};
+        int32_t targets[2] = {2, -100};
+        float hd[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
+        float wd[12] = {0.05F, -0.03F, 0.07F, 0.11F, -0.13F, 0.17F,
+                        -0.19F, 0.23F, -0.29F, 0.31F, -0.37F, 0.41F};
+        CHECK_OK(make_grad_input(ctx, 2, hs, hd, &t.hidden));
+        CHECK_OK(make_grad_input(ctx, 2, ws, wd, &t.weight));
+        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
+        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
+        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
+        t.has_ignore_index = true;
+        t.ignore_index = -100;
+        in[0] = t.hidden;
+        in[1] = t.weight;
+        CHECK_TRUE(gradcheck(ctx, build_lmce, &t, in, 2, "lm_cross_entropy_ignore") == 0);
         gd_tensor_release(t.hidden);
         gd_tensor_release(t.weight);
         gd_tensor_release(t.targets);

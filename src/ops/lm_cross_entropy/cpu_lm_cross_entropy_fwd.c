@@ -42,7 +42,8 @@ static gd_status lm_cross_entropy_run(_gd_cpu_exec *exec, const _gd_node *node)
     }
     return _gd_cpu_k_lm_cross_entropy(out_data, row_max_data, row_sum_data,
                                       hidden_desc, hidden_data, weight_desc, weight_data,
-                                      targets_desc, targets_data);
+                                      targets_desc, targets_data,
+                                      node->attrs.has_ignore_index, node->attrs.ignore_index);
 }
 
 const _gd_cpu_op _gd_cpu_op_lm_cross_entropy = {

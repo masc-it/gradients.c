@@ -76,7 +76,7 @@ static gd_status lm_cross_entropy_backward(_gd_bwd_ctx *b, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    status = _gd_bwd_emit_multi(b, _GD_OP_LM_CROSS_ENTROPY_BWD, inputs, 6, NULL,
+    status = _gd_bwd_emit_multi(b, _GD_OP_LM_CROSS_ENTROPY_BWD, inputs, 6, &node->attrs,
                                 out_descs, 2, grads);
     if (status != GD_OK) {
         return status;

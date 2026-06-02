@@ -115,7 +115,9 @@ GD_REF(gd_mean, gd_status, (gd_context *, gd_tensor *, int, bool, gd_tensor **))
 GD_REF(gd_rms_norm, gd_status, (gd_context *, gd_tensor *, gd_tensor *, float, gd_tensor **));
 GD_REF(gd_softmax, gd_status, (gd_context *, gd_tensor *, int, gd_tensor **));
 GD_REF(gd_cross_entropy, gd_status, (gd_context *, gd_tensor *, gd_tensor *, int, gd_tensor **));
+GD_REF(gd_cross_entropy_ex, gd_status, (gd_context *, const gd_cross_entropy_desc *, gd_tensor *, gd_tensor *, gd_tensor **));
 GD_REF(gd_lm_cross_entropy, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor **));
+GD_REF(gd_lm_cross_entropy_ex, gd_status, (gd_context *, const gd_lm_cross_entropy_desc *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor **));
 GD_REF(gd_cast, gd_status, (gd_context *, gd_tensor *, gd_dtype, gd_tensor **));
 GD_REF(gd_gelu, gd_status, (gd_context *, gd_tensor *, bool, gd_tensor **));
 GD_REF(gd_transpose, gd_status, (gd_context *, gd_tensor *, const int *, int, gd_tensor **));
@@ -126,6 +128,9 @@ GD_REF(gd_backward, gd_status, (gd_context *, gd_tensor *));
 GD_REF(gd_zero_grad, gd_status, (gd_context *, gd_tensor **, int));
 GD_REF(gd_clip_grad_norm, gd_status, (gd_context *, gd_tensor **, int, float, gd_tensor **));
 
+GD_REF(gd_sdpa_varlen, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_sdpa_varlen_config *, gd_tensor **));
+GD_REF(gd_slice, gd_status, (gd_context *, gd_tensor *, int, int64_t, int64_t, gd_tensor **));
+GD_REF(gd_concat, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor **));
 /* module.h */
 GD_REF(gd_module_create, gd_status, (gd_context *, const char *, gd_module **));
 GD_REF(gd_module_destroy, void, (gd_module *));

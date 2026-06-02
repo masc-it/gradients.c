@@ -81,6 +81,7 @@ typedef struct gd_metal_value {
     bool external_alias;
     bool needs_writeback;
     bool is_input;
+    bool planned;
     bool has_staged;
     uint64_t staged_version;
 } gd_metal_value;

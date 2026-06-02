@@ -141,6 +141,52 @@ static int test_metal_add_direct(gd_context *ctx)
     return 0;
 }
 
+/* A virtual reshape emits a copy node. The Metal compiler may not alias that
+ * copy onto a lifetime-planned source buffer unless the source lifetime is
+ * extended through the view. This direct run catches stale alias/lifetime reuse:
+ * x dies at the reshape, y reuses x's slot, but v must still read original x. */
+static int test_metal_memory_plan_view_lifetime(gd_context *ctx)
+{
+    int64_t s23[2] = {2, 3};
+    int64_t s6[1] = {6};
+    float a[6] = {1, 2, 3, 4, 5, 6};
+    float b[6] = {10, 20, 30, 40, 50, 60};
+    float out[6];
+    gd_tensor *ta = NULL;
+    gd_tensor *tb = NULL;
+    gd_tensor *x = NULL;
+    gd_tensor *v = NULL;
+    gd_tensor *y = NULL;
+    gd_tensor *z = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+
+    CHECK_OK(make_f32(ctx, 2, s23, a, &ta));
+    CHECK_OK(make_f32(ctx, 1, s6, b, &tb));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_scale(ctx, ta, 2.0F, &x));
+    CHECK_OK(gd_tensor_reshape(x, 1, s6, &v));
+    CHECK_OK(gd_scale(ctx, tb, 3.0F, &y));
+    CHECK_OK(gd_add(ctx, v, y, &z));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, METAL));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, z, out, sizeof(out)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(close_to(out[i], 2.0F * a[i] + 3.0F * b[i]));
+    }
+
+    gd_tensor_release(x);
+    gd_tensor_release(v);
+    gd_tensor_release(y);
+    gd_tensor_release(z);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(ta);
+    gd_tensor_release(tb);
+    return 0;
+}
+
 /* CPU<->Metal parity via the P8 harness, plain + broadcast adds. */
 static int test_metal_add_parity(gd_context *ctx)
 {
@@ -2040,6 +2086,7 @@ int main(void)
     }
 
     rc |= test_metal_add_direct(ctx);
+    rc |= test_metal_memory_plan_view_lifetime(ctx);
     rc |= test_metal_add_parity(ctx);
     rc |= test_metal_unary_parity(ctx);
     rc |= test_metal_cast_parity(ctx);

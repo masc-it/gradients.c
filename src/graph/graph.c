@@ -113,6 +113,7 @@ gd_status _gd_graph_clear(gd_graph *graph)
     graph->input_cap = 0;
     graph->has_target = false;
     graph->target = (gd_device){GD_DEVICE_CPU, 0};
+    graph->preserve_all_values = false;
     graph->state = _GD_GRAPH_EMPTY;
     _gd_set_last_error(GD_OK, NULL);
     return GD_OK;

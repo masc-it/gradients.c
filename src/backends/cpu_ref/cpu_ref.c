@@ -133,7 +133,7 @@ static gd_status cpu_run_node(_gd_executable *exe, const _gd_node *node)
     return op->run(exe, node);
 }
 
-/* ---- Compiled executable: naive per-value buffer plan. ---- */
+/* ---- Compiled executable: lifetime-planned value buffers. ---- */
 
 static void cpu_executable_free(_gd_backend *self, _gd_executable *exe)
 {
@@ -156,10 +156,11 @@ static gd_status cpu_compile(_gd_backend *self, gd_graph *graph, _gd_executable 
 {
     gd_status status = GD_OK;
     _gd_executable *exe = NULL;
+    _gd_memory_plan plan = {0};
+    gd_storage **slot_storage = NULL;
     int n = 0;
     int i = 0;
 
-    (void)self;
     *out = NULL;
     n = graph->n_values;
 
@@ -175,8 +176,32 @@ static gd_status cpu_compile(_gd_backend *self, gd_graph *graph, _gd_executable 
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate exec buffers");
     }
 
+    status = _gd_memory_plan_build(graph, &plan);
+    if (status != GD_OK) {
+        goto fail;
+    }
+    if (plan.n_slots > 0) {
+        slot_storage = calloc((size_t)plan.n_slots, sizeof(*slot_storage));
+        if (slot_storage == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate CPU_REF plan slots");
+            goto fail;
+        }
+        for (i = 0; i < plan.n_slots; ++i) {
+            gd_storage_desc sdesc = {0};
+            sdesc.device = (gd_device){GD_DEVICE_CPU, self->device_index};
+            sdesc.memory = self->caps.default_memory;
+            sdesc.nbytes = plan.slot_nbytes[i];
+            sdesc.alignment = plan.slot_alignment[i];
+            status = gd_storage_create(graph->ctx, &sdesc, &slot_storage[i]);
+            if (status != GD_OK) {
+                goto fail;
+            }
+        }
+    }
+
     for (i = 0; i < n; ++i) {
         const _gd_value *value = &graph->values[i];
+        int slot = plan.values != NULL ? plan.values[i].slot : -1;
 
         if (value->kind == _GD_VALUE_INPUT) {
             exe->buffers[i].storage = NULL;
@@ -197,6 +222,14 @@ static gd_status cpu_compile(_gd_backend *self, gd_graph *graph, _gd_executable 
             exe->buffers[i].storage = storage;
             exe->buffers[i].offset = (size_t)value->desc.storage_offset_bytes;
             exe->buffers[i].owned = false;
+        } else if (slot >= 0) {
+            status = gd_storage_retain(slot_storage[slot]);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            exe->buffers[i].storage = slot_storage[slot];
+            exe->buffers[i].offset = 0U;
+            exe->buffers[i].owned = true;
         } else {
             gd_storage_desc sdesc;
             gd_storage *storage = NULL;
@@ -219,10 +252,22 @@ static gd_status cpu_compile(_gd_backend *self, gd_graph *graph, _gd_executable 
         }
     }
 
+    for (i = 0; i < plan.n_slots; ++i) {
+        gd_storage_release(slot_storage[i]);
+    }
+    free(slot_storage);
+    _gd_memory_plan_free(&plan);
     *out = exe;
     return GD_OK;
 
 fail:
+    if (slot_storage != NULL) {
+        for (i = 0; i < plan.n_slots; ++i) {
+            gd_storage_release(slot_storage[i]);
+        }
+        free(slot_storage);
+    }
+    _gd_memory_plan_free(&plan);
     cpu_executable_free(self, exe);
     return status;
 }

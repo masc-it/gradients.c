@@ -155,6 +155,9 @@ static gd_status alias_copy_values(_gd_executable *exe)
         }
         input = node->inputs[0];
         output = node->outputs[0];
+        if (exe->values[input].planned || exe->values[output].planned) {
+            continue;
+        }
         if (exe->values[input].storage == exe->values[output].storage) {
             continue;
         }
@@ -173,6 +176,8 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
 {
     gd_status status = GD_OK;
     _gd_executable *exe = NULL;
+    _gd_memory_plan plan = {0};
+    gd_storage **slot_storage = NULL;
     int n = graph->n_values;
     int i = 0;
 
@@ -189,12 +194,34 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal value table");
     }
 
+    status = _gd_memory_plan_build(graph, &plan);
+    if (status != GD_OK) {
+        goto fail;
+    }
+    if (plan.n_slots > 0) {
+        slot_storage = calloc((size_t)plan.n_slots, sizeof(*slot_storage));
+        if (slot_storage == NULL) {
+            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal plan slots");
+            goto fail;
+        }
+        for (i = 0; i < plan.n_slots; ++i) {
+            gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
+                                     plan.slot_nbytes[i], plan.slot_alignment[i]};
+            status = gd_storage_create(graph->ctx, &sdesc, &slot_storage[i]);
+            if (status != GD_OK) {
+                goto fail;
+            }
+        }
+    }
+
     for (i = 0; i < n; ++i) {
         const _gd_value *value = &graph->values[i];
         gd_storage_desc sdesc;
         gd_storage *storage = NULL;
         size_t nbytes = 0U;
         size_t alignment = 0U;
+
+        int slot = plan.values != NULL ? plan.values[i].slot : -1;
 
         if (value->external != NULL && !_gd_tensor_is_contiguous(value->external)) {
             status = _gd_error(GD_ERR_UNSUPPORTED, "metal requires contiguous leaf inputs");
@@ -229,6 +256,12 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
                 goto fail;
             }
             exe->values[i].external_alias = true;
+        } else if (slot >= 0) {
+            storage = slot_storage[slot];
+            status = gd_storage_retain(storage);
+            if (status != GD_OK) {
+                goto fail;
+            }
         } else {
             sdesc = (gd_storage_desc){{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
                                       nbytes, alignment};
@@ -238,6 +271,7 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
             }
         }
         exe->values[i].storage = storage;
+        exe->values[i].planned = slot >= 0;
         exe->values[i].external = value->external; /* borrowed; graph retains it */
         exe->values[i].leaf_offset =
             value->external != NULL ? (size_t)value->desc.storage_offset_bytes : 0U;
@@ -320,10 +354,22 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
         _gd_metal_plan_fusions(self, graph, exe);
     }
 
+    for (i = 0; i < plan.n_slots; ++i) {
+        gd_storage_release(slot_storage[i]);
+    }
+    free(slot_storage);
+    _gd_memory_plan_free(&plan);
     *out = exe;
     return GD_OK;
 
 fail:
+    if (slot_storage != NULL) {
+        for (i = 0; i < plan.n_slots; ++i) {
+            gd_storage_release(slot_storage[i]);
+        }
+        free(slot_storage);
+    }
+    _gd_memory_plan_free(&plan);
     _gd_metal_executable_free(self, exe);
     return status;
 }

@@ -265,6 +265,7 @@ gd_status gd_graph_compare(gd_graph *graph,
     double atol = _GD_COMPARE_DEFAULT_ATOL;
     double rtol = _GD_COMPARE_DEFAULT_RTOL;
     bool compare_externals = false;
+    bool preserve_old = false;
     int n = 0;
     int i = 0;
 
@@ -282,13 +283,17 @@ gd_status gd_graph_compare(gd_graph *graph,
     }
 
     n = graph->n_values;
+    preserve_old = graph->preserve_all_values;
+    graph->preserve_all_values = true;
 
     status = run_and_snapshot(graph, reference, compare_externals, &ref_snaps);
     if (status != GD_OK) {
+        graph->preserve_all_values = preserve_old;
         return status;
     }
     status = run_and_snapshot(graph, target, compare_externals, &tgt_snaps);
     if (status != GD_OK) {
+        graph->preserve_all_values = preserve_old;
         free_snapshots(ref_snaps, n);
         return status;
     }
@@ -322,6 +327,7 @@ gd_status gd_graph_compare(gd_graph *graph,
 
     free_snapshots(ref_snaps, n);
     free_snapshots(tgt_snaps, n);
+    graph->preserve_all_values = preserve_old;
     if (status == GD_OK) {
         _gd_set_last_error(GD_OK, NULL);
     }

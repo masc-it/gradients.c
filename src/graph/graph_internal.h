@@ -93,6 +93,22 @@ typedef struct _gd_node {
 typedef struct _gd_backend _gd_backend;
 typedef struct _gd_executable _gd_executable;
 
+typedef struct _gd_memory_plan_value {
+    int slot;                    /* -1 means allocate/bind normally */
+    size_t nbytes;
+    size_t alignment;
+    int start_node;
+    int end_node;
+} _gd_memory_plan_value;
+
+typedef struct _gd_memory_plan {
+    int n_values;
+    int n_slots;
+    _gd_memory_plan_value *values;
+    size_t *slot_nbytes;
+    size_t *slot_alignment;
+} _gd_memory_plan;
+
 struct gd_graph_input {
     gd_graph *graph;
     int index;
@@ -127,6 +143,7 @@ struct gd_graph {
     int input_cap;
     _gd_backend *backend;         /* selected at compile time */
     _gd_executable *exec;         /* backend-owned compiled artifact */
+    bool preserve_all_values;     /* debug/compare: disable lifetime reuse */
 };
 
 const char *_gd_graph_state_name(_gd_graph_state state);
@@ -196,6 +213,9 @@ gd_status _gd_graph_value_storage(gd_graph *graph,
 gd_status _gd_graph_set_value_name(gd_graph *graph, int value_id, const char *name);
 gd_status _gd_graph_materialize_live_virtuals(gd_graph *graph);
 gd_status _gd_graph_runner_validate_ready(const gd_graph_runner *runner);
+
+gd_status _gd_memory_plan_build(const gd_graph *graph, _gd_memory_plan *plan);
+void _gd_memory_plan_free(_gd_memory_plan *plan);
 
 gd_status _gd_graph_dump_text(gd_graph *graph, const char *path);
 

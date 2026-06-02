@@ -1242,6 +1242,7 @@ static int build_train_graph(gd_context *ctx,
     gd_tensor *positions = NULL;
     gd_tensor *targets = NULL;
     gd_tensor *cu = NULL;
+    gd_tensor *patch_linear = NULL;
     gd_tensor *patch_embeds = NULL;
     gd_tensor *text_embeds_raw = NULL;
     gd_tensor *text_embeds = NULL;
@@ -1278,7 +1279,8 @@ static int build_train_graph(gd_context *ctx,
                          tok_sizes, &targets, &out->targets_in));
     CHECK_ZERO(add_input(ctx, out->graph, "cu_seqlens", GD_DTYPE_I32, device, 1,
                          cu_sizes, &cu, &out->cu_in));
-    CHECK_OK(gd_linear(ctx, patches, w_patch, b_patch, &patch_embeds));
+    CHECK_OK(gd_linear(ctx, patches, w_patch, NULL, &patch_linear));
+    CHECK_OK(gd_add(ctx, patch_linear, b_patch, &patch_embeds));
     CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, text_tokens, &text_embeds_raw));
     CHECK_OK(gd_rms_norm(ctx, text_embeds_raw, txt_norm, 1.0e-5F, &text_embeds));
     for (b = 0; b < batch->batch_size; ++b) {
@@ -1337,6 +1339,7 @@ static int build_train_graph(gd_context *ctx,
     gd_tensor_release(positions);
     gd_tensor_release(targets);
     gd_tensor_release(cu);
+    gd_tensor_release(patch_linear);
     gd_tensor_release(patch_embeds);
     gd_tensor_release(text_embeds_raw);
     gd_tensor_release(text_embeds);

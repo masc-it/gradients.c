@@ -466,7 +466,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     gd_sdpa_config sdpa = {0.0f, true, c->attention_window, prefix_len};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
-    gd_tensor *om = NULL, *op = NULL, *drop = NULL, *out = NULL;
+    gd_tensor *om = NULL, *op_mat = NULL, *op = NULL, *drop = NULL, *out = NULL;
     gd_status s = GD_OK;
 
     *out_p = NULL;
@@ -479,7 +479,8 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
     if (s == GD_OK) { s = gd_sdpa(ctx, qr, kr, v, NULL, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
-    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], g->b_wo[l], &op); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op_mat); }
+    if (s == GD_OK) { s = gd_add(ctx, op_mat, g->b_wo[l], &op); }
     if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
     if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
 
@@ -494,6 +495,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     gd_tensor_release(kr);
     gd_tensor_release(o);
     gd_tensor_release(om);
+    gd_tensor_release(op_mat);
     gd_tensor_release(op);
     gd_tensor_release(drop);
     *out_p = out;
@@ -523,7 +525,7 @@ static gd_status attention_block_varlen(gd_context *ctx,
     gd_sdpa_varlen_config sdpa = {0.0f, true, c->attention_window, prefix_len, max_seqlen};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
-    gd_tensor *om = NULL, *op = NULL, *drop = NULL, *out = NULL;
+    gd_tensor *om = NULL, *op_mat = NULL, *op = NULL, *drop = NULL, *out = NULL;
     gd_status s = GD_OK;
 
     *out_p = NULL;
@@ -536,7 +538,8 @@ static gd_status attention_block_varlen(gd_context *ctx,
     if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
     if (s == GD_OK) { s = gd_sdpa_varlen(ctx, qr, kr, v, cu_seqlens, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 2, o2, &om); }
-    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], g->b_wo[l], &op); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op_mat); }
+    if (s == GD_OK) { s = gd_add(ctx, op_mat, g->b_wo[l], &op); }
     if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
     if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
 
@@ -551,6 +554,7 @@ static gd_status attention_block_varlen(gd_context *ctx,
     gd_tensor_release(kr);
     gd_tensor_release(o);
     gd_tensor_release(om);
+    gd_tensor_release(op_mat);
     gd_tensor_release(op);
     gd_tensor_release(drop);
     *out_p = out;
@@ -562,13 +566,14 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
                            gd_tensor **out_p)
 {
     const gd_gpt_config *c = &g->cfg;
-    gd_tensor *n = NULL, *gate = NULL, *act = NULL, *up = NULL, *hh = NULL;
+    gd_tensor *n = NULL, *gate_mat = NULL, *gate = NULL, *act = NULL, *up = NULL, *hh = NULL;
     gd_tensor *down = NULL, *drop = NULL, *out = NULL;
     gd_status s = GD_OK;
 
     *out_p = NULL;
     s = gd_rms_norm(ctx, h, g->ln2[l], c->norm_eps, &n);
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->w_gate[l], g->b_gate[l], &gate); }
+    if (s == GD_OK) { s = gd_linear(ctx, n, g->w_gate[l], NULL, &gate_mat); }
+    if (s == GD_OK) { s = gd_add(ctx, gate_mat, g->b_gate[l], &gate); }
     if (c->mlp_kind == GD_GPT_MLP_POWLU) {
         if (s == GD_OK) { s = gd_linear(ctx, n, g->w_up[l], NULL, &up); }
         if (s == GD_OK) { s = gd_powlu(ctx, up, gate, c->powlu_m, &hh); }
@@ -584,6 +589,7 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
     if (s == GD_OK) { s = gd_add(ctx, h, drop, &out); }
 
     gd_tensor_release(n);
+    gd_tensor_release(gate_mat);
     gd_tensor_release(gate);
     gd_tensor_release(act);
     gd_tensor_release(up);

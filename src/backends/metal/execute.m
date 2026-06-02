@@ -225,8 +225,12 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
         }
         st.inFlight = nil;
         if (exe->needs_writeback) {
-            return _gd_metal_writeback_externals(self, exe);
+            status = _gd_metal_writeback_externals(self, exe);
+            if (status != GD_OK) {
+                return status;
+            }
         }
+        exe->run_id += 1U;
         return GD_OK;
     }
 
@@ -299,6 +303,7 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
          * runs, so deferring does not lose in-place updates. */
         _gd_metal_register_pending_writeback(self, exe);
     }
+    exe->run_id += 1U;
     return GD_OK;
 }
 

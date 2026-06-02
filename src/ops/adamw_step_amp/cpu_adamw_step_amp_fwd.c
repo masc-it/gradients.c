@@ -47,10 +47,20 @@ static gd_status adamw_step_amp_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (found_desc->dtype != GD_DTYPE_I32 || found_desc->ndim != 0) {
         return _gd_error(GD_ERR_DTYPE, "adamw_step_amp expects I32 found_inf");
     }
-    if (node->n_inputs == 7) {
-        status = _gd_cpu_exec_input(exec, node, 6, &refresh, &refresh_desc);
+    if (node->n_inputs == 7 || node->n_inputs == 8) {
+        int refresh_index = 6;
+        if (node->n_inputs == 8) {
+            status = _gd_cpu_exec_input(exec, node, 6, (void **)&lr, &lr_desc);
+            if (status != GD_OK) { return status; }
+            if (lr_desc->dtype != GD_DTYPE_F32 || lr_desc->ndim != 0) {
+                return _gd_error(GD_ERR_DTYPE, "adamw lr tensor must be F32 scalar");
+            }
+            refresh_index = 7;
+        }
+        status = _gd_cpu_exec_input(exec, node, refresh_index, &refresh, &refresh_desc);
         if (status != GD_OK) { return status; }
-        if (refresh_desc->dtype == GD_DTYPE_F32 && refresh_desc->ndim == 0) {
+        if (node->n_inputs == 7 && refresh_desc->dtype == GD_DTYPE_F32 &&
+            refresh_desc->ndim == 0) {
             lr = (float *)refresh;
             lr_desc = refresh_desc;
         } else {

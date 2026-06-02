@@ -7,6 +7,16 @@
 
 SHELL := /bin/bash
 
+# Default to parallel builds. Override with `make MAKE_JOBS=1 ...` for serial,
+# or pass an explicit `-jN` to make. Recursive makes inherit jobserver tokens.
+DEFAULT_JOBS := $(shell { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; } | tail -n 1)
+MAKE_JOBS ?= $(DEFAULT_JOBS)
+ifneq ($(MAKE_JOBS),1)
+ifeq ($(filter -j%,$(MAKEFLAGS))$(findstring jobserver,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(MAKE_JOBS)
+endif
+endif
+
 # ----- Project layout -------------------------------------------------------
 BUILD_DIR := build
 INCLUDE_DIR := include
@@ -118,9 +128,11 @@ MLP_SRC := $(EXAMPLE_DIR)/mlp/mlp.c
 MLP_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/mlp/mlp
 GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
+GPT_LM_SRC := $(EXAMPLE_DIR)/gpt-lm/gpt_lm.c
+GPT_LM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-lm/gpt_lm
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
+.PHONY: help all build check test tests mlp gpt gpt-lm bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -131,6 +143,7 @@ help:
 	@printf '%s\n' '  make generated   regenerate operator registry scaffolding'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
+	@printf '%s\n' '  make gpt-lm      build library + real GPT-LM trainer (pass GPT_LM_ARGS=...)'
 	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
 	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
@@ -138,6 +151,8 @@ help:
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
 	@printf '%s\n' '  make list        show discovered source/test/example files'
 	@printf '%s\n' '  make clean       remove build artifacts'
+	@printf '%s\n' ''
+	@printf '%s\n' 'Parallelism: default MAKE_JOBS=$(MAKE_JOBS); use MAKE_JOBS=1 or -jN to override.'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Primary run commands intentionally build first.'
 
@@ -177,6 +192,15 @@ else
 	@$(MAKE) --no-print-directory $(GPT_BIN)
 	@printf '[gpt] run %s (GD_DEVICE=%s)\n' '$(GPT_BIN)' '$(GD_DEVICE)'
 	@$(GPT_BIN)
+endif
+
+ifeq ($(wildcard $(GPT_LM_SRC)),)
+gpt-lm: build
+	@printf '[gpt-lm] missing %s; skipped\n' '$(GPT_LM_SRC)'
+else
+gpt-lm: $(LIB) $(METALLIB) $(GPT_LM_BIN)
+	@printf '[gpt-lm] run %s %s\n' '$(GPT_LM_BIN)' '$(GPT_LM_ARGS)'
+	@$(GPT_LM_BIN) $(GPT_LM_ARGS)
 endif
 
 bench-gpt:

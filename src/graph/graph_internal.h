@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "gradients/dtype.h"
 #include "gradients/graph.h"
@@ -27,6 +28,7 @@ typedef struct _gd_op_attrs {
     bool has_bias;               /* LINEAR */
     float eps;                   /* RMS_NORM / ADAMW */
     float powlu_m;               /* POWLU */
+    uint64_t dropout_seed;       /* DROPOUT */
     gd_dtype cast_dtype;         /* CAST */
     bool gelu_tanh;              /* GELU: tanh approximation vs exact erf */
     int perm[GD_MAX_DIMS];      /* TRANSPOSE: output axis permutation */

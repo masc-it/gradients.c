@@ -14,6 +14,8 @@ struct gd_gpt {
     gd_context *ctx;
     gd_gpt_config cfg;
     gd_module *module; /* owns all parameter tensors */
+    uint64_t dropout_seed;
+    bool training;
 
     gd_tensor *wte;    /* [V, d] token embedding (also tied LM head) */
     gd_tensor *ln_f;   /* [d] final norm */
@@ -33,14 +35,33 @@ struct gd_gpt {
 
 /* Deterministic PRNG (splitmix64-ish) so two models built from the same seed
  * have identical initial weights -- required for CPU<->Metal parity tests. */
-static float nrand(uint64_t *state)
+static uint64_t next_rand_u64(uint64_t *state)
 {
     uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z = z ^ (z >> 31);
-    /* uniform in [-1, 1) */
-    return ((float)(z >> 40) / (float)(1u << 24)) * 2.0f - 1.0f;
+    return z ^ (z >> 31);
+}
+
+static float rand_uniform01(uint64_t *state)
+{
+    uint64_t z = next_rand_u64(state);
+    /* 24 random mantissa bits, open interval avoids log(0) in normal init. */
+    return ((float)(z >> 40) + 0.5F) * (1.0F / 16777216.0F);
+}
+
+static float rand_normal(uint64_t *state)
+{
+    float u = 0.0F;
+    float v = 0.0F;
+    float s = 0.0F;
+
+    do {
+        u = 2.0F * rand_uniform01(state) - 1.0F;
+        v = 2.0F * rand_uniform01(state) - 1.0F;
+        s = u * u + v * v;
+    } while (s >= 1.0F || s <= 0.0F);
+    return u * sqrtf(-2.0F * logf(s) / s);
 }
 
 static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64_t *sizes,
@@ -81,12 +102,12 @@ static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64
     if (dtype == GD_DTYPE_F32) {
         float *f = (float *)buf;
         for (j = 0; j < numel; ++j) {
-            f[j] = ones ? 1.0f : scale * nrand(rng);
+            f[j] = ones ? 1.0f : scale * rand_normal(rng);
         }
     } else {
         uint16_t *h = (uint16_t *)buf;
         for (j = 0; j < numel; ++j) {
-            h[j] = _gd_f32_to_f16_bits(ones ? 1.0f : scale * nrand(rng));
+            h[j] = _gd_f32_to_f16_bits(ones ? 1.0f : scale * rand_normal(rng));
         }
     }
     status = gd_tensor_copy_from_cpu(g->ctx, t, buf, nbytes);
@@ -130,6 +151,7 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     gd_status status = GD_OK;
     uint64_t rng = seed ? seed : 0x123456789ULL;
     float wscale = 0.02f;
+    float residual_wscale = 0.02f;
     int d = 0, dff = 0, Hq = 0, Hkv = 0, Dh = 0, V = 0, L = 0, l = 0;
     char name[64];
 
@@ -152,6 +174,9 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     }
     if (cfg.attention_window < 0) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "attention_window must be non-negative");
+    }
+    if (!isfinite(cfg.dropout_p) || cfg.dropout_p < 0.0F || cfg.dropout_p >= 1.0F) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dropout_p must satisfy 0 <= p < 1");
     }
     if (cfg.param_dtype == GD_DTYPE_INVALID) {
         cfg.param_dtype = GD_DTYPE_F32;
@@ -179,6 +204,9 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
         return _gd_error(GD_ERR_INVALID_ARGUMENT,
                          "invalid gpt config (need d_model==n_heads*head_dim, n_heads%n_kv_heads==0)");
     }
+    /* GPT-2-style init: normal(0, 0.02) for weights; residual output
+     * projections use 0.02/sqrt(2*n_layers) to control residual-path growth. */
+    residual_wscale = wscale / sqrtf(2.0F * (float)L);
 
     g = calloc(1u, sizeof(*g));
     if (g == NULL) {
@@ -186,6 +214,8 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     }
     g->ctx = ctx;
     g->cfg = cfg;
+    g->dropout_seed = rng ^ UINT64_C(0xd1b54a32d192ed03);
+    g->training = false;
     status = gd_module_create(ctx, "gpt", &g->module);
     if (status != GD_OK) {
         free(g);
@@ -234,7 +264,7 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
         }
         if (status == GD_OK) {
             (void)snprintf(name, sizeof(name), "blk.%d.wo", l);
-            status = create_param(g, name, 2, s_wo, wscale, 0, &rng, &g->wo[l]);
+            status = create_param(g, name, 2, s_wo, residual_wscale, 0, &rng, &g->wo[l]);
         }
         if (status == GD_OK) {
             (void)snprintf(name, sizeof(name), "blk.%d.ln2", l);
@@ -250,7 +280,7 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
         }
         if (status == GD_OK) {
             (void)snprintf(name, sizeof(name), "blk.%d.w_down", l);
-            status = create_param(g, name, 2, s_ff_out, wscale, 0, &rng, &g->w_down[l]);
+            status = create_param(g, name, 2, s_ff_out, residual_wscale, 0, &rng, &g->w_down[l]);
         }
     }
 
@@ -279,6 +309,18 @@ void gd_gpt_destroy(gd_gpt *gpt)
     free(gpt->w_up);
     free(gpt->w_down);
     free(gpt);
+}
+
+void gd_gpt_set_training(gd_gpt *gpt, bool training)
+{
+    if (gpt != NULL) {
+        gpt->training = training;
+    }
+}
+
+bool gd_gpt_is_training(const gd_gpt *gpt)
+{
+    return gpt != NULL && gpt->training;
 }
 
 gd_status gd_gpt_parameters(gd_gpt *gpt, gd_tensor ***params_out, int *n_out)
@@ -373,6 +415,25 @@ void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups)
     free(groups);
 }
 
+static uint64_t mix_dropout_seed(uint64_t seed, uint64_t site)
+{
+    uint64_t x = seed + site * UINT64_C(0x9E3779B97F4A7C15);
+
+    x = (x ^ (x >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return x ^ (x >> 31);
+}
+
+static gd_status gpt_dropout(gd_context *ctx,
+                             gd_gpt *g,
+                             gd_tensor *x,
+                             uint64_t site,
+                             gd_tensor **out)
+{
+    return gd_dropout(ctx, x, g->cfg.dropout_p, mix_dropout_seed(g->dropout_seed, site),
+                      g->training, out);
+}
+
 /* x[B,T,d] -> x + attn(rms_norm(x)). Returns a new virtual tensor. */
 static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
                                  gd_tensor *x, gd_tensor *positions,
@@ -387,7 +448,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     gd_sdpa_config sdpa = {0.0f, true, c->attention_window, 0};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
-    gd_tensor *om = NULL, *op = NULL, *out = NULL;
+    gd_tensor *om = NULL, *op = NULL, *drop = NULL, *out = NULL;
     gd_status s = GD_OK;
 
     *out_p = NULL;
@@ -403,7 +464,8 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     if (s == GD_OK) { s = gd_sdpa(ctx, qr, kr, v, NULL, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
     if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op); }
-    if (s == GD_OK) { s = gd_add(ctx, x, op, &out); }
+    if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
+    if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
 
     gd_tensor_release(n);
     gd_tensor_release(qf);
@@ -417,6 +479,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     gd_tensor_release(o);
     gd_tensor_release(om);
     gd_tensor_release(op);
+    gd_tensor_release(drop);
     *out_p = out;
     return s;
 }
@@ -427,7 +490,7 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
 {
     const gd_gpt_config *c = &g->cfg;
     gd_tensor *n = NULL, *gate = NULL, *act = NULL, *up = NULL, *hh = NULL;
-    gd_tensor *down = NULL, *out = NULL;
+    gd_tensor *down = NULL, *drop = NULL, *out = NULL;
     gd_status s = GD_OK;
 
     *out_p = NULL;
@@ -444,7 +507,8 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
         if (s == GD_OK) { s = gd_gelu(ctx, gate, false, &hh); }
     }
     if (s == GD_OK) { s = gd_linear(ctx, hh, g->w_down[l], NULL, &down); }
-    if (s == GD_OK) { s = gd_add(ctx, h, down, &out); }
+    if (s == GD_OK) { s = gpt_dropout(ctx, g, down, UINT64_C(0x2000) + (uint64_t)l, &drop); }
+    if (s == GD_OK) { s = gd_add(ctx, h, drop, &out); }
 
     gd_tensor_release(n);
     gd_tensor_release(gate);
@@ -452,6 +516,7 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
     gd_tensor_release(up);
     gd_tensor_release(hh);
     gd_tensor_release(down);
+    gd_tensor_release(drop);
     *out_p = out;
     return s;
 }
@@ -462,6 +527,7 @@ static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
 {
     gd_status s = GD_OK;
     int64_t B = 0, T = 0;
+    gd_tensor *emb = NULL;
     gd_tensor *x = NULL;
     gd_tensor *normed = NULL;
     int l = 0;
@@ -477,7 +543,10 @@ static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
     B = gd_tensor_size(tokens, 0);
     T = gd_tensor_size(tokens, 1);
 
-    s = gd_embedding(ctx, gpt->wte, tokens, &x);
+    s = gd_embedding(ctx, gpt->wte, tokens, &emb);
+    if (s == GD_OK) {
+        s = gpt_dropout(ctx, gpt, emb, UINT64_C(0x1), &x);
+    }
     for (l = 0; l < gpt->cfg.n_layers && s == GD_OK; ++l) {
         gd_tensor *attn = NULL;
         gd_tensor *mlp = NULL;
@@ -495,6 +564,7 @@ static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
     if (s == GD_OK) {
         s = gd_rms_norm(ctx, x, gpt->ln_f, gpt->cfg.norm_eps, &normed);
     }
+    gd_tensor_release(emb);
     gd_tensor_release(x);
     if (s != GD_OK) {
         gd_tensor_release(normed);

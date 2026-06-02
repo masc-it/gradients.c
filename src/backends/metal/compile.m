@@ -69,7 +69,7 @@ static bool can_alias_copy_value(const gd_graph *graph, const _gd_node *node)
     return in_bytes == out_bytes;
 }
 
-static bool node_mutates_input(const _gd_node *node, int input_index)
+static bool node_mutates_input(const gd_graph *graph, const _gd_node *node, int input_index)
 {
     switch (node->op) {
     case _GD_OP_STEP_INC:
@@ -81,7 +81,13 @@ static bool node_mutates_input(const _gd_node *node, int input_index)
     case _GD_OP_ADAMW_STEP:
         return input_index == 0 || input_index == 2 || input_index == 3;
     case _GD_OP_ADAMW_STEP_AMP:
-        return input_index == 0 || input_index == 2 || input_index == 3 || input_index == 6;
+        if (input_index == 0 || input_index == 2 || input_index == 3) { return true; }
+        if (node->n_inputs == 8) { return input_index == 7; }
+        if (node->n_inputs == 7 && input_index == 6) {
+            const _gd_value *extra = &graph->values[node->inputs[6]];
+            return !(extra->desc.dtype == GD_DTYPE_F32 && extra->desc.ndim == 0);
+        }
+        return false;
     case _GD_OP_AMP_UNSCALE_GRAD:
         return input_index == 0 || input_index == 2;
     case _GD_OP_AMP_STEP_INC:
@@ -110,7 +116,7 @@ static void mark_external_writebacks(_gd_executable *exe)
         }
         for (j = 0; j < node->n_inputs; ++j) {
             int value_id = node->inputs[j];
-            if (node_mutates_input(node, j) && value_id >= 0 && value_id < exe->n_values &&
+            if (node_mutates_input(exe->graph, node, j) && value_id >= 0 && value_id < exe->n_values &&
                 exe->values[value_id].external != NULL && !exe->values[value_id].external_alias) {
                 exe->values[value_id].needs_writeback = true;
             }

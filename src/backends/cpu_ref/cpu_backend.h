@@ -21,6 +21,12 @@ gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
 gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, void *out, const void *x, float scale);
 gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, void *out, const void *x);
 gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, void *out, const void *x);
+gd_status _gd_cpu_k_dropout(const gd_tensor_desc *desc,
+                            void *out,
+                            const void *x,
+                            float p,
+                            uint64_t seed,
+                            uint64_t run_id);
 gd_status _gd_cpu_k_powlu(const gd_tensor_desc *desc, void *out,
                           const void *x1, const void *x2, float m);
 gd_status _gd_cpu_k_powlu_bwd(const gd_tensor_desc *desc, void *dx1, void *dx2,
@@ -133,6 +139,12 @@ gd_status _gd_cpu_k_silu_bwd(const gd_tensor_desc *desc,
                              void *dx,
                              const void *x,
                              const void *go);
+gd_status _gd_cpu_k_dropout_bwd(const gd_tensor_desc *desc,
+                                void *dx,
+                                const void *go,
+                                float p,
+                                uint64_t seed,
+                                uint64_t run_id);
 gd_status _gd_cpu_k_softmax_bwd(const gd_tensor_desc *desc,
                                 float *dx,
                                 const float *y,

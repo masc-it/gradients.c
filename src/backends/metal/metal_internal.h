@@ -89,6 +89,7 @@ struct _gd_executable {
     size_t scratch_arena_bytes;
     uint8_t *node_absorbed;
     int *node_fused_src;
+    uint64_t run_id;
 };
 
 GDMetalState *_gd_metal_state(_gd_backend *self);

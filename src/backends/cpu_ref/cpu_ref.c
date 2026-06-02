@@ -19,6 +19,7 @@ struct _gd_executable {
     const gd_graph *graph;
     int n_values;
     _gd_exec_buffer *buffers;
+    uint64_t run_id;
 };
 
 gd_status _gd_cpu_exec_value(_gd_cpu_exec *exec,
@@ -70,6 +71,11 @@ gd_status _gd_cpu_exec_output(_gd_cpu_exec *exec,
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "CPU_REF output index is out of range");
     }
     return _gd_cpu_exec_value(exec, node->outputs[output_index], data_out, desc_out);
+}
+
+uint64_t _gd_cpu_exec_run_id(const _gd_cpu_exec *exec)
+{
+    return exec == NULL ? 0U : exec->run_id;
 }
 
 gd_status _gd_cpu_require_f32(const gd_tensor_desc *desc)
@@ -223,6 +229,7 @@ static gd_status cpu_execute(_gd_backend *self, _gd_executable *exe)
             return status;
         }
     }
+    exe->run_id += 1U;
     return GD_OK;
 }
 
@@ -238,6 +245,7 @@ static gd_status cpu_execute_until(_gd_backend *self, _gd_executable *exe, int n
             return status;
         }
     }
+    exe->run_id += 1U;
     return GD_OK;
 }
 

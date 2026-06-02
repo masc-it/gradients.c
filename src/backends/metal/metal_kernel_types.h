@@ -98,6 +98,16 @@ typedef struct gd_metal_powlu_params {
     int dtype;                         /* GD_METAL_DT_*; inputs/output share dtype */
 } gd_metal_powlu_params;
 
+typedef struct gd_metal_dropout_params {
+    int numel;
+    float p;
+    int dtype;                         /* GD_METAL_DT_*; input/output share dtype */
+    unsigned int seed_lo;
+    unsigned int seed_hi;
+    unsigned int run_lo;
+    unsigned int run_hi;
+} gd_metal_dropout_params;
+
 /* dtype codes shared with the cast kernel (a small closed set, not the full
  * gd_dtype enum, so the host maps explicitly). */
 #define GD_METAL_DT_F32 0

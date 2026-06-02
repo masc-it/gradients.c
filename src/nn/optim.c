@@ -476,13 +476,9 @@ static gd_status optimizer_step_impl(gd_context *ctx,
 }
 
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
-{
-    return optimizer_step_impl(ctx, optimizer, NULL);
-}
+{ return optimizer_step_impl(ctx, optimizer, NULL); }
 
-gd_status gd_optimizer_step_lr(gd_context *ctx,
-                               gd_optimizer *optimizer,
-                               gd_tensor *lr_scalar)
+gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, gd_tensor *lr_scalar)
 {
     if (lr_scalar == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_lr lr_scalar is NULL");
@@ -490,11 +486,9 @@ gd_status gd_optimizer_step_lr(gd_context *ctx,
     return optimizer_step_impl(ctx, optimizer, lr_scalar);
 }
 
-static gd_status optimizer_step_amp_impl(gd_context *ctx,
-                                        gd_optimizer *optimizer,
-                                        gd_amp_scaler *scaler,
-                                        float max_norm,
-                                        gd_tensor **norm_out)
+static gd_status optimizer_step_amp_impl(gd_context *ctx, gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler, float max_norm,
+                                        gd_tensor **norm_out, gd_tensor *lr_scalar)
 {
     gd_status status = GD_OK;
     gd_graph *graph = NULL;
@@ -513,6 +507,8 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
     if (max_norm < 0.0F || !isfinite(max_norm)) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "AMP grad clip max_norm must be nonnegative finite");
     }
+    status = validate_lr_tensor(lr_scalar);
+    if (status != GD_OK) { return status; }
     status = _gd_amp_scaler_validate(scaler);
     if (status != GD_OK) {
         return status;
@@ -585,8 +581,8 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
         adamw_slot *slot = &optimizer->slots[i];
         gd_tensor *grad = NULL;
         gd_tensor *update_param = slot->master != NULL ? slot->master : slot->param;
-        gd_tensor *inputs[7];
-        int n_inputs = slot->master != NULL ? 7 : 6;
+        gd_tensor *inputs[8];
+        int n_inputs = 6;
 
         status = _gd_tensor_ensure_grad(ctx, slot->param, &grad);
         if (status != GD_OK) {
@@ -594,14 +590,14 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
         }
         attrs.weight_decay = slot->weight_decay;
         attrs.scale = slot->lr_scale;
-        inputs[0] = update_param;
-        inputs[1] = grad;
-        inputs[2] = slot->m;
-        inputs[3] = slot->v;
-        inputs[4] = optimizer->step;
-        inputs[5] = found_inf;
+        inputs[0] = update_param; inputs[1] = grad;
+        inputs[2] = slot->m; inputs[3] = slot->v;
+        inputs[4] = optimizer->step; inputs[5] = found_inf;
+        if (lr_scalar != NULL) {
+            inputs[n_inputs++] = lr_scalar;
+        }
         if (slot->master != NULL) {
-            inputs[6] = slot->param;
+            inputs[n_inputs++] = slot->param;
         }
         status = _gd_graph_emit_inplace(graph, _GD_OP_ADAMW_STEP_AMP,
                                         inputs, n_inputs, &attrs);
@@ -612,23 +608,32 @@ static gd_status optimizer_step_amp_impl(gd_context *ctx,
     return GD_OK;
 }
 
-gd_status gd_optimizer_step_amp(gd_context *ctx,
-                                gd_optimizer *optimizer,
+gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer,
                                 gd_amp_scaler *scaler)
+{ return optimizer_step_amp_impl(ctx, optimizer, scaler, 0.0F, NULL, NULL); }
+
+gd_status gd_optimizer_step_amp_lr(gd_context *ctx, gd_optimizer *optimizer,
+                                   gd_amp_scaler *scaler, gd_tensor *lr_scalar)
 {
-    return optimizer_step_amp_impl(ctx, optimizer, scaler, 0.0F, NULL);
+    if (lr_scalar == NULL) { return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_lr lr_scalar is NULL"); }
+    return optimizer_step_amp_impl(ctx, optimizer, scaler, 0.0F, NULL, lr_scalar);
 }
 
-gd_status gd_optimizer_step_amp_clip(gd_context *ctx,
-                                     gd_optimizer *optimizer,
-                                     gd_amp_scaler *scaler,
-                                     float max_norm,
+gd_status gd_optimizer_step_amp_clip(gd_context *ctx, gd_optimizer *optimizer,
+                                     gd_amp_scaler *scaler, float max_norm,
                                      gd_tensor **norm_out)
 {
-    if (max_norm <= 0.0F) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_clip max_norm must be positive");
-    }
-    return optimizer_step_amp_impl(ctx, optimizer, scaler, max_norm, norm_out);
+    if (max_norm <= 0.0F) { return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_clip max_norm must be positive"); }
+    return optimizer_step_amp_impl(ctx, optimizer, scaler, max_norm, norm_out, NULL);
+}
+
+gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx, gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler, float max_norm,
+                                        gd_tensor **norm_out, gd_tensor *lr_scalar)
+{
+    if (lr_scalar == NULL) { return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_clip_lr lr_scalar is NULL"); }
+    if (max_norm <= 0.0F) { return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_optimizer_step_amp_clip_lr max_norm must be positive"); }
+    return optimizer_step_amp_impl(ctx, optimizer, scaler, max_norm, norm_out, lr_scalar);
 }
 
 gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,

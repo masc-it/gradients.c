@@ -42,6 +42,8 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_COPY, "copy"},
     {_GD_OP_CROSS_ENTROPY_BWD, "cross_entropy_bwd"},
     {_GD_OP_CROSS_ENTROPY, "cross_entropy"},
+    {_GD_OP_DROPOUT_BWD, "dropout_bwd"},
+    {_GD_OP_DROPOUT, "dropout"},
     {_GD_OP_EMBEDDING_BWD, "embedding_bwd"},
     {_GD_OP_EMBEDDING, "embedding"},
     {_GD_OP_GELU_BWD, "gelu_bwd"},

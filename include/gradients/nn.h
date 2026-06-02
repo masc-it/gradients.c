@@ -40,6 +40,7 @@ typedef struct gd_gpt_config {
     int attention_window; /* 0 => full causal; >0 => causal sliding-window */
     gd_dtype param_dtype; /* 0/GD_DTYPE_INVALID => F32; F16 enables forward-only v1 */
     bool tie_embeddings; /* LM head shares the token embedding */
+    float dropout_p; /* 0 => disabled; inverted dropout on embedding/residual branches */
 } gd_gpt_config;
 
 typedef struct gd_gpt gd_gpt;
@@ -47,6 +48,8 @@ typedef struct gd_gpt gd_gpt;
 gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
                         uint64_t seed, gd_gpt **out);
 void gd_gpt_destroy(gd_gpt *gpt);
+void gd_gpt_set_training(gd_gpt *gpt, bool training);
+bool gd_gpt_is_training(const gd_gpt *gpt);
 
 /* Trainable parameters (owned by the model; valid until destroy). */
 gd_status gd_gpt_parameters(gd_gpt *gpt, gd_tensor ***params_out, int *n_out);

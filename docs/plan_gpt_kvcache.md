@@ -1,6 +1,6 @@
 # gradients.c — GPT KV Cache Design
 
-Status: planned v0.1
+Status: planned v0.2 (reviewed; sliding-window decode included in v1)
 
 Goal: add production inference KV cache for decoder-only GPT while reusing the
 existing SDPA implementation family. Training stays unchanged. Prefill uses the
@@ -53,12 +53,20 @@ Host/runtime owns cache allocation and sequence state:
 gd_kv_cache
   k_cache[layer]
   v_cache[layer]
+  base_len_tensor[B]
+  append_len_tensor[B]
+  src_offset_tensor[B]
   committed_len[B]
+  last_append_len[B]
   capacity
   batch_size
+  dtype
 ```
 
-Graph does not allocate pages, resize buffers, or own serving policy.
+Graph does not allocate pages, resize buffers, or own serving policy. Cache owns
+persistent length tensors on the cache device. Host `committed_len` is source of
+truth; `set_lengths` mirrors host lengths into those device tensors before graph
+run.
 
 ### 2.2 Cache reads/writes inside graph
 
@@ -110,6 +118,11 @@ src_offset[B]   # source column in k_new/v_new; 0 for decode, T-len for left-pad
 Same-length batch remains fastest. Ragged decode avoids padded cache work because
 kernels loop only over each row's live length.
 
+`gd_kv_cache_set_lengths` validates host arrays, stores `last_append_len`, and
+copies `base_len/append_len/src_offset` into cache-owned device tensors. Prefill
+and decode graphs import those tensors as external values, so one compiled graph
+can be reused while host updates lengths between runs.
+
 ### 2.5 Block decode / future MTP support
 
 Do not bake `Tnew=1` into the op contracts.
@@ -145,6 +158,7 @@ typedef struct gd_kv_cache_config {
     int batch_size;
     int capacity;       /* token capacity per row */
     gd_device device;
+    gd_dtype dtype;     /* 0/GD_DTYPE_INVALID => model activation dtype */
 } gd_kv_cache_config;
 
 gd_status gd_kv_cache_create(gd_context *ctx,
@@ -161,11 +175,32 @@ gd_status gd_kv_cache_set_lengths(gd_kv_cache *cache,
                                   const int32_t *src_offset,
                                   int n);
 
-gd_status gd_kv_cache_commit(gd_kv_cache *cache);
+gd_status gd_kv_cache_set_prefill_lengths(gd_kv_cache *cache,
+                                          const int32_t *prompt_lens,
+                                          int tmax,
+                                          bool left_padded,
+                                          int n);
+
+gd_status gd_kv_cache_commit(gd_kv_cache *cache,
+                             const int32_t *accepted_len); /* NULL => append_len */
 ```
 
-`commit` updates host-side `committed_len[b] += append_len[b]` after successful
-graph execution. It does not need to read GPU data.
+`set_lengths` requires `n == batch_size`; `append_len` is required,
+`base_len == NULL` means current `committed_len`, and `src_offset == NULL` means
+zero. `set_prefill_lengths` is convenience for ragged prompts: it writes
+`base_len=0`, `append_len=prompt_lens`, and
+`src_offset=(left_padded ? tmax-prompt_lens : 0)`.
+
+`commit` is called only after successful graph execution. `accepted_len == NULL`
+commits every appended token. Non-NULL `accepted_len[b]` must satisfy
+`0 <= accepted_len[b] <= last_append_len[b]`; host updates
+`committed_len[b] += accepted_len[b]`. This supports future partial block accept
+without GPU rollback: uncommitted cache rows are ignored and overwritten by the
+next append. `commit` does not read GPU data.
+
+Cache dtype is fixed at creation and must match `k_new/v_new` dtype at append;
+there is no implicit cast in v1. `GD_DTYPE_INVALID` resolves to the GPT activation
+path dtype (`F32` for normal models, `F16` for forward-only F16 models).
 
 ### 3.2 GPT inference APIs
 
@@ -175,7 +210,7 @@ gd_status gd_gpt_prefill(gd_context *ctx,
                          gd_kv_cache *cache,
                          gd_tensor *tokens,       /* int32 [B,T] */
                          gd_tensor *positions,    /* int32 [B,T] */
-                         gd_tensor *prompt_lens,  /* nullable int32 [B] */
+                         gd_tensor *prefill_bias, /* nullable additive SDPA bias */
                          gd_tensor **logits_out);
 
 gd_status gd_gpt_decode_block(gd_context *ctx,
@@ -186,8 +221,10 @@ gd_status gd_gpt_decode_block(gd_context *ctx,
                               gd_tensor **logits_out);
 ```
 
-`gd_gpt_decode_block` uses the cache's `base_len/append_len` tensors set before
-recording/running the graph.
+`gd_gpt_prefill` and `gd_gpt_decode_block` use the cache's
+`base_len/append_len/src_offset` tensors set before recording/running the graph.
+`prefill_bias` is nullable and broadcastable to `[B,Hq,T,T]`; generation builds
+it from the same host prompt lengths used for `gd_kv_cache_set_prefill_lengths`.
 
 Generation v1 calls `gd_gpt_decode_block` with `Tnew=1`.
 
@@ -229,7 +266,12 @@ src_offset[b] + append_len[b] <= Tnew
 base_len[b] + append_len[b] <= capacity
 ```
 
-Op is inference-only, mutating, no backward.
+Op is inference-only, mutating, no backward. `_GD_OP_KV_APPEND` has no outputs
+and is flagged `GD_OPF_MUTATES | GD_OPF_SIDE_EFFECT`. `k_cache/v_cache` must be
+materialized external contiguous tensors on the same device/dtype as
+`k_new/v_new`; they must not require grad and must not alias `k_new/v_new`.
+Backend execution must preserve program order so a following `sdpa_decode` reads
+newly written rows.
 
 ### 4.2 SDPA decode
 
@@ -248,17 +290,19 @@ gd_status gd_sdpa_decode(gd_context *ctx,
 
 - `scale`: same as `gd_sdpa`.
 - `causal`: must be true for decode/block decode.
-- `sliding_window`: optional later.
-- `prefix_len`: not used in decode v1.
+- `sliding_window`: supported in v1; `0` means full causal cache.
+- `prefix_len`: not used in decode v1; reject `prefix_len > 0`.
 - `bias`: omitted in v1 decode path.
 
 Per query row:
 
 ```text
 valid_q = t < append_len[b]
-key_end = base_len[b] + t + 1
+qpos = base_len[b] + t
+key_end = qpos + 1
+key_start = (sliding_window > 0) ? max(0, key_end - sliding_window) : 0
 if !valid_q: out[b,t,h,:] = 0
-else attend j in [0, key_end)
+else attend j in [key_start, key_end)
 ```
 
 This assumes `kv_append` ran earlier in the same graph, so newly appended rows
@@ -303,7 +347,8 @@ Shared with existing SDPA:
 Different from existing SDPA:
 
 - K/V read from cache capacity dimension.
-- live key bound is `base_len[b] + t + 1`, not `Tk` or causal offset.
+- live key range is `[key_start, base_len[b] + t + 1)`, with `key_start`
+  derived from `sliding_window`, not `Tk` or causal offset.
 - no backward.
 - no dense additive bias in v1.
 - no split-K initially unless profiling shows decode needs it.
@@ -368,7 +413,7 @@ Flat cache decode kernel:
 ```text
 grid: one threadgroup per (batch row, query head, query block)
 q block: small Tnew block, optimized for Tnew=1..4
-key loop: tiles over [0, base_len[b] + t + 1)
+key loop: tiles over [key_start, base_len[b] + t + 1)
 ```
 
 Pseudo-kernel:
@@ -380,7 +425,8 @@ for each query t in q block:
   if t >= append_len[b]: write zero
   else:
     end = base_len[b] + t + 1
-    online_softmax over j=0..end-1 using k_cache[b,j,hkv,:]
+    start = (window > 0) ? max(0, end - window) : 0
+    online_softmax over j=start..end-1 using k_cache[b,j,hkv,:]
     accumulate v_cache[b,j,hkv,:]
 ```
 
@@ -419,37 +465,58 @@ o = gd_sdpa(q_rope, k_rope, v, NULL, causal_cfg)
 ```text
 q,k,v = projections + RoPE
 kv_append(cache[layer], k, v,
-          base_len=0,
-          append_len=prompt_lens or T,
-          src_offset=left_pad_offsets or 0)
-o = gd_sdpa(q, k, v, prefill_bias_or_null, causal_cfg)
+          base_len=cache.base_len_tensor,      # 0 for prefill
+          append_len=cache.append_len_tensor,  # prompt_lens or T
+          src_offset=cache.src_offset_tensor)
+o = gd_sdpa(q, k, v, prefill_bias, causal_cfg)
 ```
 
-Same-length prompts use `bias=NULL` and existing fast causal SDPA.
+Same-length prompts call `gd_kv_cache_set_prefill_lengths` with all lengths `T`,
+use `src_offset=0`, `prefill_bias=NULL`, and existing fast causal SDPA.
 
 Ragged padded prompts:
 
+- Host `prompt_lens[B]` are source of truth. Generation calls
+  `gd_kv_cache_set_prefill_lengths(cache, prompt_lens, Tmax, true, B)` before
+  recording/running the prefill graph.
 - Generation default is left padding: valid prompt tokens occupy the right side
   of `[B,Tmax]`, so last-token logits are at column `Tmax-1` for every row.
 - `positions` for valid tokens are logical positions `0..prompt_lens[b)-1`; pad
-  positions are don't-care because mask hides them.
+  positions are don't-care because pad-key bias hides them and pad-query outputs
+  are ignored.
 - Cache append uses `src_offset[b] = Tmax - prompt_lens[b]` so cache rows are
   compacted to logical positions `0..prompt_lens[b)-1`.
+- `prefill_bias` is generated from host `prompt_lens` as additive pad-key mask
+  (broadcastable `[B,1,1,Tmax]` is enough). Causal structure still comes from
+  `gd_sdpa(causal=true)`.
 - Correctness via existing additive bias mask in v1.
 - Not fully compute-fast: dense SDPA still scans `Tmax^2`.
 - Production use should length-bucket prompts to reduce padding waste.
 - Native variable-length prefill can come later, likely via paged/packed SDPA.
 
+After successful prefill graph execution, host calls `gd_kv_cache_commit(cache,
+NULL)` before first decode so `committed_len[b] == prompt_lens[b]`.
+
 ### 6.3 Decode/block decode
 
 ```text
 q,k,v = projections + RoPE
-kv_append(cache[layer], k, v, base_len, append_len)
-o = gd_sdpa_decode(q, cache[layer].k, cache[layer].v, base_len, append_len)
+kv_append(cache[layer], k, v,
+          cache.base_len_tensor,
+          cache.append_len_tensor,
+          src_offset=NULL)
+o = gd_sdpa_decode(q, cache[layer].k, cache[layer].v,
+                   cache.base_len_tensor,
+                   cache.append_len_tensor,
+                   causal_cfg_with_sliding_window)
 ```
 
+For valid decode tokens, `positions[b,t]` must equal `committed_len[b] + t`
+(the same value as `base_len[b] + t` loaded into the cache tensors). This keeps
+RoPE aligned with cache coordinates and makes sliding-window parity exact.
+
 After all layers and LM head, host samples/accepts tokens and calls
-`gd_kv_cache_commit(cache)`.
+`gd_kv_cache_commit(cache, accepted_len_or_null)`.
 
 ---
 
@@ -466,7 +533,8 @@ append_len[b] = Tnew
 ```
 
 This path uses existing SDPA fast kernels for prefill and decode scans exactly
-live cache lengths.
+live cache lengths, or exactly the live sliding-window range when
+`attention_window > 0`.
 
 ### Ragged prefill
 
@@ -491,9 +559,12 @@ Supported efficiently:
 ```text
 base_len[B]
 append_len[B]
+sliding_window optional per model config
 ```
 
-Each row loops only to its own `base_len[b] + t + 1`.
+Each row loops only to its own live key range:
+`[max(0, base_len[b] + t + 1 - window), base_len[b] + t + 1)` when windowed,
+or `[0, base_len[b] + t + 1)` when unwindowed.
 
 ---
 
@@ -505,7 +576,10 @@ Each row loops only to its own `base_len[b] + t + 1`.
 - Per-row `append_len` skips padded query rows.
 - `src_offset` compacts left-padded prefill K/V into cache row 0.
 - Bounds errors when `base_len + append_len > capacity` or `src_offset + append_len > Tnew`.
+- Reject dtype/device mismatches, grad-enabled cache tensors, and cache/new aliasing.
 - Metal append matches CPU and persists across graph runs.
+- Reused decode graph sees updated cache length tensors across many runs.
+- `reset` clears host committed lengths and length tensors.
 
 ### 8.2 SDPA decode unit tests
 
@@ -513,9 +587,12 @@ Each row loops only to its own `base_len[b] + t + 1`.
   `k/v[:, :live_len]`.
 - `Tnew=4`: causal-in-block output matches full causal `gd_sdpa` on
   `old_cache + new_block`.
+- Sliding-window decode (`window=1,4,17`) matches `gd_sdpa(causal=true,
+  sliding_window=window)` over materialized K/V.
 - GQA case `Hq > Hkv` matches CPU_REF.
 - Ragged `base_len[B]` matches per-row reference.
 - Invalid padded query positions output zero.
+- `prefix_len > 0` is rejected in v1 decode.
 
 ### 8.3 GPT parity tests
 
@@ -535,6 +612,8 @@ Run on:
 - batched ragged decode
 - `Tnew=1`
 - `Tnew=4` block decode
+- `attention_window=0` and `attention_window>0`
+- F32 and F16 cache dtypes where backend supports them
 
 Acceptance tolerance mirrors existing GPT/SDPA parity.
 
@@ -542,6 +621,9 @@ Acceptance tolerance mirrors existing GPT/SDPA parity.
 
 - Greedy generation stops on `<|im_end|>`.
 - `prompt_len + max_new_tokens <= capacity` validation.
+- EOS rows can set `append_len=0` and remain stable while other rows continue.
+- `accepted_len < append_len` commits only accepted prefix and later append
+  overwrites uncommitted rows.
 - No recompute of old K/V during decode, verified by profiler/op trace.
 
 ---
@@ -551,16 +633,17 @@ Acceptance tolerance mirrors existing GPT/SDPA parity.
 ### K0 — API + cache object
 
 - Add `gd_kv_cache` opaque type.
-- Allocate flat per-layer K/V tensors.
-- Add length mirror/tensors.
-- Add reset/set/commit helpers.
+- Allocate flat per-layer K/V tensors with resolved dtype.
+- Add host committed-length mirror plus device `base_len/append_len/src_offset`
+  tensors.
+- Add reset/set/set-prefill/commit helpers, including partial accepted commit.
 
 ### K1 — CPU_REF ops
 
 - `_GD_OP_KV_APPEND` CPU kernel.
-- `_GD_OP_SDPA_DECODE` CPU kernel.
+- `_GD_OP_SDPA_DECODE` CPU kernel with sliding-window support.
 - Shared CPU SDPA helper factoring.
-- Unit tests vs existing `gd_sdpa`.
+- Unit tests vs existing `gd_sdpa`, including windowed decode.
 
 ### K2 — Metal KV append
 
@@ -572,15 +655,15 @@ Acceptance tolerance mirrors existing GPT/SDPA parity.
 ### K3 — Metal SDPA decode
 
 - Add `metal_sdpa_common.metal.h` helpers.
-- Add `metal_sdpa_decode.metal` entrypoint.
+- Add `metal_sdpa_decode.metal` entrypoint with sliding-window start bound.
 - Reuse SDPA params/planning style.
-- CPU↔Metal parity for `Tnew=1` and `Tnew=4`.
+- CPU↔Metal parity for `Tnew=1`, `Tnew=4`, and windowed decode.
 
 ### K4 — GPT prefill/decode APIs
 
 - Factor projection/RoPE helpers in `src/nn/nn.c`.
 - Add `gd_gpt_prefill` and `gd_gpt_decode_block`.
-- Full-forward vs cached-decode parity tests.
+- Full-forward vs cached-decode parity tests, with and without sliding window.
 
 ### K5 — Generation CLI
 
@@ -601,6 +684,7 @@ Acceptance tolerance mirrors existing GPT/SDPA parity.
 - No duplicate large SDPA implementation: decode shares SDPA math helpers and
   conventions; full prefill/training remains on existing `gd_sdpa`.
 - Cached decode logits match full-forward logits token-by-token.
+- Sliding-window cached decode is supported in v1 and matches full-forward.
 - Batched decode supports per-row lengths.
 - `Tnew=4` block decode works for future MTP plumbing.
 - CPU_REF and Metal parity pass.

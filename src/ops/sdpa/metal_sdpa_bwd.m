@@ -102,12 +102,18 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             NSUInteger sdq_threads = GD_METAL_SDPA_BQ;
             if (sdpa_is_causal_no_bias(&p)) {
                 if (p.window > 0) {
+                    const char *sdq_window_name = f16 && p.Dh == 64
+                        ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_dh64_f16"
+                        : (f16 ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_f16"
+                               : "gd_sdpa_bwd_stats_dq_split_causal_window_lane8");
+                    const char *dks_window_name = f16 && p.Dh == 64
+                        ? "gd_sdpa_bwd_dkv_split_causal_window_k16_dh64_f16"
+                        : (f16 ? "gd_sdpa_bwd_dkv_split_causal_window_k16_f16"
+                               : "gd_sdpa_bwd_dkv_split_causal_window_k16");
                     id<MTLComputePipelineState> fast_sdq_window =
-                        _gd_metal_pipeline_named(st,
-                                                 f16 ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_f16" : "gd_sdpa_bwd_stats_dq_split_causal_window_lane8");
+                        _gd_metal_pipeline_named(st, sdq_window_name);
                     id<MTLComputePipelineState> fast_dks_window =
-                        _gd_metal_pipeline_named(st,
-                                                 f16 ? "gd_sdpa_bwd_dkv_split_causal_window_k16_f16" : "gd_sdpa_bwd_dkv_split_causal_window_k16");
+                        _gd_metal_pipeline_named(st, dks_window_name);
                     if (fast_sdq_window != nil) {
                         sdq_pso = fast_sdq_window;
                         sdq_lane_split = true;

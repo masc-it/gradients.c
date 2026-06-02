@@ -36,6 +36,7 @@ gd_status _gd_cpu_exec_output(_gd_cpu_exec *exec,
                               int output_index,
                               void **data_out,
                               const gd_tensor_desc **desc_out);
+uint64_t _gd_cpu_exec_run_id(const _gd_cpu_exec *exec);
 
 gd_status _gd_cpu_require_f32(const gd_tensor_desc *desc);
 

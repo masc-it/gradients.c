@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #define CHECK_OK(expr)                                                            \
@@ -42,6 +43,31 @@ static gd_status make_param_vec(gd_context *ctx, const float *values, int64_t n,
 static gd_status make_param(gd_context *ctx, float value, gd_tensor **out)
 {
     return make_param_vec(ctx, &value, 1, out);
+}
+
+static gd_status make_f16_param(gd_context *ctx, uint16_t value, gd_tensor **out)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t n = 1;
+    gd_tensor_desc desc;
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, &n, &desc);
+    if (status != GD_OK) { return status; }
+    status = gd_tensor_empty(ctx, &desc, out);
+    if (status != GD_OK) { return status; }
+    status = gd_tensor_copy_from_cpu(ctx, *out, &value, sizeof(value));
+    if (status != GD_OK) { return status; }
+    return gd_tensor_set_requires_grad(*out, true);
+}
+
+static gd_status make_scalar(gd_context *ctx, float value, gd_tensor **out)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_tensor_desc desc;
+    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 0, NULL, &desc);
+    if (status != GD_OK) { return status; }
+    status = gd_tensor_empty(ctx, &desc, out);
+    if (status != GD_OK) { return status; }
+    return gd_tensor_copy_from_cpu(ctx, *out, &value, sizeof(value));
 }
 
 static void adamw_config(gd_adamw_config *cfg)
@@ -203,6 +229,112 @@ static int test_amp_skip_preserves_step(gd_context *ctx)
     return 0;
 }
 
+static int test_amp_lr_tensor_changes_without_rebuild(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_adamw_config ocfg = {0};
+    gd_amp_scaler_config scfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_amp_scaler *scaler = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_tensor *lr = NULL;
+    gd_graph *graph = NULL;
+    float grad_value = 1.0F;
+    float lr_value = 0.1F;
+    float got = 0.0F;
+    bool stepped = false;
+
+    adamw_config(&ocfg);
+    scaler_config(&scfg);
+    ocfg.lr = 0.0F;
+    scfg.init_scale = 1.0F;
+    scfg.growth_interval = 1000;
+    CHECK_OK(make_param(ctx, 1.0F, &param));
+    CHECK_OK(make_scalar(ctx, lr_value, &lr));
+    CHECK_OK(gd_adamw_create(ctx, &param, 1, &ocfg, &opt));
+    CHECK_OK(gd_amp_scaler_create(ctx, &scfg, &scaler));
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step_amp_lr(ctx, opt, scaler, lr));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, &grad_value, sizeof(grad_value)));
+    CHECK_OK(gd_graph_run(graph));
+    CHECK_OK(gd_amp_scaler_update(ctx, scaler, &stepped));
+    CHECK_TRUE(stepped);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.9F));
+
+    lr_value = 0.01F;
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, lr, &lr_value, sizeof(lr_value)));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, &grad_value, sizeof(grad_value)));
+    CHECK_OK(gd_graph_run(graph));
+    CHECK_OK(gd_amp_scaler_update(ctx, scaler, &stepped));
+    CHECK_TRUE(stepped);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, &got, sizeof(got)));
+    CHECK_TRUE(close_to(got, 0.89F));
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_amp_scaler_destroy(scaler);
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(lr);
+    gd_tensor_release(param);
+    return 0;
+}
+
+static int test_amp_lr_tensor_f16_master_refresh(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    gd_adamw_config ocfg = {0};
+    gd_amp_scaler_config scfg = {0};
+    gd_optimizer *opt = NULL;
+    gd_amp_scaler *scaler = NULL;
+    gd_tensor *param = NULL;
+    gd_tensor *grad = NULL;
+    gd_tensor *lr = NULL;
+    gd_graph *graph = NULL;
+    float grad_value = 1.0F;
+    float lr_value = 0.0F;
+    uint16_t got = 0U;
+    bool stepped = false;
+
+    adamw_config(&ocfg);
+    scaler_config(&scfg);
+    ocfg.lr = 0.25F;
+    scfg.init_scale = 1.0F;
+    CHECK_OK(make_f16_param(ctx, 0x3c00U, &param));
+    CHECK_OK(make_scalar(ctx, lr_value, &lr));
+    CHECK_OK(gd_adamw_create(ctx, &param, 1, &ocfg, &opt));
+    CHECK_OK(gd_amp_scaler_create(ctx, &scfg, &scaler));
+    CHECK_OK(gd_graph_create(ctx, &graph));
+    CHECK_OK(gd_graph_begin(ctx, graph));
+    CHECK_OK(gd_optimizer_step_amp_lr(ctx, opt, scaler, lr));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(graph, cpu));
+    CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
+    CHECK_OK(gd_tensor_grad(param, &grad));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, grad, &grad_value, sizeof(grad_value)));
+    CHECK_OK(gd_graph_run(graph));
+    CHECK_OK(gd_amp_scaler_update(ctx, scaler, &stepped));
+    CHECK_TRUE(stepped);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, param, &got, sizeof(got)));
+    CHECK_TRUE(got == 0x3c00U);
+
+    CHECK_OK(gd_graph_reset(graph));
+    CHECK_OK(gd_graph_destroy(graph));
+    gd_amp_scaler_destroy(scaler);
+    gd_optimizer_destroy(opt);
+    gd_tensor_release(lr);
+    gd_tensor_release(param);
+    return 0;
+}
+
 int main(void)
 {
     gd_context *ctx = NULL;
@@ -210,7 +342,9 @@ int main(void)
     CHECK_OK(gd_context_create(&ctx));
     if (test_amp_scaled_backward(ctx) != 0 ||
         test_amp_clip_unscales_before_clipping(ctx) != 0 ||
-        test_amp_skip_preserves_step(ctx) != 0) {
+        test_amp_skip_preserves_step(ctx) != 0 ||
+        test_amp_lr_tensor_changes_without_rebuild(ctx) != 0 ||
+        test_amp_lr_tensor_f16_master_refresh(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

@@ -2,6 +2,7 @@
 #define GRADIENTS_OPS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "gradients/context.h"
 #include "gradients/dtype.h"
@@ -48,6 +49,14 @@ gd_status gd_linear_ex(gd_context *ctx,
 
 gd_status gd_relu(gd_context *ctx, gd_tensor *x, gd_tensor **out);
 gd_status gd_silu(gd_context *ctx, gd_tensor *x, gd_tensor **out);
+/* Inverted dropout. Training mode applies y=x*mask/(1-p) with deterministic
+ * per-graph-run masks from seed; eval mode or p==0 returns x unchanged. */
+gd_status gd_dropout(gd_context *ctx,
+                     gd_tensor *x,
+                     float p,
+                     uint64_t seed,
+                     bool training,
+                     gd_tensor **out);
 /* PowLU gated activation: out = x1 * f(x2, m). m must satisfy 0 < m < 10. */
 gd_status gd_powlu(gd_context *ctx,
                    gd_tensor *x1,

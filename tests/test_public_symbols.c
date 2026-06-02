@@ -103,6 +103,7 @@ GD_REF(gd_linear, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor 
 GD_REF(gd_linear_ex, gd_status, (gd_context *, const gd_linear_desc *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor **));
 GD_REF(gd_relu, gd_status, (gd_context *, gd_tensor *, gd_tensor **));
 GD_REF(gd_silu, gd_status, (gd_context *, gd_tensor *, gd_tensor **));
+GD_REF(gd_dropout, gd_status, (gd_context *, gd_tensor *, float, uint64_t, bool, gd_tensor **));
 GD_REF(gd_powlu, gd_status, (gd_context *, gd_tensor *, gd_tensor *, float, gd_tensor **));
 GD_REF(gd_sum, gd_status, (gd_context *, gd_tensor *, int, bool, gd_tensor **));
 GD_REF(gd_mean, gd_status, (gd_context *, gd_tensor *, int, bool, gd_tensor **));
@@ -137,7 +138,9 @@ GD_REF(gd_optimizer_destroy, void, (gd_optimizer *));
 GD_REF(gd_optimizer_step, gd_status, (gd_context *, gd_optimizer *));
 GD_REF(gd_optimizer_step_lr, gd_status, (gd_context *, gd_optimizer *, gd_tensor *));
 GD_REF(gd_optimizer_step_amp, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *));
+GD_REF(gd_optimizer_step_amp_lr, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *, gd_tensor *));
 GD_REF(gd_optimizer_step_amp_clip, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *, float, gd_tensor **));
+GD_REF(gd_optimizer_step_amp_clip_lr, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *, float, gd_tensor **, gd_tensor *));
 GD_REF(gd_optimizer_zero_grad, gd_status, (gd_context *, gd_optimizer *));
 GD_REF(gd_optimizer_save, gd_status, (gd_optimizer *, const char *));
 GD_REF(gd_optimizer_load, gd_status, (gd_optimizer *, const char *));
@@ -153,6 +156,8 @@ GD_REF(gd_amp_scaler_found_inf, gd_status, (gd_context *, gd_amp_scaler *, bool 
 /* nn.h */
 GD_REF(gd_gpt_create, gd_status, (gd_context *, const gd_gpt_config *, uint64_t, gd_gpt **));
 GD_REF(gd_gpt_destroy, void, (gd_gpt *));
+GD_REF(gd_gpt_set_training, void, (gd_gpt *, bool));
+GD_REF(gd_gpt_is_training, bool, (const gd_gpt *));
 GD_REF(gd_gpt_parameters, gd_status, (gd_gpt *, gd_tensor ***, int *));
 GD_REF(gd_gpt_parameter_groups, gd_status, (gd_gpt *, float, gd_param_group **, int *));
 GD_REF(gd_gpt_parameter_groups_free, void, (gd_param_group *, int));

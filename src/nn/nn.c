@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "gradients/module.h"
 #include "gradients/ops.h"
@@ -33,6 +34,17 @@ struct gd_gpt {
     gd_tensor **b_gate; /* [d_ff] gate/fc bias */
     gd_tensor **w_up;   /* powlu/swiglu value projection (NULL for gelu) */
     gd_tensor **w_down; /* powlu/swiglu/gelu down (proj) */
+};
+
+struct gd_kv_cache {
+    gd_gpt_config cfg;
+    gd_device device;
+    int batch_size;
+    int max_seq_len;
+    int len;
+    gd_tensor **k;   /* [L][B,max_seq,Hkv,Dh] */
+    gd_tensor **v;   /* [L][B,max_seq,Hkv,Dh] */
+    gd_tensor *pos;  /* scalar I32, current write position */
 };
 
 /* Deterministic PRNG (splitmix64-ish) so two models built from the same seed
@@ -432,6 +444,136 @@ void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups)
     free(groups);
 }
 
+static void kv_cache_release_tensors(gd_kv_cache *cache)
+{
+    int l = 0;
+    if (cache == NULL) {
+        return;
+    }
+    if (cache->k != NULL) {
+        for (l = 0; l < cache->cfg.n_layers; ++l) {
+            gd_tensor_release(cache->k[l]);
+        }
+    }
+    if (cache->v != NULL) {
+        for (l = 0; l < cache->cfg.n_layers; ++l) {
+            gd_tensor_release(cache->v[l]);
+        }
+    }
+    free(cache->k);
+    free(cache->v);
+    gd_tensor_release(cache->pos);
+}
+
+gd_status gd_kv_cache_create(gd_context *ctx,
+                             const gd_gpt_config *config,
+                             int batch_size,
+                             int max_seq_len,
+                             gd_device device,
+                             gd_kv_cache **out)
+{
+    gd_kv_cache *cache = NULL;
+    gd_gpt_config cfg;
+    int64_t kv_sizes[4];
+    gd_tensor_desc pos_desc;
+    int l = 0;
+    gd_status status = GD_OK;
+
+    if (ctx == NULL || config == NULL || out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_kv_cache_create argument is NULL");
+    }
+    *out = NULL;
+    cfg = *config;
+    if (cfg.n_kv_heads <= 0) {
+        cfg.n_kv_heads = cfg.n_heads;
+    }
+    if (cfg.param_dtype == GD_DTYPE_INVALID) {
+        cfg.param_dtype = GD_DTYPE_F32;
+    }
+    if (batch_size <= 0 || max_seq_len <= 0 || cfg.n_layers <= 0 || cfg.n_heads <= 0 ||
+        cfg.n_kv_heads <= 0 || cfg.head_dim <= 0 ||
+        (cfg.param_dtype != GD_DTYPE_F32 && cfg.param_dtype != GD_DTYPE_F16)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid kv cache config");
+    }
+    cache = (gd_kv_cache *)calloc(1U, sizeof(*cache));
+    if (cache == NULL) {
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate kv cache");
+    }
+    cache->cfg = cfg;
+    cache->device = device;
+    cache->batch_size = batch_size;
+    cache->max_seq_len = max_seq_len;
+    cache->k = (gd_tensor **)calloc((size_t)cfg.n_layers, sizeof(*cache->k));
+    cache->v = (gd_tensor **)calloc((size_t)cfg.n_layers, sizeof(*cache->v));
+    if (cache->k == NULL || cache->v == NULL) {
+        status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate kv cache layer table");
+        goto fail;
+    }
+    kv_sizes[0] = batch_size;
+    kv_sizes[1] = max_seq_len;
+    kv_sizes[2] = cfg.n_kv_heads;
+    kv_sizes[3] = cfg.head_dim;
+    for (l = 0; l < cfg.n_layers; ++l) {
+        gd_tensor_desc desc;
+        status = gd_tensor_desc_contiguous(cfg.param_dtype, device, 4, kv_sizes, &desc);
+        if (status != GD_OK) { goto fail; }
+        status = gd_tensor_empty(ctx, &desc, &cache->k[l]);
+        if (status != GD_OK) { goto fail; }
+        status = gd_tensor_empty(ctx, &desc, &cache->v[l]);
+        if (status != GD_OK) { goto fail; }
+    }
+    status = gd_tensor_desc_contiguous(GD_DTYPE_I32, device, 0, NULL, &pos_desc);
+    if (status != GD_OK) { goto fail; }
+    status = gd_tensor_empty(ctx, &pos_desc, &cache->pos);
+    if (status != GD_OK) { goto fail; }
+    status = gd_kv_cache_set_len(ctx, cache, 0);
+    if (status != GD_OK) { goto fail; }
+    *out = cache;
+    return GD_OK;
+
+fail:
+    kv_cache_release_tensors(cache);
+    free(cache);
+    return status;
+}
+
+void gd_kv_cache_destroy(gd_kv_cache *cache)
+{
+    if (cache == NULL) {
+        return;
+    }
+    kv_cache_release_tensors(cache);
+    free(cache);
+}
+
+gd_status gd_kv_cache_reset(gd_context *ctx, gd_kv_cache *cache)
+{
+    return gd_kv_cache_set_len(ctx, cache, 0);
+}
+
+gd_status gd_kv_cache_set_len(gd_context *ctx, gd_kv_cache *cache, int len)
+{
+    int32_t value = (int32_t)len;
+    gd_status status = GD_OK;
+
+    if (ctx == NULL || cache == NULL || cache->pos == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_kv_cache_set_len argument is NULL");
+    }
+    if (len < 0 || len > cache->max_seq_len) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "kv cache length out of range");
+    }
+    status = gd_tensor_copy_from_cpu(ctx, cache->pos, &value, sizeof(value));
+    if (status == GD_OK) {
+        cache->len = len;
+    }
+    return status;
+}
+
+int gd_kv_cache_len(const gd_kv_cache *cache)
+{
+    return cache != NULL ? cache->len : 0;
+}
+
 static uint64_t mix_dropout_seed(uint64_t seed, uint64_t site)
 {
     uint64_t x = seed + site * UINT64_C(0x9E3779B97F4A7C15);
@@ -478,6 +620,120 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     if (s == GD_OK) { s = gd_rope(ctx, q, positions, &rope, &qr); }
     if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
     if (s == GD_OK) { s = gd_sdpa(ctx, qr, kr, v, NULL, &sdpa, &o); }
+    if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op_mat); }
+    if (s == GD_OK) { s = gd_add(ctx, op_mat, g->b_wo[l], &op); }
+    if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
+    if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
+
+    gd_tensor_release(n);
+    gd_tensor_release(qf);
+    gd_tensor_release(q);
+    gd_tensor_release(kf);
+    gd_tensor_release(k);
+    gd_tensor_release(vf);
+    gd_tensor_release(v);
+    gd_tensor_release(qr);
+    gd_tensor_release(kr);
+    gd_tensor_release(o);
+    gd_tensor_release(om);
+    gd_tensor_release(op_mat);
+    gd_tensor_release(op);
+    gd_tensor_release(drop);
+    *out_p = out;
+    return s;
+}
+
+static gd_status attention_block_kv_prefill(gd_context *ctx,
+                                            gd_gpt *g,
+                                            gd_kv_cache *cache,
+                                            int l,
+                                            gd_tensor *x,
+                                            gd_tensor *positions,
+                                            int64_t B,
+                                            int64_t T,
+                                            int prefix_len,
+                                            gd_tensor **out_p)
+{
+    const gd_gpt_config *c = &g->cfg;
+    int64_t Hq = c->n_heads, Hkv = c->n_kv_heads, Dh = c->head_dim;
+    int64_t q4[4] = {B, T, Hq, Dh};
+    int64_t kv4[4] = {B, T, Hkv, Dh};
+    int64_t o3[3] = {B, T, Hq * Dh};
+    gd_rope_config rope = {c->rope_theta, 0, false};
+    gd_sdpa_config sdpa = {0.0f, true, c->attention_window, prefix_len};
+    gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
+    gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
+    gd_tensor *om = NULL, *op_mat = NULL, *op = NULL, *drop = NULL, *out = NULL;
+    gd_status s = GD_OK;
+
+    *out_p = NULL;
+    s = gd_rms_norm_qkv(ctx, x, g->ln1[l], g->wq[l], g->wk[l], g->wv[l],
+                        c->norm_eps, &n, &qf, &kf, &vf);
+    if (s == GD_OK) { s = gd_tensor_reshape(qf, 4, q4, &q); }
+    if (s == GD_OK) { s = gd_tensor_reshape(kf, 4, kv4, &k); }
+    if (s == GD_OK) { s = gd_tensor_reshape(vf, 4, kv4, &v); }
+    if (s == GD_OK) { s = gd_rope(ctx, q, positions, &rope, &qr); }
+    if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
+    if (s == GD_OK) { s = gd_kv_cache_append(ctx, cache->k[l], cache->v[l], cache->pos, kr, v); }
+    if (s == GD_OK) { s = gd_sdpa(ctx, qr, kr, v, NULL, &sdpa, &o); }
+    if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op_mat); }
+    if (s == GD_OK) { s = gd_add(ctx, op_mat, g->b_wo[l], &op); }
+    if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
+    if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
+
+    gd_tensor_release(n);
+    gd_tensor_release(qf);
+    gd_tensor_release(q);
+    gd_tensor_release(kf);
+    gd_tensor_release(k);
+    gd_tensor_release(vf);
+    gd_tensor_release(v);
+    gd_tensor_release(qr);
+    gd_tensor_release(kr);
+    gd_tensor_release(o);
+    gd_tensor_release(om);
+    gd_tensor_release(op_mat);
+    gd_tensor_release(op);
+    gd_tensor_release(drop);
+    *out_p = out;
+    return s;
+}
+
+static gd_status attention_block_kv_decode(gd_context *ctx,
+                                           gd_gpt *g,
+                                           gd_kv_cache *cache,
+                                           int l,
+                                           gd_tensor *x,
+                                           gd_tensor *positions,
+                                           int64_t B,
+                                           int64_t T,
+                                           int prefix_len,
+                                           gd_tensor **out_p)
+{
+    const gd_gpt_config *c = &g->cfg;
+    int64_t Hq = c->n_heads, Hkv = c->n_kv_heads, Dh = c->head_dim;
+    int64_t q4[4] = {B, T, Hq, Dh};
+    int64_t kv4[4] = {B, T, Hkv, Dh};
+    int64_t o3[3] = {B, T, Hq * Dh};
+    gd_rope_config rope = {c->rope_theta, 0, false};
+    gd_sdpa_decode_config sdpa = {0.0f, c->attention_window, prefix_len};
+    gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
+    gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
+    gd_tensor *om = NULL, *op_mat = NULL, *op = NULL, *drop = NULL, *out = NULL;
+    gd_status s = GD_OK;
+
+    *out_p = NULL;
+    s = gd_rms_norm_qkv(ctx, x, g->ln1[l], g->wq[l], g->wk[l], g->wv[l],
+                        c->norm_eps, &n, &qf, &kf, &vf);
+    if (s == GD_OK) { s = gd_tensor_reshape(qf, 4, q4, &q); }
+    if (s == GD_OK) { s = gd_tensor_reshape(kf, 4, kv4, &k); }
+    if (s == GD_OK) { s = gd_tensor_reshape(vf, 4, kv4, &v); }
+    if (s == GD_OK) { s = gd_rope(ctx, q, positions, &rope, &qr); }
+    if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
+    if (s == GD_OK) { s = gd_kv_cache_append(ctx, cache->k[l], cache->v[l], cache->pos, kr, v); }
+    if (s == GD_OK) { s = gd_sdpa_decode(ctx, qr, cache->k[l], cache->v[l], cache->pos, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
     if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op_mat); }
     if (s == GD_OK) { s = gd_add(ctx, op_mat, g->b_wo[l], &op); }
@@ -692,6 +948,25 @@ static gd_status gpt_validate_embeds(gd_gpt *gpt,
     return GD_OK;
 }
 
+static gd_status gpt_validate_cache(gd_gpt *gpt, gd_kv_cache *cache, int64_t B, int64_t T)
+{
+    if (gpt == NULL || cache == NULL || cache->k == NULL || cache->v == NULL || cache->pos == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt kv cache is NULL");
+    }
+    if (cache->batch_size != (int)B || cache->cfg.n_layers != gpt->cfg.n_layers ||
+        cache->cfg.n_heads != gpt->cfg.n_heads || cache->cfg.n_kv_heads != gpt->cfg.n_kv_heads ||
+        cache->cfg.head_dim != gpt->cfg.head_dim || cache->cfg.param_dtype != gpt->cfg.param_dtype) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt kv cache config does not match model");
+    }
+    if (T <= 0 || T > (int64_t)cache->max_seq_len) {
+        return _gd_error(GD_ERR_SHAPE, "gpt kv cache sequence length out of range");
+    }
+    if (gd_tensor_dtype(cache->pos) != GD_DTYPE_I32 || gd_tensor_ndim(cache->pos) != 0) {
+        return _gd_error(GD_ERR_INVALID_STATE, "gpt kv cache position tensor is invalid");
+    }
+    return GD_OK;
+}
+
 static gd_status gpt_validate_varlen_embeds(gd_gpt *gpt,
                                             gd_tensor *inputs_embeds,
                                             gd_tensor *positions,
@@ -873,6 +1148,112 @@ gd_status gd_gpt_decode_embeds_varlen(gd_context *ctx,
     return GD_OK;
 }
 
+gd_status gd_gpt_kv_prefill_embeds(gd_context *ctx,
+                                   gd_gpt *gpt,
+                                   gd_kv_cache *cache,
+                                   gd_tensor *inputs_embeds,
+                                   gd_tensor *positions,
+                                   const gd_gpt_forward_config *config,
+                                   gd_tensor **hidden_out)
+{
+    gd_status s = GD_OK;
+    gd_gpt_forward_config cfg = gpt_forward_config_or_default(config);
+    int64_t B = 0;
+    int64_t T = 0;
+    gd_tensor *x = NULL;
+    gd_tensor *normed = NULL;
+    int l = 0;
+
+    if (ctx == NULL || gpt == NULL || cache == NULL || inputs_embeds == NULL ||
+        positions == NULL || hidden_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_kv_prefill_embeds argument is NULL");
+    }
+    *hidden_out = NULL;
+    s = gpt_validate_embeds(gpt, inputs_embeds, positions, &cfg, &B, &T);
+    if (s == GD_OK) { s = gpt_validate_cache(gpt, cache, B, T); }
+    if (s != GD_OK) { return s; }
+
+    s = gpt_dropout(ctx, gpt, inputs_embeds, UINT64_C(0x1), &x);
+    for (l = 0; l < gpt->cfg.n_layers && s == GD_OK; ++l) {
+        gd_tensor *attn = NULL;
+        gd_tensor *mlp = NULL;
+        s = attention_block_kv_prefill(ctx, gpt, cache, l, x, positions, B, T,
+                                       cfg.prefix_len, &attn);
+        gd_tensor_release(x);
+        x = attn;
+        if (s != GD_OK) { break; }
+        s = mlp_block(ctx, gpt, l, x, &mlp);
+        gd_tensor_release(x);
+        x = mlp;
+    }
+    if (s == GD_OK) { s = gd_rms_norm(ctx, x, gpt->ln_f, gpt->cfg.norm_eps, &normed); }
+    gd_tensor_release(x);
+    if (s != GD_OK) {
+        gd_tensor_release(normed);
+        return s;
+    }
+    *hidden_out = normed;
+    return GD_OK;
+}
+
+gd_status gd_gpt_kv_decode_step_embeds(gd_context *ctx,
+                                       gd_gpt *gpt,
+                                       gd_kv_cache *cache,
+                                       gd_tensor *inputs_embeds,
+                                       gd_tensor *positions,
+                                       const gd_gpt_forward_config *config,
+                                       gd_tensor **hidden_out)
+{
+    gd_status s = GD_OK;
+    gd_gpt_forward_config cfg = gpt_forward_config_or_default(config);
+    int64_t B = 0;
+    int64_t T = 0;
+    gd_tensor *x = NULL;
+    gd_tensor *normed = NULL;
+    int l = 0;
+
+    if (ctx == NULL || gpt == NULL || cache == NULL || inputs_embeds == NULL ||
+        positions == NULL || hidden_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_kv_decode_step_embeds argument is NULL");
+    }
+    *hidden_out = NULL;
+    if (cfg.prefix_len < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt prefix_len must be non-negative");
+    }
+    {
+        gd_gpt_forward_config validate_cfg = cfg;
+        validate_cfg.prefix_len = 0; /* Decode chunk can be shorter than cached prefix. */
+        s = gpt_validate_embeds(gpt, inputs_embeds, positions, &validate_cfg, &B, &T);
+    }
+    if (s == GD_OK) { s = gpt_validate_cache(gpt, cache, B, T); }
+    if (s == GD_OK && cfg.prefix_len > cache->max_seq_len) {
+        s = _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt prefix_len exceeds cache length");
+    }
+    if (s != GD_OK) { return s; }
+
+    s = gpt_dropout(ctx, gpt, inputs_embeds, UINT64_C(0x1), &x);
+    for (l = 0; l < gpt->cfg.n_layers && s == GD_OK; ++l) {
+        gd_tensor *attn = NULL;
+        gd_tensor *mlp = NULL;
+        s = attention_block_kv_decode(ctx, gpt, cache, l, x, positions, B, T,
+                                      cfg.prefix_len, &attn);
+        gd_tensor_release(x);
+        x = attn;
+        if (s != GD_OK) { break; }
+        s = mlp_block(ctx, gpt, l, x, &mlp);
+        gd_tensor_release(x);
+        x = mlp;
+    }
+    if (s == GD_OK) { s = gd_rms_norm(ctx, x, gpt->ln_f, gpt->cfg.norm_eps, &normed); }
+    gd_tensor_release(x);
+    if (s != GD_OK) {
+        gd_tensor_release(normed);
+        return s;
+    }
+    *hidden_out = normed;
+    return GD_OK;
+}
+
 static gd_status gpt_lm_head(gd_context *ctx, gd_gpt *gpt,
                              gd_tensor *hidden, gd_tensor **logits_out)
 {
@@ -885,6 +1266,14 @@ static gd_status gpt_lm_head(gd_context *ctx, gd_gpt *gpt,
         gd_matmul_desc md = {false, true, gd_compute_policy_default()};
         return gd_matmul_ex(ctx, &md, hidden, weight, logits_out); /* x @ W^T */
     }
+}
+
+gd_status gd_gpt_logits(gd_context *ctx,
+                        gd_gpt *gpt,
+                        gd_tensor *hidden,
+                        gd_tensor **logits_out)
+{
+    return gpt_lm_head(ctx, gpt, hidden, logits_out);
 }
 
 static gd_status gpt_lm_loss(gd_context *ctx,

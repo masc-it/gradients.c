@@ -200,6 +200,32 @@ gd_status gd_sdpa_varlen(gd_context *ctx,
                          const gd_sdpa_varlen_config *config,
                          gd_tensor **out);
 
+/* Append new RoPE-applied K and raw V rows into fixed-size decode cache at
+ * scalar cache_pos. k_cache/v_cache are [B,max_seq,Hkv,Dh], k_new/v_new are
+ * [B,Tnew,Hkv,Dh]. Forward-only inference op; mutates cache tensors. */
+gd_status gd_kv_cache_append(gd_context *ctx,
+                             gd_tensor *k_cache,
+                             gd_tensor *v_cache,
+                             gd_tensor *cache_pos,
+                             gd_tensor *k_new,
+                             gd_tensor *v_new);
+
+/* Decode attention over fixed-size K/V cache. q is [B,Tq,Hq,Dh], cache tensors
+ * are [B,max_seq,Hkv,Dh], cache_pos is scalar current write position before q.
+ * Live keys are [0, cache_pos + Tq). Causal/prefix/window semantics match SDPA. */
+typedef struct gd_sdpa_decode_config {
+    float scale;          /* 0 => 1/sqrt(head_dim) */
+    int   sliding_window; /* 0 => none */
+    int   prefix_len;     /* >0 => VLM prefix-causal */
+} gd_sdpa_decode_config;
+gd_status gd_sdpa_decode(gd_context *ctx,
+                         gd_tensor *q,
+                         gd_tensor *k_cache,
+                         gd_tensor *v_cache,
+                         gd_tensor *cache_pos,
+                         const gd_sdpa_decode_config *config,
+                         gd_tensor **out);
+
 /* Compact slice along one axis. `dim` may be negative; `start` is zero-based
  * after normalization and `len` must be positive. Output is contiguous with the
  * same rank as `x` and size[dim] = len. Backward scatters the slice gradient

@@ -44,6 +44,7 @@
 
 typedef struct app_config {
     char data_dir[GD_VLM_MAX_PATH];
+    char tokenizer_path[GD_VLM_MAX_PATH];
     char split[64];
     int epochs;
     int steps;
@@ -51,6 +52,9 @@ typedef struct app_config {
     int max_text_len;
     int log_interval;
     int skip_batches;
+    int generate_interval;
+    int generate_samples;
+    int generate_max_new_tokens;
     uint64_t seed;
     float lr;
     float weight_decay;
@@ -96,6 +100,32 @@ typedef struct train_graph {
     gd_tensor *scaled_loss;
     gd_tensor *grad_norm;
 } train_graph;
+
+typedef struct generate_graph {
+    gd_graph *graph;
+    gd_graph_runner *runner;
+    gd_graph_input *patches_in;
+    gd_graph_input *tokens_in;
+    gd_graph_input *positions_in;
+    gd_tensor *logits;
+} generate_graph;
+
+typedef struct generate_state {
+    int ready;
+    int batch_size;
+    int prefix_len;
+    int patch_dim;
+    int max_seq_len;
+    int vocab_size;
+    gd_kv_cache *cache;
+    generate_graph prefill;
+    generate_graph decode;
+    gd_tensor *prefill_patches;
+    gd_tensor *prefill_tokens;
+    gd_tensor *prefill_positions;
+    gd_tensor *decode_tokens;
+    gd_tensor *decode_positions;
+} generate_state;
 
 typedef struct materialized_batch {
     gd_tensor *patches;
@@ -265,6 +295,28 @@ static int copy_path(char *dst, size_t cap, const char *src)
     return 0;
 }
 
+static int join_path(char *dst, size_t cap, const char *dir, const char *name)
+{
+    size_t nd;
+    size_t nn;
+    int need_slash;
+    if (dst == NULL || dir == NULL || name == NULL || cap == 0U) {
+        return 1;
+    }
+    nd = strlen(dir);
+    nn = strlen(name);
+    need_slash = nd > 0U && dir[nd - 1U] != '/';
+    if (nd + (need_slash ? 1U : 0U) + nn + 1U > cap) {
+        return 1;
+    }
+    memcpy(dst, dir, nd);
+    if (need_slash) {
+        dst[nd++] = '/';
+    }
+    memcpy(dst + nd, name, nn + 1U);
+    return 0;
+}
+
 static int parse_int_arg(const char *s, int *out)
 {
     char *end = NULL;
@@ -309,6 +361,10 @@ static void usage(FILE *f)
     fprintf(f, "  --max-text-len N     truncate suffix tokens to N (default: dataset max)\n");
     fprintf(f, "  --log-interval N     log interval (default: 1)\n");
     fprintf(f, "  --skip-batches N     advance sampler by N batches before step 1 (debug)\n");
+    fprintf(f, "  --tokenizer PATH     tokenizer path (default: DIR/tokenizer.json)\n");
+    fprintf(f, "  --generate-interval N sample generations every N steps; 0 disables (default: 500)\n");
+    fprintf(f, "  --generate-samples N  random image count per generation (default: 10)\n");
+    fprintf(f, "  --generate-max-new N  max generated text tokens (default: max text len)\n");
     fprintf(f, "  --lr F               learning rate (default: 1e-4)\n");
     fprintf(f, "  --seed N             seed (default: 1234)\n\n");
     fprintf(f, "Bucket/cache knobs: GD_VLM_TEXT_BUCKET_MULTIPLE (default 8), GD_VLM_GRAPH_CACHE_MAX (default 16), GD_VLM_GRAPH_CACHE_FOOTPRINT_MB (default 0 disables).\n");
@@ -326,6 +382,9 @@ static void init_app(app_config *app)
     app->max_text_len = env_int("GD_VLM_MAX_TEXT_LEN", 0);
     app->log_interval = env_int("GD_VLM_LOG_INTERVAL", 1);
     app->skip_batches = env_int("GD_VLM_SKIP_BATCHES", 0);
+    app->generate_interval = env_int("GD_VLM_GENERATE_INTERVAL", 500);
+    app->generate_samples = env_int("GD_VLM_GENERATE_SAMPLES", 10);
+    app->generate_max_new_tokens = env_int("GD_VLM_GENERATE_MAX_NEW", 0);
     app->seed = env_u64("GD_VLM_SEED", 1234U);
     app->lr = env_float("GD_VLM_LR", 1.0e-4F);
     app->weight_decay = env_float("GD_VLM_WEIGHT_DECAY", 4.0e-3F);
@@ -371,6 +430,17 @@ static int parse_args(int argc, char **argv, app_config *app)
             if (parse_int_arg(argv[++i], &app->log_interval) != 0) { return 1; }
         } else if (strcmp(a, "--skip-batches") == 0 && i + 1 < argc) {
             if (parse_int_arg(argv[++i], &app->skip_batches) != 0) { return 1; }
+        } else if (strcmp(a, "--tokenizer") == 0 && i + 1 < argc) {
+            if (copy_path(app->tokenizer_path, sizeof(app->tokenizer_path), argv[++i]) != 0) {
+                fprintf(stderr, "tokenizer path too long\n");
+                return 1;
+            }
+        } else if (strcmp(a, "--generate-interval") == 0 && i + 1 < argc) {
+            if (parse_int_arg(argv[++i], &app->generate_interval) != 0) { return 1; }
+        } else if (strcmp(a, "--generate-samples") == 0 && i + 1 < argc) {
+            if (parse_int_arg(argv[++i], &app->generate_samples) != 0) { return 1; }
+        } else if (strcmp(a, "--generate-max-new") == 0 && i + 1 < argc) {
+            if (parse_int_arg(argv[++i], &app->generate_max_new_tokens) != 0) { return 1; }
         } else if (strcmp(a, "--lr") == 0 && i + 1 < argc) {
             if (parse_float_arg(argv[++i], &app->lr) != 0) { return 1; }
         } else if (strcmp(a, "--seed") == 0 && i + 1 < argc) {
@@ -1221,6 +1291,478 @@ static int add_input(gd_context *ctx,
     return 0;
 }
 
+static void generate_graph_destroy(generate_graph *g)
+{
+    if (g == NULL) {
+        return;
+    }
+    gd_graph_runner_destroy(g->runner);
+    gd_tensor_release(g->logits);
+    if (g->graph != NULL) {
+        (void)gd_graph_reset(g->graph);
+        (void)gd_graph_destroy(g->graph);
+    }
+    memset(g, 0, sizeof(*g));
+}
+
+static void generate_state_destroy(generate_state *st)
+{
+    if (st == NULL) {
+        return;
+    }
+    generate_graph_destroy(&st->prefill);
+    generate_graph_destroy(&st->decode);
+    gd_tensor_release(st->prefill_patches);
+    gd_tensor_release(st->prefill_tokens);
+    gd_tensor_release(st->prefill_positions);
+    gd_tensor_release(st->decode_tokens);
+    gd_tensor_release(st->decode_positions);
+    gd_kv_cache_destroy(st->cache);
+    memset(st, 0, sizeof(*st));
+}
+
+static int build_generate_prefill_graph(gd_context *ctx,
+                                        gd_device device,
+                                        gd_gpt *gpt,
+                                        gd_kv_cache *cache,
+                                        gd_tensor *w_patch,
+                                        gd_tensor *b_patch,
+                                        gd_tensor *image_pos,
+                                        gd_tensor *img_norm,
+                                        gd_tensor *txt_norm,
+                                        int batch_size,
+                                        int prefix_len,
+                                        int patch_dim,
+                                        int d_model,
+                                        generate_graph *out)
+{
+    gd_tensor *patches = NULL;
+    gd_tensor *tokens = NULL;
+    gd_tensor *positions = NULL;
+    gd_tensor *patch_linear = NULL;
+    gd_tensor *patch_embeds = NULL;
+    gd_tensor *patch_3d = NULL;
+    gd_tensor *patch_pos = NULL;
+    gd_tensor *patch_norm = NULL;
+    gd_tensor *text_raw = NULL;
+    gd_tensor *text_norm = NULL;
+    gd_tensor *inputs = NULL;
+    gd_tensor *hidden = NULL;
+    gd_tensor *last_hidden = NULL;
+    gd_tensor *parts[2];
+    gd_gpt_forward_config fwd;
+    int64_t patch_sizes[2] = {(int64_t)batch_size * prefix_len, patch_dim};
+    int64_t token_sizes[2] = {batch_size, 1};
+    int64_t pos_sizes[2] = {batch_size, prefix_len + 1};
+    int64_t patch3_sizes[3] = {batch_size, prefix_len, d_model};
+
+    memset(out, 0, sizeof(*out));
+    CHECK_OK(gd_graph_create(ctx, &out->graph));
+    CHECK_OK(gd_graph_begin(ctx, out->graph));
+    CHECK_ZERO(add_input(ctx, out->graph, "gen_patches", GD_DTYPE_F16, device, 2,
+                         patch_sizes, &patches, &out->patches_in));
+    CHECK_ZERO(add_input(ctx, out->graph, "gen_prefill_tokens", GD_DTYPE_I32, device, 2,
+                         token_sizes, &tokens, &out->tokens_in));
+    CHECK_ZERO(add_input(ctx, out->graph, "gen_prefill_positions", GD_DTYPE_I32, device, 2,
+                         pos_sizes, &positions, &out->positions_in));
+    CHECK_OK(gd_linear(ctx, patches, w_patch, NULL, &patch_linear));
+    CHECK_OK(gd_add(ctx, patch_linear, b_patch, &patch_embeds));
+    CHECK_OK(gd_tensor_reshape(patch_embeds, 3, patch3_sizes, &patch_3d));
+    CHECK_OK(gd_add(ctx, patch_3d, image_pos, &patch_pos));
+    CHECK_OK(gd_rms_norm(ctx, patch_pos, img_norm, 1.0e-5F, &patch_norm));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, tokens, &text_raw));
+    CHECK_OK(gd_rms_norm(ctx, text_raw, txt_norm, 1.0e-5F, &text_norm));
+    parts[0] = patch_norm;
+    parts[1] = text_norm;
+    CHECK_OK(gd_concat(ctx, parts, 2, 1, &inputs));
+    memset(&fwd, 0, sizeof(fwd));
+    fwd.prefix_len = prefix_len;
+    CHECK_OK(gd_gpt_kv_prefill_embeds(ctx, gpt, cache, inputs, positions, &fwd, &hidden));
+    CHECK_OK(gd_slice(ctx, hidden, 1, prefix_len, 1, &last_hidden));
+    CHECK_OK(gd_gpt_logits(ctx, gpt, last_hidden, &out->logits));
+    CHECK_OK(gd_graph_end(ctx));
+
+    gd_tensor_release(patches);
+    gd_tensor_release(tokens);
+    gd_tensor_release(positions);
+    gd_tensor_release(patch_linear);
+    gd_tensor_release(patch_embeds);
+    gd_tensor_release(patch_3d);
+    gd_tensor_release(patch_pos);
+    gd_tensor_release(patch_norm);
+    gd_tensor_release(text_raw);
+    gd_tensor_release(text_norm);
+    gd_tensor_release(inputs);
+    gd_tensor_release(hidden);
+    gd_tensor_release(last_hidden);
+    CHECK_OK(gd_graph_compile(out->graph, device));
+    CHECK_OK(gd_graph_runner_create(out->graph, &out->runner));
+    return 0;
+}
+
+static int build_generate_decode_graph(gd_context *ctx,
+                                       gd_device device,
+                                       gd_gpt *gpt,
+                                       gd_kv_cache *cache,
+                                       gd_tensor *txt_norm,
+                                       int batch_size,
+                                       int prefix_len,
+                                       generate_graph *out)
+{
+    gd_tensor *tokens = NULL;
+    gd_tensor *positions = NULL;
+    gd_tensor *text_raw = NULL;
+    gd_tensor *text_norm = NULL;
+    gd_tensor *hidden = NULL;
+    gd_gpt_forward_config fwd;
+    int64_t step_sizes[2] = {batch_size, 1};
+
+    memset(out, 0, sizeof(*out));
+    CHECK_OK(gd_graph_create(ctx, &out->graph));
+    CHECK_OK(gd_graph_begin(ctx, out->graph));
+    CHECK_ZERO(add_input(ctx, out->graph, "gen_decode_tokens", GD_DTYPE_I32, device, 2,
+                         step_sizes, &tokens, &out->tokens_in));
+    CHECK_ZERO(add_input(ctx, out->graph, "gen_decode_positions", GD_DTYPE_I32, device, 2,
+                         step_sizes, &positions, &out->positions_in));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, tokens, &text_raw));
+    CHECK_OK(gd_rms_norm(ctx, text_raw, txt_norm, 1.0e-5F, &text_norm));
+    memset(&fwd, 0, sizeof(fwd));
+    fwd.prefix_len = prefix_len;
+    CHECK_OK(gd_gpt_kv_decode_step_embeds(ctx, gpt, cache, text_norm, positions, &fwd,
+                                          &hidden));
+    CHECK_OK(gd_gpt_logits(ctx, gpt, hidden, &out->logits));
+    CHECK_OK(gd_graph_end(ctx));
+
+    gd_tensor_release(tokens);
+    gd_tensor_release(positions);
+    gd_tensor_release(text_raw);
+    gd_tensor_release(text_norm);
+    gd_tensor_release(hidden);
+    CHECK_OK(gd_graph_compile(out->graph, device));
+    CHECK_OK(gd_graph_runner_create(out->graph, &out->runner));
+    return 0;
+}
+
+static int generate_state_ensure(gd_context *ctx,
+                                 gd_device device,
+                                 gd_gpt *gpt,
+                                 const gd_gpt_config *gpt_cfg,
+                                 gd_tensor *w_patch,
+                                 gd_tensor *b_patch,
+                                 gd_tensor *image_pos,
+                                 gd_tensor *img_norm,
+                                 gd_tensor *txt_norm,
+                                 int batch_size,
+                                 int prefix_len,
+                                 int patch_dim,
+                                 int max_seq_len,
+                                 int vocab_size,
+                                 generate_state *st)
+{
+    int64_t patch_sizes[2] = {(int64_t)batch_size * prefix_len, patch_dim};
+    int64_t prefill_token_sizes[2] = {batch_size, 1};
+    int64_t prefill_pos_sizes[2] = {batch_size, prefix_len + 1};
+    int64_t step_sizes[2] = {batch_size, 1};
+
+    if (st->ready) {
+        return 0;
+    }
+    memset(st, 0, sizeof(*st));
+    st->batch_size = batch_size;
+    st->prefix_len = prefix_len;
+    st->patch_dim = patch_dim;
+    st->max_seq_len = max_seq_len;
+    st->vocab_size = vocab_size;
+    CHECK_OK(gd_kv_cache_create(ctx, gpt_cfg, batch_size, max_seq_len, device, &st->cache));
+    CHECK_ZERO(empty_tensor(ctx, device, GD_DTYPE_F16, 2, patch_sizes, &st->prefill_patches));
+    CHECK_ZERO(empty_tensor(ctx, device, GD_DTYPE_I32, 2, prefill_token_sizes,
+                            &st->prefill_tokens));
+    CHECK_ZERO(empty_tensor(ctx, device, GD_DTYPE_I32, 2, prefill_pos_sizes,
+                            &st->prefill_positions));
+    CHECK_ZERO(empty_tensor(ctx, device, GD_DTYPE_I32, 2, step_sizes, &st->decode_tokens));
+    CHECK_ZERO(empty_tensor(ctx, device, GD_DTYPE_I32, 2, step_sizes, &st->decode_positions));
+    CHECK_ZERO(build_generate_prefill_graph(ctx, device, gpt, st->cache, w_patch, b_patch,
+                                            image_pos, img_norm, txt_norm, batch_size,
+                                            prefix_len, patch_dim, gpt_cfg->d_model,
+                                            &st->prefill));
+    CHECK_ZERO(build_generate_decode_graph(ctx, device, gpt, st->cache, txt_norm,
+                                           batch_size, prefix_len, &st->decode));
+    st->ready = 1;
+    return 0;
+}
+
+static int greedy_next_f16(const uint16_t *logits,
+                           int row,
+                           int vocab,
+                           int32_t pad_id,
+                           int32_t im_start_id)
+{
+    int best = 0;
+    float best_v = -INFINITY;
+    int v;
+    for (v = 0; v < vocab; ++v) {
+        float x;
+        if (v == pad_id || v == im_start_id) {
+            continue;
+        }
+        x = f16_bits_to_f32(logits[(size_t)row * (size_t)vocab + (size_t)v]);
+        if (x > best_v) {
+            best_v = x;
+            best = v;
+        }
+    }
+    return best;
+}
+
+static char *decode_token_span(gd_tokenizer *tok,
+                               const int32_t *ids,
+                               int n,
+                               int32_t im_start_id,
+                               int32_t im_end_id)
+{
+    int start = 0;
+    int end = n;
+    char *text = NULL;
+    while (start < end && ids[start] == im_start_id) {
+        ++start;
+    }
+    while (start < end && ids[end - 1] == im_end_id) {
+        --end;
+    }
+    if (start >= end) {
+        text = (char *)malloc(1U);
+        if (text != NULL) {
+            text[0] = '\0';
+        }
+        return text;
+    }
+    if (gd_tokenizer_decode(tok, ids + start, end - start, &text) != GD_OK) {
+        text = (char *)malloc(1U);
+        if (text != NULL) {
+            text[0] = '\0';
+        }
+    }
+    return text;
+}
+
+static int run_vlm_generation(gd_context *ctx,
+                              gd_device device,
+                              gd_dataset *ds,
+                              gd_tokenizer *tok,
+                              gd_gpt *gpt,
+                              const gd_gpt_config *gpt_cfg,
+                              gd_tensor *w_patch,
+                              gd_tensor *b_patch,
+                              gd_tensor *image_pos,
+                              gd_tensor *img_norm,
+                              gd_tensor *txt_norm,
+                              int step,
+                              int batch_size,
+                              int prefix_len,
+                              int patch_dim,
+                              int max_text,
+                              int max_new_tokens,
+                              int32_t pad_id,
+                              int32_t im_start_id,
+                              int32_t im_end_id,
+                              uint64_t seed,
+                              generate_state *st)
+{
+    uint64_t n_samples = gd_dataset_num_samples(ds);
+    uint64_t rng = seed ^ ((uint64_t)step * UINT64_C(0x9e3779b97f4a7c15));
+    uint64_t *sample_ids = NULL;
+    uint16_t *patches = NULL;
+    int32_t *truth = NULL;
+    int *truth_lens = NULL;
+    int32_t *prefill_tokens = NULL;
+    int32_t *prefill_positions = NULL;
+    int32_t *decode_tokens = NULL;
+    int32_t *decode_positions = NULL;
+    int32_t *generated = NULL;
+    int *gen_lens = NULL;
+    int *active = NULL;
+    int32_t *next_tokens = NULL;
+    uint16_t *logits = NULL;
+    size_t patch_elems_per_sample = (size_t)prefix_len * (size_t)patch_dim;
+    int prefill_len = prefix_len + 1;
+    int pos;
+    int b;
+    int old_training;
+    int rc = 1;
+
+    if (batch_size <= 0 || max_new_tokens <= 0 || n_samples == 0U || tok == NULL) {
+        return 0;
+    }
+    if (prefill_len + max_new_tokens > gpt_cfg->max_seq_len) {
+        max_new_tokens = gpt_cfg->max_seq_len - prefill_len;
+        if (max_new_tokens <= 0) {
+            return 0;
+        }
+    }
+    old_training = gd_gpt_is_training(gpt) ? 1 : 0;
+    gd_gpt_set_training(gpt, false);
+#define GEN_CHECK_OK(expr)                                                        \
+    do {                                                                         \
+        gd_status status_ = (expr);                                              \
+        if (status_ != GD_OK) {                                                  \
+            fprintf(stderr, "%s failed: %s\n", #expr, gd_last_error());        \
+            goto cleanup;                                                        \
+        }                                                                        \
+    } while (0)
+#define GEN_CHECK_ZERO(expr)                                                      \
+    do {                                                                         \
+        int rc_ = (expr);                                                        \
+        if (rc_ != 0) {                                                          \
+            goto cleanup;                                                        \
+        }                                                                        \
+    } while (0)
+    GEN_CHECK_ZERO(generate_state_ensure(ctx, device, gpt, gpt_cfg, w_patch, b_patch,
+                                     image_pos, img_norm, txt_norm, batch_size,
+                                     prefix_len, patch_dim, gpt_cfg->max_seq_len,
+                                     gpt_cfg->vocab_size, st));
+    sample_ids = (uint64_t *)calloc((size_t)batch_size, sizeof(*sample_ids));
+    patches = (uint16_t *)calloc((size_t)batch_size * patch_elems_per_sample, sizeof(*patches));
+    truth = (int32_t *)calloc((size_t)batch_size * (size_t)max_text, sizeof(*truth));
+    truth_lens = (int *)calloc((size_t)batch_size, sizeof(*truth_lens));
+    prefill_tokens = (int32_t *)calloc((size_t)batch_size, sizeof(*prefill_tokens));
+    prefill_positions = (int32_t *)calloc((size_t)batch_size * (size_t)prefill_len,
+                                          sizeof(*prefill_positions));
+    decode_tokens = (int32_t *)calloc((size_t)batch_size, sizeof(*decode_tokens));
+    decode_positions = (int32_t *)calloc((size_t)batch_size, sizeof(*decode_positions));
+    generated = (int32_t *)calloc((size_t)batch_size * (size_t)max_new_tokens,
+                                  sizeof(*generated));
+    gen_lens = (int *)calloc((size_t)batch_size, sizeof(*gen_lens));
+    active = (int *)calloc((size_t)batch_size, sizeof(*active));
+    next_tokens = (int32_t *)calloc((size_t)batch_size, sizeof(*next_tokens));
+    logits = (uint16_t *)calloc((size_t)batch_size * (size_t)gpt_cfg->vocab_size,
+                                sizeof(*logits));
+    if (sample_ids == NULL || patches == NULL || truth == NULL || truth_lens == NULL ||
+        prefill_tokens == NULL || prefill_positions == NULL || decode_tokens == NULL ||
+        decode_positions == NULL || generated == NULL || gen_lens == NULL || active == NULL ||
+        next_tokens == NULL || logits == NULL) {
+        fprintf(stderr, "generation allocation failed\n");
+        goto cleanup;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        gd_gdvlm_sample_info info;
+        sample_ids[b] = splitmix64(&rng) % n_samples;
+        GEN_CHECK_OK(gd_gdvlm_dataset_read_sample(ds, sample_ids[b], &info,
+                                              &truth[(size_t)b * (size_t)max_text], max_text,
+                                              &patches[(size_t)b * patch_elems_per_sample],
+                                              patch_elems_per_sample * sizeof(uint16_t)));
+        truth_lens[b] = (int)info.tokens_copied;
+        prefill_tokens[b] = im_start_id;
+        for (pos = 0; pos < prefill_len; ++pos) {
+            prefill_positions[(size_t)b * (size_t)prefill_len + (size_t)pos] = pos;
+        }
+    }
+
+    GEN_CHECK_OK(gd_kv_cache_reset(ctx, st->cache));
+    GEN_CHECK_OK(gd_tensor_copy_from_cpu(ctx, st->prefill_patches, patches,
+                                     (size_t)batch_size * patch_elems_per_sample * sizeof(uint16_t)));
+    GEN_CHECK_OK(gd_tensor_copy_from_cpu(ctx, st->prefill_tokens, prefill_tokens,
+                                     (size_t)batch_size * sizeof(int32_t)));
+    GEN_CHECK_OK(gd_tensor_copy_from_cpu(ctx, st->prefill_positions, prefill_positions,
+                                     (size_t)batch_size * (size_t)prefill_len * sizeof(int32_t)));
+    GEN_CHECK_OK(gd_graph_runner_bind(st->prefill.runner, st->prefill.patches_in,
+                                  st->prefill_patches));
+    GEN_CHECK_OK(gd_graph_runner_bind(st->prefill.runner, st->prefill.tokens_in,
+                                  st->prefill_tokens));
+    GEN_CHECK_OK(gd_graph_runner_bind(st->prefill.runner, st->prefill.positions_in,
+                                  st->prefill_positions));
+    GEN_CHECK_OK(gd_graph_runner_run(st->prefill.runner));
+    GEN_CHECK_OK(gd_synchronize(ctx, device));
+    GEN_CHECK_OK(gd_kv_cache_set_len(ctx, st->cache, prefill_len));
+    GEN_CHECK_OK(gd_tensor_copy_to_cpu(ctx, st->prefill.logits, logits,
+                                   (size_t)batch_size * (size_t)gpt_cfg->vocab_size * sizeof(uint16_t)));
+
+    for (b = 0; b < batch_size; ++b) {
+        int32_t id = greedy_next_f16(logits, b, gpt_cfg->vocab_size, pad_id, im_start_id);
+        if (id != im_end_id && gen_lens[b] < max_new_tokens) {
+            generated[(size_t)b * (size_t)max_new_tokens + (size_t)gen_lens[b]++] = id;
+            next_tokens[b] = id;
+            active[b] = 1;
+        }
+    }
+
+    for (pos = prefill_len; pos < prefill_len + max_new_tokens; ++pos) {
+        int any_active = 0;
+        for (b = 0; b < batch_size; ++b) {
+            if (active[b]) {
+                any_active = 1;
+            }
+            decode_tokens[b] = active[b] ? next_tokens[b] : pad_id;
+            decode_positions[b] = pos;
+        }
+        if (!any_active) {
+            break;
+        }
+        GEN_CHECK_OK(gd_kv_cache_set_len(ctx, st->cache, pos));
+        GEN_CHECK_OK(gd_tensor_copy_from_cpu(ctx, st->decode_tokens, decode_tokens,
+                                         (size_t)batch_size * sizeof(int32_t)));
+        GEN_CHECK_OK(gd_tensor_copy_from_cpu(ctx, st->decode_positions, decode_positions,
+                                         (size_t)batch_size * sizeof(int32_t)));
+        GEN_CHECK_OK(gd_graph_runner_bind(st->decode.runner, st->decode.tokens_in,
+                                      st->decode_tokens));
+        GEN_CHECK_OK(gd_graph_runner_bind(st->decode.runner, st->decode.positions_in,
+                                      st->decode_positions));
+        GEN_CHECK_OK(gd_graph_runner_run(st->decode.runner));
+        GEN_CHECK_OK(gd_synchronize(ctx, device));
+        GEN_CHECK_OK(gd_kv_cache_set_len(ctx, st->cache, pos + 1));
+        GEN_CHECK_OK(gd_tensor_copy_to_cpu(ctx, st->decode.logits, logits,
+                                       (size_t)batch_size * (size_t)gpt_cfg->vocab_size * sizeof(uint16_t)));
+        for (b = 0; b < batch_size; ++b) {
+            int32_t id;
+            if (!active[b]) {
+                continue;
+            }
+            id = greedy_next_f16(logits, b, gpt_cfg->vocab_size, pad_id, im_start_id);
+            if (id == im_end_id || gen_lens[b] >= max_new_tokens) {
+                active[b] = 0;
+            } else {
+                generated[(size_t)b * (size_t)max_new_tokens + (size_t)gen_lens[b]++] = id;
+                next_tokens[b] = id;
+            }
+        }
+    }
+
+    printf("vlm_generate step=%d samples=%d max_new=%d prompt=image+<|im_start|>\n",
+           step, batch_size, max_new_tokens);
+    for (b = 0; b < batch_size; ++b) {
+        char *target_text = decode_token_span(tok, &truth[(size_t)b * (size_t)max_text],
+                                              truth_lens[b], im_start_id, im_end_id);
+        char *pred_text = decode_token_span(tok, &generated[(size_t)b * (size_t)max_new_tokens],
+                                            gen_lens[b], im_start_id, im_end_id);
+        printf("  sample=%llu target=\"%s\" pred=\"%s\"\n",
+               (unsigned long long)sample_ids[b],
+               target_text != NULL ? target_text : "",
+               pred_text != NULL ? pred_text : "");
+        gd_tokenizer_free(target_text);
+        gd_tokenizer_free(pred_text);
+    }
+    fflush(stdout);
+    rc = 0;
+
+cleanup:
+    gd_gpt_set_training(gpt, old_training != 0);
+    free(sample_ids);
+    free(patches);
+    free(truth);
+    free(truth_lens);
+    free(prefill_tokens);
+    free(prefill_positions);
+    free(decode_tokens);
+    free(decode_positions);
+    free(generated);
+    free(gen_lens);
+    free(active);
+    free(next_tokens);
+    free(logits);
+#undef GEN_CHECK_OK
+#undef GEN_CHECK_ZERO
+    return rc;
+}
+
 static int build_train_graph(gd_context *ctx,
                              gd_device device,
                              gd_gpt *gpt,
@@ -1602,6 +2144,11 @@ int main(int argc, char **argv)
     gd_device target = cpu;
     const char *dev_env = getenv("GD_DEVICE");
     gd_dataset *ds = NULL;
+    gd_tokenizer *tok = NULL;
+    int32_t pad_id = 0;
+    int32_t im_start_id = 0;
+    int32_t im_end_id = 0;
+    int generation_enabled = 0;
     gd_gpt_config gpt_cfg;
     gd_gpt *gpt = NULL;
     gd_tensor *w_patch = NULL;
@@ -1636,6 +2183,7 @@ int main(int argc, char **argv)
     uint64_t *batch_ids = NULL;
     epoch_sampler sampler = {0};
     train_graph_cache graph_cache = {0};
+    generate_state gen_state = {0};
     double t0;
     int rc = 1;
 
@@ -1654,8 +2202,16 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (app.tokenizer_path[0] == '\0' &&
+        join_path(app.tokenizer_path, sizeof(app.tokenizer_path), app.data_dir,
+                  "tokenizer.json") != 0) {
+        fprintf(stderr, "tokenizer path too long\n");
+        return 2;
+    }
     if (app.epochs <= 0 || app.steps < 0 || app.batch_size <= 0 ||
         app.log_interval <= 0 || app.skip_batches < 0 ||
+        app.generate_interval < 0 || app.generate_samples < 0 ||
+        app.generate_max_new_tokens < 0 ||
         app.text_bucket_multiple < 0 || app.graph_cache_max <= 0 ||
         app.graph_cache_footprint_mb < 0 || app.attention_window <= 0 ||
         app.n_heads <= 0 || app.n_kv_heads <= 0 ||
@@ -1698,6 +2254,28 @@ int main(int argc, char **argv)
     if (n_samples == 0U) {
         fprintf(stderr, "dataset has no samples\n");
         goto cleanup;
+    }
+    generation_enabled = app.generate_interval > 0 && app.generate_samples > 0;
+    if (generation_enabled) {
+        gd_tokenizer_config tok_cfg;
+        memset(&tok_cfg, 0, sizeof(tok_cfg));
+        tok_cfg.split_digits = 1;
+        tok_cfg.allow_special = 1;
+        if (gd_bpe_tokenizer_load(app.tokenizer_path, &tok_cfg, &tok) != GD_OK ||
+            gd_tokenizer_id(tok, "<|pad|>", &pad_id) != GD_OK ||
+            gd_tokenizer_id(tok, "<|im_start|>", &im_start_id) != GD_OK ||
+            gd_tokenizer_id(tok, "<|im_end|>", &im_end_id) != GD_OK) {
+            fprintf(stderr, "generation disabled: tokenizer load/special lookup failed: %s\n",
+                    gd_last_error());
+            gd_tokenizer_destroy(tok);
+            tok = NULL;
+            generation_enabled = 0;
+        } else if (gd_tokenizer_vocab_size(tok) != (int)vocab_size) {
+            fprintf(stderr, "generation disabled: tokenizer/model vocab mismatch\n");
+            gd_tokenizer_destroy(tok);
+            tok = NULL;
+            generation_enabled = 0;
+        }
     }
     steps_per_epoch = ((n_samples - 1U) / (uint64_t)app.batch_size) + 1U;
     if (steps_per_epoch > UINT64_MAX / (uint64_t)app.epochs) {
@@ -1825,6 +2403,12 @@ int main(int argc, char **argv)
            run_steps, schedule_steps, app.batch_size, app.log_interval);
     printf("  graph_cache : max_entries=%d text_bucket_multiple=%d footprint_limit_mb=%d\n",
            app.graph_cache_max, app.text_bucket_multiple, app.graph_cache_footprint_mb);
+    printf("  generation  : %s interval=%d samples=%d max_new=%d tokenizer=%s\n",
+           generation_enabled ? "on" : "off", app.generate_interval,
+           app.generate_samples,
+           app.generate_max_new_tokens > 0 ? app.generate_max_new_tokens :
+               (max_text > 1 ? max_text - 1 : max_text),
+           generation_enabled ? app.tokenizer_path : "-");
     printf("  optimized   : requires F16 && Dh==64 && causal && prefix_len>0 && sliding_window>0 (satisfied)\n");
     if (env_flag_enabled("GD_VLM_DEBUG")) {
         fprintf(stderr,
@@ -1942,6 +2526,16 @@ int main(int argc, char **argv)
                    (double)grad_norm, eta_buf);
         }
         packed_batch_clear(&pb);
+        if (generation_enabled && (step + 1) % app.generate_interval == 0) {
+            int gen_max = app.generate_max_new_tokens > 0 ? app.generate_max_new_tokens :
+                          (max_text > 1 ? max_text - 1 : max_text);
+            CHECK_ZERO(run_vlm_generation(ctx, target, ds, tok, gpt, &gpt_cfg, w_patch,
+                                          b_patch, image_pos, img_norm, txt_norm,
+                                          step + 1, app.generate_samples, prefix_len,
+                                          patch_dim, max_text, gen_max, pad_id,
+                                          im_start_id, im_end_id,
+                                          app.seed ^ UINT64_C(0x76543210), &gen_state));
+        }
         if (env_flag_enabled("GD_VLM_DEBUG")) {
             fprintf(stderr, "vlm_debug step=%d after_cleanup footprint_mb=%.1f\n",
                     step + 1, current_footprint_mb());
@@ -1955,6 +2549,7 @@ int main(int argc, char **argv)
     rc = 0;
 
 cleanup:
+    generate_state_destroy(&gen_state);
     train_graph_cache_destroy(&graph_cache);
     free(batch_ids);
     epoch_sampler_destroy(&sampler);
@@ -1968,6 +2563,7 @@ cleanup:
     gd_tensor_release(b_patch);
     gd_tensor_release(w_patch);
     gd_gpt_destroy(gpt);
+    gd_tokenizer_destroy(tok);
     gd_dataset_destroy(ds);
     gd_context_destroy(ctx);
     return rc;

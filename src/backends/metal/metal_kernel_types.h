@@ -336,6 +336,29 @@ typedef struct gd_metal_sdpa_params {
     int dtype;      /* GD_METAL_DT_* q/k/v/output dtype */
 } gd_metal_sdpa_params;
 
+/* KV-cache append writes new K/V rows at runtime cache_pos. */
+typedef struct gd_metal_kv_cache_append_params {
+    int B;
+    int Tmax;
+    int Tnew;
+    int row_bytes;  /* Hkv * Dh * elem_size */
+} gd_metal_kv_cache_append_params;
+
+/* Decode attention over fixed-size K/V cache. cache_pos is a runtime scalar;
+ * live keys are [0, cache_pos + Tq). */
+typedef struct gd_metal_sdpa_decode_params {
+    int B;
+    int Tq;
+    int Tmax;
+    int Hq;
+    int Hkv;
+    int Dh;
+    float scale;
+    int window;
+    int prefix_len;
+    int dtype;
+} gd_metal_sdpa_decode_params;
+
 /* Rotary embedding; one thread per (.., head) row over head_dim. sin_sign is
  * +1 forward, -1 backward (transpose rotation). */
 typedef struct gd_metal_rope_params {

@@ -44,6 +44,7 @@ typedef struct gd_gpt_config {
 } gd_gpt_config;
 
 typedef struct gd_gpt gd_gpt;
+typedef struct gd_kv_cache gd_kv_cache;
 
 gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
                         uint64_t seed, gd_gpt **out);
@@ -58,6 +59,19 @@ gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
                                   gd_param_group **groups_out,
                                   int *n_groups_out);
 void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups);
+
+/* Fixed-size per-layer KV cache for autoregressive inference. V1 uses uniform
+ * batch cache length stored as scalar I32 on the cache device. */
+gd_status gd_kv_cache_create(gd_context *ctx,
+                             const gd_gpt_config *config,
+                             int batch_size,
+                             int max_seq_len,
+                             gd_device device,
+                             gd_kv_cache **out);
+void gd_kv_cache_destroy(gd_kv_cache *cache);
+gd_status gd_kv_cache_reset(gd_context *ctx, gd_kv_cache *cache);
+gd_status gd_kv_cache_set_len(gd_context *ctx, gd_kv_cache *cache, int len);
+int gd_kv_cache_len(const gd_kv_cache *cache);
 
 /* Shared decoder config for token-id and inputs_embeds GPT forwards.
  * prefix_len=0 gives normal causal attention. prefix_len>0 gives prefix-causal
@@ -97,6 +111,31 @@ gd_status gd_gpt_decode_embeds_varlen(gd_context *ctx,
                                       gd_tensor *cu_seqlens,
                                       const gd_gpt_forward_config *config,
                                       gd_tensor **hidden_out);
+
+/* Cached inference trunks. Prefill appends every input token's K/V to cache and
+ * uses full attention within the prefill chunk. Decode appends Tq new K/V rows
+ * then attends over cache rows [0, cache_pos+Tq). Caller updates cache length
+ * before each graph run with gd_kv_cache_set_len. */
+gd_status gd_gpt_kv_prefill_embeds(gd_context *ctx,
+                                   gd_gpt *gpt,
+                                   gd_kv_cache *cache,
+                                   gd_tensor *inputs_embeds,
+                                   gd_tensor *positions,
+                                   const gd_gpt_forward_config *config,
+                                   gd_tensor **hidden_out);
+
+gd_status gd_gpt_kv_decode_step_embeds(gd_context *ctx,
+                                       gd_gpt *gpt,
+                                       gd_kv_cache *cache,
+                                       gd_tensor *inputs_embeds,
+                                       gd_tensor *positions,
+                                       const gd_gpt_forward_config *config,
+                                       gd_tensor **hidden_out);
+
+gd_status gd_gpt_logits(gd_context *ctx,
+                        gd_gpt *gpt,
+                        gd_tensor *hidden,
+                        gd_tensor **logits_out);
 
 /* Records the forward pass into the active graph. `tokens` is int32 [B,T];
  * `positions` is int32 [B,T] (RoPE/causal positions). Produces logits[B,T,V]

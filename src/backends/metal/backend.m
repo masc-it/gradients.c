@@ -51,6 +51,8 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_SLICE_BWD, "gd_slice_bwd"},
     {_GD_OP_CONCAT, "gd_concat"},
     {_GD_OP_RMS_NORM_QKV, "gd_rms_norm_qkv"},
+    {_GD_OP_KV_CACHE_APPEND, "gd_kv_cache_append"},
+    {_GD_OP_SDPA_DECODE, "gd_sdpa_decode"},
 };
 
 /* Kernels not mapped 1:1 to an op (looked up by name during encode). */

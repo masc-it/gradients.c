@@ -52,6 +52,42 @@ static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk,
     }
     return lim;
 }
+static inline int gd_sdpa_kb_start(int q0, int Tq, int Tk,
+                                    int window, int prefix_len)
+{
+    if (window <= 0) {
+        return 0;
+    }
+    int qpos = q0 + (Tk - Tq);
+    if (prefix_len > 0) {
+        if (qpos < prefix_len) {
+            qpos = prefix_len;
+        }
+        int first = qpos - window + 1;
+        if (first < prefix_len) {
+            first = prefix_len;
+        }
+        if (first > Tk) {
+            first = Tk;
+        }
+        return first;
+    }
+    int first = qpos - window + 1;
+    if (first <= 0) {
+        return 0;
+    }
+    if (first > Tk) {
+        return Tk;
+    }
+    return first;
+}
+static inline int gd_sdpa_kb_prefix_end(int Tk, int window, int prefix_len)
+{
+    if (window <= 0 || prefix_len <= 0) {
+        return 0;
+    }
+    return prefix_len < Tk ? prefix_len : Tk;
+}
 static inline int gd_sdpa_causal_kb_end(int q0, int bq, int Tq, int Tk)
 {
     int qmax = q0 + bq - 1;
@@ -134,8 +170,15 @@ kernel void gd_sdpa_tiled(device const float *q              [[buffer(0)]],
     float m = -INFINITY;
     float l = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
+    int q0 = qb * GD_SDPA_BQ;
+    int kb_start = gd_sdpa_kb_start(q0, p.Tq, p.Tk, p.window, p.prefix_len);
+    int kb_prefix_end = gd_sdpa_kb_prefix_end(p.Tk, p.window, p.prefix_len);
+    int kb_end = gd_sdpa_kb_end(q0, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - GD_SDPA_BK;
+            continue;
+        }
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;
@@ -298,13 +341,20 @@ kernel void gd_sdpa_splitk(device const float *q              [[buffer(0)]],
     float m = -INFINITY;
     float l = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
+    int q0 = qb * GD_SDPA_BQ;
+    int kb_start = gd_sdpa_kb_start(q0, p.Tq, p.Tk, p.window, p.prefix_len);
+    int kb_prefix_end = gd_sdpa_kb_prefix_end(p.Tk, p.window, p.prefix_len);
+    int kb_end = gd_sdpa_kb_end(q0, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     int k_lo = s * p.split_len;
     int k_hi = k_lo + p.split_len;
     if (k_hi > kb_end) {
         k_hi = kb_end;
     }
     for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - GD_SDPA_BK;
+            continue;
+        }
         int tile = k_hi - kb;
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;

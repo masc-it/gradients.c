@@ -1,6 +1,6 @@
 # gradients.c — Prefix-Causal SDPA for VLM Attention
 
-Status: implemented v1
+Status: implemented v2 (prefix-causal + suffix sliding-window)
 
 Goal: support VLM-style self-attention where a fixed prefix block (image tokens)
 attends bidirectionally within the prefix, while suffix tokens (text) attend
@@ -23,7 +23,9 @@ j    = key position
 if qpos < prefix_len:
     allow j < prefix_len          # image sees image, not text
 else:
-    allow j <= qpos               # text sees all image + prior/current text
+    allow j < prefix_len          # text always sees all image/prefix
+       or (j <= qpos and          # text sees causal suffix
+           (sliding_window == 0 or qpos - j < sliding_window))
 ```
 
 This is the common LLaVA/Qwen-VL-style prefix mask: image/image is bidirectional,
@@ -38,7 +40,7 @@ References:
 
 ## 1. Current state
 
-`gd_sdpa` currently supports:
+Before this plan, `gd_sdpa` supported:
 
 ```c
 typedef struct gd_sdpa_config {
@@ -48,7 +50,7 @@ typedef struct gd_sdpa_config {
 } gd_sdpa_config;
 ```
 
-and optional additive bias:
+It now also supports `prefix_len` plus optional additive bias:
 
 ```text
 bias [B, Hq, Tq, Tk], broadcastable
@@ -65,8 +67,8 @@ but this is not efficient: kernels still scan dense `Tq*Tk` pairs. Fully-masked
 text keys for image queries still burn compute and memory bandwidth. Bias storage
 can be broadcast/small, but compute stays dense.
 
-Desired change: make prefix-causal a native SDPA mask mode so tiled kernels skip
-fully-dead blocks, like causal block-skip.
+Implemented change: prefix-causal is a native SDPA mask mode, so tiled kernels
+skip fully-dead blocks like causal block-skip.
 
 ---
 
@@ -88,7 +90,8 @@ Semantics:
 - `causal=false, prefix_len=0`: dense/bidirectional.
 - `causal=true, prefix_len=0`: standard causal.
 - `causal=true, prefix_len>0`: prefix-causal.
-- `causal=false, prefix_len>0`: invalid in v1. Return `GD_ERR_INVALID_ARGUMENT`.
+- `causal=false, prefix_len>0`: invalid. `prefix_len` is a prefix-causal mask
+  mode and requires `causal=true`.
 
 `prefix_len` is counted in key/value sequence coordinates. For normal training
 prefill, `Tq == Tk == T`, so query `i` has `qpos=i`. For decode/paged-style
@@ -106,17 +109,19 @@ if Tq == Tk: prefix_len <= Tq
 if Tq < Tk: prefix_len may be <= Tk; queries may all be suffix queries
 ```
 
-Sliding-window composition:
-
-- v1: allow `sliding_window=0` only when `prefix_len>0`.
-- later: text/text window can apply only to suffix keys, while prefix keys remain
-  globally visible:
+Sliding-window composition is supported:
 
 ```text
-if qpos >= prefix_len && j >= prefix_len:
-    require qpos - j < sliding_window
-prefix keys j < prefix_len remain visible to all suffix queries
+if qpos < prefix_len:
+    allow j < prefix_len
+else:
+    allow j < prefix_len
+       or (j <= qpos and
+           (sliding_window == 0 or qpos - j < sliding_window))
 ```
+
+The window applies only to suffix/suffix attention. Prefix keys remain globally
+visible to all suffix queries.
 
 Additive bias still composes with prefix-causal: bias is added only for positions
 that pass the structural mask.
@@ -196,10 +201,8 @@ static inline bool gd_sdpa_allowed(int i, int j, int Tq, int Tk,
 }
 ```
 
-For v1, reject `window>0 && prefix_len>0`, so kernel branch exists but is not
-used until tests land.
-
-CPU_REF and Metal must use identical predicate semantics.
+CPU_REF and Metal use identical predicate semantics, including prefix + suffix
+sliding-window composition.
 
 ---
 
@@ -277,15 +280,16 @@ Again, per-element predicate handles boundary blocks exactly.
 
 ### 5.3 Sliding-window skip
 
-V1 can defer prefix+window. If implemented later, block bounds become:
+Prefix + window is implemented with these bounds:
 
 ```text
 prefix keys: always visible to suffix queries
 suffix keys: apply causal/window bounds within suffix region
 ```
 
-Need both lower and upper key bounds per query block, not only upper. This is
-covered by block-sparse plan; do not block prefix-causal v1 on it.
+Forward/stats/dq keep the prefix range and skip fully-old suffix ranges below the
+window. dK/dV caps query ranges for suffix key blocks; prefix key blocks still
+start at query 0 because every suffix query can see prefix keys.
 
 ---
 
@@ -360,10 +364,10 @@ In `gd_sdpa()` or shape inference:
 
 ```text
 prefix_len >= 0
+sliding_window >= 0
 prefix_len <= k.size[1]
 if prefix_len > 0:
     causal == true
-    sliding_window == 0       # v1 restriction
 ```
 
 Bias validation unchanged:
@@ -406,7 +410,9 @@ compare native prefix-causal vs dense bias mask
 ```text
 T=16, prefix_len=5
 T=130, prefix_len=33        # crosses multiple BQ blocks
+T=130, prefix_len=33, sliding_window=48
 T=600, prefix_len=257       # split-K path
+T=600, prefix_len=257, sliding_window=48
 ```
 
 4. Boundary cases:
@@ -424,6 +430,7 @@ prefix_len=T-1   => one text token
 image query cannot attend text key
 text query can attend all image keys
 text query cannot attend future text key
+text query keeps all image keys even when sliding_window=1
 ```
 
 Use hand-constructed logits/value rows where forbidden positions would visibly
@@ -433,56 +440,60 @@ change output if included.
 
 ## 11. Benchmark plan
 
-Canonical benchmark variants:
+Raw SDPA benchmark:
 
 ```bash
-GD_METAL_MPS=1 GD_DEVICE=metal GD_BENCH_B=8 GD_BENCH_T=1024 make gpt-bench
+GD_DEVICE=metal GD_BENCH_DTYPE=f16 GD_BENCH_MASK=prefix_window \
+  GD_BENCH_IMAGE_SIZE=224 GD_BENCH_PATCH=16 GD_BENCH_T=1024 \
+  GD_BENCH_ATTN_WINDOW=128 make sdpa-bench
 ```
 
-Add VLM-specific benchmark knobs later:
+`224/16 = 14` patches per side, so the default image prefix is:
 
 ```text
-GD_BENCH_PREFIX=256
-GD_BENCH_MASK=prefix
+prefix_len = 14 * 14 = 196 image tokens
 ```
 
-Compare three modes:
+Compare modes:
 
-1. Dense causal baseline (`prefix_len=0`, `causal=true`).
-2. Prefix-causal native (`prefix_len=M`, `causal=true`).
-3. Dense bias mask (`causal=false`, bias [1,1,T,T]).
+1. Dense baseline (`GD_BENCH_MASK=dense`).
+2. Standard causal (`GD_BENCH_MASK=causal`).
+3. Prefix-causal (`GD_BENCH_MASK=prefix`).
+4. Prefix + suffix sliding window (`GD_BENCH_MASK=prefix_window`).
 
-Expected attention pair counts for `T=M+N`:
+Expected attention pair counts for `T=P+N`:
 
 ```text
 dense bidir       T*T
 causal            T*(T+1)/2
-prefix-causal     M*M + N*M + N*(N+1)/2
+window            W*(W+1)/2 + (T-W)*W       if T > W
+prefix-causal     P*P + N*P + N*(N+1)/2
+prefix+window     P*P + N*P + W*(W+1)/2 + (N-W)*W   if N > W
 ```
 
-Example `M=256, N=768, T=1024`:
+Example `P=196, N=828, T=1024` from 224px/16px image patches:
 
 ```text
 dense bidir       1,048,576 pairs
 causal              524,800 pairs
-prefix-causal       557,440 pairs
+prefix-causal       543,910 pairs    (1.04x causal, 0.52x dense)
+prefix+W=48         239,320 pairs    (0.46x causal, 0.23x dense)
+prefix+W=128        298,560 pairs    (0.57x causal, 0.28x dense)
+prefix+W=256        380,032 pairs    (0.72x causal, 0.36x dense)
 ```
 
-So native prefix-causal should be close to causal cost, not dense cost:
+The irreducible VLM term is `N*P`: every text token sees every image token, so
+prefix+window cannot be as cheap as pure local attention.
 
-```text
-prefix-causal / causal ≈ 1.06x pairs
-prefix-causal / dense  ≈ 0.53x pairs
-```
-
-Acceptance target:
+Acceptance target for 224px/16px VLM shape:
 
 ```text
 native prefix-causal attention time <= 1.15x standard causal
-native prefix-causal attention time <= 0.65x dense bias mask
+native prefix-window attention time <= 0.75x standard causal when W=128
+native prefix-window attention time <= 0.40x dense bidirectional when W=128
 ```
 
-for `M=256,N=768,Dh=64,H=5,B=8`, allowing launch/shape noise.
+for `P=196,N=828,Dh=64,H>=8,B` matching workload, allowing launch/shape noise.
 
 ---
 
@@ -510,11 +521,23 @@ for `M=256,N=768,Dh=64,H=5,B=8`, allowing launch/shape noise.
 - Add optional `prefix_len` path in model builders once VLM model API exists.
 - Add benchmark knobs for prefix masks.
 
-### P4 — Optional prefix+window
+### P4 — Prefix+window
 
-- Let suffix tokens use sliding window over suffix while keeping prefix globally
-  visible.
-- Needs lower-bound key skip in forward/stats/dq plus extra tests.
+- Implemented: suffix tokens use sliding window over suffix while keeping prefix
+  globally visible.
+- Implemented: lower-bound key skip in forward/stats/dq, query cap in dK/dV,
+  and CPU/Metal prefix+window tests.
+
+### P5 — VLM f16/Dh64 backward hot path
+
+- Implemented: split-K f16/Dh64 prefix-window `stats+dq` and `dk/dv` Metal
+  kernels for `causal=true, has_bias=false, sliding_window>0, prefix_len>0`.
+- Implemented: dispatch/planning so prefix-window f16/Dh64 uses split backward;
+  non-Dh64 f16 keeps generic single-pass fallback.
+- Measured `P=196,T=1024,H=8,Dh=64,W=128,B=1` train best:
+  - generic fast-off: `178.7 ms`
+  - prefix-window Dh64 split bwd: `104.4 ms`
+  - causal baseline: `244.7 ms`
 
 ---
 
@@ -533,6 +556,8 @@ for `M=256,N=768,Dh=64,H=5,B=8`, allowing launch/shape noise.
 
 Current additive bias can make VLM prefix attention correct, but it is dense.
 Native `prefix_len` in SDPA gives the exact VLM mask while preserving block-skip:
-image queries scan only image keys; text queries scan prefix + causal text. For
-common `M=256,N=768`, work is ~6% above causal and ~47% below dense bidirectional
-attention.
+image queries scan only image keys; text queries scan prefix + causal/windowed
+text. For 224px/16px image patches (`P=196,T=1024,W=128`), prefix-window work is
+~57% of causal and ~28% of dense bidirectional attention; f16/Dh64 split backward
+now makes the measured train path ~43% of causal best time on the local Metal
+bench.

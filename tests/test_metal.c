@@ -38,6 +38,39 @@ static int close_to(float a, float b)
     return diff <= 1e-4F * (1.0F + (b < 0.0F ? -b : b));
 }
 
+static int arrays_close_tol(const char *name, const float *ref, const float *got,
+                            int n, float atol, float rtol)
+{
+    float max_abs = 0.0F;
+    float max_rel = 0.0F;
+    int first_bad = -1;
+    int i = 0;
+
+    for (i = 0; i < n; ++i) {
+        float av = ref[i];
+        float bv = got[i];
+        float abs_err = fabsf(av - bv);
+        float denom = fabsf(av);
+        float rel_err = denom > 0.0F ? abs_err / denom : abs_err;
+        if (abs_err > atol + rtol * denom && first_bad < 0) {
+            first_bad = i;
+        }
+        if (abs_err > max_abs) {
+            max_abs = abs_err;
+        }
+        if (rel_err > max_rel) {
+            max_rel = rel_err;
+        }
+    }
+    if (first_bad >= 0) {
+        fprintf(stderr, "%s mismatch at %d: ref=%g got=%g max_abs=%g max_rel=%g\n",
+                name, first_bad, (double)ref[first_bad], (double)got[first_bad],
+                (double)max_abs, (double)max_rel);
+        return 0;
+    }
+    return 1;
+}
+
 static gd_status make_i32(gd_context *ctx, int ndim, const int64_t *sizes, const int32_t *data,
                           gd_tensor **out);
 
@@ -636,6 +669,91 @@ static int test_metal_f16_sdpa_backward(gd_context *ctx)
     gd_tensor_release(loss); gd_tensor_release(m2); gd_tensor_release(m1); gd_tensor_release(m0);
     gd_tensor_release(yf); gd_tensor_release(y); gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
     CHECK_OK(gd_graph_destroy(g)); gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
+static int run_f16_sdpa_prefix_window_dh64_backward(gd_context *ctx, gd_device dev,
+                                                     const float *qdata,
+                                                     const float *kdata,
+                                                     const float *vdata,
+                                                     float *gq, float *gk,
+                                                     float *gv)
+{
+    enum { B = 1, T = 300, H = 1, DH = 64, N = B * T * H * DH };
+    int64_t shape[4] = {B, T, H, DH};
+    int64_t flat[1] = {N};
+    gd_sdpa_config cfg = {0.0F, true, 48, 129};
+    gd_tensor *q = NULL, *k = NULL, *v = NULL, *qh = NULL, *kh = NULL, *vh = NULL;
+    gd_tensor *y = NULL, *yf = NULL, *gel = NULL, *fl = NULL, *loss = NULL;
+    gd_tensor *grad = NULL;
+    gd_graph *g = NULL;
+
+    CHECK_OK(make_f32(ctx, 4, shape, qdata, &q));
+    CHECK_OK(make_f32(ctx, 4, shape, kdata, &k));
+    CHECK_OK(make_f32(ctx, 4, shape, vdata, &v));
+    CHECK_OK(gd_tensor_set_requires_grad(q, true));
+    CHECK_OK(gd_tensor_set_requires_grad(k, true));
+    CHECK_OK(gd_tensor_set_requires_grad(v, true));
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_cast(ctx, q, GD_DTYPE_F16, &qh));
+    CHECK_OK(gd_cast(ctx, k, GD_DTYPE_F16, &kh));
+    CHECK_OK(gd_cast(ctx, v, GD_DTYPE_F16, &vh));
+    CHECK_OK(gd_sdpa(ctx, qh, kh, vh, NULL, &cfg, &y));
+    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
+    CHECK_OK(gd_gelu(ctx, yf, false, &gel));
+    CHECK_OK(gd_tensor_reshape(gel, 1, flat, &fl));
+    CHECK_OK(gd_sum(ctx, fl, 0, false, &loss));
+    CHECK_OK(gd_backward(ctx, loss));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(loss); gd_tensor_release(fl); gd_tensor_release(gel); gd_tensor_release(yf);
+    gd_tensor_release(y); gd_tensor_release(vh); gd_tensor_release(kh); gd_tensor_release(qh);
+
+    CHECK_OK(gd_graph_compile(g, dev));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, dev));
+    CHECK_OK(gd_tensor_grad(q, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gq, N * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(k, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gk, N * sizeof(float)));
+    CHECK_OK(gd_tensor_grad(v, &grad));
+    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gv, N * sizeof(float)));
+
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(v); gd_tensor_release(k); gd_tensor_release(q);
+    return 0;
+}
+
+static int test_metal_f16_sdpa_prefix_window_dh64_backward(gd_context *ctx)
+{
+    enum { B = 1, T = 300, H = 1, DH = 64, N = B * T * H * DH };
+    static float qdata[N];
+    static float kdata[N];
+    static float vdata[N];
+    static float gq_cpu[N], gk_cpu[N], gv_cpu[N];
+    static float gq_metal[N], gk_metal[N], gv_metal[N];
+    int i = 0;
+
+    for (i = 0; i < N; ++i) {
+        qdata[i] = 0.020F * (float)((i % 17) - 8);
+        kdata[i] = 0.015F * (float)((i % 13) - 6);
+        vdata[i] = 0.025F * (float)((i % 11) - 5);
+    }
+    if (run_f16_sdpa_prefix_window_dh64_backward(ctx, CPU, qdata, kdata, vdata,
+                                                 gq_cpu, gk_cpu, gv_cpu) != 0 ||
+        run_f16_sdpa_prefix_window_dh64_backward(ctx, METAL, qdata, kdata, vdata,
+                                                 gq_metal, gk_metal, gv_metal) != 0) {
+        return 1;
+    }
+    CHECK_TRUE(arrays_close_tol("prefix_window_dh64_f16 dq", gq_cpu, gq_metal,
+                                N, 3.0e-2F, 8.0e-2F));
+    CHECK_TRUE(arrays_close_tol("prefix_window_dh64_f16 dk", gk_cpu, gk_metal,
+                                N, 3.0e-2F, 8.0e-2F));
+    CHECK_TRUE(arrays_close_tol("prefix_window_dh64_f16 dv", gv_cpu, gv_metal,
+                                N, 3.0e-2F, 8.0e-2F));
     return 0;
 }
 
@@ -1607,6 +1725,7 @@ int main(void)
     rc |= test_metal_f16_cross_entropy(ctx);
     rc |= test_metal_f16_sdpa(ctx);
     rc |= test_metal_f16_sdpa_backward(ctx);
+    rc |= test_metal_f16_sdpa_prefix_window_dh64_backward(ctx);
     rc |= test_metal_f16_rope(ctx);
     rc |= test_metal_matmul_parity(ctx);
     rc |= test_metal_linear_parity(ctx);

@@ -688,7 +688,9 @@ int main(void)
     rc |= test_sdpa_multiblock(ctx, 300, 0, 0);    /* causal, split-K */
     rc |= test_sdpa_multiblock(ctx, 300, 48, 0);   /* causal + window, split-K */
     rc |= test_sdpa_multiblock(ctx, 130, 0, 33);   /* prefix-causal, boundary block */
+    rc |= test_sdpa_multiblock(ctx, 130, 48, 33);  /* prefix + suffix sliding window */
     rc |= test_sdpa_multiblock(ctx, 300, 0, 129);  /* prefix-causal, split-K */
+    rc |= test_sdpa_multiblock(ctx, 300, 48, 129); /* prefix + window, split-K */
     rc |= test_swiglu_fusion(ctx);            /* F1 fused silu+mul + fired check */
     rc |= test_add_rms_norm_fusion(ctx);      /* F4 residual add+rms_norm fwd/bwd */
     rc |= backward_parity(ctx, build_sdpa_bias, "sdpa_bias");

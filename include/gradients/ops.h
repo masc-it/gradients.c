@@ -139,7 +139,9 @@ gd_status gd_rope(gd_context *ctx,
  *
  * `prefix_len` enables VLM prefix-causal attention when `causal=true`: query
  * positions before prefix_len attend bidirectionally within the prefix only;
- * later positions attend causally to prefix + prior/current suffix tokens. */
+ * later positions attend causally to prefix + prior/current suffix tokens. When
+ * `sliding_window > 0`, the window applies only to suffix/suffix attention;
+ * prefix keys stay visible to all suffix queries. */
 typedef struct gd_sdpa_config {
     float scale;          /* 0 => 1/sqrt(head_dim) */
     bool  causal;

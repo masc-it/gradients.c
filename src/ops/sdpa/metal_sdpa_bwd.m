@@ -29,14 +29,30 @@ static void fill_sdpa_params(gd_metal_sdpa_params *p,
     (void)_gd_metal_dtype_code(q_desc->dtype, &p->dtype);
 }
 
-static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
+static bool sdpa_fast_enabled(void)
 {
     const char *fast = getenv("GD_METAL_SDPA_CAUSAL_FAST");
 
-    if (fast != NULL && fast[0] == '0') {
-        return false;
-    }
-    return p != NULL && p->causal != 0 && p->prefix_len == 0 && p->has_bias == 0;
+    return fast == NULL || fast[0] != '0';
+}
+
+static bool sdpa_is_causal_no_bias(const gd_metal_sdpa_params *p)
+{
+    return sdpa_fast_enabled() && p != NULL && p->causal != 0 &&
+           p->prefix_len == 0 && p->has_bias == 0;
+}
+
+static bool sdpa_is_causal_window_no_bias(const gd_metal_sdpa_params *p)
+{
+    return sdpa_fast_enabled() && p != NULL && p->causal != 0 &&
+           p->window > 0 && p->has_bias == 0;
+}
+
+static bool sdpa_f16_window_split_supported(const gd_metal_sdpa_params *p,
+                                            bool f16)
+{
+    return f16 && sdpa_is_causal_window_no_bias(p) &&
+           (p->prefix_len == 0 || p->Dh == 64);
 }
 
 static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
@@ -77,7 +93,7 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
      * threadgroups into per-split partials, then reduce. stats/dq split the key
      * range (per query block); dkv splits the query range (per key block). */
     {
-        bool f16_window_split = f16 && sdpa_is_causal_no_bias(&p) && p.window > 0;
+        bool f16_window_split = sdpa_f16_window_split_supported(&p, f16);
         int nsplit = (f16 && !f16_window_split) ? 1 :
             _gd_metal_sdpa_num_splits(p.Tk > p.Tq ? p.Tk : p.Tq);
         if (nsplit > 1) {
@@ -100,8 +116,27 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
             id<MTLComputePipelineState> dkr_pso = _gd_metal_pipeline_named(st, f16 ? "gd_sdpa_bwd_dkv_reduce_f16" : "gd_sdpa_bwd_dkv_reduce");
             bool sdq_lane_split = false;
             NSUInteger sdq_threads = GD_METAL_SDPA_BQ;
-            if (sdpa_is_causal_no_bias(&p)) {
-                if (p.window > 0) {
+            if (sdpa_is_causal_window_no_bias(&p)) {
+                if (p.prefix_len > 0) {
+                    if (f16 && p.Dh == 64) {
+                        id<MTLComputePipelineState> fast_sdq_window =
+                            _gd_metal_pipeline_named(st,
+                                "gd_sdpa_bwd_stats_dq_split_prefix_window_lane8_dh64_f16");
+                        id<MTLComputePipelineState> fast_dks_window =
+                            _gd_metal_pipeline_named(st,
+                                "gd_sdpa_bwd_dkv_split_prefix_window_k16_dh64_f16");
+                        if (fast_sdq_window == nil || fast_dks_window == nil) {
+                            return _gd_error(GD_ERR_BACKEND,
+                                             "metal sdpa_bwd prefix-window f16 dh64 pipeline missing");
+                        }
+                        sdq_pso = fast_sdq_window;
+                        sdq_lane_split = true;
+                        sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
+                        dks_pso = fast_dks_window;
+                        dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
+                        dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
+                    }
+                } else {
                     const char *sdq_window_name = f16 && p.Dh == 64
                         ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_dh64_f16"
                         : (f16 ? "gd_sdpa_bwd_stats_dq_split_causal_window_lane8_f16"
@@ -114,6 +149,10 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
                         _gd_metal_pipeline_named(st, sdq_window_name);
                     id<MTLComputePipelineState> fast_dks_window =
                         _gd_metal_pipeline_named(st, dks_window_name);
+                    if (f16 && (fast_sdq_window == nil || fast_dks_window == nil)) {
+                        return _gd_error(GD_ERR_BACKEND,
+                                         "metal sdpa_bwd window f16 pipeline missing");
+                    }
                     if (fast_sdq_window != nil) {
                         sdq_pso = fast_sdq_window;
                         sdq_lane_split = true;
@@ -124,29 +163,29 @@ static gd_status sdpa_bwd_kernel(_gd_metal_encode_ctx *ctx)
                         dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
                         dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
                     }
-                } else {
-                    id<MTLComputePipelineState> fast_sdq_lane =
-                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal_lane8");
-                    id<MTLComputePipelineState> fast_sdq =
-                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
-                    id<MTLComputePipelineState> fast_dks_wide =
-                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal_k16");
-                    id<MTLComputePipelineState> fast_dks =
-                        _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
-                    if (fast_sdq_lane != nil) {
-                        sdq_pso = fast_sdq_lane;
-                        sdq_lane_split = true;
-                        sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
-                    } else if (fast_sdq != nil) {
-                        sdq_pso = fast_sdq;
-                    }
-                    if (fast_dks_wide != nil) {
-                        dks_pso = fast_dks_wide;
-                        dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
-                        dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
-                    } else if (fast_dks != nil) {
-                        dks_pso = fast_dks;
-                    }
+                }
+            } else if (sdpa_is_causal_no_bias(&p)) {
+                id<MTLComputePipelineState> fast_sdq_lane =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal_lane8");
+                id<MTLComputePipelineState> fast_sdq =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_stats_dq_split_causal");
+                id<MTLComputePipelineState> fast_dks_wide =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal_k16");
+                id<MTLComputePipelineState> fast_dks =
+                    _gd_metal_pipeline_named(st, "gd_sdpa_bwd_dkv_split_causal");
+                if (fast_sdq_lane != nil) {
+                    sdq_pso = fast_sdq_lane;
+                    sdq_lane_split = true;
+                    sdq_threads = GD_METAL_SDPA_CAUSAL_THREADS;
+                } else if (fast_sdq != nil) {
+                    sdq_pso = fast_sdq;
+                }
+                if (fast_dks_wide != nil) {
+                    dks_pso = fast_dks_wide;
+                    dkv_keys = GD_METAL_SDPA_DKV_WIDE_KEYS;
+                    dkv_threads = GD_METAL_SDPA_DKV_WIDE_THREADS;
+                } else if (fast_dks != nil) {
+                    dks_pso = fast_dks;
                 }
             }
             id<MTLBuffer> go_b = _gd_metal_value_buffer(exe, node->inputs[0]);
@@ -288,9 +327,9 @@ static gd_status sdpa_bwd_plan(_gd_metal_plan_ctx *ctx)
         int Tk = (int)kd->sizes[1];
         int Hkv = (int)kd->sizes[2];
         bool f16_window_split = qd->dtype == GD_DTYPE_F16 && ctx->node->attrs.causal &&
-                                ctx->node->attrs.prefix_len == 0 &&
                                 !ctx->node->attrs.has_bias &&
-                                ctx->node->attrs.sliding_window > 0;
+                                ctx->node->attrs.sliding_window > 0 &&
+                                (ctx->node->attrs.prefix_len == 0 || Dh == 64);
         int nsplit = (qd->dtype == GD_DTYPE_F16 && !f16_window_split) ? 1 :
             _gd_metal_sdpa_num_splits(Tk > Tq ? Tk : Tq);
         int64_t nfloats = Dh <= GD_METAL_SDPA_DHT && nsplit > 1

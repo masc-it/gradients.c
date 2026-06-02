@@ -279,6 +279,69 @@ static int test_sdpa_prefix_cpu(gd_context *ctx)
     return 0;
 }
 
+static int test_sdpa_prefix_window_cpu(gd_context *ctx)
+{
+    gd_device cpu = {GD_DEVICE_CPU, 0};
+    int64_t xs[4] = {1, 6, 1, 1};
+    int64_t bs[4] = {1, 1, 6, 6};
+    float qd[6] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    float kd[6] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    float vd[6] = {10.0F, 20.0F, 100.0F, 200.0F, 400.0F, 800.0F};
+    float bd[36];
+    float native[6];
+    float dense[6];
+    float expect[6] = {15.0F, 15.0F, 130.0F / 3.0F, 230.0F / 3.0F,
+                       430.0F / 3.0F, 830.0F / 3.0F};
+    gd_sdpa_config prefix = {0};
+    gd_tensor *q = NULL;
+    gd_tensor *k = NULL;
+    gd_tensor *v = NULL;
+    gd_tensor *bias = NULL;
+    gd_tensor *yn = NULL;
+    gd_tensor *yd = NULL;
+    gd_graph *g = NULL;
+    int i = 0;
+    int j = 0;
+
+    prefix.causal = true;
+    prefix.prefix_len = 2;
+    prefix.sliding_window = 1;
+    for (i = 0; i < 6; ++i) {
+        for (j = 0; j < 6; ++j) {
+            int allowed = (i < 2) ? (j < 2) : (j < 2 || (j <= i && i - j < 1));
+            bd[i * 6 + j] = allowed ? 0.0F : -1.0e9F;
+        }
+    }
+    CHECK_OK(make_f32(ctx, 4, xs, qd, &q));
+    CHECK_OK(make_f32(ctx, 4, xs, kd, &k));
+    CHECK_OK(make_f32(ctx, 4, xs, vd, &v));
+    CHECK_OK(make_f32(ctx, 4, bs, bd, &bias));
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &prefix, &yn));
+    CHECK_OK(gd_sdpa(ctx, q, k, v, bias, NULL, &yd));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, cpu));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, yn, native, sizeof(native)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, yd, dense, sizeof(dense)));
+    for (i = 0; i < 6; ++i) {
+        CHECK_TRUE(close_to(native[i], expect[i]));
+        CHECK_TRUE(close_to(native[i], dense[i]));
+    }
+
+    gd_tensor_release(yn);
+    gd_tensor_release(yd);
+    CHECK_OK(gd_graph_reset(g));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_tensor_release(q);
+    gd_tensor_release(k);
+    gd_tensor_release(v);
+    gd_tensor_release(bias);
+    return 0;
+}
+
 static int test_reuse_and_materialize(gd_context *ctx)
 {
     int64_t s2[1] = {2};
@@ -420,8 +483,8 @@ int main(void)
     CHECK_OK(gd_context_create(&ctx));
     if (test_elementwise_and_unary(ctx) != 0 || test_matmul_linear(ctx) != 0 ||
         test_softmax_sum_ce(ctx) != 0 || test_sdpa_prefix_cpu(ctx) != 0 ||
-        test_reuse_and_materialize(ctx) != 0 || test_virtual_reshape(ctx) != 0 ||
-        test_synchronize_contract(ctx) != 0) {
+        test_sdpa_prefix_window_cpu(ctx) != 0 || test_reuse_and_materialize(ctx) != 0 ||
+        test_virtual_reshape(ctx) != 0 || test_synchronize_contract(ctx) != 0) {
         gd_context_destroy(ctx);
         return 1;
     }

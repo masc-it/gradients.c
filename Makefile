@@ -112,11 +112,13 @@ GENERATED_FILES := \
   $(GENERATED_DIR)/metal_shaders.mk \
   $(GENERATED_DIR)/op_matrix.md
 
-# gpt_bench is a profiling harness, not a correctness test: exclude it from the
-# auto-discovered test runner (build/run via `make gpt-bench`).
+# Profiling harnesses, not correctness tests: exclude them from the
+# auto-discovered test runner (build/run via `make gpt-bench` / `make sdpa-bench`).
 GPT_BENCH_SRC := $(TEST_DIR)/gpt_bench.c
 GPT_BENCH_BIN := $(BUILD_DIR)/$(TEST_DIR)/gpt_bench
-TEST_SRC := $(filter-out $(GPT_BENCH_SRC),\
+SDPA_BENCH_SRC := $(TEST_DIR)/sdpa_bench.c
+SDPA_BENCH_BIN := $(BUILD_DIR)/$(TEST_DIR)/sdpa_bench
+TEST_SRC := $(filter-out $(GPT_BENCH_SRC) $(SDPA_BENCH_SRC),\
              $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort))
 TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 
@@ -133,7 +135,7 @@ GPT_LM_SRC := $(EXAMPLE_DIR)/gpt-lm/gpt_lm.c
 GPT_LM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-lm/gpt_lm
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt gpt-lm bench-gpt gpt-bench _gpt_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
+.PHONY: help all build check test tests mlp gpt gpt-lm bench-gpt gpt-bench _gpt_bench_run sdpa-bench _sdpa_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -147,6 +149,7 @@ help:
 	@printf '%s\n' '  make gpt-lm      build library + real GPT-LM trainer (pass GPT_LM_ARGS=...)'
 	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
 	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
+	@printf '%s\n' '  make sdpa-bench  release build, then run raw SDPA profiling harness (GD_DEVICE, GD_BENCH_*)'
 	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
 	@printf '%s\n' '  make tools       build command-line tools'
 	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
@@ -214,6 +217,13 @@ gpt-bench:
 _gpt_bench_run: build $(GPT_BENCH_BIN)
 	@printf '[gpt-bench] run %s (GD_DEVICE=%s)\n' '$(GPT_BENCH_BIN)' '$(GD_DEVICE)'
 	@GRADIENTS_METALLIB=$(BUILD_DIR)/gradients.metallib $(GPT_BENCH_BIN)
+
+sdpa-bench:
+	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' _sdpa_bench_run
+
+_sdpa_bench_run: build $(SDPA_BENCH_BIN)
+	@printf '[sdpa-bench] run %s (GD_DEVICE=%s)\n' '$(SDPA_BENCH_BIN)' '$(GD_DEVICE)'
+	@GRADIENTS_METALLIB=$(BUILD_DIR)/gradients.metallib $(SDPA_BENCH_BIN)
 
 examples: build $(EXAMPLE_BINS)
 ifeq ($(strip $(EXAMPLE_BINS)),)

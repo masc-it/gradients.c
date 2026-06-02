@@ -255,9 +255,15 @@ static int test_sdpa_prefix_schema(gd_context *ctx)
     CHECK_TRUE(out == NULL);
 
     cfg.causal = true;
-    cfg.sliding_window = 3;
+    cfg.sliding_window = -1;
     CHECK_STATUS(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out), GD_ERR_INVALID_ARGUMENT);
     CHECK_TRUE(out == NULL);
+
+    cfg.sliding_window = 3;
+    CHECK_OK(gd_sdpa(ctx, q, k, v, NULL, &cfg, &out));
+    CHECK_TRUE(check_shape(out, 4, xs) == 0);
+    gd_tensor_release(out);
+    out = NULL;
 
     cfg.sliding_window = 0;
     cfg.prefix_len = 6;

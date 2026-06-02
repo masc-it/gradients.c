@@ -52,6 +52,42 @@ static inline int gd_sdpa_kb_end(int q0, int bq, int Tq, int Tk,
     }
     return lim;
 }
+static inline int gd_sdpa_kb_start(int q0, int Tq, int Tk,
+                                    int window, int prefix_len)
+{
+    if (window <= 0) {
+        return 0;
+    }
+    int qpos = q0 + (Tk - Tq);
+    if (prefix_len > 0) {
+        if (qpos < prefix_len) {
+            qpos = prefix_len;
+        }
+        int first = qpos - window + 1;
+        if (first < prefix_len) {
+            first = prefix_len;
+        }
+        if (first > Tk) {
+            first = Tk;
+        }
+        return first;
+    }
+    int first = qpos - window + 1;
+    if (first <= 0) {
+        return 0;
+    }
+    if (first > Tk) {
+        return Tk;
+    }
+    return first;
+}
+static inline int gd_sdpa_kb_prefix_end(int Tk, int window, int prefix_len)
+{
+    if (window <= 0 || prefix_len <= 0) {
+        return 0;
+    }
+    return prefix_len < Tk ? prefix_len : Tk;
+}
 static inline int gd_sdpa_qb_start(int k0, int qblk, int Tk, int Tq,
                                     int causal, int prefix_len)
 {
@@ -69,6 +105,25 @@ static inline int gd_sdpa_qb_start(int k0, int qblk, int Tk, int Tq,
         return Tq;
     }
     return (qmin / qblk) * qblk;
+}
+static inline int gd_sdpa_qb_end(int k0, int key_count, int Tk, int Tq,
+                                  int window, int prefix_len)
+{
+    if (window <= 0) {
+        return Tq;
+    }
+    if (prefix_len > 0 && k0 < prefix_len) {
+        return Tq;
+    }
+    int kend = k0 + key_count;
+    if (kend > Tk) {
+        kend = Tk;
+    }
+    int lim = kend + window - 1 - (Tk - Tq);
+    if (lim < 0) {
+        return 0;
+    }
+    return lim > Tq ? Tq : lim;
 }
 static inline float gd_sdpa_bias_at(device const float *bias,
                                     constant gd_metal_sdpa_params &p,
@@ -136,8 +191,15 @@ kernel void gd_sdpa_bwd_stats(device const uchar *go            [[buffer(0)]],
     float l = 0.0f;
     float raw = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
+    int q0 = qb * GD_SDPA_BQ;
+    int kb_start = gd_sdpa_kb_start(q0, p.Tq, p.Tk, p.window, p.prefix_len);
+    int kb_prefix_end = gd_sdpa_kb_prefix_end(p.Tk, p.window, p.prefix_len);
+    int kb_end = gd_sdpa_kb_end(q0, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - GD_SDPA_BK;
+            continue;
+        }
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;
@@ -218,8 +280,15 @@ kernel void gd_sdpa_bwd_dq(device const uchar *go            [[buffer(0)]],
     }
     bool run = active && l > 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
+    int q0 = qb * GD_SDPA_BQ;
+    int kb_start = gd_sdpa_kb_start(q0, p.Tq, p.Tk, p.window, p.prefix_len);
+    int kb_prefix_end = gd_sdpa_kb_prefix_end(p.Tk, p.window, p.prefix_len);
+    int kb_end = gd_sdpa_kb_end(q0, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     for (int kb = 0; kb < kb_end; kb += GD_SDPA_BK) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - GD_SDPA_BK;
+            continue;
+        }
         int tile = kb_end - kb;
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;
@@ -298,11 +367,13 @@ kernel void gd_sdpa_bwd_dkv(device const uchar *go            [[buffer(0)]],
         dvacc[c] = 0.0f;
     }
 
-    int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_BQ, GD_SDPA_BK, p.Tk, p.Tq, p.causal, p.prefix_len);
+    int k0 = kblk * GD_SDPA_BQ;
+    int qb_start = gd_sdpa_qb_start(k0, GD_SDPA_BK, p.Tk, p.Tq, p.causal, p.prefix_len);
+    int qb_end = gd_sdpa_qb_end(k0, GD_SDPA_BQ, p.Tk, p.Tq, p.window, p.prefix_len);
     for (int g = 0; g < group; ++g) {
         int hq = hkv * group + g;
-        for (int qb = qb_start; qb < p.Tq; qb += GD_SDPA_BK) {
-            int tile = p.Tq - qb;
+        for (int qb = qb_start; qb < qb_end; qb += GD_SDPA_BK) {
+            int tile = qb_end - qb;
             if (tile > GD_SDPA_BK) {
                 tile = GD_SDPA_BK;
             }
@@ -398,7 +469,10 @@ kernel void gd_sdpa_bwd_stats_dq_split(device const float *go          [[buffer(
     float l = 0.0f;
     float raw = 0.0f;
 
-    int kb_end = gd_sdpa_kb_end(qb * GD_SDPA_BQ, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
+    int q0 = qb * GD_SDPA_BQ;
+    int kb_start = gd_sdpa_kb_start(q0, p.Tq, p.Tk, p.window, p.prefix_len);
+    int kb_prefix_end = gd_sdpa_kb_prefix_end(p.Tk, p.window, p.prefix_len);
+    int kb_end = gd_sdpa_kb_end(q0, GD_SDPA_BQ, p.Tq, p.Tk, p.causal, p.prefix_len);
     int slen = gd_sdpa_split_len(p.Tk, p.n_splits);
     int k_lo = sp * slen;
     int k_hi = k_lo + slen;
@@ -406,6 +480,10 @@ kernel void gd_sdpa_bwd_stats_dq_split(device const float *go          [[buffer(
         k_hi = kb_end;
     }
     for (int kb = k_lo; kb < k_hi; kb += GD_SDPA_BK) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - GD_SDPA_BK;
+            continue;
+        }
         int tile = k_hi - kb;
         if (tile > GD_SDPA_BK) {
             tile = GD_SDPA_BK;
@@ -608,16 +686,17 @@ kernel void gd_sdpa_bwd_dkv_split(device const float *go            [[buffer(0)]
         nchan++;
     }
 
-    int qb_start = gd_sdpa_qb_start(kblk * GD_SDPA_DKV_KEYS, GD_SDPA_BK,
-                                    p.Tk, p.Tq, p.causal, p.prefix_len);
+    int k0 = kblk * GD_SDPA_DKV_KEYS;
+    int qb_start = gd_sdpa_qb_start(k0, GD_SDPA_BK, p.Tk, p.Tq, p.causal, p.prefix_len);
+    int qb_end = gd_sdpa_qb_end(k0, GD_SDPA_DKV_KEYS, p.Tk, p.Tq, p.window, p.prefix_len);
     int slen = gd_sdpa_split_len(p.Tq, p.n_splits);
     int q_lo = s * slen;
     int q_hi = q_lo + slen;
     if (q_lo < qb_start) {
         q_lo = qb_start;
     }
-    if (q_hi > p.Tq) {
-        q_hi = p.Tq;
+    if (q_hi > qb_end) {
+        q_hi = qb_end;
     }
     for (int g = 0; g < group; ++g) {
         int hq = hkv * group + g;

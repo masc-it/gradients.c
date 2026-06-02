@@ -3,7 +3,7 @@
  *
  * End-to-end path for docs/plan_gpt_preparation.md without generation/KV cache:
  *   optional bootstrap BPE + packed gdtok dataset from plain text
- *   double-buffer dataloaders
+ *   async background-worker dataloaders
  *   two static train graphs (one per slot)
  *   fused tied-LM CE, AMP, grad clip, mutable LR scheduler, parameter groups
  *   periodic validation perplexity
@@ -28,7 +28,6 @@
 #include <sys/types.h>
 
 #define GD_LM_MAX_PATH 4096U
-#define GD_LM_N_SLOTS 2
 
 #define CHECK_OK(expr)                                                           \
     do {                                                                         \
@@ -71,6 +70,8 @@ typedef struct app_config {
     int eval_batches;
     int train_eval;
     int log_interval;
+    int num_workers;
+    int prefetch_factor;
     uint64_t seed;
     int vocab_from_env;
 } app_config;
@@ -289,6 +290,8 @@ static void usage(FILE *f)
             "  --train-eval       report eval-mode train_loss with val_loss (default)\n"
             "  --no-train-eval    disable eval-mode train_loss\n"
             "  --log-interval N   train log interval (default: 10)\n"
+            "  --num-workers N    dataloader workers (default: GD_LM_NUM_WORKERS or 1)\n"
+            "  --prefetch-factor N batches queued per worker (default: GD_LM_PREFETCH_FACTOR or 2)\n"
             "  --seed N           master seed (default: 1234)\n"
             "\n"
             "Model/training knobs intentionally mirror gpt_bench:\n"
@@ -345,6 +348,8 @@ static void init_app_config(app_config *cfg)
     cfg->eval_batches = env_int("GD_LM_EVAL_BATCHES", 8);
     cfg->train_eval = env_flag_default("GD_LM_TRAIN_EVAL", 1);
     cfg->log_interval = env_int("GD_LM_LOG_INTERVAL", 10);
+    cfg->num_workers = env_int("GD_LM_NUM_WORKERS", 1);
+    cfg->prefetch_factor = env_int("GD_LM_PREFETCH_FACTOR", 2);
     cfg->seed = env_u64("GD_LM_SEED", 1234U);
     cfg->vocab_from_env = getenv("GD_BENCH_VOCAB") != NULL;
 }
@@ -423,6 +428,16 @@ static int parse_args(int argc, char **argv, app_config *cfg)
         } else if (strcmp(argv[i], "--log-interval") == 0) {
             if (i + 1 >= argc || parse_int_arg(argv[++i], &cfg->log_interval) != 0) {
                 fprintf(stderr, "invalid --log-interval\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--num-workers") == 0) {
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &cfg->num_workers) != 0) {
+                fprintf(stderr, "invalid --num-workers\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--prefetch-factor") == 0) {
+            if (i + 1 >= argc || parse_int_arg(argv[++i], &cfg->prefetch_factor) != 0) {
+                fprintf(stderr, "invalid --prefetch-factor\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--seed") == 0) {
@@ -677,10 +692,23 @@ static int destroy_graph_slot(train_graph_slot *slot)
     return 0;
 }
 
-static int prefetch_twice(gd_dataloader *dl)
+static void destroy_graph_slots(train_graph_slot *slots, int n_slots)
 {
-    CHECK_OK(gd_dataloader_prefetch(dl));
-    CHECK_OK(gd_dataloader_prefetch(dl));
+    int i;
+    if (slots == NULL) {
+        return;
+    }
+    for (i = 0; i < n_slots; ++i) {
+        (void)destroy_graph_slot(&slots[i]);
+    }
+}
+
+static int prefetch_n(gd_dataloader *dl, int n)
+{
+    int i;
+    for (i = 0; i < n; ++i) {
+        CHECK_OK(gd_dataloader_prefetch(dl));
+    }
     return 0;
 }
 
@@ -688,34 +716,48 @@ static int build_eval_graphs(gd_context *ctx,
                              gd_device target,
                              gd_gpt *model,
                              gd_dataloader *dl,
-                             train_graph_slot graphs[GD_LM_N_SLOTS])
+                             train_graph_slot *graphs,
+                             int n_slots)
 {
     gd_batch_slot *slot = NULL;
-    gd_batch_slot *held[GD_LM_N_SLOTS] = {NULL, NULL};
+    gd_batch_slot **held = NULL;
     int i = 0;
 
-    for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+    held = (gd_batch_slot **)calloc((size_t)n_slots, sizeof(*held));
+    if (held == NULL) {
+        fprintf(stderr, "failed to allocate dataloader slot table\n");
+        return 1;
+    }
+    for (i = 0; i < n_slots; ++i) {
         CHECK_OK(gd_dataloader_next(dl, &slot));
+        if (slot->index < 0 || slot->index >= n_slots) {
+            free(held);
+            fprintf(stderr, "dataloader slot index out of range: %d\n", slot->index);
+            return 1;
+        }
         held[slot->index] = slot;
     }
-    for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+    for (i = 0; i < n_slots; ++i) {
         if (held[i] == NULL) {
+            free(held);
             fprintf(stderr, "dataloader did not provide slot %d\n", i);
             return 1;
         }
         CHECK_ZERO(build_eval_graph(ctx, target, model, held[i], &graphs[i]));
     }
-    for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+    for (i = 0; i < n_slots; ++i) {
         CHECK_OK(gd_dataloader_release_slot(dl, held[i]));
     }
-    CHECK_ZERO(prefetch_twice(dl));
+    free(held);
+    CHECK_ZERO(prefetch_n(dl, n_slots));
     return 0;
 }
 
 static int run_eval(gd_context *ctx,
                     gd_device target,
                     gd_dataloader *val_dl,
-                    train_graph_slot graphs[GD_LM_N_SLOTS],
+                    train_graph_slot *graphs,
+                    int n_slots,
                     int eval_batches,
                     float *loss_out)
 {
@@ -730,6 +772,10 @@ static int run_eval(gd_context *ctx,
         gd_batch_slot *slot = NULL;
         float loss = 0.0F;
         CHECK_OK(gd_dataloader_next(val_dl, &slot));
+        if (slot->index < 0 || slot->index >= n_slots) {
+            fprintf(stderr, "dataloader slot index out of range: %d\n", slot->index);
+            return 1;
+        }
         CHECK_OK(gd_graph_run(graphs[slot->index].graph));
         CHECK_OK(gd_synchronize(ctx, target));
         CHECK_OK(gd_tensor_copy_to_cpu(ctx, graphs[slot->index].loss, &loss, sizeof(loss)));
@@ -771,9 +817,12 @@ int main(int argc, char **argv)
     gd_optimizer *opt = NULL;
     gd_amp_scaler *scaler = NULL;
     gd_tensor *lr_tensor = NULL;
-    train_graph_slot train_graphs[GD_LM_N_SLOTS];
-    train_graph_slot train_eval_graphs[GD_LM_N_SLOTS];
-    train_graph_slot eval_graphs[GD_LM_N_SLOTS];
+    train_graph_slot *train_graphs = NULL;
+    train_graph_slot *train_eval_graphs = NULL;
+    train_graph_slot *eval_graphs = NULL;
+    int train_slots = 0;
+    int train_eval_slots = 0;
+    int val_slots = 0;
     const char *train_paths[1];
     const char *val_paths[1];
     long total_params = 0;
@@ -789,9 +838,6 @@ int main(int argc, char **argv)
     uint64_t last_batches = 0U;
     uint64_t last_wait_ns = 0U;
 
-    memset(train_graphs, 0, sizeof(train_graphs));
-    memset(train_eval_graphs, 0, sizeof(train_eval_graphs));
-    memset(eval_graphs, 0, sizeof(eval_graphs));
     setvbuf(stdout, NULL, _IONBF, 0);
 
     init_app_config(&app);
@@ -809,7 +855,8 @@ int main(int argc, char **argv)
         }
     }
     if (app.steps <= 0 || app.batch_size <= 0 || app.context_len <= 0 ||
-        app.log_interval <= 0 || app.eval_batches < 0) {
+        app.log_interval <= 0 || app.eval_batches < 0 || app.num_workers <= 0 ||
+        app.prefetch_factor <= 0) {
         fprintf(stderr, "invalid train shape/control config\n");
         return 2;
     }
@@ -937,12 +984,20 @@ int main(int argc, char **argv)
     dl_cfg.block_len = app.context_len;
     dl_cfg.double_buffer = 1;
     dl_cfg.device = target;
+    dl_cfg.num_workers = app.num_workers;
+    dl_cfg.prefetch_factor = app.prefetch_factor;
 
     dl_cfg.seed = app.seed ^ UINT64_C(0x243f6a8885a308d3);
     dl_cfg.shuffle = 1;
     dl_cfg.mode = GD_DATALOADER_RANDOM;
     dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(train_ds);
     CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, &train_dl));
+    train_slots = gd_dataloader_slot_count(train_dl);
+    train_graphs = (train_graph_slot *)calloc((size_t)train_slots, sizeof(*train_graphs));
+    if (train_graphs == NULL) {
+        fprintf(stderr, "failed to allocate train graphs\n");
+        goto cleanup;
+    }
 
     if (do_train_eval) {
         dl_cfg.seed = app.seed ^ UINT64_C(0xa4093822299f31d0);
@@ -950,6 +1005,13 @@ int main(int argc, char **argv)
         dl_cfg.mode = GD_DATALOADER_SEQUENTIAL;
         dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(train_ds);
         CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, &train_eval_dl));
+        train_eval_slots = gd_dataloader_slot_count(train_eval_dl);
+        train_eval_graphs = (train_graph_slot *)calloc((size_t)train_eval_slots,
+                                                       sizeof(*train_eval_graphs));
+        if (train_eval_graphs == NULL) {
+            fprintf(stderr, "failed to allocate train eval graphs\n");
+            goto cleanup;
+        }
     }
 
     if (do_eval) {
@@ -958,14 +1020,20 @@ int main(int argc, char **argv)
         dl_cfg.mode = GD_DATALOADER_SEQUENTIAL;
         dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(val_ds);
         CHECK_OK(gd_dataloader_create(ctx, val_ds, &dl_cfg, &val_dl));
+        val_slots = gd_dataloader_slot_count(val_dl);
+        eval_graphs = (train_graph_slot *)calloc((size_t)val_slots, sizeof(*eval_graphs));
+        if (eval_graphs == NULL) {
+            fprintf(stderr, "failed to allocate eval graphs\n");
+            goto cleanup;
+        }
     }
 
-    CHECK_ZERO(prefetch_twice(train_dl));
+    CHECK_ZERO(prefetch_n(train_dl, train_slots));
     if (do_train_eval) {
-        CHECK_ZERO(prefetch_twice(train_eval_dl));
+        CHECK_ZERO(prefetch_n(train_eval_dl, train_eval_slots));
     }
     if (do_eval) {
-        CHECK_ZERO(prefetch_twice(val_dl));
+        CHECK_ZERO(prefetch_n(val_dl, val_slots));
     }
 
     CHECK_OK(gd_gpt_create(ctx, &model_cfg, app.seed ^ UINT64_C(0xdeadbeef), &model));
@@ -1013,6 +1081,8 @@ int main(int argc, char **argv)
            (unsigned long long)gd_token_dataset_num_samples(train_ds),
            (unsigned long long)gd_token_dataset_num_samples(val_ds), app.context_len,
            app.batch_size);
+    printf("  loader      : workers=%d prefetch_factor=%d slots=%d\n",
+           app.num_workers, app.prefetch_factor, train_slots);
     printf("  tokenizer   : hash=%016" PRIx64 " dataset_vocab=%u model_vocab=%d\n",
            gd_token_dataset_tokenizer_hash(train_ds), gd_token_dataset_vocab_size(train_ds),
            model_cfg.vocab_size);
@@ -1035,13 +1105,24 @@ int main(int argc, char **argv)
     {
         int i = 0;
         gd_batch_slot *slot = NULL;
-        gd_batch_slot *held[GD_LM_N_SLOTS] = {NULL, NULL};
-        for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+        gd_batch_slot **held = NULL;
+        held = (gd_batch_slot **)calloc((size_t)train_slots, sizeof(*held));
+        if (held == NULL) {
+            fprintf(stderr, "failed to allocate train slot table\n");
+            goto cleanup;
+        }
+        for (i = 0; i < train_slots; ++i) {
             CHECK_OK(gd_dataloader_next(train_dl, &slot));
+            if (slot->index < 0 || slot->index >= train_slots) {
+                free(held);
+                fprintf(stderr, "train dataloader slot index out of range: %d\n", slot->index);
+                goto cleanup;
+            }
             held[slot->index] = slot;
         }
-        for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+        for (i = 0; i < train_slots; ++i) {
             if (held[i] == NULL) {
+                free(held);
                 fprintf(stderr, "train dataloader did not provide slot %d\n", i);
                 goto cleanup;
             }
@@ -1049,16 +1130,18 @@ int main(int argc, char **argv)
                                          params, n_params, fused_lmce, amp_enabled, grad_clip,
                                          &train_graphs[i]));
         }
-        for (i = 0; i < GD_LM_N_SLOTS; ++i) {
+        for (i = 0; i < train_slots; ++i) {
             CHECK_OK(gd_dataloader_release_slot(train_dl, held[i]));
         }
-        CHECK_ZERO(prefetch_twice(train_dl));
+        free(held);
+        CHECK_ZERO(prefetch_n(train_dl, train_slots));
     }
     if (do_train_eval) {
-        CHECK_ZERO(build_eval_graphs(ctx, target, model, train_eval_dl, train_eval_graphs));
+        CHECK_ZERO(build_eval_graphs(ctx, target, model, train_eval_dl, train_eval_graphs,
+                                     train_eval_slots));
     }
     if (do_eval) {
-        CHECK_ZERO(build_eval_graphs(ctx, target, model, val_dl, eval_graphs));
+        CHECK_ZERO(build_eval_graphs(ctx, target, model, val_dl, eval_graphs, val_slots));
     }
 
     printf("  training    : steps=%d log_interval=%d eval_interval=%d eval_batches=%d train_eval=%s\n",
@@ -1078,6 +1161,10 @@ int main(int argc, char **argv)
         float lr = 0.0F;
         bool stepped = true;
         CHECK_OK(gd_dataloader_next(train_dl, &slot));
+        if (slot->index < 0 || slot->index >= train_slots) {
+            fprintf(stderr, "train dataloader slot index out of range: %d\n", slot->index);
+            goto cleanup;
+        }
         tg = &train_graphs[slot->index];
         CHECK_OK(gd_lr_scheduler_write(ctx, &lr_cfg, step, lr_tensor, &lr));
         CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
@@ -1145,13 +1232,14 @@ int main(int argc, char **argv)
             double ppl = 0.0;
             if (do_train_eval) {
                 CHECK_ZERO(run_eval(ctx, target, train_eval_dl, train_eval_graphs,
-                                    app.eval_batches, &train_eval_loss));
+                                    train_eval_slots, app.eval_batches, &train_eval_loss));
                 if (!isfinite(train_eval_loss)) {
                     fprintf(stderr, "non-finite train eval loss\n");
                     goto cleanup;
                 }
             }
-            CHECK_ZERO(run_eval(ctx, target, val_dl, eval_graphs, app.eval_batches, &val_loss));
+            CHECK_ZERO(run_eval(ctx, target, val_dl, eval_graphs, val_slots,
+                                app.eval_batches, &val_loss));
             ppl = val_loss < 80.0F ? exp((double)val_loss) : HUGE_VAL;
             if (do_train_eval) {
                 printf("eval step %6d train_loss %.5f val_loss %.5f gap %.5f ppl %.5g\n",
@@ -1168,20 +1256,32 @@ int main(int argc, char **argv)
         }
     }
     {
+        gd_dataloader_metrics m;
         double elapsed = (now_ms() - t_start) / 1000.0;
         double toks = (double)app.steps * (double)app.batch_size * (double)app.context_len;
+        gd_dataloader_metrics_get(train_dl, &m);
         printf("done steps=%d elapsed_s=%.3f avg_tok/s=%.1f\n", app.steps, elapsed,
                elapsed > 0.0 ? toks / elapsed : 0.0);
+        if (m.batches_prepared > 0U) {
+            printf("loader final prepared=%llu returned=%llu fill_ms/batch=%.3f copy_ms/batch=%.3f wait_ms_total=%.3f requests=%llu max_ready=%llu\n",
+                   (unsigned long long)m.batches_prepared,
+                   (unsigned long long)m.batches_returned,
+                   (double)m.host_fill_ns / (double)m.batches_prepared / 1.0e6,
+                   (double)m.host_to_device_copy_ns / (double)m.batches_prepared / 1.0e6,
+                   (double)m.wait_for_batch_ns / 1.0e6,
+                   (unsigned long long)m.prefetch_requests,
+                   (unsigned long long)m.max_ready_depth);
+        }
     }
     rc = 0;
 
 cleanup:
-    (void)destroy_graph_slot(&train_graphs[0]);
-    (void)destroy_graph_slot(&train_graphs[1]);
-    (void)destroy_graph_slot(&train_eval_graphs[0]);
-    (void)destroy_graph_slot(&train_eval_graphs[1]);
-    (void)destroy_graph_slot(&eval_graphs[0]);
-    (void)destroy_graph_slot(&eval_graphs[1]);
+    destroy_graph_slots(train_graphs, train_slots);
+    destroy_graph_slots(train_eval_graphs, train_eval_slots);
+    destroy_graph_slots(eval_graphs, val_slots);
+    free(train_graphs);
+    free(train_eval_graphs);
+    free(eval_graphs);
     gd_tensor_release(lr_tensor);
     gd_amp_scaler_destroy(scaler);
     gd_optimizer_destroy(opt);

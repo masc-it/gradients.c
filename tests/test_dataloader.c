@@ -173,15 +173,18 @@ static int arrays_equal(const int32_t *a, const int32_t *b, int n)
     return 1;
 }
 
-static int make_loader(gd_context *ctx,
-                       gd_token_dataset *ds,
-                       gd_dataloader_mode mode,
-                       uint64_t seed,
-                       gd_dataloader **out)
+static int make_loader_ex(gd_context *ctx,
+                          gd_token_dataset *ds,
+                          gd_dataloader_mode mode,
+                          uint64_t seed,
+                          int batch_size,
+                          int num_workers,
+                          int prefetch_factor,
+                          gd_dataloader **out)
 {
     gd_dataloader_config cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.batch_size = 2;
+    cfg.batch_size = batch_size;
     cfg.block_len = 4;
     cfg.seed = seed;
     cfg.shuffle = mode == GD_DATALOADER_RANDOM ? 1 : 0;
@@ -189,8 +192,19 @@ static int make_loader(gd_context *ctx,
     cfg.device = (gd_device){GD_DEVICE_CPU, 0};
     cfg.mode = mode;
     cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(ds);
+    cfg.num_workers = num_workers;
+    cfg.prefetch_factor = prefetch_factor;
     CHECK_OK(gd_dataloader_create(ctx, ds, &cfg, out));
     return 0;
+}
+
+static int make_loader(gd_context *ctx,
+                       gd_token_dataset *ds,
+                       gd_dataloader_mode mode,
+                       uint64_t seed,
+                       gd_dataloader **out)
+{
+    return make_loader_ex(ctx, ds, mode, seed, 2, 0, 0, out);
 }
 
 static int test_sequential_loader_matches_shard_payload(void)
@@ -254,6 +268,7 @@ static int test_double_buffer_slot_states(void)
     CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
     CHECK_OK(gd_context_create(&ctx));
     CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_SEQUENTIAL, 7U, &dl) == 0);
+    CHECK_TRUE(gd_dataloader_slot_count(dl) == 2);
 
     CHECK_OK(gd_dataloader_prefetch(dl));
     CHECK_OK(gd_dataloader_prefetch(dl));
@@ -276,11 +291,59 @@ static int test_double_buffer_slot_states(void)
     return 0;
 }
 
+static int test_multi_worker_prefetch_order(void)
+{
+    const char *corpus_path = "/tmp/gd_loader_workers.txt";
+    const char *tokenizer_path = "/tmp/gd_loader_workers_tok.json";
+    const char *paths[1];
+    gd_dataset_build_result build;
+    gd_token_dataset *ds = NULL;
+    gd_context *ctx = NULL;
+    gd_dataloader *dl = NULL;
+    gd_batch_slot *slot = NULL;
+    int32_t payload[17];
+    int32_t tokens[4];
+    int32_t targets[4];
+    int32_t positions[4];
+    int i;
+    int j;
+
+    CHECK_TRUE(build_fixture_dataset(corpus_path, tokenizer_path, "/tmp/gd_loader_workers_ds", &build) == 0);
+    paths[0] = build.train.shard_path;
+    CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
+    CHECK_OK(gd_context_create(&ctx));
+    CHECK_TRUE(make_loader_ex(ctx, ds, GD_DATALOADER_SEQUENTIAL, 11U, 1, 3, 2, &dl) == 0);
+    CHECK_TRUE(gd_dataloader_slot_count(dl) == 6);
+    CHECK_TRUE(read_shard_tokens(build.train.shard_path, payload, 17) == 0);
+
+    for (i = 0; i < 4; ++i) {
+        CHECK_OK(gd_dataloader_prefetch(dl));
+    }
+    for (i = 0; i < 4; ++i) {
+        CHECK_OK(gd_dataloader_next(dl, &slot));
+        CHECK_TRUE(copy_slot(ctx, slot, tokens, targets, positions, 4) == 0);
+        for (j = 0; j < 4; ++j) {
+            CHECK_TRUE(tokens[j] == payload[i * 4 + j]);
+            CHECK_TRUE(targets[j] == payload[i * 4 + j + 1]);
+            CHECK_TRUE(positions[j] == j);
+        }
+        CHECK_OK(gd_dataloader_release_slot(dl, slot));
+    }
+
+    gd_dataloader_destroy(dl);
+    gd_context_destroy(ctx);
+    gd_token_dataset_close(ds);
+    gd_dataset_build_result_clear(&build);
+    (void)remove(corpus_path);
+    (void)remove(tokenizer_path);
+    return 0;
+}
+
 static int test_random_determinism_state_and_metrics(void)
 {
     const char *corpus_path = "/tmp/gd_loader_rand.txt";
     const char *tokenizer_path = "/tmp/gd_loader_rand_tok.json";
-    const char *state_path = "/tmp/gd_loader_state.json";
+    const char *state_path = "/tmp/gd_loader_state.bin";
     const char *paths[1];
     gd_dataset_build_result build;
     gd_token_dataset *ds = NULL;
@@ -358,6 +421,9 @@ int main(void)
         return 1;
     }
     if (test_double_buffer_slot_states() != 0) {
+        return 1;
+    }
+    if (test_multi_worker_prefetch_order() != 0) {
         return 1;
     }
     if (test_random_determinism_state_and_metrics() != 0) {

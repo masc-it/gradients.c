@@ -44,6 +44,7 @@ BENCH_CFLAGS ?= -std=c11 -O3 -ffast-math -DNDEBUG -Wall -Wextra -Wpedantic -Werr
                 -Wmissing-prototypes -Wno-unused-parameter
 LDFLAGS ?=
 LDLIBS ?= -lm
+LDLIBS += -pthread
 
 # Override from CLI when needed:
 #   make test CFLAGS='-std=c11 -O2 -g -Wall'

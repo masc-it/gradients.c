@@ -44,6 +44,8 @@ typedef struct gd_dataloader_config {
     gd_device device;
     gd_dataloader_mode mode;
     uint64_t expected_tokenizer_hash; /* 0 disables check */
+    int num_workers;                 /* 0 => 1 background worker */
+    int prefetch_factor;             /* 0 => 2 slots per worker */
 } gd_dataloader_config;
 
 typedef struct gd_dataloader_metrics {
@@ -53,6 +55,8 @@ typedef struct gd_dataloader_metrics {
     uint64_t host_fill_ns;
     uint64_t host_to_device_copy_ns;
     uint64_t wait_for_batch_ns;
+    uint64_t prefetch_requests;
+    uint64_t max_ready_depth;
 } gd_dataloader_metrics;
 
 gd_status gd_token_dataset_open(const char **paths,
@@ -74,6 +78,7 @@ void gd_dataloader_destroy(gd_dataloader *dl);
 gd_status gd_dataloader_prefetch(gd_dataloader *dl);
 gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch_slot **slot_out);
 gd_status gd_dataloader_release_slot(gd_dataloader *dl, gd_batch_slot *slot);
+int gd_dataloader_slot_count(const gd_dataloader *dl);
 
 gd_status gd_dataloader_state_save(gd_dataloader *dl, const char *path);
 gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path);

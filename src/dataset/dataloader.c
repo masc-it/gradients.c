@@ -1,4 +1,4 @@
-#include "gradients/dataloader.h"
+#include "dataloader_internal.h"
 
 #include "../core/internal.h"
 
@@ -14,8 +14,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#define GD_DL_N_SLOTS 2
 
 typedef struct gd_token_shard {
     char *path;
@@ -36,23 +34,6 @@ struct gd_token_dataset {
     uint64_t tokenizer_hash;
     uint64_t n_samples;
     uint64_t n_tokens;
-};
-
-typedef struct gd_loader_slot {
-    gd_batch_slot pub;
-    int32_t *host_tokens;
-    int32_t *host_targets;
-    int32_t *host_positions;
-} gd_loader_slot;
-
-struct gd_dataloader {
-    gd_context *ctx;
-    gd_token_dataset *ds;
-    gd_dataloader_config cfg;
-    gd_loader_slot slots[GD_DL_N_SLOTS];
-    uint64_t rng_state;
-    uint64_t cursor;
-    gd_dataloader_metrics metrics;
 };
 
 static char *gd_dl_strdup(const char *s)
@@ -363,6 +344,15 @@ static gd_status gd_token_dataset_read_sample(const gd_token_dataset *ds,
     return GD_OK;
 }
 
+static void *gd_dl_alloc_host_buffer(size_t nbytes)
+{
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64U, nbytes) != 0) {
+        return NULL;
+    }
+    return ptr;
+}
+
 static void gd_loader_slot_clear(gd_loader_slot *slot)
 {
     if (slot == NULL) {
@@ -374,6 +364,7 @@ static void gd_loader_slot_clear(gd_loader_slot *slot)
     free(slot->host_tokens);
     free(slot->host_targets);
     free(slot->host_positions);
+    free(slot->sample_ids);
     memset(slot, 0, sizeof(*slot));
 }
 
@@ -394,17 +385,21 @@ static gd_status gd_loader_slot_init(gd_context *ctx,
     memset(slot, 0, sizeof(*slot));
     slot->pub.index = index;
     slot->pub.state = GD_BATCH_SLOT_FREE;
-    n_elem = (size_t)cfg->batch_size * (size_t)cfg->block_len;
     if (cfg->batch_size <= 0 || cfg->block_len <= 0 ||
-        n_elem > SIZE_MAX / sizeof(int32_t)) {
+        (size_t)cfg->batch_size > SIZE_MAX / (size_t)cfg->block_len) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid loader slot shape");
     }
+    n_elem = (size_t)cfg->batch_size * (size_t)cfg->block_len;
+    if (n_elem > SIZE_MAX / sizeof(int32_t)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid loader slot byte size");
+    }
     nbytes = n_elem * sizeof(int32_t);
-    slot->host_tokens = (int32_t *)malloc(nbytes);
-    slot->host_targets = (int32_t *)malloc(nbytes);
-    slot->host_positions = (int32_t *)malloc(nbytes);
+    slot->host_tokens = (int32_t *)gd_dl_alloc_host_buffer(nbytes);
+    slot->host_targets = (int32_t *)gd_dl_alloc_host_buffer(nbytes);
+    slot->host_positions = (int32_t *)gd_dl_alloc_host_buffer(nbytes);
+    slot->sample_ids = (uint64_t *)calloc((size_t)cfg->batch_size, sizeof(uint64_t));
     if (slot->host_tokens == NULL || slot->host_targets == NULL ||
-        slot->host_positions == NULL) {
+        slot->host_positions == NULL || slot->sample_ids == NULL) {
         gd_loader_slot_clear(slot);
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "loader host buffer allocation failed");
     }
@@ -427,7 +422,7 @@ static gd_status gd_loader_slot_init(gd_context *ctx,
     return GD_OK;
 }
 
-static uint64_t gd_dataloader_next_sample(gd_dataloader *dl)
+static uint64_t gd_dataloader_next_sample_locked(gd_dataloader *dl)
 {
     if (dl->cfg.mode == GD_DATALOADER_SEQUENTIAL || dl->cfg.shuffle == 0) {
         uint64_t sample = dl->cursor % dl->ds->n_samples;
@@ -437,7 +432,9 @@ static uint64_t gd_dataloader_next_sample(gd_dataloader *dl)
     return gd_dl_splitmix64(&dl->rng_state) % dl->ds->n_samples;
 }
 
-static gd_status gd_dataloader_fill_slot(gd_dataloader *dl, gd_loader_slot *slot)
+gd_status _gd_dataloader_fill_slot_from_samples(gd_dataloader *dl,
+                                                gd_loader_slot *slot,
+                                                gd_dataloader_fill_stats *stats)
 {
     uint64_t t0;
     uint64_t t1;
@@ -448,21 +445,19 @@ static gd_status gd_dataloader_fill_slot(gd_dataloader *dl, gd_loader_slot *slot
     int j;
     gd_status status;
 
-    if (dl == NULL || slot == NULL || slot->pub.state != GD_BATCH_SLOT_FREE) {
-        return _gd_error(GD_ERR_INVALID_STATE, "loader slot is not free");
+    if (dl == NULL || slot == NULL || stats == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid loader fill args");
     }
-    slot->pub.state = GD_BATCH_SLOT_FILLING;
+    memset(stats, 0, sizeof(*stats));
     n_elem = (size_t)dl->cfg.batch_size * (size_t)dl->cfg.block_len;
     nbytes = n_elem * sizeof(int32_t);
     t0 = _gd_profile_now_ns();
     for (b = 0; b < dl->cfg.batch_size; ++b) {
-        uint64_t sample = gd_dataloader_next_sample(dl);
         int32_t *tokens = &slot->host_tokens[(size_t)b * (size_t)dl->cfg.block_len];
         int32_t *targets = &slot->host_targets[(size_t)b * (size_t)dl->cfg.block_len];
         int32_t *positions = &slot->host_positions[(size_t)b * (size_t)dl->cfg.block_len];
-        status = gd_token_dataset_read_sample(dl->ds, sample, tokens, targets);
+        status = gd_token_dataset_read_sample(dl->ds, slot->sample_ids[b], tokens, targets);
         if (status != GD_OK) {
-            slot->pub.state = GD_BATCH_SLOT_FREE;
             return status;
         }
         for (j = 0; j < dl->cfg.block_len; ++j) {
@@ -479,14 +474,241 @@ static gd_status gd_dataloader_fill_slot(gd_dataloader *dl, gd_loader_slot *slot
     }
     t2 = _gd_profile_now_ns();
     if (status != GD_OK) {
-        slot->pub.state = GD_BATCH_SLOT_FREE;
         return status;
     }
-    dl->metrics.host_fill_ns += t1 - t0;
-    dl->metrics.host_to_device_copy_ns += t2 - t1;
+    stats->host_fill_ns = t1 - t0;
+    stats->host_to_device_copy_ns = t2 - t1;
+    stats->samples_prepared = (uint64_t)dl->cfg.batch_size;
+    return GD_OK;
+}
+
+static int gd_dataloader_ready_count_locked(const gd_dataloader *dl)
+{
+    int ready_depth = 0;
+    int i;
+    for (i = 0; i < dl->n_slots; ++i) {
+        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY) {
+            ready_depth += 1;
+        }
+    }
+    return ready_depth;
+}
+
+void _gd_dataloader_add_fill_metrics_locked(gd_dataloader *dl,
+                                            const gd_dataloader_fill_stats *stats)
+{
+    int ready_depth;
+    if (dl == NULL || stats == NULL) {
+        return;
+    }
+    dl->metrics.host_fill_ns += stats->host_fill_ns;
+    dl->metrics.host_to_device_copy_ns += stats->host_to_device_copy_ns;
     dl->metrics.batches_prepared += 1U;
-    dl->metrics.samples_prepared += (uint64_t)dl->cfg.batch_size;
-    slot->pub.state = GD_BATCH_SLOT_READY;
+    dl->metrics.samples_prepared += stats->samples_prepared;
+    ready_depth = gd_dataloader_ready_count_locked(dl);
+    if ((uint64_t)ready_depth > dl->metrics.max_ready_depth) {
+        dl->metrics.max_ready_depth = (uint64_t)ready_depth;
+    }
+}
+
+static gd_loader_slot *gd_dataloader_find_free_slot_locked(gd_dataloader *dl)
+{
+    int i;
+    for (i = 0; i < dl->n_slots; ++i) {
+        if (dl->slots[i].pub.state == GD_BATCH_SLOT_FREE) {
+            return &dl->slots[i];
+        }
+    }
+    return NULL;
+}
+
+static gd_loader_slot *gd_dataloader_find_ready_seq_locked(gd_dataloader *dl,
+                                                           uint64_t seq)
+{
+    int i;
+    for (i = 0; i < dl->n_slots; ++i) {
+        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY && dl->slots[i].seq == seq) {
+            return &dl->slots[i];
+        }
+    }
+    return NULL;
+}
+
+static uint64_t gd_dataloader_queued_locked(const gd_dataloader *dl)
+{
+    uint64_t queued;
+    int i;
+    queued = dl->requested;
+    for (i = 0; i < dl->n_slots; ++i) {
+        if (dl->slots[i].pub.state != GD_BATCH_SLOT_FREE) {
+            queued += 1U;
+        }
+    }
+    return queued;
+}
+
+gd_status _gd_dataloader_worker_status_locked(const gd_dataloader *dl)
+{
+    if (dl == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader is null");
+    }
+    if (dl->worker_status != GD_OK) {
+        const char *msg = dl->worker_error[0] != '\0' ? dl->worker_error :
+                          "dataloader worker failed";
+        return _gd_error(dl->worker_status, msg);
+    }
+    return GD_OK;
+}
+
+static void gd_dataloader_set_worker_error_locked(gd_dataloader *dl, gd_status status)
+{
+    const char *err;
+    if (dl->worker_status != GD_OK) {
+        return;
+    }
+    dl->worker_status = status != GD_OK ? status : GD_ERR_INTERNAL;
+    err = gd_last_error();
+    if (err != NULL && err[0] != '\0') {
+        (void)snprintf(dl->worker_error, sizeof(dl->worker_error), "%s", err);
+    } else {
+        (void)snprintf(dl->worker_error, sizeof(dl->worker_error),
+                       "%s", gd_status_message(dl->worker_status));
+    }
+}
+
+static gd_status gd_dataloader_request_locked(gd_dataloader *dl)
+{
+    gd_status status = _gd_dataloader_worker_status_locked(dl);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (gd_dataloader_queued_locked(dl) >= (uint64_t)dl->n_slots) {
+        if (gd_dataloader_ready_count_locked(dl) > 0) {
+            return GD_OK;
+        }
+        return _gd_error(GD_ERR_INVALID_STATE, "no free dataloader slot");
+    }
+    dl->requested += 1U;
+    dl->metrics.prefetch_requests += 1U;
+    pthread_cond_signal(&dl->work_cv);
+    return GD_OK;
+}
+
+static void *gd_dataloader_worker_main(void *arg)
+{
+    gd_dataloader *dl = (gd_dataloader *)arg;
+    for (;;) {
+        gd_loader_slot *slot = NULL;
+        gd_dataloader_fill_stats stats;
+        gd_status status = GD_OK;
+        int b;
+
+        pthread_mutex_lock(&dl->mutex);
+        while (dl->stop == 0) {
+            slot = gd_dataloader_find_free_slot_locked(dl);
+            if (dl->paused == 0 && dl->requested > 0U && slot != NULL &&
+                dl->worker_status == GD_OK) {
+                break;
+            }
+            pthread_cond_wait(&dl->work_cv, &dl->mutex);
+        }
+        if (dl->stop != 0) {
+            pthread_mutex_unlock(&dl->mutex);
+            break;
+        }
+        slot->pub.state = GD_BATCH_SLOT_FILLING;
+        slot->seq = dl->next_seq;
+        dl->next_seq += 1U;
+        dl->requested -= 1U;
+        for (b = 0; b < dl->cfg.batch_size; ++b) {
+            slot->sample_ids[b] = gd_dataloader_next_sample_locked(dl);
+        }
+        dl->filling_count += 1;
+        pthread_mutex_unlock(&dl->mutex);
+
+        status = _gd_dataloader_fill_slot_from_samples(dl, slot, &stats);
+
+        pthread_mutex_lock(&dl->mutex);
+        dl->filling_count -= 1;
+        if (status == GD_OK) {
+            slot->pub.state = GD_BATCH_SLOT_READY;
+            _gd_dataloader_add_fill_metrics_locked(dl, &stats);
+        } else {
+            slot->pub.state = GD_BATCH_SLOT_FREE;
+            gd_dataloader_set_worker_error_locked(dl, status);
+        }
+        pthread_cond_broadcast(&dl->ready_cv);
+        pthread_cond_broadcast(&dl->work_cv);
+        pthread_cond_broadcast(&dl->state_cv);
+        pthread_mutex_unlock(&dl->mutex);
+    }
+    return NULL;
+}
+
+static gd_status gd_dataloader_init_sync(gd_dataloader *dl)
+{
+    if (pthread_mutex_init(&dl->mutex, NULL) != 0) {
+        return _gd_error(GD_ERR_INTERNAL, "failed to init dataloader mutex");
+    }
+    if (pthread_cond_init(&dl->work_cv, NULL) != 0) {
+        pthread_mutex_destroy(&dl->mutex);
+        return _gd_error(GD_ERR_INTERNAL, "failed to init dataloader work cond");
+    }
+    if (pthread_cond_init(&dl->ready_cv, NULL) != 0) {
+        pthread_cond_destroy(&dl->work_cv);
+        pthread_mutex_destroy(&dl->mutex);
+        return _gd_error(GD_ERR_INTERNAL, "failed to init dataloader ready cond");
+    }
+    if (pthread_cond_init(&dl->state_cv, NULL) != 0) {
+        pthread_cond_destroy(&dl->ready_cv);
+        pthread_cond_destroy(&dl->work_cv);
+        pthread_mutex_destroy(&dl->mutex);
+        return _gd_error(GD_ERR_INTERNAL, "failed to init dataloader state cond");
+    }
+    dl->sync_ready = 1;
+    return GD_OK;
+}
+
+static gd_status gd_dataloader_start_workers(gd_dataloader *dl)
+{
+    int i;
+    for (i = 0; i < dl->n_workers; ++i) {
+        if (pthread_create(&dl->workers[i], NULL, gd_dataloader_worker_main, dl) != 0) {
+            return _gd_error(GD_ERR_INTERNAL, "failed to start dataloader worker");
+        }
+        dl->workers_started += 1;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_dataloader_normalize_config(const gd_dataloader_config *cfg,
+                                                int *workers_out,
+                                                int *prefetch_out,
+                                                int *slots_out)
+{
+    int workers;
+    int prefetch;
+    uint64_t slots;
+
+    if (cfg->num_workers < 0 || cfg->prefetch_factor < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader worker config");
+    }
+    workers = cfg->num_workers > 0 ? cfg->num_workers : GD_DL_DEFAULT_WORKERS;
+    prefetch = cfg->prefetch_factor > 0 ? cfg->prefetch_factor : GD_DL_DEFAULT_PREFETCH_FACTOR;
+    if (workers <= 0 || workers > GD_DL_MAX_WORKERS ||
+        prefetch <= 0 || prefetch > GD_DL_MAX_PREFETCH_FACTOR) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader worker config out of range");
+    }
+    slots = (uint64_t)workers * (uint64_t)prefetch;
+    if (slots < 2U) {
+        slots = 2U;
+    }
+    if (slots > GD_DL_MAX_SLOTS) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader slot count out of range");
+    }
+    *workers_out = workers;
+    *prefetch_out = prefetch;
+    *slots_out = (int)slots;
     return GD_OK;
 }
 
@@ -497,6 +719,9 @@ gd_status gd_dataloader_create(gd_context *ctx,
 {
     gd_dataloader *dl;
     int i;
+    int n_workers = 0;
+    int prefetch_factor = 0;
+    int n_slots = 0;
     gd_status status;
 
     if (out == NULL) {
@@ -519,6 +744,10 @@ gd_status gd_dataloader_create(gd_context *ctx,
         cfg->expected_tokenizer_hash != ds->tokenizer_hash) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader tokenizer hash mismatch");
     }
+    status = gd_dataloader_normalize_config(cfg, &n_workers, &prefetch_factor, &n_slots);
+    if (status != GD_OK) {
+        return status;
+    }
     dl = (gd_dataloader *)calloc(1U, sizeof(*dl));
     if (dl == NULL) {
         return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader allocation failed");
@@ -526,14 +755,35 @@ gd_status gd_dataloader_create(gd_context *ctx,
     dl->ctx = ctx;
     dl->ds = ds;
     dl->cfg = *cfg;
+    dl->cfg.num_workers = n_workers;
+    dl->cfg.prefetch_factor = prefetch_factor;
+    dl->n_workers = n_workers;
+    dl->n_slots = n_slots;
     dl->rng_state = cfg->seed;
     dl->cursor = 0U;
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        status = gd_loader_slot_init(ctx, cfg, i, &dl->slots[i]);
+    dl->worker_status = GD_OK;
+    dl->slots = (gd_loader_slot *)calloc((size_t)n_slots, sizeof(gd_loader_slot));
+    dl->workers = (pthread_t *)calloc((size_t)n_workers, sizeof(pthread_t));
+    if (dl->slots == NULL || dl->workers == NULL) {
+        gd_dataloader_destroy(dl);
+        return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader queue allocation failed");
+    }
+    status = gd_dataloader_init_sync(dl);
+    if (status != GD_OK) {
+        gd_dataloader_destroy(dl);
+        return status;
+    }
+    for (i = 0; i < dl->n_slots; ++i) {
+        status = gd_loader_slot_init(ctx, &dl->cfg, i, &dl->slots[i]);
         if (status != GD_OK) {
             gd_dataloader_destroy(dl);
             return status;
         }
+    }
+    status = gd_dataloader_start_workers(dl);
+    if (status != GD_OK) {
+        gd_dataloader_destroy(dl);
+        return status;
     }
     *out = dl;
     return GD_OK;
@@ -545,68 +795,91 @@ void gd_dataloader_destroy(gd_dataloader *dl)
     if (dl == NULL) {
         return;
     }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        gd_loader_slot_clear(&dl->slots[i]);
+    if (dl->sync_ready != 0) {
+        pthread_mutex_lock(&dl->mutex);
+        dl->stop = 1;
+        pthread_cond_broadcast(&dl->work_cv);
+        pthread_mutex_unlock(&dl->mutex);
     }
+    for (i = 0; i < dl->workers_started; ++i) {
+        (void)pthread_join(dl->workers[i], NULL);
+    }
+    if (dl->slots != NULL) {
+        for (i = 0; i < dl->n_slots; ++i) {
+            gd_loader_slot_clear(&dl->slots[i]);
+        }
+    }
+    if (dl->sync_ready != 0) {
+        pthread_cond_destroy(&dl->state_cv);
+        pthread_cond_destroy(&dl->ready_cv);
+        pthread_cond_destroy(&dl->work_cv);
+        pthread_mutex_destroy(&dl->mutex);
+    }
+    free(dl->workers);
+    free(dl->slots);
     free(dl);
 }
 
 gd_status gd_dataloader_prefetch(gd_dataloader *dl)
 {
-    int i;
-    int ready_count = 0;
+    gd_status status;
     if (dl == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader is null");
     }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY) {
-            ready_count += 1;
-        }
-    }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_FREE) {
-            return gd_dataloader_fill_slot(dl, &dl->slots[i]);
-        }
-    }
-    if (ready_count > 0) {
-        return GD_OK;
-    }
-    return _gd_error(GD_ERR_INVALID_STATE, "no free dataloader slot");
+    pthread_mutex_lock(&dl->mutex);
+    status = gd_dataloader_request_locked(dl);
+    pthread_mutex_unlock(&dl->mutex);
+    return status;
 }
 
 gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch_slot **slot_out)
 {
     uint64_t t0;
-    int i;
+    int waited = 0;
+    gd_loader_slot *slot;
     gd_status status;
 
     if (dl == NULL || slot_out == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader next args");
     }
     *slot_out = NULL;
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY) {
-            dl->slots[i].pub.state = GD_BATCH_SLOT_IN_USE;
-            dl->metrics.batches_returned += 1U;
-            *slot_out = &dl->slots[i].pub;
-            return GD_OK;
-        }
-    }
     t0 = _gd_profile_now_ns();
-    status = gd_dataloader_prefetch(dl);
-    dl->metrics.wait_for_batch_ns += _gd_profile_now_ns() - t0;
+    pthread_mutex_lock(&dl->mutex);
+    status = _gd_dataloader_worker_status_locked(dl);
     if (status != GD_OK) {
+        pthread_mutex_unlock(&dl->mutex);
         return status;
     }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY) {
-            dl->slots[i].pub.state = GD_BATCH_SLOT_IN_USE;
-            dl->metrics.batches_returned += 1U;
-            *slot_out = &dl->slots[i].pub;
-            return GD_OK;
+    slot = gd_dataloader_find_ready_seq_locked(dl, dl->deliver_seq);
+    while (slot == NULL) {
+        if (gd_dataloader_queued_locked(dl) == 0U) {
+            status = gd_dataloader_request_locked(dl);
+            if (status != GD_OK) {
+                pthread_mutex_unlock(&dl->mutex);
+                return status;
+            }
+        } else if (dl->requested == 0U && dl->filling_count == 0) {
+            pthread_mutex_unlock(&dl->mutex);
+            return _gd_error(GD_ERR_INTERNAL, "dataloader ordered batch is missing");
         }
+        waited = 1;
+        pthread_cond_wait(&dl->ready_cv, &dl->mutex);
+        status = _gd_dataloader_worker_status_locked(dl);
+        if (status != GD_OK) {
+            pthread_mutex_unlock(&dl->mutex);
+            return status;
+        }
+        slot = gd_dataloader_find_ready_seq_locked(dl, dl->deliver_seq);
     }
-    return _gd_error(GD_ERR_INVALID_STATE, "dataloader has no ready slot");
+    if (waited != 0) {
+        dl->metrics.wait_for_batch_ns += _gd_profile_now_ns() - t0;
+    }
+    slot->pub.state = GD_BATCH_SLOT_IN_USE;
+    dl->deliver_seq += 1U;
+    dl->metrics.batches_returned += 1U;
+    *slot_out = &slot->pub;
+    pthread_mutex_unlock(&dl->mutex);
+    return GD_OK;
 }
 
 gd_status gd_dataloader_release_slot(gd_dataloader *dl, gd_batch_slot *slot)
@@ -615,25 +888,39 @@ gd_status gd_dataloader_release_slot(gd_dataloader *dl, gd_batch_slot *slot)
     if (dl == NULL || slot == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader release args");
     }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
+    pthread_mutex_lock(&dl->mutex);
+    for (i = 0; i < dl->n_slots; ++i) {
         if (&dl->slots[i].pub == slot) {
             if (dl->slots[i].pub.state != GD_BATCH_SLOT_IN_USE) {
+                pthread_mutex_unlock(&dl->mutex);
                 return _gd_error(GD_ERR_INVALID_STATE, "dataloader slot is not in use");
             }
             dl->slots[i].pub.state = GD_BATCH_SLOT_FREE;
+            dl->slots[i].seq = 0U;
+            pthread_cond_signal(&dl->work_cv);
+            pthread_mutex_unlock(&dl->mutex);
             return GD_OK;
         }
     }
+    pthread_mutex_unlock(&dl->mutex);
     return _gd_error(GD_ERR_INVALID_ARGUMENT, "slot does not belong to dataloader");
 }
 
-static int gd_dataloader_has_live_slot(const gd_dataloader *dl)
+int gd_dataloader_slot_count(const gd_dataloader *dl)
+{
+    return dl != NULL ? dl->n_slots : 0;
+}
+
+int _gd_dataloader_has_live_slot_locked(const gd_dataloader *dl)
 {
     int i;
     if (dl == NULL) {
         return 0;
     }
-    for (i = 0; i < GD_DL_N_SLOTS; ++i) {
+    if (dl->requested != 0U) {
+        return 1;
+    }
+    for (i = 0; i < dl->n_slots; ++i) {
         if (dl->slots[i].pub.state != GD_BATCH_SLOT_FREE) {
             return 1;
         }
@@ -641,142 +928,47 @@ static int gd_dataloader_has_live_slot(const gd_dataloader *dl)
     return 0;
 }
 
-gd_status gd_dataloader_state_save(gd_dataloader *dl, const char *path)
+gd_status _gd_dataloader_lock_quiesced(gd_dataloader *dl)
 {
-    FILE *f;
-    if (dl == NULL || path == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state save args");
-    }
-    f = fopen(path, "wb");
-    if (f == NULL) {
-        return _gd_error(GD_ERR_IO, "failed to open dataloader state output");
-    }
-    fprintf(f,
-            "{\n"
-            "  \"format\": \"gd-dataloader-v1\",\n"
-            "  \"cursor\": %" PRIu64 ",\n"
-            "  \"rng_state\": %" PRIu64 ",\n"
-            "  \"batches_prepared\": %" PRIu64 ",\n"
-            "  \"batches_returned\": %" PRIu64 "\n"
-            "}\n",
-            dl->cursor,
-            dl->rng_state,
-            dl->metrics.batches_prepared,
-            dl->metrics.batches_returned);
-    if (fclose(f) != 0) {
-        return _gd_error(GD_ERR_IO, "failed to close dataloader state output");
-    }
-    return GD_OK;
-}
-
-static gd_status gd_dl_read_file(const char *path, char **text_out)
-{
-    FILE *f;
-    long end;
-    char *text;
-    size_t nread;
-    if (path == NULL || text_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state read args");
-    }
-    *text_out = NULL;
-    f = fopen(path, "rb");
-    if (f == NULL) {
-        return _gd_error(GD_ERR_IO, "failed to open dataloader state");
-    }
-    if (fseek(f, 0L, SEEK_END) != 0) {
-        (void)fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to seek dataloader state");
-    }
-    end = ftell(f);
-    if (end < 0) {
-        (void)fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to size dataloader state");
-    }
-    if (fseek(f, 0L, SEEK_SET) != 0) {
-        (void)fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to rewind dataloader state");
-    }
-    text = (char *)malloc((size_t)end + 1U);
-    if (text == NULL) {
-        (void)fclose(f);
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader state allocation failed");
-    }
-    nread = fread(text, 1U, (size_t)end, f);
-    if (nread != (size_t)end) {
-        free(text);
-        (void)fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to read dataloader state");
-    }
-    if (fclose(f) != 0) {
-        free(text);
-        return _gd_error(GD_ERR_IO, "failed to close dataloader state");
-    }
-    text[(size_t)end] = '\0';
-    *text_out = text;
-    return GD_OK;
-}
-
-static gd_status gd_dl_parse_u64_field(const char *text,
-                                       const char *field,
-                                       uint64_t *out)
-{
-    const char *p;
-    char *end = NULL;
-    unsigned long long v;
-    if (text == NULL || field == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state field args");
-    }
-    p = strstr(text, field);
-    if (p == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "missing dataloader state field");
-    }
-    p += strlen(field);
-    errno = 0;
-    v = strtoull(p, &end, 10);
-    if (errno != 0 || end == p) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state integer");
-    }
-    *out = (uint64_t)v;
-    return GD_OK;
-}
-
-gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path)
-{
-    char *text = NULL;
-    uint64_t cursor = 0U;
-    uint64_t rng_state = 0U;
     gd_status status;
-    if (dl == NULL || path == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state load args");
+    if (dl == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader is null");
     }
-    if (gd_dataloader_has_live_slot(dl) != 0) {
-        return _gd_error(GD_ERR_INVALID_STATE, "cannot load dataloader state with live slots");
-    }
-    status = gd_dl_read_file(path, &text);
+    pthread_mutex_lock(&dl->mutex);
+    status = _gd_dataloader_worker_status_locked(dl);
     if (status != GD_OK) {
+        pthread_mutex_unlock(&dl->mutex);
         return status;
     }
-    if (strstr(text, "gd-dataloader-v1") == NULL) {
-        free(text);
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "unsupported dataloader state format");
+    dl->paused = 1;
+    pthread_cond_broadcast(&dl->work_cv);
+    while (dl->filling_count > 0 && dl->worker_status == GD_OK) {
+        pthread_cond_wait(&dl->state_cv, &dl->mutex);
     }
-    status = gd_dl_parse_u64_field(text, "\"cursor\":", &cursor);
-    if (status == GD_OK) {
-        status = gd_dl_parse_u64_field(text, "\"rng_state\":", &rng_state);
-    }
-    free(text);
+    status = _gd_dataloader_worker_status_locked(dl);
     if (status != GD_OK) {
+        dl->paused = 0;
+        pthread_cond_broadcast(&dl->work_cv);
+        pthread_mutex_unlock(&dl->mutex);
         return status;
     }
-    dl->cursor = cursor;
-    dl->rng_state = rng_state;
-    memset(&dl->metrics, 0, sizeof(dl->metrics));
     return GD_OK;
+}
+
+void _gd_dataloader_unlock_resume(gd_dataloader *dl)
+{
+    if (dl == NULL) {
+        return;
+    }
+    dl->paused = 0;
+    pthread_cond_broadcast(&dl->work_cv);
+    pthread_mutex_unlock(&dl->mutex);
 }
 
 void gd_dataloader_metrics_get(const gd_dataloader *dl,
                                gd_dataloader_metrics *metrics_out)
 {
+    gd_dataloader *mut;
     if (metrics_out == NULL) {
         return;
     }
@@ -784,5 +976,8 @@ void gd_dataloader_metrics_get(const gd_dataloader *dl,
     if (dl == NULL) {
         return;
     }
-    *metrics_out = dl->metrics;
+    mut = (gd_dataloader *)dl;
+    pthread_mutex_lock(&mut->mutex);
+    *metrics_out = mut->metrics;
+    pthread_mutex_unlock(&mut->mutex);
 }

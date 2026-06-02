@@ -193,6 +193,7 @@ GD_REF(gd_dataloader_destroy, void, (gd_dataloader *));
 GD_REF(gd_dataloader_prefetch, gd_status, (gd_dataloader *));
 GD_REF(gd_dataloader_next, gd_status, (gd_dataloader *, gd_batch_slot **));
 GD_REF(gd_dataloader_release_slot, gd_status, (gd_dataloader *, gd_batch_slot *));
+GD_REF(gd_dataloader_slot_count, int, (const gd_dataloader *));
 GD_REF(gd_dataloader_state_save, gd_status, (gd_dataloader *, const char *));
 GD_REF(gd_dataloader_state_load, gd_status, (gd_dataloader *, const char *));
 GD_REF(gd_dataloader_metrics_get, void, (const gd_dataloader *, gd_dataloader_metrics *));

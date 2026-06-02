@@ -32,7 +32,6 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_AMP_UNSCALE_GRAD, "gd_amp_unscale_grad"},
     {_GD_OP_AMP_CLIP_GRAD_NORM, "gd_amp_clip_norm_partial"},
     {_GD_OP_AMP_STEP_INC, "gd_amp_step_inc"},
-    {_GD_OP_AMP_REFRESH_PARAM, "gd_amp_refresh_param"},
     {_GD_OP_GELU, "gd_gelu"},
     {_GD_OP_GELU_BWD, "gd_gelu_bwd"},
     {_GD_OP_TRANSPOSE, "gd_transpose"},

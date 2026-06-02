@@ -91,8 +91,6 @@ static bool node_mutates_input(const gd_graph *graph, const _gd_node *node, int 
         return input_index == 0 || input_index == 2;
     case _GD_OP_AMP_STEP_INC:
         return input_index == 0;
-    case _GD_OP_AMP_REFRESH_PARAM:
-        return input_index == 0;
     default:
         return false;
     }

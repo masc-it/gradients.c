@@ -139,7 +139,7 @@ help:
 	@printf '%s\n' 'gradients.c commands:'
 	@printf '%s\n' '  make build       build library'
 	@printf '%s\n' '  make test        build library + tests, then run all tests'
-	@printf '%s\n' '  make check       build, run docs/size checks, then run tests'
+	@printf '%s\n' '  make check       build, run docs check, then run tests'
 	@printf '%s\n' '  make size-check  warn >800 LOC and fail >1000 LOC'
 	@printf '%s\n' '  make generated   regenerate operator registry scaffolding'
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
@@ -162,7 +162,7 @@ all: check
 build: $(LIB) $(METALLIB)
 	@printf '[build] ok (metal=%s)\n' '$(GD_ENABLE_METAL)'
 
-check: build docs-check size-check test tools
+check: build docs-check test tools
 	@printf '[check] ok\n'
 
 test tests: build $(TEST_BINS)

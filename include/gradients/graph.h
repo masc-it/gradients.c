@@ -11,6 +11,8 @@ extern "C" {
 #endif
 
 typedef struct gd_graph gd_graph;
+typedef struct gd_graph_input gd_graph_input;
+typedef struct gd_graph_runner gd_graph_runner;
 typedef gd_status (*gd_immediate_build_fn)(gd_context *ctx, void *user);
 
 typedef enum gd_dump_format {
@@ -24,6 +26,16 @@ gd_status gd_graph_destroy(gd_graph *graph);
 gd_status gd_graph_begin(gd_context *ctx, gd_graph *graph);
 gd_status gd_graph_end(gd_context *ctx);
 gd_status gd_graph_validate(gd_graph *graph);
+/* Add a runtime-bound graph input while capturing. `tensor_out` is a virtual
+ * tensor used inside the graph; bind concrete tensors to `input_out` through a
+ * runner after compile. Bound tensors must match dtype, shape, layout, and
+ * device from `desc`. */
+gd_status gd_graph_add_input(gd_context *ctx,
+                             gd_graph *graph,
+                             const char *name,
+                             const gd_tensor_desc *desc,
+                             gd_tensor **tensor_out,
+                             gd_graph_input **input_out);
 gd_status gd_graph_compile(gd_graph *graph, gd_device target);
 gd_status gd_graph_run(gd_graph *graph);
 gd_status gd_graph_reset(gd_graph *graph);
@@ -35,6 +47,15 @@ gd_status gd_graph_run_immediate(gd_context *ctx,
                                  void *user);
 
 gd_status gd_graph_run_until(gd_graph *graph, int node_id);
+
+gd_status gd_graph_runner_create(gd_graph *graph, gd_graph_runner **out);
+void gd_graph_runner_destroy(gd_graph_runner *runner);
+/* Bind/rebind one graph input for the next runner execution. Bindings are
+ * retained by the runner and may be changed between runs. */
+gd_status gd_graph_runner_bind(gd_graph_runner *runner,
+                               gd_graph_input *input,
+                               gd_tensor *tensor);
+gd_status gd_graph_runner_run(gd_graph_runner *runner);
 
 /* Backend parity harness: run the same finalized graph on `reference` and
  * `target`, then compare every produced value within tolerance. Reports the

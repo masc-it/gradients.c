@@ -89,18 +89,28 @@ gd_status _gd_graph_clear(gd_graph *graph)
         free(graph->values[i].name);
         graph->values[i].name = NULL;
     }
+    for (i = 0; i < graph->n_inputs; ++i) {
+        if (graph->inputs[i] != NULL) {
+            free(graph->inputs[i]->name);
+            free(graph->inputs[i]);
+        }
+    }
     free(graph->nodes);
     free(graph->values);
     free(graph->virtual_tensors);
+    free(graph->inputs);
     graph->nodes = NULL;
     graph->values = NULL;
     graph->virtual_tensors = NULL;
+    graph->inputs = NULL;
     graph->n_nodes = 0;
     graph->node_cap = 0;
     graph->n_values = 0;
     graph->value_cap = 0;
     graph->n_virtual = 0;
     graph->virtual_cap = 0;
+    graph->n_inputs = 0;
+    graph->input_cap = 0;
     graph->has_target = false;
     graph->target = (gd_device){GD_DEVICE_CPU, 0};
     graph->state = _GD_GRAPH_EMPTY;
@@ -192,11 +202,13 @@ static gd_status grow_nodes(gd_graph *graph)
     return GD_OK;
 }
 
-static gd_status add_value(gd_graph *graph,
-                           const gd_tensor_desc *desc,
-                           int producer_node_id,
-                           gd_tensor *external,
-                           int *value_id_out)
+gd_status _gd_graph_add_value(gd_graph *graph,
+                              const gd_tensor_desc *desc,
+                              int producer_node_id,
+                              gd_tensor *external,
+                              _gd_value_kind kind,
+                              int input_index,
+                              int *value_id_out)
 {
     gd_status status = GD_OK;
     _gd_value *value = NULL;
@@ -210,6 +222,8 @@ static gd_status add_value(gd_graph *graph,
     value->producer_node_id = producer_node_id;
     value->desc = *desc;
     value->external = external;
+    value->kind = kind;
+    value->input_index = input_index;
     value->name = NULL; /* values grow via realloc; name must be set before use */
     *value_id_out = value->id;
     graph->n_values += 1;
@@ -237,7 +251,8 @@ static gd_status import_tensor(gd_graph *graph, gd_tensor *tensor, int *value_id
     }
 
     for (i = 0; i < graph->n_values; ++i) {
-        if (graph->values[i].external == tensor) {
+        if (graph->values[i].kind == _GD_VALUE_EXTERNAL &&
+            graph->values[i].external == tensor) {
             *value_id_out = graph->values[i].id;
             return GD_OK;
         }
@@ -251,7 +266,8 @@ static gd_status import_tensor(gd_graph *graph, gd_tensor *tensor, int *value_id
     if (status != GD_OK) {
         return status;
     }
-    status = add_value(graph, desc, -1, tensor, value_id_out);
+    status = _gd_graph_add_value(graph, desc, -1, tensor, _GD_VALUE_EXTERNAL, -1,
+                                 value_id_out);
     if (status != GD_OK) {
         gd_tensor_release(tensor);
         return status;
@@ -309,7 +325,8 @@ gd_status _gd_graph_emit(gd_graph *graph,
     }
 
     node_id = graph->n_nodes;
-    status = add_value(graph, out_desc, node_id, NULL, &out_value_id);
+    status = _gd_graph_add_value(graph, out_desc, node_id, NULL, _GD_VALUE_PRODUCED,
+                                 -1, &out_value_id);
     if (status != GD_OK) {
         return status;
     }
@@ -417,7 +434,8 @@ gd_status _gd_graph_emit_multi(gd_graph *graph,
 
     node_id = graph->n_nodes;
     for (i = 0; i < n_outputs; ++i) {
-        status = add_value(graph, &out_descs[i], node_id, NULL, &out_value_ids[i]);
+        status = _gd_graph_add_value(graph, &out_descs[i], node_id, NULL,
+                                     _GD_VALUE_PRODUCED, -1, &out_value_ids[i]);
         if (status != GD_OK) {
             goto fail;
         }
@@ -530,7 +548,8 @@ gd_status _gd_graph_emit_to(gd_graph *graph,
     if (status != GD_OK) {
         return status;
     }
-    status = add_value(graph, out_desc, node_id, out_external, &out_value_id);
+    status = _gd_graph_add_value(graph, out_desc, node_id, out_external,
+                                 _GD_VALUE_EXTERNAL, -1, &out_value_id);
     if (status != GD_OK) {
         gd_tensor_release(out_external);
         return status;
@@ -732,17 +751,70 @@ gd_status gd_graph_end(gd_context *ctx)
     return _gd_context_set_active_graph(ctx, NULL);
 }
 
+static int graph_node_mutates_input(const gd_graph *graph,
+                                    const _gd_node *node,
+                                    int input_index)
+{
+    switch (node->op) {
+    case _GD_OP_STEP_INC:
+        return input_index == 0;
+    case _GD_OP_CLIP_GRAD_NORM:
+        return 1;
+    case _GD_OP_AMP_CLIP_GRAD_NORM:
+        return input_index >= 1;
+    case _GD_OP_ADAMW_STEP:
+        return input_index == 0 || input_index == 2 || input_index == 3;
+    case _GD_OP_ADAMW_STEP_AMP:
+        if (input_index == 0 || input_index == 2 || input_index == 3) {
+            return 1;
+        }
+        if (node->n_inputs == 8) {
+            return input_index == 7;
+        }
+        if (node->n_inputs == 7 && input_index == 6) {
+            const _gd_value *extra = &graph->values[node->inputs[6]];
+            return !(extra->desc.dtype == GD_DTYPE_F32 && extra->desc.ndim == 0);
+        }
+        return 0;
+    case _GD_OP_AMP_UNSCALE_GRAD:
+        return input_index == 0 || input_index == 2;
+    case _GD_OP_AMP_STEP_INC:
+        return input_index == 0;
+    case _GD_OP_AMP_REFRESH_PARAM:
+        return input_index == 0;
+    default:
+        return 0;
+    }
+}
+
 gd_status gd_graph_validate(gd_graph *graph)
 {
+    int i = 0;
     if (graph == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_graph_validate graph is NULL");
     }
     if (graph->state == _GD_GRAPH_BUILDING) {
         return _gd_error(GD_ERR_INVALID_STATE, "cannot validate graph while building");
     }
-    if (graph->n_nodes < 0 || graph->n_values < 0 ||
-        graph->n_nodes > graph->node_cap || graph->n_values > graph->value_cap) {
+    if (graph->n_nodes < 0 || graph->n_values < 0 || graph->n_inputs < 0 ||
+        graph->n_nodes > graph->node_cap || graph->n_values > graph->value_cap ||
+        graph->n_inputs > graph->input_cap) {
         return _gd_error(GD_ERR_INTERNAL, "graph has invalid counts");
+    }
+    for (i = 0; i < graph->n_nodes; ++i) {
+        const _gd_node *node = &graph->nodes[i];
+        int j = 0;
+        for (j = 0; j < node->n_inputs; ++j) {
+            int value_id = node->inputs[j];
+            if (value_id < 0 || value_id >= graph->n_values) {
+                return _gd_error(GD_ERR_INTERNAL, "graph node input id out of range");
+            }
+            if (graph->values[value_id].kind == _GD_VALUE_INPUT &&
+                graph_node_mutates_input(graph, node, j)) {
+                return _gd_error(GD_ERR_UNSUPPORTED,
+                                 "graph inputs cannot be mutation targets in v1");
+            }
+        }
     }
     _gd_set_last_error(GD_OK, NULL);
     return GD_OK;

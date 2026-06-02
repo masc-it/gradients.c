@@ -11,9 +11,10 @@
 #include "cpu_registry.inc"
 
 typedef struct _gd_exec_buffer {
-    gd_storage *storage;  /* owned for produced values, borrowed for leaves */
+    gd_storage *storage;  /* owned for produced/runtime-bound values, borrowed for leaves */
     size_t offset;
     bool owned;
+    bool input_binding;
 } _gd_exec_buffer;
 
 struct _gd_executable {
@@ -39,6 +40,9 @@ gd_status _gd_cpu_exec_value(_gd_cpu_exec *exec,
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "value id is out of range");
     }
     buffer = &exec->buffers[value_id];
+    if (buffer->storage == NULL) {
+        return _gd_error(GD_ERR_INVALID_STATE, "CPU_REF graph input is unbound");
+    }
     status = gd_storage_data_cpu(buffer->storage, &base);
     if (status != GD_OK) {
         return status;
@@ -174,7 +178,12 @@ static gd_status cpu_compile(_gd_backend *self, gd_graph *graph, _gd_executable 
     for (i = 0; i < n; ++i) {
         const _gd_value *value = &graph->values[i];
 
-        if (value->external != NULL) {
+        if (value->kind == _GD_VALUE_INPUT) {
+            exe->buffers[i].storage = NULL;
+            exe->buffers[i].offset = 0U;
+            exe->buffers[i].owned = false;
+            exe->buffers[i].input_binding = true;
+        } else if (value->external != NULL) {
             gd_storage *storage = gd_tensor_storage(value->external);
 
             if (!_gd_tensor_is_contiguous(value->external)) {
@@ -218,6 +227,50 @@ fail:
     return status;
 }
 
+static gd_status cpu_apply_runner_bindings(_gd_executable *exe,
+                                            const gd_graph_runner *runner)
+{
+    gd_status status = _gd_graph_runner_validate_ready(runner);
+    int i = 0;
+
+    if (status != GD_OK) {
+        return status;
+    }
+    if (runner->graph != exe->graph) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "runner graph mismatch");
+    }
+    for (i = 0; i < exe->graph->n_inputs; ++i) {
+        gd_graph_input *input = exe->graph->inputs[i];
+        gd_tensor *tensor = runner->bindings[i];
+        gd_storage *storage = gd_tensor_storage(tensor);
+        _gd_exec_buffer *buffer = NULL;
+
+        if (input == NULL || input->value_id < 0 || input->value_id >= exe->n_values ||
+            storage == NULL) {
+            return _gd_error(GD_ERR_INVALID_STATE, "invalid CPU_REF graph input binding");
+        }
+        buffer = &exe->buffers[input->value_id];
+        if (!buffer->input_binding) {
+            return _gd_error(GD_ERR_INTERNAL, "CPU_REF binding target is not an input");
+        }
+        if (buffer->owned && buffer->storage != storage) {
+            gd_storage_release(buffer->storage);
+            buffer->storage = NULL;
+            buffer->owned = false;
+        }
+        if (buffer->storage != storage) {
+            status = gd_storage_retain(storage);
+            if (status != GD_OK) {
+                return status;
+            }
+            buffer->storage = storage;
+            buffer->owned = true;
+        }
+        buffer->offset = (size_t)_gd_tensor_desc_ptr(tensor)->storage_offset_bytes;
+    }
+    return GD_OK;
+}
+
 static gd_status cpu_execute(_gd_backend *self, _gd_executable *exe)
 {
     gd_status status = GD_OK;
@@ -232,6 +285,17 @@ static gd_status cpu_execute(_gd_backend *self, _gd_executable *exe)
     }
     exe->run_id += 1U;
     return GD_OK;
+}
+
+static gd_status cpu_execute_bound(_gd_backend *self,
+                                   _gd_executable *exe,
+                                   const gd_graph_runner *runner)
+{
+    gd_status status = cpu_apply_runner_bindings(exe, runner);
+    if (status != GD_OK) {
+        return status;
+    }
+    return cpu_execute(self, exe);
 }
 
 static gd_status cpu_execute_until(_gd_backend *self, _gd_executable *exe, int node_id)
@@ -395,6 +459,7 @@ static const _gd_backend_vtable cpu_backend_vtable = {
     .download = cpu_download,
     .compile = cpu_compile,
     .execute = cpu_execute,
+    .execute_bound = cpu_execute_bound,
     .execute_until = cpu_execute_until,
     .executable_free = cpu_executable_free,
     .value_storage = cpu_value_storage,

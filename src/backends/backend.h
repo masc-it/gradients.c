@@ -15,6 +15,7 @@ extern "C" {
 
 /* Forward declarations: backends see the IR/graph opaquely. */
 typedef struct gd_graph gd_graph;
+typedef struct gd_graph_runner gd_graph_runner;
 typedef struct _gd_node _gd_node;
 typedef struct _gd_executable _gd_executable;
 typedef struct _gd_backend _gd_backend;
@@ -46,6 +47,9 @@ typedef struct _gd_backend_vtable {
     /* Execution (P3). */
     gd_status (*compile)(_gd_backend *self, gd_graph *graph, _gd_executable **out);
     gd_status (*execute)(_gd_backend *self, _gd_executable *exe);
+    gd_status (*execute_bound)(_gd_backend *self,
+                               _gd_executable *exe,
+                               const gd_graph_runner *runner); /* nullable */
     gd_status (*execute_until)(_gd_backend *self, _gd_executable *exe, int node_id); /* nullable */
     void (*executable_free)(_gd_backend *self, _gd_executable *exe);
     /* Storage backing a compiled value (for host transfer / materialization). */

@@ -65,10 +65,13 @@ typedef struct gd_metal_lmce_scratch_layout {
 
 typedef struct gd_metal_value {
     gd_storage *storage;
+    gd_storage *input_staging;
     gd_tensor *external;
+    gd_storage *staged_source;
     size_t leaf_offset;
     bool external_alias;
     bool needs_writeback;
+    bool is_input;
     bool has_staged;
     uint64_t staged_version;
 } gd_metal_value;
@@ -165,6 +168,9 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
 void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe);
 
 gd_status _gd_metal_execute(_gd_backend *self, _gd_executable *exe);
+gd_status _gd_metal_execute_bound(_gd_backend *self,
+                                  _gd_executable *exe,
+                                  const gd_graph_runner *runner);
 gd_status _gd_metal_execute_until(_gd_backend *self, _gd_executable *exe, int node_id);
 gd_status _gd_metal_value_storage(_gd_backend *self, _gd_executable *exe, int value_id,
                                   gd_storage **storage_out, size_t *offset_out);

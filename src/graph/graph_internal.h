@@ -54,11 +54,19 @@ typedef struct _gd_op_attrs {
     gd_tensor_desc reduce_to_desc; /* REDUCE_TO target output descriptor */
 } _gd_op_attrs;
 
+typedef enum _gd_value_kind {
+    _GD_VALUE_PRODUCED = 0,
+    _GD_VALUE_EXTERNAL,
+    _GD_VALUE_INPUT
+} _gd_value_kind;
+
 typedef struct _gd_value {
     int id;
-    int producer_node_id;        /* -1 for external leaf values */
+    int producer_node_id;        /* -1 for external/input values */
     gd_tensor_desc desc;
-    gd_tensor *external;          /* retained leaf tensor, NULL for produced values */
+    gd_tensor *external;          /* retained leaf tensor for EXTERNAL values */
+    _gd_value_kind kind;
+    int input_index;              /* graph input index for INPUT values, else -1 */
     char *name;                   /* optional debug name */
 } _gd_value;
 
@@ -77,6 +85,20 @@ typedef struct _gd_node {
 typedef struct _gd_backend _gd_backend;
 typedef struct _gd_executable _gd_executable;
 
+struct gd_graph_input {
+    gd_graph *graph;
+    int index;
+    int value_id;
+    char *name;
+};
+
+struct gd_graph_runner {
+    gd_graph *graph;
+    gd_tensor **bindings;
+    unsigned char *bound;
+    int n_bindings;
+};
+
 struct gd_graph {
     gd_context *ctx;
     _gd_graph_state state;
@@ -89,9 +111,12 @@ struct gd_graph {
     _gd_value *values;
     int n_values;
     int value_cap;
-    gd_tensor **virtual_tensors;  /* weak handles to live virtual output tensors */
+    gd_tensor **virtual_tensors;  /* weak handles to live virtual/input tensors */
     int n_virtual;
     int virtual_cap;
+    gd_graph_input **inputs;
+    int n_inputs;
+    int input_cap;
     _gd_backend *backend;         /* selected at compile time */
     _gd_executable *exec;         /* backend-owned compiled artifact */
 };
@@ -101,6 +126,13 @@ const char *_gd_op_kind_name(_gd_op_kind op);
 
 gd_status _gd_graph_clear(gd_graph *graph);
 void _gd_graph_free_executable(gd_graph *graph);
+gd_status _gd_graph_add_value(gd_graph *graph,
+                              const gd_tensor_desc *desc,
+                              int producer_node_id,
+                              gd_tensor *external,
+                              _gd_value_kind kind,
+                              int input_index,
+                              int *value_id_out);
 gd_status _gd_graph_note_virtual_tensor_create(gd_graph *graph, gd_tensor *tensor);
 void _gd_graph_note_virtual_tensor_release(gd_graph *graph, gd_tensor *tensor);
 
@@ -155,6 +187,7 @@ gd_status _gd_graph_value_storage(gd_graph *graph,
                                   const gd_tensor_desc **desc_out);
 gd_status _gd_graph_set_value_name(gd_graph *graph, int value_id, const char *name);
 gd_status _gd_graph_materialize_live_virtuals(gd_graph *graph);
+gd_status _gd_graph_runner_validate_ready(const gd_graph_runner *runner);
 
 gd_status _gd_graph_dump_text(gd_graph *graph, const char *path);
 

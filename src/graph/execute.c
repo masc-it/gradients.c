@@ -177,6 +177,10 @@ gd_status gd_graph_run(gd_graph *graph)
     if (graph->state != _GD_GRAPH_COMPILED) {
         return _gd_error(GD_ERR_INVALID_STATE, "graph must be compiled before run");
     }
+    if (graph->n_inputs != 0) {
+        return _gd_error(GD_ERR_INVALID_STATE,
+                         "graph has inputs; use gd_graph_runner_run");
+    }
 
     {
         uint64_t start = _gd_profile_enabled(graph->ctx) ? _gd_profile_now_ns() : 0U;
@@ -326,6 +330,10 @@ gd_status gd_graph_run_until(gd_graph *graph, int node_id)
     }
     if (graph->state != _GD_GRAPH_COMPILED) {
         return _gd_error(GD_ERR_INVALID_STATE, "graph must be compiled before partial run");
+    }
+    if (graph->n_inputs != 0) {
+        return _gd_error(GD_ERR_INVALID_STATE,
+                         "partial graph run does not support bound inputs yet");
     }
     if (node_id >= graph->n_nodes) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "node id is out of range");

@@ -78,15 +78,17 @@ gd_status _gd_graph_dump_text(gd_graph *graph, const char *path)
 
     for (i = 0; i < graph->n_values; ++i) {
         const _gd_value *value = &graph->values[i];
-        int leaf = value->external != NULL;
+        int leaf = value->kind == _GD_VALUE_EXTERNAL;
         int requires_grad = leaf && gd_tensor_requires_grad(value->external);
+        const char *kind = value->kind == _GD_VALUE_INPUT ? "input" :
+                           (leaf ? "leaf" : "produced");
 
         if (fprintf(file,
                     "value %d name=%s producer=%d kind=%s requires_grad=%d dtype=%s device=%s:%d shape=",
                     value->id,
                     value->name != NULL ? value->name : "-",
                     value->producer_node_id,
-                    leaf ? "leaf" : "produced",
+                    kind,
                     requires_grad,
                     gd_dtype_name(value->desc.dtype),
                     gd_device_type_name(value->desc.device.type),

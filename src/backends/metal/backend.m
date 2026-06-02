@@ -216,6 +216,7 @@ static const _gd_backend_vtable metal_backend_vtable = {
     .download = _gd_metal_download,
     .compile = _gd_metal_compile,
     .execute = _gd_metal_execute,
+    .execute_bound = _gd_metal_execute_bound,
     .execute_until = _gd_metal_execute_until,
     .executable_free = _gd_metal_executable_free,
     .value_storage = _gd_metal_value_storage,

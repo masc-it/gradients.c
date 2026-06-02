@@ -12,6 +12,7 @@ void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
     if (exe->values != NULL) {
         for (i = 0; i < exe->n_values; ++i) {
             gd_storage_release(exe->values[i].storage);
+            gd_storage_release(exe->values[i].input_staging);
         }
         free(exe->values);
     }
@@ -131,7 +132,8 @@ static void refresh_external_flags(_gd_executable *exe)
     exe->needs_stage = false;
     exe->needs_writeback = false;
     for (i = 0; i < exe->n_values; ++i) {
-        if (exe->values[i].external != NULL && !exe->values[i].external_alias) {
+        if (exe->values[i].is_input ||
+            (exe->values[i].external != NULL && !exe->values[i].external_alias)) {
             exe->needs_stage = true;
         }
         if (exe->values[i].needs_writeback) {
@@ -204,11 +206,25 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
         if (status != GD_OK) {
             goto fail;
         }
-        if (value->external != NULL &&
-            gd_tensor_storage(value->external) != NULL &&
-            gd_storage_device(gd_tensor_storage(value->external)).type == GD_DEVICE_METAL &&
-            gd_storage_device(gd_tensor_storage(value->external)).index == self->device_index &&
-            value->desc.storage_offset_bytes == 0) {
+        if (value->kind == _GD_VALUE_INPUT) {
+            sdesc = (gd_storage_desc){{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
+                                      nbytes, alignment};
+            status = gd_storage_create(graph->ctx, &sdesc, &storage);
+            if (status != GD_OK) {
+                goto fail;
+            }
+            status = gd_storage_retain(storage);
+            if (status != GD_OK) {
+                gd_storage_release(storage);
+                goto fail;
+            }
+            exe->values[i].is_input = true;
+            exe->values[i].input_staging = storage;
+        } else if (value->external != NULL &&
+                   gd_tensor_storage(value->external) != NULL &&
+                   gd_storage_device(gd_tensor_storage(value->external)).type == GD_DEVICE_METAL &&
+                   gd_storage_device(gd_tensor_storage(value->external)).index == self->device_index &&
+                   value->desc.storage_offset_bytes == 0) {
             storage = gd_tensor_storage(value->external);
             status = gd_storage_retain(storage);
             if (status != GD_OK) {

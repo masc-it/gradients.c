@@ -58,11 +58,32 @@ static bool metal_needs_stage_now(const _gd_executable *exe)
             continue;
         }
         src = gd_tensor_storage(v->external);
-        if (src == NULL || !v->has_staged || v->staged_version != _gd_storage_version(src)) {
+        if (src == NULL || !v->has_staged || v->staged_source != src ||
+            v->staged_version != _gd_storage_version(src)) {
             return true;
         }
     }
     return false;
+}
+
+static gd_status metal_stage_copy(gd_context *ctx,
+                                  gd_storage *dst_storage,
+                                  gd_storage *src_storage,
+                                  size_t src_offset,
+                                  size_t nbytes)
+{
+    void *dst = NULL;
+    void *src = NULL;
+    gd_status status = gd_storage_data_cpu(dst_storage, &dst);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_storage_data_cpu(src_storage, &src);
+    if (status == GD_OK) {
+        memcpy(dst, (const unsigned char *)src + src_offset, nbytes);
+        return GD_OK;
+    }
+    return gd_storage_copy_to_cpu(ctx, src_storage, src_offset, dst, nbytes);
 }
 
 static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
@@ -75,7 +96,6 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
     for (i = 0; i < exe->n_values; ++i) {
         gd_metal_value *v = &exe->values[i];
         gd_storage *src = NULL;
-        void *dst = NULL;
         size_t nbytes = 0U;
         gd_status status = GD_OK;
 
@@ -87,19 +107,17 @@ static gd_status stage_leaves(_gd_backend *self, _gd_executable *exe)
             return _gd_error(GD_ERR_INVALID_STATE, "metal leaf input has no storage");
         }
         nbytes = gd_storage_nbytes(v->storage);
-        if (v->has_staged && v->staged_version == _gd_storage_version(src)) {
+        if (v->has_staged && v->staged_source == src &&
+            v->staged_version == _gd_storage_version(src)) {
             continue;
         }
         bytes += nbytes;
         count += 1U;
-        status = gd_storage_data_cpu(v->storage, &dst);
+        status = metal_stage_copy(self->ctx, v->storage, src, v->leaf_offset, nbytes);
         if (status != GD_OK) {
             return status;
         }
-        status = gd_storage_copy_to_cpu(self->ctx, src, v->leaf_offset, dst, nbytes);
-        if (status != GD_OK) {
-            return status;
-        }
+        v->staged_source = src;
         v->staged_version = _gd_storage_version(src);
         v->has_staged = true;
     }
@@ -153,6 +171,104 @@ static gd_status encode_planned_node(_gd_backend *self,
     return op->encode(&ctx);
 }
 
+
+static gd_status metal_set_active_storage(gd_metal_value *value, gd_storage *storage)
+{
+    gd_status status = GD_OK;
+
+    if (value == NULL || storage == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "metal active storage argument is NULL");
+    }
+    if (value->storage == storage) {
+        return GD_OK;
+    }
+    status = gd_storage_retain(storage);
+    if (status != GD_OK) {
+        return status;
+    }
+    gd_storage_release(value->storage);
+    value->storage = storage;
+    return GD_OK;
+}
+
+static bool metal_can_alias_binding(_gd_backend *self, gd_tensor *tensor)
+{
+    gd_storage *storage = NULL;
+    const gd_tensor_desc *desc = NULL;
+    gd_device device;
+
+    if (self == NULL || tensor == NULL) {
+        return false;
+    }
+    storage = gd_tensor_storage(tensor);
+    desc = _gd_tensor_desc_ptr(tensor);
+    if (storage == NULL || desc == NULL || desc->storage_offset_bytes != 0) {
+        return false;
+    }
+    device = gd_storage_device(storage);
+    return device.type == GD_DEVICE_METAL && device.index == self->device_index;
+}
+
+static gd_status metal_apply_runner_bindings(_gd_backend *self,
+                                             _gd_executable *exe,
+                                             const gd_graph_runner *runner)
+{
+    gd_status status = _gd_graph_runner_validate_ready(runner);
+    int i = 0;
+
+    if (status != GD_OK) {
+        return status;
+    }
+    if (runner->graph != exe->graph) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "runner graph mismatch");
+    }
+    for (i = 0; i < exe->graph->n_inputs; ++i) {
+        gd_graph_input *input = exe->graph->inputs[i];
+        gd_tensor *tensor = runner->bindings[i];
+        gd_storage *storage = NULL;
+        const gd_tensor_desc *desc = NULL;
+        gd_metal_value *value = NULL;
+        bool alias = false;
+
+        if (input == NULL || input->value_id < 0 || input->value_id >= exe->n_values ||
+            tensor == NULL || gd_tensor_storage(tensor) == NULL) {
+            return _gd_error(GD_ERR_INVALID_STATE, "invalid metal graph input binding");
+        }
+        value = &exe->values[input->value_id];
+        if (!value->is_input) {
+            return _gd_error(GD_ERR_INTERNAL, "metal binding target is not an input");
+        }
+        storage = gd_tensor_storage(tensor);
+        desc = _gd_tensor_desc_ptr(tensor);
+        if (desc == NULL) {
+            return _gd_error(GD_ERR_INTERNAL, "metal binding tensor has no descriptor");
+        }
+        alias = metal_can_alias_binding(self, tensor);
+        if (alias) {
+            status = metal_set_active_storage(value, storage);
+            if (status != GD_OK) {
+                return status;
+            }
+            value->external_alias = true;
+            value->leaf_offset = 0U;
+            value->staged_source = storage;
+            value->staged_version = _gd_storage_version(storage);
+            value->has_staged = true;
+        } else {
+            if (value->input_staging == NULL) {
+                return _gd_error(GD_ERR_INTERNAL, "metal graph input has no staging storage");
+            }
+            status = metal_set_active_storage(value, value->input_staging);
+            if (status != GD_OK) {
+                return status;
+            }
+            value->external_alias = false;
+            value->leaf_offset = (size_t)desc->storage_offset_bytes;
+        }
+        value->external = tensor; /* borrowed; runner owns binding lifetime */
+    }
+    return GD_OK;
+}
 
 static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int last_node)
 {
@@ -309,6 +425,17 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
 
 gd_status _gd_metal_execute(_gd_backend *self, _gd_executable *exe)
 {
+    return metal_execute_range(self, exe, exe->graph->n_nodes - 1);
+}
+
+gd_status _gd_metal_execute_bound(_gd_backend *self,
+                                  _gd_executable *exe,
+                                  const gd_graph_runner *runner)
+{
+    gd_status status = metal_apply_runner_bindings(self, exe, runner);
+    if (status != GD_OK) {
+        return status;
+    }
     return metal_execute_range(self, exe, exe->graph->n_nodes - 1);
 }
 

@@ -130,7 +130,7 @@ GD_REF(gd_clip_grad_norm, gd_status, (gd_context *, gd_tensor **, int, float, gd
 
 GD_REF(gd_sdpa_varlen, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_sdpa_varlen_config *, gd_tensor **));
 GD_REF(gd_slice, gd_status, (gd_context *, gd_tensor *, int, int64_t, int64_t, gd_tensor **));
-GD_REF(gd_concat, gd_status, (gd_context *, gd_tensor *, gd_tensor *, gd_tensor **));
+GD_REF(gd_concat, gd_status, (gd_context *, gd_tensor *const *, int, int, gd_tensor **));
 /* module.h */
 GD_REF(gd_module_create, gd_status, (gd_context *, const char *, gd_module **));
 GD_REF(gd_module_destroy, void, (gd_module *));
@@ -172,8 +172,12 @@ GD_REF(gd_gpt_is_training, bool, (const gd_gpt *));
 GD_REF(gd_gpt_parameters, gd_status, (gd_gpt *, gd_tensor ***, int *));
 GD_REF(gd_gpt_parameter_groups, gd_status, (gd_gpt *, float, gd_param_group **, int *));
 GD_REF(gd_gpt_parameter_groups_free, void, (gd_param_group *, int));
+GD_REF(gd_gpt_embed_tokens, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor **));
+GD_REF(gd_gpt_decode_embeds, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 GD_REF(gd_gpt_forward, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor **));
+GD_REF(gd_gpt_forward_embeds, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 GD_REF(gd_gpt_forward_loss, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor **));
+GD_REF(gd_gpt_forward_embeds_loss, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 
 /* tokenizer.h */
 GD_REF(gd_bpe_tokenizer_train, gd_status, (const char **, int, const gd_bpe_train_config *, gd_tokenizer **));
@@ -188,26 +192,53 @@ GD_REF(gd_tokenizer_hash, uint64_t, (const gd_tokenizer *));
 GD_REF(gd_tokenizer_free, void, (void *));
 
 /* dataset.h */
+GD_REF(gd_dataset_create, gd_status, (const gd_dataset_ops *, void *, gd_dataset **));
+GD_REF(gd_dataset_destroy, void, (gd_dataset *));
+GD_REF(gd_dataset_name, const char *, (const gd_dataset *));
+GD_REF(gd_dataset_data, void *, (gd_dataset *));
+GD_REF(gd_dataset_const_data, const void *, (const gd_dataset *));
+GD_REF(gd_dataset_num_samples, uint64_t, (const gd_dataset *));
+GD_REF(gd_dataset_fingerprint, uint64_t, (const gd_dataset *));
+GD_REF(gd_dataset_get_u64, gd_status, (const gd_dataset *, const char *, uint64_t *));
 GD_REF(gd_dataset_build, gd_status, (const gd_dataset_build_config *, gd_dataset_build_result *));
 GD_REF(gd_dataset_build_result_clear, void, (gd_dataset_build_result *));
 GD_REF(gd_gdtok_read_header, gd_status, (const char *, gd_gdtok_header *));
+GD_REF(gd_dataset_open_gdtok, gd_status, (const char **, int, gd_dataset **));
+GD_REF(gd_gdtok_dataset_read_lm_sample, gd_status, (const gd_dataset *, uint64_t, int32_t *, int32_t *));
 
 /* dataloader.h */
-GD_REF(gd_token_dataset_open, gd_status, (const char **, int, gd_token_dataset **));
-GD_REF(gd_token_dataset_close, void, (gd_token_dataset *));
-GD_REF(gd_token_dataset_num_samples, uint64_t, (const gd_token_dataset *));
-GD_REF(gd_token_dataset_block_len, uint32_t, (const gd_token_dataset *));
-GD_REF(gd_token_dataset_vocab_size, uint32_t, (const gd_token_dataset *));
-GD_REF(gd_token_dataset_tokenizer_hash, uint64_t, (const gd_token_dataset *));
-GD_REF(gd_dataloader_create, gd_status, (gd_context *, gd_token_dataset *, const gd_dataloader_config *, gd_dataloader **));
+GD_REF(gd_dataloader_create, gd_status, (gd_context *, gd_dataset *, const gd_dataloader_config *, const gd_batch_field_desc *, int, gd_collate_fn, void *, gd_dataloader **));
 GD_REF(gd_dataloader_destroy, void, (gd_dataloader *));
 GD_REF(gd_dataloader_prefetch, gd_status, (gd_dataloader *));
-GD_REF(gd_dataloader_next, gd_status, (gd_dataloader *, gd_batch_slot **));
-GD_REF(gd_dataloader_release_slot, gd_status, (gd_dataloader *, gd_batch_slot *));
+GD_REF(gd_dataloader_next, gd_status, (gd_dataloader *, gd_batch **));
+GD_REF(gd_dataloader_release, gd_status, (gd_dataloader *, gd_batch *));
 GD_REF(gd_dataloader_slot_count, int, (const gd_dataloader *));
 GD_REF(gd_dataloader_state_save, gd_status, (gd_dataloader *, const char *));
 GD_REF(gd_dataloader_state_load, gd_status, (gd_dataloader *, const char *));
 GD_REF(gd_dataloader_metrics_get, void, (const gd_dataloader *, gd_dataloader_metrics *));
+GD_REF(gd_batch_index, int, (const gd_batch *));
+GD_REF(gd_batch_get_state, gd_batch_state, (const gd_batch *));
+GD_REF(gd_batch_field_count, int, (const gd_batch *));
+GD_REF(gd_batch_field_index, int, (const gd_batch *, const char *));
+GD_REF(gd_batch_field_name, const char *, (const gd_batch *, int));
+GD_REF(gd_batch_field_dtype, gd_dtype, (const gd_batch *, int));
+GD_REF(gd_batch_field_rank, int, (const gd_batch *, int));
+GD_REF(gd_batch_field_dim, int64_t, (const gd_batch *, int, int));
+GD_REF(gd_batch_field_nbytes, size_t, (const gd_batch *, int));
+GD_REF(gd_batch_host_data, void *, (gd_batch *, int));
+GD_REF(gd_batch_tensor_at, gd_tensor *, (gd_batch *, int));
+GD_REF(gd_batch_tensor, gd_tensor *, (gd_batch *, const char *));
+GD_REF(gd_batch_sample_ids, const uint64_t *, (const gd_batch *));
+GD_REF(gd_collate_gdtok_lm, gd_status, (gd_dataset *, const uint64_t *, int, gd_batch *, void *));
+
+/* dataset_vlm.h */
+GD_REF(gd_gdvlm_read_header, gd_status, (const char *, gd_gdvlm_header *));
+GD_REF(gd_dataset_open_gdvlm, gd_status, (const char **, int, const char *, gd_dataset **));
+GD_REF(gd_dataset_open_gdvlm_split, gd_status, (const char *, const char *, gd_dataset **));
+GD_REF(gd_gdvlm_dataset_sample_info, gd_status, (const gd_dataset *, uint64_t, gd_gdvlm_sample_info *));
+GD_REF(gd_gdvlm_dataset_read_sample, gd_status, (const gd_dataset *, uint64_t, gd_gdvlm_sample_info *, int32_t *, int, void *, size_t));
+GD_REF(gd_vlm_init_batch_fields, gd_status, (const gd_dataset *, const gd_vlm_collate_config *, int, gd_batch_field_desc *, int, int *));
+GD_REF(gd_collate_gdvlm, gd_status, (gd_dataset *, const uint64_t *, int, gd_batch *, void *));
 
 int main(void)
 {

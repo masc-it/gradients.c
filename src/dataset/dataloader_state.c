@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const unsigned char gd_dl_state_magic[8] = {'G', 'D', 'L', 'D', 'S', 'T', '2', '\0'};
+static const unsigned char gd_dl_state_magic[8] = {'G', 'D', 'L', 'D', 'S', 'T', '3', '\0'};
 
 typedef struct gd_dl_state_ready_batch {
     uint64_t seq;
@@ -15,14 +15,14 @@ typedef struct gd_dl_state_ready_batch {
 
 typedef struct gd_dl_state_file {
     uint32_t batch_size;
-    uint32_t block_len;
-    uint32_t mode;
-    uint32_t shuffle;
+    uint32_t sampler;
     uint32_t slot_count;
     uint32_t ready_count;
+    uint32_t n_fields;
     uint64_t seed;
-    uint64_t tokenizer_hash;
+    uint64_t dataset_fingerprint;
     uint64_t dataset_samples;
+    uint64_t schema_hash;
     uint64_t cursor;
     uint64_t rng_state;
     uint64_t next_seq;
@@ -122,7 +122,7 @@ static gd_loader_slot *gd_dl_find_ready_seq(gd_dataloader *dl, uint64_t seq)
 {
     int i;
     for (i = 0; i < dl->n_slots; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY && dl->slots[i].seq == seq) {
+        if (dl->slots[i].pub.state == GD_BATCH_READY && dl->slots[i].seq == seq) {
             return &dl->slots[i];
         }
     }
@@ -134,7 +134,7 @@ static uint32_t gd_dl_ready_count(const gd_dataloader *dl)
     uint32_t n = 0U;
     int i;
     for (i = 0; i < dl->n_slots; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_READY) {
+        if (dl->slots[i].pub.state == GD_BATCH_READY) {
             n += 1U;
         }
     }
@@ -155,16 +155,16 @@ static gd_status gd_dl_write_state_locked(gd_dataloader *dl, const char *path)
         return _gd_error(GD_ERR_IO, "failed to open dataloader state output");
     }
     if (gd_dl_write_bytes(f, gd_dl_state_magic, sizeof(gd_dl_state_magic)) != 0 ||
-        gd_dl_write_u32(f, 2U) != 0 ||
+        gd_dl_write_u32(f, 3U) != 0 ||
         gd_dl_write_u32(f, (uint32_t)dl->cfg.batch_size) != 0 ||
-        gd_dl_write_u32(f, (uint32_t)dl->cfg.block_len) != 0 ||
-        gd_dl_write_u32(f, (uint32_t)dl->cfg.mode) != 0 ||
-        gd_dl_write_u32(f, (uint32_t)dl->cfg.shuffle) != 0 ||
+        gd_dl_write_u32(f, (uint32_t)dl->cfg.sampler) != 0 ||
         gd_dl_write_u32(f, (uint32_t)dl->n_slots) != 0 ||
         gd_dl_write_u32(f, ready_count) != 0 ||
+        gd_dl_write_u32(f, (uint32_t)dl->n_fields) != 0 ||
         gd_dl_write_u64(f, dl->cfg.seed) != 0 ||
-        gd_dl_write_u64(f, gd_token_dataset_tokenizer_hash(dl->ds)) != 0 ||
-        gd_dl_write_u64(f, gd_token_dataset_num_samples(dl->ds)) != 0 ||
+        gd_dl_write_u64(f, gd_dataset_fingerprint(dl->dataset)) != 0 ||
+        gd_dl_write_u64(f, gd_dataset_num_samples(dl->dataset)) != 0 ||
+        gd_dl_write_u64(f, dl->schema_hash) != 0 ||
         gd_dl_write_u64(f, dl->cursor) != 0 ||
         gd_dl_write_u64(f, dl->rng_state) != 0 ||
         gd_dl_write_u64(f, dl->next_seq) != 0 ||
@@ -185,7 +185,7 @@ static gd_status gd_dl_write_state_locked(gd_dataloader *dl, const char *path)
             return _gd_error(GD_ERR_IO, "failed to write dataloader state batch");
         }
         for (b = 0; b < dl->cfg.batch_size; ++b) {
-            if (gd_dl_write_u64(f, slot->sample_ids[b]) != 0) {
+            if (gd_dl_write_u64(f, slot->pub.sample_ids[b]) != 0) {
                 (void)fclose(f);
                 return _gd_error(GD_ERR_IO, "failed to write dataloader state samples");
             }
@@ -210,10 +210,10 @@ gd_status gd_dataloader_state_save(gd_dataloader *dl, const char *path)
         return status;
     }
     for (i = 0; i < dl->n_slots; ++i) {
-        if (dl->slots[i].pub.state == GD_BATCH_SLOT_IN_USE) {
+        if (dl->slots[i].pub.state == GD_BATCH_IN_USE) {
             _gd_dataloader_unlock_resume(dl);
             return _gd_error(GD_ERR_INVALID_STATE,
-                             "cannot save dataloader state with in-use slots");
+                             "cannot save dataloader state with in-use batches");
         }
     }
     status = gd_dl_write_state_locked(dl, path);
@@ -242,7 +242,6 @@ static gd_status gd_dl_read_state_file(const char *path, gd_dl_state_file *s)
     unsigned char magic[8];
     uint32_t version = 0U;
     uint32_t i;
-    int b;
 
     memset(s, 0, sizeof(*s));
     f = fopen(path, "rb");
@@ -250,24 +249,27 @@ static gd_status gd_dl_read_state_file(const char *path, gd_dl_state_file *s)
         return _gd_error(GD_ERR_IO, "failed to open dataloader state");
     }
     if (gd_dl_read_bytes(f, magic, sizeof(magic)) != 0 ||
-        memcmp(magic, gd_dl_state_magic, sizeof(magic)) != 0 ||
         gd_dl_read_u32(f, &version) != 0) {
+        (void)fclose(f);
+        return _gd_error(GD_ERR_IO, "failed to read dataloader state magic");
+    }
+    if (memcmp(magic, gd_dl_state_magic, sizeof(magic)) != 0) {
         (void)fclose(f);
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state magic");
     }
-    if (version != 2U) {
+    if (version != 3U) {
         (void)fclose(f);
         return _gd_error(GD_ERR_UNSUPPORTED, "unsupported dataloader state version");
     }
     if (gd_dl_read_u32(f, &s->batch_size) != 0 ||
-        gd_dl_read_u32(f, &s->block_len) != 0 ||
-        gd_dl_read_u32(f, &s->mode) != 0 ||
-        gd_dl_read_u32(f, &s->shuffle) != 0 ||
+        gd_dl_read_u32(f, &s->sampler) != 0 ||
         gd_dl_read_u32(f, &s->slot_count) != 0 ||
         gd_dl_read_u32(f, &s->ready_count) != 0 ||
+        gd_dl_read_u32(f, &s->n_fields) != 0 ||
         gd_dl_read_u64(f, &s->seed) != 0 ||
-        gd_dl_read_u64(f, &s->tokenizer_hash) != 0 ||
+        gd_dl_read_u64(f, &s->dataset_fingerprint) != 0 ||
         gd_dl_read_u64(f, &s->dataset_samples) != 0 ||
+        gd_dl_read_u64(f, &s->schema_hash) != 0 ||
         gd_dl_read_u64(f, &s->cursor) != 0 ||
         gd_dl_read_u64(f, &s->rng_state) != 0 ||
         gd_dl_read_u64(f, &s->next_seq) != 0 ||
@@ -275,21 +277,23 @@ static gd_status gd_dl_read_state_file(const char *path, gd_dl_state_file *s)
         gd_dl_read_u64(f, &s->requested) != 0 ||
         gd_dl_read_metrics(f, &s->metrics) != 0) {
         (void)fclose(f);
-        gd_dl_state_file_clear(s);
         return _gd_error(GD_ERR_IO, "failed to read dataloader state header");
     }
-    if (s->ready_count > s->slot_count || s->batch_size == 0U) {
+    if (s->batch_size == 0U || s->ready_count > GD_DL_MAX_SLOTS ||
+        s->slot_count > GD_DL_MAX_SLOTS) {
         (void)fclose(f);
-        gd_dl_state_file_clear(s);
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid dataloader state counts");
     }
-    s->ready = (gd_dl_state_ready_batch *)calloc((size_t)s->ready_count,
-                                                 sizeof(*s->ready));
-    if (s->ready == NULL && s->ready_count != 0U) {
-        (void)fclose(f);
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader state allocation failed");
+    if (s->ready_count > 0U) {
+        s->ready = (gd_dl_state_ready_batch *)calloc((size_t)s->ready_count,
+                                                     sizeof(gd_dl_state_ready_batch));
+        if (s->ready == NULL) {
+            (void)fclose(f);
+            return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader state allocation failed");
+        }
     }
     for (i = 0U; i < s->ready_count; ++i) {
+        uint32_t b;
         if (gd_dl_read_u64(f, &s->ready[i].seq) != 0) {
             (void)fclose(f);
             gd_dl_state_file_clear(s);
@@ -301,7 +305,7 @@ static gd_status gd_dl_read_state_file(const char *path, gd_dl_state_file *s)
             gd_dl_state_file_clear(s);
             return _gd_error(GD_ERR_OUT_OF_MEMORY, "dataloader state sample allocation failed");
         }
-        for (b = 0; b < (int)s->batch_size; ++b) {
+        for (b = 0U; b < s->batch_size; ++b) {
             if (gd_dl_read_u64(f, &s->ready[i].samples[b]) != 0) {
                 (void)fclose(f);
                 gd_dl_state_file_clear(s);
@@ -318,18 +322,17 @@ static gd_status gd_dl_read_state_file(const char *path, gd_dl_state_file *s)
 
 static gd_status gd_dl_validate_state(const gd_dataloader *dl, const gd_dl_state_file *s)
 {
-    uint64_t tok_hash;
     if (s->batch_size != (uint32_t)dl->cfg.batch_size ||
-        s->block_len != (uint32_t)dl->cfg.block_len ||
-        s->mode != (uint32_t)dl->cfg.mode ||
-        s->shuffle != (uint32_t)dl->cfg.shuffle ||
+        s->sampler != (uint32_t)dl->cfg.sampler ||
+        s->n_fields != (uint32_t)dl->n_fields ||
         s->slot_count > (uint32_t)dl->n_slots ||
-        s->dataset_samples != gd_token_dataset_num_samples(dl->ds)) {
+        s->dataset_samples != gd_dataset_num_samples(dl->dataset) ||
+        s->schema_hash != dl->schema_hash) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader state/config mismatch");
     }
-    tok_hash = gd_token_dataset_tokenizer_hash(dl->ds);
-    if (s->tokenizer_hash != 0U && s->tokenizer_hash != tok_hash) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader state tokenizer mismatch");
+    if (s->dataset_fingerprint != 0U &&
+        s->dataset_fingerprint != gd_dataset_fingerprint(dl->dataset)) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "dataloader state dataset mismatch");
     }
     if (s->ready_count > (uint32_t)dl->n_slots ||
         s->requested > (uint64_t)dl->n_slots - (uint64_t)s->ready_count) {
@@ -359,7 +362,7 @@ gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path)
     if (_gd_dataloader_has_live_slot_locked(dl) != 0) {
         _gd_dataloader_unlock_resume(dl);
         gd_dl_state_file_clear(&s);
-        return _gd_error(GD_ERR_INVALID_STATE, "cannot load dataloader state with live slots");
+        return _gd_error(GD_ERR_INVALID_STATE, "cannot load dataloader state with live batches");
     }
     status = gd_dl_validate_state(dl, &s);
     if (status == GD_OK) {
@@ -373,16 +376,16 @@ gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path)
             gd_dataloader_fill_stats stats;
             gd_loader_slot *slot = &dl->slots[i];
             int b;
-            slot->pub.state = GD_BATCH_SLOT_FILLING;
+            slot->pub.state = GD_BATCH_FILLING;
             slot->seq = s.ready[i].seq;
             for (b = 0; b < dl->cfg.batch_size; ++b) {
-                slot->sample_ids[b] = s.ready[i].samples[b];
+                slot->pub.sample_ids[b] = s.ready[i].samples[b];
             }
             status = _gd_dataloader_fill_slot_from_samples(dl, slot, &stats);
             if (status == GD_OK) {
-                slot->pub.state = GD_BATCH_SLOT_READY;
+                slot->pub.state = GD_BATCH_READY;
             } else {
-                slot->pub.state = GD_BATCH_SLOT_FREE;
+                slot->pub.state = GD_BATCH_FREE;
             }
         }
     }

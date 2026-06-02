@@ -136,6 +136,69 @@ static int test_forward_loss_parity(gd_context *ctx, gd_tensor *tokens,
     return 0;
 }
 
+static int test_inputs_embeds_api(gd_context *ctx, gd_tensor *tokens,
+                                  gd_tensor *pos, gd_tensor *targets)
+{
+    gd_gpt *gpt = NULL;
+    gd_gpt_config cfg = tiny_config();
+    gd_graph *g = NULL;
+    gd_tensor *embeds = NULL;
+    gd_tensor *tok_logits = NULL;
+    gd_tensor *emb_logits = NULL;
+    gd_tensor *tok_loss = NULL;
+    gd_tensor *emb_loss = NULL;
+    gd_tensor *prefix_logits = NULL;
+    gd_gpt_forward_config prefix = {0};
+    gd_compare_options opts = {2e-4, 2e-4, false};
+    float tok_data[GPT_B * GPT_T * GPT_V];
+    float emb_data[GPT_B * GPT_T * GPT_V];
+    float tok_loss_v = 0.0F;
+    float emb_loss_v = 0.0F;
+    int i = 0;
+
+    prefix.prefix_len = 2;
+    CHECK_OK(gd_gpt_create(ctx, &cfg, GPT_SEED, &gpt));
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, tokens, &embeds));
+    CHECK_OK(gd_gpt_forward(ctx, gpt, tokens, pos, &tok_logits));
+    CHECK_OK(gd_gpt_forward_embeds(ctx, gpt, embeds, pos, NULL, &emb_logits));
+    CHECK_OK(gd_gpt_forward_loss(ctx, gpt, tokens, pos, targets, &tok_loss));
+    CHECK_OK(gd_gpt_forward_embeds_loss(ctx, gpt, embeds, pos, targets, NULL, &emb_loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_compile(g, CPU));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, CPU));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tok_logits, tok_data, sizeof(tok_data)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, emb_logits, emb_data, sizeof(emb_data)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tok_loss, &tok_loss_v, sizeof(tok_loss_v)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, emb_loss, &emb_loss_v, sizeof(emb_loss_v)));
+    for (i = 0; i < GPT_B * GPT_T * GPT_V; ++i) {
+        CHECK_TRUE(fabsf(tok_data[i] - emb_data[i]) <= 1e-5F);
+    }
+    CHECK_TRUE(fabsf(tok_loss_v - emb_loss_v) <= 1e-6F);
+    gd_tensor_release(emb_loss);
+    gd_tensor_release(tok_loss);
+    gd_tensor_release(emb_logits);
+    gd_tensor_release(tok_logits);
+    gd_tensor_release(embeds);
+    CHECK_OK(gd_graph_destroy(g));
+    g = NULL;
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, tokens, &embeds));
+    CHECK_OK(gd_gpt_forward_embeds(ctx, gpt, embeds, pos, &prefix, &prefix_logits));
+    CHECK_OK(gd_graph_end(ctx));
+    gd_tensor_release(prefix_logits);
+    gd_tensor_release(embeds);
+    CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
+    CHECK_OK(gd_graph_destroy(g));
+    gd_gpt_destroy(gpt);
+    return 0;
+}
+
 static int collect_f16_forward_loss(gd_context *ctx, gd_device dev,
                                     gd_tensor *tokens, gd_tensor *pos,
                                     gd_tensor *targets, float *loss_out)
@@ -438,6 +501,7 @@ int main(void)
     }
     if (metal) {
         rc |= test_forward_parity(ctx, tokens, pos);
+        rc |= test_inputs_embeds_api(ctx, tokens, pos, targets);
         if (mps_enabled) {
             rc |= test_forward_loss_parity(ctx, tokens, pos, targets);
             rc |= test_f16_amp_train_metal(ctx, tokens, pos, targets);

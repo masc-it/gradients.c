@@ -253,6 +253,18 @@ typedef struct gd_metal_transpose_params {
     int perm[GD_METAL_MAX_DIMS];
 } gd_metal_transpose_params;
 
+/* Concat one contiguous input segment into a contiguous output. The host launches
+ * this kernel once per input, so Metal buffer-count limits do not constrain
+ * variadic concat arity. Tensor is viewed as [outer, dim, inner]. */
+typedef struct gd_metal_concat_params {
+    int numel;
+    int elem_size;
+    int inner;
+    int input_dim;
+    int output_dim;
+    int dst_start;
+} gd_metal_concat_params;
+
 /* Compact slice copy and its backward scatter. Sizes/strides are element units;
  * elem_size is bytes. Forward maps contiguous output coordinates to input
  * coordinates with `coord[dim] += start`. Backward maps full input-gradient

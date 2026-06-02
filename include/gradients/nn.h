@@ -59,6 +59,30 @@ gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
                                   int *n_groups_out);
 void gd_gpt_parameter_groups_free(gd_param_group *groups, int n_groups);
 
+/* Shared decoder config for token-id and inputs_embeds GPT forwards.
+ * prefix_len=0 gives normal causal attention. prefix_len>0 gives prefix-causal
+ * attention: prefix tokens attend bidirectionally inside the prefix, suffix
+ * tokens attend all prefix tokens plus causal suffix history. Loss ignore fields
+ * are used only by *_loss variants. */
+typedef struct gd_gpt_forward_config {
+    int prefix_len;
+    bool has_ignore_index;
+    int ignore_index;
+} gd_gpt_forward_config;
+
+/* Token embedding lookup only: tokens int32/int64 [B,T] -> embeds [B,T,d_model].
+ * The returned tensor is suitable for gd_gpt_forward_embeds*. */
+gd_status gd_gpt_embed_tokens(gd_context *ctx, gd_gpt *gpt,
+                              gd_tensor *tokens, gd_tensor **embeds_out);
+
+/* Decoder trunk from already-embedded inputs. `inputs_embeds` is [B,T,d_model],
+ * `positions` is int32/int64 [B,T]. The trunk applies GPT embedding dropout,
+ * transformer blocks, and final norm, returning hidden [B,T,d_model]. */
+gd_status gd_gpt_decode_embeds(gd_context *ctx, gd_gpt *gpt,
+                               gd_tensor *inputs_embeds, gd_tensor *positions,
+                               const gd_gpt_forward_config *config,
+                               gd_tensor **hidden_out);
+
 /* Records the forward pass into the active graph. `tokens` is int32 [B,T];
  * `positions` is int32 [B,T] (RoPE/causal positions). Produces logits[B,T,V]
  * (a new virtual tensor owned by the caller). */
@@ -66,11 +90,22 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
                          gd_tensor *tokens, gd_tensor *positions,
                          gd_tensor **logits_out);
 
+gd_status gd_gpt_forward_embeds(gd_context *ctx, gd_gpt *gpt,
+                                gd_tensor *inputs_embeds, gd_tensor *positions,
+                                const gd_gpt_forward_config *config,
+                                gd_tensor **logits_out);
+
 /* Records forward + mean CE loss. For tied embeddings this may use a fused
  * LM-head CE op that avoids materializing logits. */
 gd_status gd_gpt_forward_loss(gd_context *ctx, gd_gpt *gpt,
                               gd_tensor *tokens, gd_tensor *positions,
                               gd_tensor *targets, gd_tensor **loss_out);
+
+gd_status gd_gpt_forward_embeds_loss(gd_context *ctx, gd_gpt *gpt,
+                                     gd_tensor *inputs_embeds, gd_tensor *positions,
+                                     gd_tensor *targets,
+                                     const gd_gpt_forward_config *config,
+                                     gd_tensor **loss_out);
 
 #ifdef __cplusplus
 }

@@ -52,3 +52,27 @@ Loss convention for loader/training:
 - image prefix tokens: `196`
 - causal attention with `prefix_len=196`
 - loss mask ignores image prefix; text suffix only
+
+C runtime loader:
+
+```c
+gd_dataset *ds = NULL;
+gd_vlm_collate_config vlm = {0};
+gd_batch_field_desc fields[GD_VLM_BATCH_FIELD_COUNT];
+int n_fields = 0;
+
+gd_dataset_open_gdvlm_split(out_dir, "train", &ds);
+vlm.pad_token_id = 0;
+vlm.target_pad_id = -100;
+vlm.target_mode = GD_VLM_TEXT_TARGET_SHIFT_RIGHT;
+gd_vlm_init_batch_fields(ds, &vlm, batch_size, fields,
+                         GD_VLM_BATCH_FIELD_COUNT, &n_fields);
+gd_dataloader_create(ctx, ds, &dl_cfg, fields, n_fields,
+                     gd_collate_gdvlm, &vlm, &dl);
+```
+
+Batch fields:
+- `patches` f16 `[B, 196, 768]`
+- `tokens`, `targets`, `positions` i32 `[B, T]`
+- `loss_mask` f32 `[B, T]`
+- `prefix_len`, `text_len`, `label_id` i32 `[B]`

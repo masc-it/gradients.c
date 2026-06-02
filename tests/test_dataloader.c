@@ -146,19 +146,20 @@ static int read_shard_tokens(const char *path, int32_t *out, int n)
     return 0;
 }
 
-static int copy_slot(gd_context *ctx,
-                     gd_batch_slot *slot,
-                     int32_t *tokens,
-                     int32_t *targets,
-                     int32_t *positions,
-                     int n_elem)
+static int copy_lm_batch(gd_context *ctx,
+                         gd_batch *batch,
+                         int32_t *tokens,
+                         int32_t *targets,
+                         int32_t *positions,
+                         int n_elem)
 {
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, slot->tokens, tokens,
-                                   (size_t)n_elem * sizeof(int32_t)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, slot->targets, targets,
-                                   (size_t)n_elem * sizeof(int32_t)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, slot->positions, positions,
-                                   (size_t)n_elem * sizeof(int32_t)));
+    gd_tensor *tok = gd_batch_tensor(batch, "tokens");
+    gd_tensor *tgt = gd_batch_tensor(batch, "targets");
+    gd_tensor *pos = gd_batch_tensor(batch, "positions");
+    CHECK_TRUE(tok != NULL && tgt != NULL && pos != NULL);
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tok, tokens, (size_t)n_elem * sizeof(int32_t)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tgt, targets, (size_t)n_elem * sizeof(int32_t)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, pos, positions, (size_t)n_elem * sizeof(int32_t)));
     return 0;
 }
 
@@ -173,9 +174,29 @@ static int arrays_equal(const int32_t *a, const int32_t *b, int n)
     return 1;
 }
 
+static void make_lm_fields(gd_batch_field_desc *fields, int batch_size, int block_len)
+{
+    memset(fields, 0, 3U * sizeof(fields[0]));
+    fields[0].name = "tokens";
+    fields[0].dtype = GD_DTYPE_I32;
+    fields[0].rank = 2;
+    fields[0].sizes[0] = batch_size;
+    fields[0].sizes[1] = block_len;
+    fields[1].name = "targets";
+    fields[1].dtype = GD_DTYPE_I32;
+    fields[1].rank = 2;
+    fields[1].sizes[0] = batch_size;
+    fields[1].sizes[1] = block_len;
+    fields[2].name = "positions";
+    fields[2].dtype = GD_DTYPE_I32;
+    fields[2].rank = 2;
+    fields[2].sizes[0] = batch_size;
+    fields[2].sizes[1] = block_len;
+}
+
 static int make_loader_ex(gd_context *ctx,
-                          gd_token_dataset *ds,
-                          gd_dataloader_mode mode,
+                          gd_dataset *ds,
+                          gd_sampler_mode sampler,
                           uint64_t seed,
                           int batch_size,
                           int num_workers,
@@ -183,28 +204,28 @@ static int make_loader_ex(gd_context *ctx,
                           gd_dataloader **out)
 {
     gd_dataloader_config cfg;
+    gd_batch_field_desc fields[3];
     memset(&cfg, 0, sizeof(cfg));
+    make_lm_fields(fields, batch_size, 4);
     cfg.batch_size = batch_size;
-    cfg.block_len = 4;
     cfg.seed = seed;
-    cfg.shuffle = mode == GD_DATALOADER_RANDOM ? 1 : 0;
-    cfg.double_buffer = 1;
     cfg.device = (gd_device){GD_DEVICE_CPU, 0};
-    cfg.mode = mode;
-    cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(ds);
+    cfg.sampler = sampler;
+    cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(ds);
     cfg.num_workers = num_workers;
     cfg.prefetch_factor = prefetch_factor;
-    CHECK_OK(gd_dataloader_create(ctx, ds, &cfg, out));
+    CHECK_OK(gd_dataloader_create(ctx, ds, &cfg, fields, 3,
+                                  gd_collate_gdtok_lm, NULL, out));
     return 0;
 }
 
 static int make_loader(gd_context *ctx,
-                       gd_token_dataset *ds,
-                       gd_dataloader_mode mode,
+                       gd_dataset *ds,
+                       gd_sampler_mode sampler,
                        uint64_t seed,
                        gd_dataloader **out)
 {
-    return make_loader_ex(ctx, ds, mode, seed, 2, 0, 0, out);
+    return make_loader_ex(ctx, ds, sampler, seed, 2, 0, 0, out);
 }
 
 static int test_sequential_loader_matches_shard_payload(void)
@@ -213,201 +234,191 @@ static int test_sequential_loader_matches_shard_payload(void)
     const char *tokenizer_path = "/tmp/gd_loader_seq_tok.json";
     const char *paths[1];
     gd_dataset_build_result build;
-    gd_token_dataset *ds = NULL;
+    gd_dataset *ds = NULL;
     gd_context *ctx = NULL;
     gd_dataloader *dl = NULL;
-    gd_batch_slot *slot = NULL;
+    gd_batch *batch = NULL;
     int32_t payload[9];
     int32_t tokens[8];
     int32_t targets[8];
     int32_t positions[8];
+    uint64_t block_len = 0U;
     int i;
 
     CHECK_TRUE(build_fixture_dataset(corpus_path, tokenizer_path, "/tmp/gd_loader_seq_ds", &build) == 0);
     paths[0] = build.train.shard_path;
-    CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
-    CHECK_TRUE(gd_token_dataset_num_samples(ds) == build.train.n_samples);
-    CHECK_TRUE(gd_token_dataset_block_len(ds) == 4U);
+    CHECK_OK(gd_dataset_open_gdtok(paths, 1, &ds));
+    CHECK_TRUE(gd_dataset_num_samples(ds) == build.train.n_samples);
+    CHECK_OK(gd_dataset_get_u64(ds, "block_len", &block_len));
+    CHECK_TRUE(block_len == 4U);
     CHECK_OK(gd_context_create(&ctx));
-    CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_SEQUENTIAL, 123U, &dl) == 0);
+    CHECK_TRUE(make_loader(ctx, ds, GD_SAMPLER_SEQUENTIAL, 123U, &dl) == 0);
     CHECK_OK(gd_dataloader_prefetch(dl));
-    CHECK_OK(gd_dataloader_next(dl, &slot));
-    CHECK_TRUE(slot->state == GD_BATCH_SLOT_IN_USE);
-    CHECK_TRUE(copy_slot(ctx, slot, tokens, targets, positions, 8) == 0);
+    CHECK_OK(gd_dataloader_next(dl, &batch));
+    CHECK_TRUE(gd_batch_get_state(batch) == GD_BATCH_IN_USE);
+    CHECK_TRUE(copy_lm_batch(ctx, batch, tokens, targets, positions, 8) == 0);
     CHECK_TRUE(read_shard_tokens(build.train.shard_path, payload, 9) == 0);
     for (i = 0; i < 8; ++i) {
         CHECK_TRUE(tokens[i] == payload[i]);
         CHECK_TRUE(targets[i] == payload[i + 1]);
         CHECK_TRUE(positions[i] == i % 4);
     }
-    CHECK_OK(gd_dataloader_release_slot(dl, slot));
+    CHECK_OK(gd_dataloader_release(dl, batch));
 
     gd_dataloader_destroy(dl);
     gd_context_destroy(ctx);
-    gd_token_dataset_close(ds);
+    gd_dataset_destroy(ds);
     gd_dataset_build_result_clear(&build);
     (void)remove(corpus_path);
     (void)remove(tokenizer_path);
     return 0;
 }
 
-static int test_double_buffer_slot_states(void)
+static int test_slot_lifecycle(void)
 {
     const char *corpus_path = "/tmp/gd_loader_slots.txt";
     const char *tokenizer_path = "/tmp/gd_loader_slots_tok.json";
     const char *paths[1];
     gd_dataset_build_result build;
-    gd_token_dataset *ds = NULL;
+    gd_dataset *ds = NULL;
     gd_context *ctx = NULL;
     gd_dataloader *dl = NULL;
-    gd_batch_slot *a = NULL;
-    gd_batch_slot *b = NULL;
+    gd_batch *a = NULL;
+    gd_batch *b = NULL;
 
     CHECK_TRUE(build_fixture_dataset(corpus_path, tokenizer_path, "/tmp/gd_loader_slots_ds", &build) == 0);
     paths[0] = build.train.shard_path;
-    CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
+    CHECK_OK(gd_dataset_open_gdtok(paths, 1, &ds));
     CHECK_OK(gd_context_create(&ctx));
-    CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_SEQUENTIAL, 7U, &dl) == 0);
+    CHECK_TRUE(make_loader(ctx, ds, GD_SAMPLER_SEQUENTIAL, 7U, &dl) == 0);
     CHECK_TRUE(gd_dataloader_slot_count(dl) == 2);
 
     CHECK_OK(gd_dataloader_prefetch(dl));
     CHECK_OK(gd_dataloader_prefetch(dl));
     CHECK_OK(gd_dataloader_next(dl, &a));
     CHECK_OK(gd_dataloader_next(dl, &b));
-    CHECK_TRUE(a != b);
-    CHECK_TRUE(a->state == GD_BATCH_SLOT_IN_USE);
-    CHECK_TRUE(b->state == GD_BATCH_SLOT_IN_USE);
+    CHECK_TRUE(gd_batch_get_state(a) == GD_BATCH_IN_USE);
+    CHECK_TRUE(gd_batch_get_state(b) == GD_BATCH_IN_USE);
     CHECK_STATUS(gd_dataloader_prefetch(dl), GD_ERR_INVALID_STATE);
-    CHECK_OK(gd_dataloader_release_slot(dl, a));
+    CHECK_OK(gd_dataloader_release(dl, a));
     CHECK_OK(gd_dataloader_prefetch(dl));
-    CHECK_OK(gd_dataloader_release_slot(dl, b));
+    CHECK_OK(gd_dataloader_release(dl, b));
 
     gd_dataloader_destroy(dl);
     gd_context_destroy(ctx);
-    gd_token_dataset_close(ds);
+    gd_dataset_destroy(ds);
     gd_dataset_build_result_clear(&build);
     (void)remove(corpus_path);
     (void)remove(tokenizer_path);
     return 0;
 }
 
-static int test_multi_worker_prefetch_order(void)
+static int test_worker_prefetch_factor(void)
 {
     const char *corpus_path = "/tmp/gd_loader_workers.txt";
     const char *tokenizer_path = "/tmp/gd_loader_workers_tok.json";
     const char *paths[1];
     gd_dataset_build_result build;
-    gd_token_dataset *ds = NULL;
+    gd_dataset *ds = NULL;
     gd_context *ctx = NULL;
     gd_dataloader *dl = NULL;
-    gd_batch_slot *slot = NULL;
-    int32_t payload[17];
-    int32_t tokens[4];
-    int32_t targets[4];
-    int32_t positions[4];
+    gd_batch *batch = NULL;
     int i;
-    int j;
 
     CHECK_TRUE(build_fixture_dataset(corpus_path, tokenizer_path, "/tmp/gd_loader_workers_ds", &build) == 0);
     paths[0] = build.train.shard_path;
-    CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
+    CHECK_OK(gd_dataset_open_gdtok(paths, 1, &ds));
     CHECK_OK(gd_context_create(&ctx));
-    CHECK_TRUE(make_loader_ex(ctx, ds, GD_DATALOADER_SEQUENTIAL, 11U, 1, 3, 2, &dl) == 0);
+    CHECK_TRUE(make_loader_ex(ctx, ds, GD_SAMPLER_SEQUENTIAL, 11U, 1, 3, 2, &dl) == 0);
     CHECK_TRUE(gd_dataloader_slot_count(dl) == 6);
-    CHECK_TRUE(read_shard_tokens(build.train.shard_path, payload, 17) == 0);
 
-    for (i = 0; i < 4; ++i) {
+    for (i = 0; i < 6; ++i) {
         CHECK_OK(gd_dataloader_prefetch(dl));
     }
-    for (i = 0; i < 4; ++i) {
-        CHECK_OK(gd_dataloader_next(dl, &slot));
-        CHECK_TRUE(copy_slot(ctx, slot, tokens, targets, positions, 4) == 0);
-        for (j = 0; j < 4; ++j) {
-            CHECK_TRUE(tokens[j] == payload[i * 4 + j]);
-            CHECK_TRUE(targets[j] == payload[i * 4 + j + 1]);
-            CHECK_TRUE(positions[j] == j);
-        }
-        CHECK_OK(gd_dataloader_release_slot(dl, slot));
+    for (i = 0; i < 6; ++i) {
+        CHECK_OK(gd_dataloader_next(dl, &batch));
+        CHECK_TRUE(gd_batch_get_state(batch) == GD_BATCH_IN_USE);
+        CHECK_OK(gd_dataloader_release(dl, batch));
     }
 
     gd_dataloader_destroy(dl);
     gd_context_destroy(ctx);
-    gd_token_dataset_close(ds);
+    gd_dataset_destroy(ds);
     gd_dataset_build_result_clear(&build);
     (void)remove(corpus_path);
     (void)remove(tokenizer_path);
     return 0;
 }
 
-static int test_random_determinism_state_and_metrics(void)
+static int test_random_repro_state_metrics_and_fingerprint(void)
 {
     const char *corpus_path = "/tmp/gd_loader_rand.txt";
     const char *tokenizer_path = "/tmp/gd_loader_rand_tok.json";
     const char *state_path = "/tmp/gd_loader_state.bin";
     const char *paths[1];
     gd_dataset_build_result build;
-    gd_token_dataset *ds = NULL;
+    gd_dataset *ds = NULL;
     gd_context *ctx = NULL;
     gd_dataloader *a = NULL;
     gd_dataloader *b = NULL;
     gd_dataloader *c = NULL;
-    gd_batch_slot *slot_a = NULL;
-    gd_batch_slot *slot_b = NULL;
-    gd_batch_slot *slot_c = NULL;
-    int32_t a_tokens[8];
-    int32_t b_tokens[8];
-    int32_t tmp[8];
+    gd_batch *batch_a = NULL;
+    gd_batch *batch_b = NULL;
+    gd_batch *batch_c = NULL;
+    int32_t ta[8];
+    int32_t tb[8];
+    int32_t tc[8];
+    int32_t dummy[8];
     gd_dataloader_metrics metrics;
     gd_dataloader_config bad_cfg;
+    gd_batch_field_desc fields[3];
 
     CHECK_TRUE(build_fixture_dataset(corpus_path, tokenizer_path, "/tmp/gd_loader_rand_ds", &build) == 0);
     paths[0] = build.train.shard_path;
-    CHECK_OK(gd_token_dataset_open(paths, 1, &ds));
+    CHECK_OK(gd_dataset_open_gdtok(paths, 1, &ds));
     CHECK_OK(gd_context_create(&ctx));
-    CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_RANDOM, 999U, &a) == 0);
-    CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_RANDOM, 999U, &b) == 0);
-
-    CHECK_OK(gd_dataloader_next(a, &slot_a));
-    CHECK_OK(gd_dataloader_next(b, &slot_b));
-    CHECK_TRUE(copy_slot(ctx, slot_a, a_tokens, tmp, tmp, 8) == 0);
-    CHECK_TRUE(copy_slot(ctx, slot_b, b_tokens, tmp, tmp, 8) == 0);
-    CHECK_TRUE(arrays_equal(a_tokens, b_tokens, 8));
-    CHECK_OK(gd_dataloader_release_slot(a, slot_a));
-    CHECK_OK(gd_dataloader_release_slot(b, slot_b));
+    CHECK_TRUE(make_loader(ctx, ds, GD_SAMPLER_RANDOM_REPLACEMENT, 999U, &a) == 0);
+    CHECK_TRUE(make_loader(ctx, ds, GD_SAMPLER_RANDOM_REPLACEMENT, 999U, &b) == 0);
+    CHECK_OK(gd_dataloader_next(a, &batch_a));
+    CHECK_OK(gd_dataloader_next(b, &batch_b));
+    CHECK_TRUE(copy_lm_batch(ctx, batch_a, ta, dummy, dummy, 8) == 0);
+    CHECK_TRUE(copy_lm_batch(ctx, batch_b, tb, dummy, dummy, 8) == 0);
+    CHECK_TRUE(arrays_equal(ta, tb, 8));
+    CHECK_OK(gd_dataloader_release(a, batch_a));
+    CHECK_OK(gd_dataloader_release(b, batch_b));
 
     CHECK_OK(gd_dataloader_state_save(a, state_path));
-    CHECK_OK(gd_dataloader_next(a, &slot_a));
-    CHECK_TRUE(copy_slot(ctx, slot_a, a_tokens, tmp, tmp, 8) == 0);
-    CHECK_OK(gd_dataloader_release_slot(a, slot_a));
+    CHECK_OK(gd_dataloader_next(a, &batch_a));
+    CHECK_TRUE(copy_lm_batch(ctx, batch_a, ta, dummy, dummy, 8) == 0);
+    CHECK_OK(gd_dataloader_release(a, batch_a));
 
-    CHECK_TRUE(make_loader(ctx, ds, GD_DATALOADER_RANDOM, 1U, &c) == 0);
+    CHECK_TRUE(make_loader(ctx, ds, GD_SAMPLER_RANDOM_REPLACEMENT, 1U, &c) == 0);
     CHECK_OK(gd_dataloader_state_load(c, state_path));
-    CHECK_OK(gd_dataloader_next(c, &slot_c));
-    CHECK_TRUE(copy_slot(ctx, slot_c, b_tokens, tmp, tmp, 8) == 0);
-    CHECK_TRUE(arrays_equal(a_tokens, b_tokens, 8));
-    CHECK_OK(gd_dataloader_release_slot(c, slot_c));
+    CHECK_OK(gd_dataloader_next(c, &batch_c));
+    CHECK_TRUE(copy_lm_batch(ctx, batch_c, tc, dummy, dummy, 8) == 0);
+    CHECK_TRUE(arrays_equal(ta, tc, 8));
+    CHECK_OK(gd_dataloader_release(c, batch_c));
 
     gd_dataloader_metrics_get(a, &metrics);
-    CHECK_TRUE(metrics.batches_prepared >= 2U);
     CHECK_TRUE(metrics.batches_returned >= 2U);
+    CHECK_TRUE(metrics.batches_prepared >= 2U);
     CHECK_TRUE(metrics.samples_prepared >= 4U);
 
     memset(&bad_cfg, 0, sizeof(bad_cfg));
+    make_lm_fields(fields, 2, 4);
     bad_cfg.batch_size = 2;
-    bad_cfg.block_len = 4;
-    bad_cfg.seed = 1U;
-    bad_cfg.shuffle = 1;
-    bad_cfg.double_buffer = 1;
     bad_cfg.device = (gd_device){GD_DEVICE_CPU, 0};
-    bad_cfg.mode = GD_DATALOADER_RANDOM;
-    bad_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(ds) + 1U;
-    CHECK_STATUS(gd_dataloader_create(ctx, ds, &bad_cfg, &c), GD_ERR_INVALID_ARGUMENT);
+    bad_cfg.sampler = GD_SAMPLER_RANDOM_REPLACEMENT;
+    bad_cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(ds) ^ 1U;
+    CHECK_STATUS(gd_dataloader_create(ctx, ds, &bad_cfg, fields, 3,
+                                      gd_collate_gdtok_lm, NULL, &c),
+                 GD_ERR_INVALID_ARGUMENT);
 
     gd_dataloader_destroy(a);
     gd_dataloader_destroy(b);
     gd_dataloader_destroy(c);
     gd_context_destroy(ctx);
-    gd_token_dataset_close(ds);
+    gd_dataset_destroy(ds);
     gd_dataset_build_result_clear(&build);
     (void)remove(corpus_path);
     (void)remove(tokenizer_path);
@@ -415,19 +426,109 @@ static int test_random_determinism_state_and_metrics(void)
     return 0;
 }
 
+typedef struct toy_dataset {
+    float features[4][3];
+    int32_t labels[4];
+} toy_dataset;
+
+static uint64_t toy_num_samples(const void *impl)
+{
+    (void)impl;
+    return 4U;
+}
+
+static uint64_t toy_fingerprint(const void *impl)
+{
+    (void)impl;
+    return UINT64_C(0x12345678abcdef00);
+}
+
+static gd_status toy_collate(gd_dataset *dataset,
+                             const uint64_t *sample_ids,
+                             int batch_size,
+                             gd_batch *batch,
+                             void *user_data)
+{
+    toy_dataset *toy = (toy_dataset *)gd_dataset_data(dataset);
+    int f_idx = gd_batch_field_index(batch, "features");
+    int y_idx = gd_batch_field_index(batch, "labels");
+    float *features = (float *)gd_batch_host_data(batch, f_idx);
+    int32_t *labels = (int32_t *)gd_batch_host_data(batch, y_idx);
+    int b;
+    (void)user_data;
+    if (toy == NULL || features == NULL || labels == NULL || batch_size != 2) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        uint64_t id = sample_ids[b];
+        int d;
+        if (id >= 4U) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (d = 0; d < 3; ++d) {
+            features[(size_t)b * 3U + (size_t)d] = toy->features[id][d];
+        }
+        labels[b] = toy->labels[id];
+    }
+    return GD_OK;
+}
+
+static int test_custom_classification_dataset(void)
+{
+    toy_dataset toy = {
+        {{1.0F, 2.0F, 3.0F}, {4.0F, 5.0F, 6.0F},
+         {7.0F, 8.0F, 9.0F}, {10.0F, 11.0F, 12.0F}},
+        {0, 1, 1, 0}
+    };
+    gd_dataset_ops ops = {"toy-classification", toy_num_samples, toy_fingerprint, NULL, NULL};
+    gd_dataset *ds = NULL;
+    gd_context *ctx = NULL;
+    gd_dataloader *dl = NULL;
+    gd_batch *batch = NULL;
+    gd_dataloader_config cfg;
+    gd_batch_field_desc fields[2];
+    float features[6];
+    int32_t labels[2];
+
+    CHECK_OK(gd_dataset_create(&ops, &toy, &ds));
+    CHECK_OK(gd_context_create(&ctx));
+    memset(fields, 0, sizeof(fields));
+    fields[0].name = "features";
+    fields[0].dtype = GD_DTYPE_F32;
+    fields[0].rank = 2;
+    fields[0].sizes[0] = 2;
+    fields[0].sizes[1] = 3;
+    fields[1].name = "labels";
+    fields[1].dtype = GD_DTYPE_I32;
+    fields[1].rank = 1;
+    fields[1].sizes[0] = 2;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.batch_size = 2;
+    cfg.device = (gd_device){GD_DEVICE_CPU, 0};
+    cfg.sampler = GD_SAMPLER_SEQUENTIAL;
+    cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(ds);
+    CHECK_OK(gd_dataloader_create(ctx, ds, &cfg, fields, 2, toy_collate, NULL, &dl));
+    CHECK_OK(gd_dataloader_next(dl, &batch));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, gd_batch_tensor(batch, "features"),
+                                   features, sizeof(features)));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, gd_batch_tensor(batch, "labels"),
+                                   labels, sizeof(labels)));
+    CHECK_TRUE(features[0] == 1.0F && features[5] == 6.0F);
+    CHECK_TRUE(labels[0] == 0 && labels[1] == 1);
+    CHECK_OK(gd_dataloader_release(dl, batch));
+
+    gd_dataloader_destroy(dl);
+    gd_context_destroy(ctx);
+    gd_dataset_destroy(ds);
+    return 0;
+}
+
 int main(void)
 {
-    if (test_sequential_loader_matches_shard_payload() != 0) {
-        return 1;
-    }
-    if (test_double_buffer_slot_states() != 0) {
-        return 1;
-    }
-    if (test_multi_worker_prefetch_order() != 0) {
-        return 1;
-    }
-    if (test_random_determinism_state_and_metrics() != 0) {
-        return 1;
-    }
+    CHECK_TRUE(test_sequential_loader_matches_shard_payload() == 0);
+    CHECK_TRUE(test_slot_lifecycle() == 0);
+    CHECK_TRUE(test_worker_prefetch_factor() == 0);
+    CHECK_TRUE(test_random_repro_state_metrics_and_fingerprint() == 0);
+    CHECK_TRUE(test_custom_classification_dataset() == 0);
     return 0;
 }

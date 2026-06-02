@@ -437,7 +437,8 @@ static gd_status gpt_dropout(gd_context *ctx,
 /* x[B,T,d] -> x + attn(rms_norm(x)). Returns a new virtual tensor. */
 static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
                                  gd_tensor *x, gd_tensor *positions,
-                                 int64_t B, int64_t T, gd_tensor **out_p)
+                                 int64_t B, int64_t T, int prefix_len,
+                                 gd_tensor **out_p)
 {
     const gd_gpt_config *c = &g->cfg;
     int64_t Hq = c->n_heads, Hkv = c->n_kv_heads, Dh = c->head_dim;
@@ -445,7 +446,7 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     int64_t kv4[4] = {B, T, Hkv, Dh};
     int64_t o3[3] = {B, T, Hq * Dh};
     gd_rope_config rope = {c->rope_theta, 0, false};
-    gd_sdpa_config sdpa = {0.0f, true, c->attention_window, 0};
+    gd_sdpa_config sdpa = {0.0f, true, c->attention_window, prefix_len};
     gd_tensor *n = NULL, *qf = NULL, *q = NULL, *kf = NULL, *k = NULL;
     gd_tensor *vf = NULL, *v = NULL, *qr = NULL, *kr = NULL, *o = NULL;
     gd_tensor *om = NULL, *op = NULL, *drop = NULL, *out = NULL;
@@ -521,37 +522,146 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
     return s;
 }
 
-static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
-                                    gd_tensor *tokens, gd_tensor *positions,
-                                    gd_tensor **normed_out)
+static gd_gpt_forward_config gpt_forward_config_or_default(const gd_gpt_forward_config *config)
+{
+    gd_gpt_forward_config out = {0};
+
+    if (config != NULL) {
+        out = *config;
+    }
+    return out;
+}
+
+static gd_status gpt_validate_positions(gd_tensor *positions, int64_t B, int64_t T)
+{
+    gd_dtype dtype = GD_DTYPE_INVALID;
+
+    if (positions == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt positions tensor is NULL");
+    }
+    if (gd_tensor_ndim(positions) != 2) {
+        return _gd_error(GD_ERR_SHAPE, "gpt positions must be [batch, seq]");
+    }
+    if (gd_tensor_size(positions, 0) != B || gd_tensor_size(positions, 1) != T) {
+        return _gd_error(GD_ERR_SHAPE, "gpt positions shape must match sequence");
+    }
+    dtype = gd_tensor_dtype(positions);
+    if (dtype != GD_DTYPE_I32 && dtype != GD_DTYPE_I64) {
+        return _gd_error(GD_ERR_DTYPE, "gpt positions must be I32 or I64");
+    }
+    return GD_OK;
+}
+
+static gd_status gpt_validate_forward_config(gd_gpt *gpt,
+                                             const gd_gpt_forward_config *config,
+                                             int64_t T)
+{
+    if (config->prefix_len < 0) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt prefix_len must be non-negative");
+    }
+    if ((int64_t)config->prefix_len > T) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt prefix_len exceeds sequence length");
+    }
+    if (gpt->cfg.max_seq_len > 0 && T > (int64_t)gpt->cfg.max_seq_len) {
+        return _gd_error(GD_ERR_SHAPE, "gpt sequence length exceeds max_seq_len");
+    }
+    return GD_OK;
+}
+
+static gd_status gpt_validate_embeds(gd_gpt *gpt,
+                                     gd_tensor *inputs_embeds,
+                                     gd_tensor *positions,
+                                     const gd_gpt_forward_config *config,
+                                     int64_t *B_out,
+                                     int64_t *T_out)
+{
+    gd_status status = GD_OK;
+    int64_t B = 0;
+    int64_t T = 0;
+    gd_device embed_device;
+    gd_device pos_device;
+
+    if (gpt == NULL || inputs_embeds == NULL || positions == NULL || config == NULL ||
+        B_out == NULL || T_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt embeds validation argument is NULL");
+    }
+    if (gd_tensor_ndim(inputs_embeds) != 3) {
+        return _gd_error(GD_ERR_SHAPE, "gpt inputs_embeds must be [batch, seq, d_model]");
+    }
+    B = gd_tensor_size(inputs_embeds, 0);
+    T = gd_tensor_size(inputs_embeds, 1);
+    if (gd_tensor_size(inputs_embeds, 2) != (int64_t)gpt->cfg.d_model) {
+        return _gd_error(GD_ERR_SHAPE, "gpt inputs_embeds last dimension must equal d_model");
+    }
+    if (gd_tensor_dtype(inputs_embeds) != gpt->cfg.param_dtype) {
+        return _gd_error(GD_ERR_DTYPE, "gpt inputs_embeds dtype must match model dtype");
+    }
+    status = gpt_validate_positions(positions, B, T);
+    if (status != GD_OK) {
+        return status;
+    }
+    embed_device = gd_tensor_device(inputs_embeds);
+    pos_device = gd_tensor_device(positions);
+    if (!gd_device_equal(embed_device, pos_device)) {
+        return _gd_error(GD_ERR_DEVICE, "gpt inputs_embeds and positions must share device");
+    }
+    status = gpt_validate_forward_config(gpt, config, T);
+    if (status != GD_OK) {
+        return status;
+    }
+    *B_out = B;
+    *T_out = T;
+    return GD_OK;
+}
+
+gd_status gd_gpt_embed_tokens(gd_context *ctx, gd_gpt *gpt,
+                              gd_tensor *tokens, gd_tensor **embeds_out)
+{
+    gd_dtype dtype = GD_DTYPE_INVALID;
+
+    if (ctx == NULL || gpt == NULL || tokens == NULL || embeds_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_embed_tokens argument is NULL");
+    }
+    *embeds_out = NULL;
+    if (gd_tensor_ndim(tokens) != 2) {
+        return _gd_error(GD_ERR_SHAPE, "gpt tokens must be [batch, seq]");
+    }
+    dtype = gd_tensor_dtype(tokens);
+    if (dtype != GD_DTYPE_I32 && dtype != GD_DTYPE_I64) {
+        return _gd_error(GD_ERR_DTYPE, "gpt tokens must be I32 or I64");
+    }
+    return gd_embedding(ctx, gpt->wte, tokens, embeds_out);
+}
+
+gd_status gd_gpt_decode_embeds(gd_context *ctx, gd_gpt *gpt,
+                               gd_tensor *inputs_embeds, gd_tensor *positions,
+                               const gd_gpt_forward_config *config,
+                               gd_tensor **hidden_out)
 {
     gd_status s = GD_OK;
-    int64_t B = 0, T = 0;
-    gd_tensor *emb = NULL;
+    gd_gpt_forward_config cfg = gpt_forward_config_or_default(config);
+    int64_t B = 0;
+    int64_t T = 0;
     gd_tensor *x = NULL;
     gd_tensor *normed = NULL;
     int l = 0;
 
-    if (ctx == NULL || gpt == NULL || tokens == NULL || positions == NULL ||
-        normed_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt_forward_normed argument is NULL");
+    if (ctx == NULL || gpt == NULL || inputs_embeds == NULL || positions == NULL ||
+        hidden_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_decode_embeds argument is NULL");
     }
-    *normed_out = NULL;
-    if (gd_tensor_ndim(tokens) != 2) {
-        return _gd_error(GD_ERR_SHAPE, "gpt tokens must be [batch, seq]");
+    *hidden_out = NULL;
+    s = gpt_validate_embeds(gpt, inputs_embeds, positions, &cfg, &B, &T);
+    if (s != GD_OK) {
+        return s;
     }
-    B = gd_tensor_size(tokens, 0);
-    T = gd_tensor_size(tokens, 1);
 
-    s = gd_embedding(ctx, gpt->wte, tokens, &emb);
-    if (s == GD_OK) {
-        s = gpt_dropout(ctx, gpt, emb, UINT64_C(0x1), &x);
-    }
+    s = gpt_dropout(ctx, gpt, inputs_embeds, UINT64_C(0x1), &x);
     for (l = 0; l < gpt->cfg.n_layers && s == GD_OK; ++l) {
         gd_tensor *attn = NULL;
         gd_tensor *mlp = NULL;
 
-        s = attention_block(ctx, gpt, l, x, positions, B, T, &attn);
+        s = attention_block(ctx, gpt, l, x, positions, B, T, cfg.prefix_len, &attn);
         gd_tensor_release(x);
         x = attn;
         if (s != GD_OK) {
@@ -564,14 +674,68 @@ static gd_status gpt_forward_normed(gd_context *ctx, gd_gpt *gpt,
     if (s == GD_OK) {
         s = gd_rms_norm(ctx, x, gpt->ln_f, gpt->cfg.norm_eps, &normed);
     }
-    gd_tensor_release(emb);
     gd_tensor_release(x);
     if (s != GD_OK) {
         gd_tensor_release(normed);
         return s;
     }
-    *normed_out = normed;
+    *hidden_out = normed;
     return GD_OK;
+}
+
+static gd_status gpt_lm_head(gd_context *ctx, gd_gpt *gpt,
+                             gd_tensor *hidden, gd_tensor **logits_out)
+{
+    if (ctx == NULL || gpt == NULL || hidden == NULL || logits_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt lm head argument is NULL");
+    }
+    *logits_out = NULL;
+    if (gpt->cfg.tie_embeddings) {
+        gd_matmul_desc md = {false, true, gd_compute_policy_default()};
+        return gd_matmul_ex(ctx, &md, hidden, gpt->wte, logits_out); /* x @ Wte^T */
+    }
+    return gd_linear(ctx, hidden, gpt->w_head, NULL, logits_out);
+}
+
+static gd_status gpt_lm_loss(gd_context *ctx,
+                             gd_gpt *gpt,
+                             gd_tensor *hidden,
+                             gd_tensor *targets,
+                             const gd_gpt_forward_config *config,
+                             gd_tensor **loss_out)
+{
+    gd_status s = GD_OK;
+    gd_tensor *logits = NULL;
+
+    if (ctx == NULL || gpt == NULL || hidden == NULL || targets == NULL || config == NULL ||
+        loss_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gpt lm loss argument is NULL");
+    }
+    *loss_out = NULL;
+    if (gpt->cfg.tie_embeddings) {
+        if (config->has_ignore_index) {
+            gd_lm_cross_entropy_desc desc;
+            desc.has_ignore_index = true;
+            desc.ignore_index = config->ignore_index;
+            return gd_lm_cross_entropy_ex(ctx, &desc, hidden, gpt->wte, targets, loss_out);
+        }
+        return gd_lm_cross_entropy(ctx, hidden, gpt->wte, targets, loss_out);
+    }
+
+    s = gd_linear(ctx, hidden, gpt->w_head, NULL, &logits);
+    if (s == GD_OK) {
+        if (config->has_ignore_index) {
+            gd_cross_entropy_desc desc;
+            desc.class_dim = 2;
+            desc.has_ignore_index = true;
+            desc.ignore_index = config->ignore_index;
+            s = gd_cross_entropy_ex(ctx, &desc, logits, targets, loss_out);
+        } else {
+            s = gd_cross_entropy(ctx, logits, targets, 2, loss_out);
+        }
+    }
+    gd_tensor_release(logits);
+    return s;
 }
 
 gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
@@ -579,23 +743,38 @@ gd_status gd_gpt_forward(gd_context *ctx, gd_gpt *gpt,
                          gd_tensor **logits_out)
 {
     gd_status s = GD_OK;
-    gd_tensor *normed = NULL;
-    gd_tensor *logits = NULL;
+    gd_tensor *embeds = NULL;
 
     if (logits_out == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward argument is NULL");
     }
     *logits_out = NULL;
-    s = gpt_forward_normed(ctx, gpt, tokens, positions, &normed);
+    s = gd_gpt_embed_tokens(ctx, gpt, tokens, &embeds);
     if (s == GD_OK) {
-        if (gpt->cfg.tie_embeddings) {
-            gd_matmul_desc md = {false, true, gd_compute_policy_default()};
-            s = gd_matmul_ex(ctx, &md, normed, gpt->wte, &logits); /* x @ Wte^T */
-        } else {
-            s = gd_linear(ctx, normed, gpt->w_head, NULL, &logits);
-        }
+        s = gd_gpt_forward_embeds(ctx, gpt, embeds, positions, NULL, logits_out);
     }
-    gd_tensor_release(normed);
+    gd_tensor_release(embeds);
+    return s;
+}
+
+gd_status gd_gpt_forward_embeds(gd_context *ctx, gd_gpt *gpt,
+                                gd_tensor *inputs_embeds, gd_tensor *positions,
+                                const gd_gpt_forward_config *config,
+                                gd_tensor **logits_out)
+{
+    gd_status s = GD_OK;
+    gd_tensor *hidden = NULL;
+    gd_tensor *logits = NULL;
+
+    if (logits_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward_embeds argument is NULL");
+    }
+    *logits_out = NULL;
+    s = gd_gpt_decode_embeds(ctx, gpt, inputs_embeds, positions, config, &hidden);
+    if (s == GD_OK) {
+        s = gpt_lm_head(ctx, gpt, hidden, &logits);
+    }
+    gd_tensor_release(hidden);
     if (s != GD_OK) {
         gd_tensor_release(logits);
         return s;
@@ -609,25 +788,38 @@ gd_status gd_gpt_forward_loss(gd_context *ctx, gd_gpt *gpt,
                               gd_tensor *targets, gd_tensor **loss_out)
 {
     gd_status s = GD_OK;
-    gd_tensor *normed = NULL;
-    gd_tensor *logits = NULL;
+    gd_tensor *embeds = NULL;
 
     if (loss_out == NULL) {
         return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward_loss argument is NULL");
     }
     *loss_out = NULL;
-    s = gpt_forward_normed(ctx, gpt, tokens, positions, &normed);
+    s = gd_gpt_embed_tokens(ctx, gpt, tokens, &embeds);
     if (s == GD_OK) {
-        if (gpt->cfg.tie_embeddings) {
-            s = gd_lm_cross_entropy(ctx, normed, gpt->wte, targets, loss_out);
-        } else {
-            s = gd_linear(ctx, normed, gpt->w_head, NULL, &logits);
-            if (s == GD_OK) {
-                s = gd_cross_entropy(ctx, logits, targets, 2, loss_out);
-            }
-        }
+        s = gd_gpt_forward_embeds_loss(ctx, gpt, embeds, positions, targets, NULL, loss_out);
     }
-    gd_tensor_release(normed);
-    gd_tensor_release(logits);
+    gd_tensor_release(embeds);
+    return s;
+}
+
+gd_status gd_gpt_forward_embeds_loss(gd_context *ctx, gd_gpt *gpt,
+                                     gd_tensor *inputs_embeds, gd_tensor *positions,
+                                     gd_tensor *targets,
+                                     const gd_gpt_forward_config *config,
+                                     gd_tensor **loss_out)
+{
+    gd_status s = GD_OK;
+    gd_gpt_forward_config cfg = gpt_forward_config_or_default(config);
+    gd_tensor *hidden = NULL;
+
+    if (loss_out == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_gpt_forward_embeds_loss argument is NULL");
+    }
+    *loss_out = NULL;
+    s = gd_gpt_decode_embeds(ctx, gpt, inputs_embeds, positions, &cfg, &hidden);
+    if (s == GD_OK) {
+        s = gpt_lm_loss(ctx, gpt, hidden, targets, &cfg, loss_out);
+    }
+    gd_tensor_release(hidden);
     return s;
 }

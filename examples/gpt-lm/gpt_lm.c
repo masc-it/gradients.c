@@ -720,11 +720,18 @@ static int build_eval_graph(gd_context *ctx,
     return 0;
 }
 
-static int bind_batch(train_graph *graph, gd_batch_slot *slot)
+static int bind_batch(train_graph *graph, gd_batch *batch)
 {
-    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->tokens_in, slot->tokens));
-    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->positions_in, slot->positions));
-    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->targets_in, slot->targets));
+    gd_tensor *tokens = gd_batch_tensor(batch, "tokens");
+    gd_tensor *positions = gd_batch_tensor(batch, "positions");
+    gd_tensor *targets = gd_batch_tensor(batch, "targets");
+    if (tokens == NULL || positions == NULL || targets == NULL) {
+        fprintf(stderr, "batch missing LM fields\n");
+        return 1;
+    }
+    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->tokens_in, tokens));
+    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->positions_in, positions));
+    CHECK_OK(gd_graph_runner_bind(graph->runner, graph->targets_in, targets));
     return 0;
 }
 
@@ -772,19 +779,41 @@ static int run_eval(gd_context *ctx,
         return 0;
     }
     for (i = 0; i < eval_batches; ++i) {
-        gd_batch_slot *slot = NULL;
+        gd_batch *batch = NULL;
         float loss = 0.0F;
-        CHECK_OK(gd_dataloader_next(val_dl, &slot));
-        CHECK_ZERO(bind_batch(graph, slot));
+        CHECK_OK(gd_dataloader_next(val_dl, &batch));
+        CHECK_ZERO(bind_batch(graph, batch));
         CHECK_OK(gd_graph_runner_run(graph->runner));
         CHECK_OK(gd_synchronize(ctx, target));
         CHECK_OK(gd_tensor_copy_to_cpu(ctx, graph->loss, &loss, sizeof(loss)));
-        CHECK_OK(gd_dataloader_release_slot(val_dl, slot));
+        CHECK_OK(gd_dataloader_release(val_dl, batch));
         CHECK_OK(gd_dataloader_prefetch(val_dl));
         sum += (double)loss;
     }
     *loss_out = (float)(sum / (double)eval_batches);
     return 0;
+}
+
+static void init_lm_batch_fields(gd_batch_field_desc *fields,
+                                 int batch_size,
+                                 int block_len)
+{
+    memset(fields, 0, 3U * sizeof(fields[0]));
+    fields[0].name = "tokens";
+    fields[0].dtype = GD_DTYPE_I32;
+    fields[0].rank = 2;
+    fields[0].sizes[0] = batch_size;
+    fields[0].sizes[1] = block_len;
+    fields[1].name = "targets";
+    fields[1].dtype = GD_DTYPE_I32;
+    fields[1].rank = 2;
+    fields[1].sizes[0] = batch_size;
+    fields[1].sizes[1] = block_len;
+    fields[2].name = "positions";
+    fields[2].dtype = GD_DTYPE_I32;
+    fields[2].rank = 2;
+    fields[2].sizes[0] = batch_size;
+    fields[2].sizes[1] = block_len;
 }
 
 int main(int argc, char **argv)
@@ -803,12 +832,18 @@ int main(int argc, char **argv)
     gd_adamw_config opt_cfg;
     gd_lr_scheduler_config lr_cfg;
     gd_amp_scaler_config scaler_cfg;
-    gd_token_dataset *train_ds = NULL;
-    gd_token_dataset *val_ds = NULL;
+    gd_dataset *train_ds = NULL;
+    gd_dataset *val_ds = NULL;
     gd_dataloader *train_dl = NULL;
     gd_dataloader *train_eval_dl = NULL;
     gd_dataloader *val_dl = NULL;
     gd_dataloader_config dl_cfg;
+    gd_batch_field_desc lm_fields[3];
+    uint64_t train_block_len = 0U;
+    uint64_t val_block_len = 0U;
+    uint64_t train_vocab_size = 0U;
+    uint64_t train_tokenizer_hash = 0U;
+    uint64_t val_tokenizer_hash = 0U;
     gd_gpt *model = NULL;
     gd_param_group *groups = NULL;
     int n_groups = 0;
@@ -959,57 +994,61 @@ int main(int argc, char **argv)
 
     train_paths[0] = app.train_path;
     val_paths[0] = app.val_path;
-    CHECK_OK(gd_token_dataset_open(train_paths, 1, &train_ds));
-    CHECK_OK(gd_token_dataset_open(val_paths, 1, &val_ds));
-    if ((int)gd_token_dataset_block_len(train_ds) != app.context_len ||
-        (int)gd_token_dataset_block_len(val_ds) != app.context_len) {
-        fprintf(stderr, "dataset block_len mismatch: train=%u val=%u expected=%d\n",
-                gd_token_dataset_block_len(train_ds), gd_token_dataset_block_len(val_ds),
+    CHECK_OK(gd_dataset_open_gdtok(train_paths, 1, &train_ds));
+    CHECK_OK(gd_dataset_open_gdtok(val_paths, 1, &val_ds));
+    CHECK_OK(gd_dataset_get_u64(train_ds, "block_len", &train_block_len));
+    CHECK_OK(gd_dataset_get_u64(val_ds, "block_len", &val_block_len));
+    CHECK_OK(gd_dataset_get_u64(train_ds, "vocab_size", &train_vocab_size));
+    CHECK_OK(gd_dataset_get_u64(train_ds, "tokenizer_hash", &train_tokenizer_hash));
+    CHECK_OK(gd_dataset_get_u64(val_ds, "tokenizer_hash", &val_tokenizer_hash));
+    if (train_block_len != (uint64_t)app.context_len ||
+        val_block_len != (uint64_t)app.context_len) {
+        fprintf(stderr, "dataset block_len mismatch: train=%llu val=%llu expected=%d\n",
+                (unsigned long long)train_block_len, (unsigned long long)val_block_len,
                 app.context_len);
         goto cleanup;
     }
-    if (gd_token_dataset_tokenizer_hash(train_ds) != gd_token_dataset_tokenizer_hash(val_ds)) {
+    if (train_tokenizer_hash != val_tokenizer_hash) {
         fprintf(stderr, "train/val tokenizer hash mismatch\n");
         goto cleanup;
     }
     if (!app.vocab_from_env) {
-        model_cfg.vocab_size = (int)gd_token_dataset_vocab_size(train_ds);
-    } else if (gd_token_dataset_vocab_size(train_ds) > (uint32_t)model_cfg.vocab_size) {
-        fprintf(stderr, "dataset vocab %u exceeds model vocab %d\n",
-                gd_token_dataset_vocab_size(train_ds), model_cfg.vocab_size);
+        model_cfg.vocab_size = (int)train_vocab_size;
+    } else if (train_vocab_size > (uint64_t)model_cfg.vocab_size) {
+        fprintf(stderr, "dataset vocab %llu exceeds model vocab %d\n",
+                (unsigned long long)train_vocab_size, model_cfg.vocab_size);
         goto cleanup;
     }
 
+    init_lm_batch_fields(lm_fields, app.batch_size, app.context_len);
     memset(&dl_cfg, 0, sizeof(dl_cfg));
     dl_cfg.batch_size = app.batch_size;
-    dl_cfg.block_len = app.context_len;
-    dl_cfg.double_buffer = 1;
     dl_cfg.device = target;
     dl_cfg.num_workers = app.num_workers;
     dl_cfg.prefetch_factor = app.prefetch_factor;
 
     dl_cfg.seed = app.seed ^ UINT64_C(0x243f6a8885a308d3);
-    dl_cfg.shuffle = 1;
-    dl_cfg.mode = GD_DATALOADER_RANDOM;
-    dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(train_ds);
-    CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, &train_dl));
+    dl_cfg.sampler = GD_SAMPLER_RANDOM_REPLACEMENT;
+    dl_cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(train_ds);
+    CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, lm_fields, 3,
+                                  gd_collate_gdtok_lm, NULL, &train_dl));
     train_slots = gd_dataloader_slot_count(train_dl);
 
     if (do_train_eval) {
         dl_cfg.seed = app.seed ^ UINT64_C(0xa4093822299f31d0);
-        dl_cfg.shuffle = 0;
-        dl_cfg.mode = GD_DATALOADER_SEQUENTIAL;
-        dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(train_ds);
-        CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, &train_eval_dl));
+        dl_cfg.sampler = GD_SAMPLER_SEQUENTIAL;
+        dl_cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(train_ds);
+        CHECK_OK(gd_dataloader_create(ctx, train_ds, &dl_cfg, lm_fields, 3,
+                                      gd_collate_gdtok_lm, NULL, &train_eval_dl));
         train_eval_slots = gd_dataloader_slot_count(train_eval_dl);
     }
 
     if (do_eval) {
         dl_cfg.seed = app.seed ^ UINT64_C(0x13198a2e03707344);
-        dl_cfg.shuffle = 0;
-        dl_cfg.mode = GD_DATALOADER_SEQUENTIAL;
-        dl_cfg.expected_tokenizer_hash = gd_token_dataset_tokenizer_hash(val_ds);
-        CHECK_OK(gd_dataloader_create(ctx, val_ds, &dl_cfg, &val_dl));
+        dl_cfg.sampler = GD_SAMPLER_SEQUENTIAL;
+        dl_cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(val_ds);
+        CHECK_OK(gd_dataloader_create(ctx, val_ds, &dl_cfg, lm_fields, 3,
+                                      gd_collate_gdtok_lm, NULL, &val_dl));
         val_slots = gd_dataloader_slot_count(val_dl);
     }
 
@@ -1063,13 +1102,13 @@ int main(int argc, char **argv)
            amp_enabled ? " + amp" : "", fused_lmce ? " + fused_lmce" : "");
     printf("  data        : train=%s val=%s\n", app.train_path, app.val_path);
     printf("  samples     : train=%llu val=%llu block=%d batch=%d\n",
-           (unsigned long long)gd_token_dataset_num_samples(train_ds),
-           (unsigned long long)gd_token_dataset_num_samples(val_ds), app.context_len,
+           (unsigned long long)gd_dataset_num_samples(train_ds),
+           (unsigned long long)gd_dataset_num_samples(val_ds), app.context_len,
            app.batch_size);
     printf("  loader      : workers=%d prefetch_factor=%d slots=%d\n",
            app.num_workers, app.prefetch_factor, train_slots);
-    printf("  tokenizer   : hash=%016" PRIx64 " dataset_vocab=%u model_vocab=%d\n",
-           gd_token_dataset_tokenizer_hash(train_ds), gd_token_dataset_vocab_size(train_ds),
+    printf("  tokenizer   : hash=%016" PRIx64 " dataset_vocab=%llu model_vocab=%d\n",
+           train_tokenizer_hash, (unsigned long long)train_vocab_size,
            model_cfg.vocab_size);
     printf("  model       : d=%d L=%d H=%d Hkv=%d Dh=%d dff=%d params=%ld (%.2fM)\n",
            model_cfg.d_model, model_cfg.n_layers, model_cfg.n_heads, model_cfg.n_kv_heads,
@@ -1107,12 +1146,12 @@ int main(int argc, char **argv)
     t_start = now_ms();
     t_last = t_start;
     for (step = 0; step < app.steps; ++step) {
-        gd_batch_slot *slot = NULL;
+        gd_batch *batch = NULL;
         train_graph *tg = &train_step;
         float lr = 0.0F;
         bool stepped = true;
-        CHECK_OK(gd_dataloader_next(train_dl, &slot));
-        CHECK_ZERO(bind_batch(tg, slot));
+        CHECK_OK(gd_dataloader_next(train_dl, &batch));
+        CHECK_ZERO(bind_batch(tg, batch));
         CHECK_OK(gd_lr_scheduler_write(ctx, &lr_cfg, step, lr_tensor, &lr));
         CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
         CHECK_OK(gd_graph_runner_run(tg->runner));
@@ -1170,7 +1209,7 @@ int main(int argc, char **argv)
             }
         }
 
-        CHECK_OK(gd_dataloader_release_slot(train_dl, slot));
+        CHECK_OK(gd_dataloader_release(train_dl, batch));
         CHECK_OK(gd_dataloader_prefetch(train_dl));
 
         if (do_eval && ((step + 1) % app.eval_interval == 0 || step + 1 == app.steps)) {
@@ -1232,8 +1271,8 @@ cleanup:
     gd_dataloader_destroy(train_dl);
     gd_dataloader_destroy(train_eval_dl);
     gd_dataloader_destroy(val_dl);
-    gd_token_dataset_close(train_ds);
-    gd_token_dataset_close(val_ds);
+    gd_dataset_destroy(train_ds);
+    gd_dataset_destroy(val_ds);
     gd_context_destroy(ctx);
     return rc;
 }

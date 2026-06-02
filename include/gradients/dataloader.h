@@ -3,49 +3,55 @@
 
 #include "gradients/dataset.h"
 #include "gradients/device.h"
+#include "gradients/dtype.h"
 #include "gradients/status.h"
 #include "gradients/tensor.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct gd_token_dataset gd_token_dataset;
+#define GD_BATCH_MAX_RANK 8
+
 typedef struct gd_dataloader gd_dataloader;
+typedef struct gd_batch gd_batch;
 
-typedef enum gd_dataloader_mode {
-    GD_DATALOADER_RANDOM = 0,
-    GD_DATALOADER_SEQUENTIAL = 1
-} gd_dataloader_mode;
+typedef enum gd_sampler_mode {
+    GD_SAMPLER_RANDOM_REPLACEMENT = 0,
+    GD_SAMPLER_SEQUENTIAL = 1
+} gd_sampler_mode;
 
-typedef enum gd_batch_slot_state {
-    GD_BATCH_SLOT_FREE = 0,
-    GD_BATCH_SLOT_FILLING = 1,
-    GD_BATCH_SLOT_READY = 2,
-    GD_BATCH_SLOT_IN_USE = 3
-} gd_batch_slot_state;
+typedef enum gd_batch_state {
+    GD_BATCH_FREE = 0,
+    GD_BATCH_FILLING = 1,
+    GD_BATCH_READY = 2,
+    GD_BATCH_IN_USE = 3
+} gd_batch_state;
 
-typedef struct gd_batch_slot {
-    int index;
-    gd_batch_slot_state state;
-    gd_tensor *tokens;    /* int32 [B,T] */
-    gd_tensor *targets;   /* int32 [B,T] */
-    gd_tensor *positions; /* int32 [B,T] */
-} gd_batch_slot;
+typedef struct gd_batch_field_desc {
+    const char *name;
+    gd_dtype dtype;
+    int rank;
+    int64_t sizes[GD_BATCH_MAX_RANK];
+} gd_batch_field_desc;
+
+typedef gd_status (*gd_collate_fn)(gd_dataset *dataset,
+                                   const uint64_t *sample_ids,
+                                   int batch_size,
+                                   gd_batch *batch,
+                                   void *user_data);
 
 typedef struct gd_dataloader_config {
     int batch_size;
-    int block_len;
     uint64_t seed;
-    int shuffle;
-    int double_buffer;
+    gd_sampler_mode sampler;
     gd_device device;
-    gd_dataloader_mode mode;
-    uint64_t expected_tokenizer_hash; /* 0 disables check */
-    int num_workers;                 /* 0 => 1 background worker */
-    int prefetch_factor;             /* 0 => 2 slots per worker */
+    uint64_t expected_dataset_fingerprint; /* 0 disables check */
+    int num_workers;                       /* 0 => 1 background worker */
+    int prefetch_factor;                   /* 0 => 2 slots per worker */
 } gd_dataloader_config;
 
 typedef struct gd_dataloader_metrics {
@@ -59,25 +65,19 @@ typedef struct gd_dataloader_metrics {
     uint64_t max_ready_depth;
 } gd_dataloader_metrics;
 
-gd_status gd_token_dataset_open(const char **paths,
-                                int n_paths,
-                                gd_token_dataset **out);
-void gd_token_dataset_close(gd_token_dataset *ds);
-
-uint64_t gd_token_dataset_num_samples(const gd_token_dataset *ds);
-uint32_t gd_token_dataset_block_len(const gd_token_dataset *ds);
-uint32_t gd_token_dataset_vocab_size(const gd_token_dataset *ds);
-uint64_t gd_token_dataset_tokenizer_hash(const gd_token_dataset *ds);
-
 gd_status gd_dataloader_create(gd_context *ctx,
-                               gd_token_dataset *ds,
+                               gd_dataset *dataset,
                                const gd_dataloader_config *cfg,
+                               const gd_batch_field_desc *fields,
+                               int n_fields,
+                               gd_collate_fn collate,
+                               void *collate_data,
                                gd_dataloader **out);
 void gd_dataloader_destroy(gd_dataloader *dl);
 
 gd_status gd_dataloader_prefetch(gd_dataloader *dl);
-gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch_slot **slot_out);
-gd_status gd_dataloader_release_slot(gd_dataloader *dl, gd_batch_slot *slot);
+gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch **batch_out);
+gd_status gd_dataloader_release(gd_dataloader *dl, gd_batch *batch);
 int gd_dataloader_slot_count(const gd_dataloader *dl);
 
 gd_status gd_dataloader_state_save(gd_dataloader *dl, const char *path);
@@ -85,6 +85,28 @@ gd_status gd_dataloader_state_load(gd_dataloader *dl, const char *path);
 
 void gd_dataloader_metrics_get(const gd_dataloader *dl,
                                gd_dataloader_metrics *metrics_out);
+
+int gd_batch_index(const gd_batch *batch);
+gd_batch_state gd_batch_get_state(const gd_batch *batch);
+int gd_batch_field_count(const gd_batch *batch);
+int gd_batch_field_index(const gd_batch *batch, const char *name);
+const char *gd_batch_field_name(const gd_batch *batch, int field_index);
+gd_dtype gd_batch_field_dtype(const gd_batch *batch, int field_index);
+int gd_batch_field_rank(const gd_batch *batch, int field_index);
+int64_t gd_batch_field_dim(const gd_batch *batch, int field_index, int dim_index);
+size_t gd_batch_field_nbytes(const gd_batch *batch, int field_index);
+void *gd_batch_host_data(gd_batch *batch, int field_index);
+gd_tensor *gd_batch_tensor_at(gd_batch *batch, int field_index);
+gd_tensor *gd_batch_tensor(gd_batch *batch, const char *name);
+const uint64_t *gd_batch_sample_ids(const gd_batch *batch);
+
+/* Built-in collate for fixed-block GDTOK language-model batches.
+ * Requires fields named: tokens, targets, positions. All int32 [B,T]. */
+gd_status gd_collate_gdtok_lm(gd_dataset *dataset,
+                              const uint64_t *sample_ids,
+                              int batch_size,
+                              gd_batch *batch,
+                              void *user_data);
 
 #ifdef __cplusplus
 }

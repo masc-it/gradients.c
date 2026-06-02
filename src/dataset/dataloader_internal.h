@@ -4,8 +4,8 @@
 #include "gradients/dataloader.h"
 
 #include <pthread.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define GD_DL_DEFAULT_WORKERS 1
 #define GD_DL_DEFAULT_PREFETCH_FACTOR 2
@@ -13,12 +13,27 @@
 #define GD_DL_MAX_PREFETCH_FACTOR 16
 #define GD_DL_MAX_SLOTS 1024
 
-typedef struct gd_loader_slot {
-    gd_batch_slot pub;
-    int32_t *host_tokens;
-    int32_t *host_targets;
-    int32_t *host_positions;
+typedef struct gd_batch_field {
+    char *name;
+    gd_dtype dtype;
+    int rank;
+    int64_t sizes[GD_BATCH_MAX_RANK];
+    size_t nbytes;
+    void *host_data;
+    gd_tensor *tensor;
+} gd_batch_field;
+
+struct gd_batch {
+    int index;
+    gd_batch_state state;
+    int batch_size;
+    int n_fields;
+    gd_batch_field *fields;
     uint64_t *sample_ids;
+};
+
+typedef struct gd_loader_slot {
+    gd_batch pub;
     uint64_t seq;
 } gd_loader_slot;
 
@@ -30,8 +45,13 @@ typedef struct gd_dataloader_fill_stats {
 
 struct gd_dataloader {
     gd_context *ctx;
-    gd_token_dataset *ds;
+    gd_dataset *dataset;
     gd_dataloader_config cfg;
+    gd_batch_field_desc *field_descs;
+    int n_fields;
+    uint64_t schema_hash;
+    gd_collate_fn collate;
+    void *collate_data;
     gd_loader_slot *slots;
     int n_slots;
     int n_workers;
@@ -64,5 +84,6 @@ gd_status _gd_dataloader_lock_quiesced(gd_dataloader *dl);
 void _gd_dataloader_unlock_resume(gd_dataloader *dl);
 int _gd_dataloader_has_live_slot_locked(const gd_dataloader *dl);
 gd_status _gd_dataloader_worker_status_locked(const gd_dataloader *dl);
+uint64_t _gd_dataloader_schema_hash(const gd_dataloader *dl);
 
 #endif /* GD_DATALOADER_INTERNAL_H */

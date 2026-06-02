@@ -15,5 +15,6 @@
 #include "gradients/tokenizer.h"
 #include "gradients/dataset.h"
 #include "gradients/dataloader.h"
+#include "gradients/dataset_vlm.h"
 
 #endif /* GRADIENTS_H */

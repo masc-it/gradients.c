@@ -37,6 +37,7 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_BACKWARD, "backward"},
     {_GD_OP_CAST, "cast"},
     {_GD_OP_CLIP_GRAD_NORM, "clip_grad_norm"},
+    {_GD_OP_CONCAT, "concat"},
     {_GD_OP_COPY, "copy"},
     {_GD_OP_CROSS_ENTROPY_BWD, "cross_entropy_bwd"},
     {_GD_OP_CROSS_ENTROPY, "cross_entropy"},
@@ -79,7 +80,6 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_SDPA_VARLEN_BWD, "sdpa_varlen_bwd"},
     {_GD_OP_SLICE, "slice"},
     {_GD_OP_SLICE_BWD, "slice_bwd"},
-    {_GD_OP_CONCAT, "concat"},
 };
 
 static int test_registry_contents(void)
@@ -121,6 +121,10 @@ static int test_registry_helpers(void)
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_LINEAR, 2, 1), GD_OK);
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_LINEAR, 3, 1), GD_OK);
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_LINEAR, 4, 1), GD_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(_gd_op_validate_arity(_GD_OP_CONCAT, 1, 1), GD_OK);
+    CHECK_STATUS(_gd_op_validate_arity(_GD_OP_CONCAT, 256, 1), GD_OK);
+    CHECK_STATUS(_gd_op_validate_arity(_GD_OP_CONCAT, 0, 1), GD_ERR_INVALID_ARGUMENT);
+    CHECK_STATUS(_gd_op_validate_arity(_GD_OP_CONCAT, 257, 1), GD_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_ASSERT_FINITE, 1, 0), GD_OK);
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_ASSERT_FINITE, 1, 1), GD_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(_gd_op_validate_arity(_GD_OP_SDPA_BWD, 4, 3), GD_OK);

@@ -219,7 +219,7 @@ static const _gd_backend_vtable metal_backend_vtable = {
     .execute_until = _gd_metal_execute_until,
     .executable_free = _gd_metal_executable_free,
     .value_storage = _gd_metal_value_storage,
-    .supports_node = _gd_metal_supports_node,
+    .check_node = _gd_metal_check_node,
     .synchronize = _gd_metal_synchronize,
     .flush_pending = _gd_metal_flush_pending,
 };

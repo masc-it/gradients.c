@@ -334,7 +334,7 @@ gd_status _gd_metal_value_storage(_gd_backend *self, _gd_executable *exe, int va
     return GD_OK;
 }
 
-bool _gd_metal_supports_node(_gd_backend *self, const _gd_node *node)
+gd_status _gd_metal_check_node(_gd_backend *self, const gd_graph *graph, const _gd_node *node)
 {
-    return _gd_metal_support_node(self, node) == GD_OK;
+    return _gd_metal_support_node(self, graph, node);
 }

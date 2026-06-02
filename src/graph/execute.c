@@ -26,37 +26,53 @@ static gd_status select_exec_backend(gd_graph *graph,
                                      _gd_backend *target_backend,
                                      _gd_backend **out)
 {
+    gd_status status = GD_OK;
     int bad_node = -1;
-    const char *bad_reason = NULL;
-    int i = 0;
+    char reason[256] = "";
+    const char *last = NULL;
 
-    *out = target_backend;
-    if (target_backend->vt->supports_node == NULL) {
-        return GD_OK; /* NULL => supports all (reference backend) */
-    }
-    for (i = 0; i < graph->n_nodes; ++i) {
-        if (!target_backend->vt->supports_node(target_backend, &graph->nodes[i])) {
-            bad_node = i;
-            bad_reason = gd_last_error();
-            if (bad_reason != NULL && strcmp(bad_reason, "ok") == 0) {
-                bad_reason = NULL;
-            }
-            break;
-        }
-    }
-    if (bad_node < 0) {
+    *out = NULL;
+    status = _gd_backend_check_graph(target_backend, graph, &bad_node);
+    if (status == GD_OK) {
+        *out = target_backend;
         return GD_OK;
     }
 
+    last = gd_last_error();
+    if (last != NULL && last[0] != '\0') {
+        (void)snprintf(reason, sizeof(reason), "%s", last);
+    }
+    if (bad_node < 0 || bad_node >= graph->n_nodes) {
+        return status;
+    }
+    if (target_backend->caps.supports_cpu_ref) {
+        char msg[384];
+        if (reason[0] != '\0') {
+            (void)snprintf(msg, sizeof(msg),
+                           "backend '%s' cannot execute op '%s' (node %d): %s",
+                           target_backend->vt->name,
+                           _gd_op_kind_name(graph->nodes[bad_node].op),
+                           bad_node,
+                           reason);
+        } else {
+            (void)snprintf(msg, sizeof(msg),
+                           "backend '%s' cannot execute op '%s' (node %d)",
+                           target_backend->vt->name,
+                           _gd_op_kind_name(graph->nodes[bad_node].op),
+                           bad_node);
+        }
+        return _gd_error(GD_ERR_UNSUPPORTED, msg);
+    }
+
     if (gd_context_fallback_policy(graph->ctx) != GD_FALLBACK_CPU_REF) {
-        char msg[256];
-        if (bad_reason != NULL && bad_reason[0] != '\0') {
+        char msg[384];
+        if (reason[0] != '\0') {
             (void)snprintf(msg, sizeof(msg),
                            "backend '%s' does not support op '%s' (node %d): %s; enable CPU_REF fallback",
                            target_backend->vt->name,
                            _gd_op_kind_name(graph->nodes[bad_node].op),
                            bad_node,
-                           bad_reason);
+                           reason);
         } else {
             (void)snprintf(msg, sizeof(msg),
                            "backend '%s' does not support op '%s' (node %d); enable CPU_REF fallback",
@@ -70,14 +86,31 @@ static gd_status select_exec_backend(gd_graph *graph,
     /* v1 fallback: run the entire graph on the CPU reference backend. */
     {
         _gd_backend *cpu = _gd_context_backend(graph->ctx, (gd_device){GD_DEVICE_CPU, 0});
+        int cpu_bad_node = -1;
+        gd_status cpu_status = GD_OK;
+
         if (cpu == NULL || !cpu->caps.supports_cpu_ref) {
             return _gd_error(GD_ERR_UNSUPPORTED, "CPU reference fallback is not available");
         }
         if (cpu->vt->compile == NULL || cpu->vt->execute == NULL) {
             return _gd_error(GD_ERR_UNSUPPORTED, "CPU reference backend cannot execute");
         }
+        cpu_status = _gd_backend_check_graph(cpu, graph, &cpu_bad_node);
+        if (cpu_status != GD_OK) {
+            char msg[384];
+            const char *cpu_reason = gd_last_error();
+            const char *op = (cpu_bad_node >= 0 && cpu_bad_node < graph->n_nodes) ?
+                _gd_op_kind_name(graph->nodes[cpu_bad_node].op) : "unknown";
+            (void)snprintf(msg, sizeof(msg),
+                           "CPU reference fallback cannot execute op '%s' (node %d): %s",
+                           op,
+                           cpu_bad_node,
+                           cpu_reason != NULL && cpu_reason[0] != '\0' ? cpu_reason : "unsupported");
+            return _gd_error(GD_ERR_UNSUPPORTED, msg);
+        }
         *out = cpu;
     }
+    _gd_set_last_error(GD_OK, NULL);
     return GD_OK;
 }
 

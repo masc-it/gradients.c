@@ -52,8 +52,9 @@ typedef struct _gd_backend_vtable {
     gd_status (*value_storage)(_gd_backend *self, _gd_executable *exe, int value_id,
                                gd_storage **storage_out, size_t *offset_out);
 
-    /* Fallback decisions (P5). */
-    bool (*supports_node)(_gd_backend *self, const _gd_node *node);
+    /* Capability preflight. Must return the same decision compile would make
+     * for this finalized graph node, including dtype/layout/shape/attrs. */
+    gd_status (*check_node)(_gd_backend *self, const gd_graph *graph, const _gd_node *node);
 
     /* Ordering (P4). */
     gd_status (*synchronize)(_gd_backend *self);
@@ -75,6 +76,13 @@ struct _gd_backend {
 };
 
 /* Backend registration entry points (one per backend). */
+gd_status _gd_backend_check_node(_gd_backend *backend,
+                                 const gd_graph *graph,
+                                 const _gd_node *node);
+gd_status _gd_backend_check_graph(_gd_backend *backend,
+                                  const gd_graph *graph,
+                                  int *bad_node_out);
+
 gd_status _gd_cpu_backend_register(gd_context *ctx);
 #if defined(GD_ENABLE_METAL)
 /* Best-effort: returns GD_ERR_UNSUPPORTED (without registering) when no Metal

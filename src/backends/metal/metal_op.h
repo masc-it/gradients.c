@@ -43,7 +43,9 @@ gd_status _gd_metal_support_default(const _gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_support_f32_f16_same_dtype(const _gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_plan_default(_gd_metal_plan_ctx *ctx);
 gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx);
-gd_status _gd_metal_support_node(_gd_backend *self, const _gd_node *node);
+gd_status _gd_metal_support_node(_gd_backend *self,
+                                 const gd_graph *graph,
+                                 const _gd_node *node);
 
 void _gd_metal_split_around_dim(const gd_tensor_desc *desc, int dim,
                                 int *outer, int *d, int *inner);

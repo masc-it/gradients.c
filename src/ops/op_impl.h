@@ -18,7 +18,10 @@ typedef enum _gd_op_flags {
     GD_OPF_SIDE_EFFECT = 1u << 4,
     GD_OPF_DEBUG       = 1u << 5,
     GD_OPF_BROADCAST   = 1u << 6,
-    GD_OPF_AUX_OUTS    = 1u << 7
+    GD_OPF_AUX_OUTS    = 1u << 7,
+    /* Registry-only placeholder. Pseudo ops are never executable graph nodes
+     * and are exempt from backend kernel coverage. */
+    GD_OPF_PSEUDO      = 1u << 8
 } _gd_op_flags;
 
 typedef gd_status (*_gd_meta_fn)(const gd_tensor_desc *const *inputs,

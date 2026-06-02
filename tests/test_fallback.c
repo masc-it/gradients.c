@@ -50,11 +50,15 @@ static gd_status stub_init(_gd_backend *self, gd_context *ctx, int device_index)
 
 static void stub_shutdown(_gd_backend *self) { (void)self; }
 
-static bool stub_supports_node(_gd_backend *self, const _gd_node *node)
+static gd_status stub_check_node(_gd_backend *self,
+                                 const gd_graph *graph,
+                                 const _gd_node *node)
 {
     (void)self;
+    (void)graph;
     (void)node;
-    return false; /* supports nothing -> forces fallback decision */
+    return _gd_error(GD_ERR_UNSUPPORTED,
+                     "stub backend intentionally supports no graph nodes");
 }
 
 static gd_status stub_synchronize(_gd_backend *self)
@@ -79,7 +83,7 @@ static const _gd_backend_vtable stub_vtable = {
     .execute_until = NULL,
     .executable_free = NULL,
     .value_storage = NULL,
-    .supports_node = stub_supports_node,
+    .check_node = stub_check_node,
     .synchronize = stub_synchronize,
 };
 
@@ -124,6 +128,9 @@ int main(void)
     CHECK_OK(gd_context_set_fallback_policy(ctx, GD_FALLBACK_NONE));
     CHECK_STATUS(gd_graph_compile(g, stub_dev), GD_ERR_UNSUPPORTED);
     CHECK_TRUE(strstr(gd_last_error(), "stub") != NULL);
+    CHECK_TRUE(strstr(gd_last_error(), "scale") != NULL);
+    CHECK_TRUE(strstr(gd_last_error(), "node 0") != NULL);
+    CHECK_TRUE(strstr(gd_last_error(), "intentionally supports no graph nodes") != NULL);
 
     /* Policy CPU_REF: whole-graph fallback to CPU, correct results. */
     CHECK_OK(gd_context_set_fallback_policy(ctx, GD_FALLBACK_CPU_REF));

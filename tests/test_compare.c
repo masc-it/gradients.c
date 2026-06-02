@@ -207,7 +207,7 @@ static const _gd_backend_vtable g_perturb_vtable = {
     .execute_until = NULL,
     .executable_free = perturb_executable_free,
     .value_storage = perturb_value_storage,
-    .supports_node = NULL, /* supports all ops -> no fallback */
+    .check_node = NULL, /* supports all ops -> no fallback */
     .synchronize = perturb_synchronize,
 };
 

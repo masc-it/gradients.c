@@ -1,5 +1,6 @@
 #include "cpu_op.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -361,6 +362,27 @@ static gd_status cpu_backend_synchronize(_gd_backend *self)
     return GD_OK; /* CPU_REF executes synchronously */
 }
 
+static gd_status cpu_check_node(_gd_backend *self,
+                                const gd_graph *graph,
+                                const _gd_node *node)
+{
+    const _gd_cpu_op *op = NULL;
+
+    (void)self;
+    (void)graph;
+    if (node == NULL) {
+        return _gd_error(GD_ERR_INVALID_ARGUMENT, "CPU_REF node is NULL");
+    }
+    op = _gd_cpu_op_for(node->op);
+    if (op == NULL || op->run == NULL) {
+        char msg[112];
+        (void)snprintf(msg, sizeof(msg), "cpu_ref has no kernel for op '%s'",
+                       _gd_op_kind_name(node->op));
+        return _gd_error(GD_ERR_UNSUPPORTED, msg);
+    }
+    return op->support != NULL ? op->support(node) : _gd_cpu_support_default(node);
+}
+
 static const _gd_backend_vtable cpu_backend_vtable = {
     .type = GD_DEVICE_CPU,
     .name = "cpu_ref",
@@ -376,7 +398,7 @@ static const _gd_backend_vtable cpu_backend_vtable = {
     .execute_until = cpu_execute_until,
     .executable_free = cpu_executable_free,
     .value_storage = cpu_value_storage,
-    .supports_node = NULL,
+    .check_node = cpu_check_node,
     .synchronize = cpu_backend_synchronize,
 };
 

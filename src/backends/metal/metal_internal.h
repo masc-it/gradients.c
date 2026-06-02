@@ -168,7 +168,7 @@ gd_status _gd_metal_execute(_gd_backend *self, _gd_executable *exe);
 gd_status _gd_metal_execute_until(_gd_backend *self, _gd_executable *exe, int node_id);
 gd_status _gd_metal_value_storage(_gd_backend *self, _gd_executable *exe, int value_id,
                                   gd_storage **storage_out, size_t *offset_out);
-bool _gd_metal_supports_node(_gd_backend *self, const _gd_node *node);
+gd_status _gd_metal_check_node(_gd_backend *self, const gd_graph *graph, const _gd_node *node);
 
 void _gd_metal_plan_fusions(_gd_backend *self, const gd_graph *graph, _gd_executable *exe);
 gd_status _gd_metal_encode_fused_head(id<MTLComputeCommandEncoder> enc,

@@ -20,10 +20,10 @@
         }                                                                         \
     } while (0)
 
-static int is_known_cpu_ref_non_exec_op(_gd_op_kind kind)
+static int op_is_pseudo(_gd_op_kind kind)
 {
-    return kind == _GD_OP_BACKWARD || kind == _GD_OP_ZERO_GRAD ||
-           kind == _GD_OP_OPTIMIZER_STEP;
+    const _gd_op_def *def = _gd_op_def_for(kind);
+    return def != NULL && (def->flags & GD_OPF_PSEUDO) != 0U;
 }
 
 static int test_cpu_registry_coverage(void)
@@ -40,7 +40,7 @@ static int test_cpu_registry_coverage(void)
         _gd_node node = {0};
 
         CHECK_TRUE(def != NULL);
-        if (is_known_cpu_ref_non_exec_op(kind)) {
+        if (op_is_pseudo(kind)) {
             CHECK_TRUE(op == NULL);
             continue;
         }
@@ -61,6 +61,9 @@ static int test_cpu_registry_coverage(void)
 
 static int test_cpu_registry_missing_op_guards(void)
 {
+    CHECK_TRUE(op_is_pseudo(_GD_OP_BACKWARD));
+    CHECK_TRUE(op_is_pseudo(_GD_OP_ZERO_GRAD));
+    CHECK_TRUE(op_is_pseudo(_GD_OP_OPTIMIZER_STEP));
     CHECK_TRUE(_gd_cpu_op_for(_GD_OP_BACKWARD) == NULL);
     CHECK_TRUE(_gd_cpu_op_for(_GD_OP_ZERO_GRAD) == NULL);
     CHECK_TRUE(_gd_cpu_op_for(_GD_OP_OPTIMIZER_STEP) == NULL);

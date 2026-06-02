@@ -80,7 +80,9 @@ gd_status _gd_metal_plan_default(_gd_metal_plan_ctx *ctx)
     return GD_OK;
 }
 
-gd_status _gd_metal_support_node(_gd_backend *self, const _gd_node *node)
+gd_status _gd_metal_support_node(_gd_backend *self,
+                                 const gd_graph *graph,
+                                 const _gd_node *node)
 {
     const _gd_metal_op *op = NULL;
     _gd_metal_plan_ctx ctx;
@@ -98,7 +100,7 @@ gd_status _gd_metal_support_node(_gd_backend *self, const _gd_node *node)
     ctx = (_gd_metal_plan_ctx){
         .backend = self,
         .state = self != NULL ? _gd_metal_state(self) : nil,
-        .graph = NULL,
+        .graph = (gd_graph *)graph,
         .exe = NULL,
         .node = node,
         .node_id = -1,

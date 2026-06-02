@@ -21,7 +21,7 @@ GD_GPT_MLP_POWLU=1 \
 GD_BENCH_FUSED_LMCE=1 \
 GD_METAL_MPS=1 \
 GD_DEVICE=metal \
-make gpt-lm GPT_LM_ARGS="--prepare --steps 1000 --batch-size 1"
+make gpt-lm GPT_LM_ARGS="--prepare --steps 1000 --batch-size 8"
 ```
 
 Defaults:
@@ -41,7 +41,7 @@ Defaults:
 ```bash
 GD_BENCH_DTYPE=f16 GD_BENCH_AMP=1 GD_BENCH_ATTN_WINDOW=512 \
 GD_GPT_MLP_POWLU=1 GD_BENCH_FUSED_LMCE=1 GD_METAL_MPS=1 GD_DEVICE=metal \
-make gpt-lm GPT_LM_ARGS="--steps 1000 --batch-size 1"
+make gpt-lm GPT_LM_ARGS="--steps 1000 --batch-size 8"
 ```
 
 Trainer auto-loads:

@@ -53,7 +53,6 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_MEAN_BWD, "mean_bwd"},
     {_GD_OP_MEAN, "mean"},
     {_GD_OP_MUL, "mul"},
-    {_GD_OP_OPTIMIZER_STEP, "optimizer_step"},
     {_GD_OP_POWLU_BWD, "powlu_bwd"},
     {_GD_OP_POWLU, "powlu"},
     {_GD_OP_REDUCE_TO, "reduce_to"},

@@ -63,10 +63,8 @@ static int test_cpu_registry_missing_op_guards(void)
 {
     CHECK_TRUE(op_is_pseudo(_GD_OP_BACKWARD));
     CHECK_TRUE(op_is_pseudo(_GD_OP_ZERO_GRAD));
-    CHECK_TRUE(op_is_pseudo(_GD_OP_OPTIMIZER_STEP));
     CHECK_TRUE(_gd_cpu_op_for(_GD_OP_BACKWARD) == NULL);
     CHECK_TRUE(_gd_cpu_op_for(_GD_OP_ZERO_GRAD) == NULL);
-    CHECK_TRUE(_gd_cpu_op_for(_GD_OP_OPTIMIZER_STEP) == NULL);
     return 0;
 }
 

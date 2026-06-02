@@ -22,7 +22,7 @@ static gd_status add_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    return _gd_cpu_k_elementwise(_GD_OP_ADD, out_desc, out_data, a_desc, a_data, b_desc, b_data);
+    return _gd_cpu_k_add(out_desc, out_data, a_desc, a_data, b_desc, b_data);
 }
 
 const _gd_cpu_op _gd_cpu_op_add = {

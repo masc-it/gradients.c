@@ -20,7 +20,7 @@ static gd_status sum_run(_gd_cpu_exec *exec, const _gd_node *node)
     if (status != GD_OK) {
         return status;
     }
-    return _gd_cpu_k_reduce(out_desc, out_data, x_desc, x_data, node->attrs.dim, false);
+    return _gd_cpu_k_sum(out_desc, out_data, x_desc, x_data, node->attrs.dim);
 }
 
 const _gd_cpu_op _gd_cpu_op_sum = {

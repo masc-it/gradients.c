@@ -6,18 +6,30 @@
 
 #include "../../graph/graph_internal.h"
 
-/* Scalar reference kernels. All tensors are contiguous. */
+/* Scalar reference helpers. All tensors are contiguous. */
+int64_t _gd_cpu_desc_numel(const gd_tensor_desc *desc);
+void _gd_cpu_unravel(int64_t linear, const gd_tensor_desc *desc, int64_t *index);
+int64_t _gd_cpu_broadcast_offset(const int64_t *out_index,
+                                 int out_ndim,
+                                 const gd_tensor_desc *in_desc);
 gd_status _gd_cpu_load_float(const gd_tensor_desc *desc, const void *data,
                              int64_t i, float *out);
 gd_status _gd_cpu_store_float(const gd_tensor_desc *desc, void *data,
                               int64_t i, float value);
-gd_status _gd_cpu_k_elementwise(_gd_op_kind op,
-                                const gd_tensor_desc *out_desc,
-                                void *out,
-                                const gd_tensor_desc *a_desc,
-                                const void *a,
-                                const gd_tensor_desc *b_desc,
-                                const void *b);
+
+/* Scalar reference kernels. All tensors are contiguous. */
+gd_status _gd_cpu_k_add(const gd_tensor_desc *out_desc,
+                        void *out,
+                        const gd_tensor_desc *a_desc,
+                        const void *a,
+                        const gd_tensor_desc *b_desc,
+                        const void *b);
+gd_status _gd_cpu_k_mul(const gd_tensor_desc *out_desc,
+                        void *out,
+                        const gd_tensor_desc *a_desc,
+                        const void *a,
+                        const gd_tensor_desc *b_desc,
+                        const void *b);
 gd_status _gd_cpu_k_scale(const gd_tensor_desc *desc, void *out, const void *x, float scale);
 gd_status _gd_cpu_k_relu(const gd_tensor_desc *desc, void *out, const void *x);
 gd_status _gd_cpu_k_silu(const gd_tensor_desc *desc, void *out, const void *x);
@@ -48,12 +60,16 @@ gd_status _gd_cpu_k_linear(const gd_tensor_desc *out_desc,
                            const void *w,
                            bool trans_w,
                            const void *bias);
-gd_status _gd_cpu_k_reduce(const gd_tensor_desc *out_desc,
-                           float *out,
-                           const gd_tensor_desc *x_desc,
-                           const float *x,
-                           int dim,
-                           bool mean);
+gd_status _gd_cpu_k_sum(const gd_tensor_desc *out_desc,
+                        float *out,
+                        const gd_tensor_desc *x_desc,
+                        const float *x,
+                        int dim);
+gd_status _gd_cpu_k_mean(const gd_tensor_desc *out_desc,
+                         float *out,
+                         const gd_tensor_desc *x_desc,
+                         const float *x,
+                         int dim);
 gd_status _gd_cpu_k_softmax(const gd_tensor_desc *desc, void *out, const void *x, int dim);
 gd_status _gd_cpu_k_rms_norm(const gd_tensor_desc *desc,
                              void *out,
@@ -153,8 +169,11 @@ gd_status _gd_cpu_k_softmax_bwd(const gd_tensor_desc *desc,
 gd_status _gd_cpu_k_sum_bwd(const gd_tensor_desc *x_desc,
                             float *dx,
                             const float *go,
-                            int dim,
-                            bool mean);
+                            int dim);
+gd_status _gd_cpu_k_mean_bwd(const gd_tensor_desc *x_desc,
+                             float *dx,
+                             const float *go,
+                             int dim);
 gd_status _gd_cpu_k_cross_entropy_bwd(const gd_tensor_desc *logits_desc,
                                       float *dlogits,
                                       const float *logits,

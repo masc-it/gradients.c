@@ -8,108 +8,96 @@ shape/meta logic, autograd rules, and backend kernels kept in per-op capsules.
 
 ## Adding a new operator
 
-Operators live as small capsules under `src/ops/<op>/`. Registries are generated
-from filenames by `tools/gen_ops.c`, so names must follow existing grammar.
+Operators live as per-op capsules under `src/ops/<op>/`. Registries are generated
+from filenames by `tools/gen_ops.c`; do not hand-edit `build/generated/*`.
 
-### 1. Add public API
+### Fast path: scaffold stubs
 
-Add declaration to `include/gradients/ops.h` if op is public:
+Use the scaffold tool for new ops:
 
-```c
-gd_status gd_my_op(gd_context *ctx, gd_tensor *x, gd_tensor **out);
+```sh
+make tools
+build/tools/gradients-new-op my_op
 ```
 
-### 2. Add core op capsule
+Defaults match the common case:
 
-Create `src/ops/my_op/core_my_op_fwd.c`.
+- public API: yes
+- differentiable: yes
+- custom backward op: yes
+- backends: CPU reference + accelerated backends (Metal today; CUDA/Vulkan later)
+- inputs/outputs: `1 -> 1`
+- runs `make generated` after writing buildable stubs
 
-Core capsule owns:
+Generated stubs contain explicit `TODO` comments and return `GD_ERR_UNSUPPORTED`
+until implementation is filled; they never fake math.
 
-- `_gd_op_def _gd_opdef_my_op`
-- meta function: validate dtype/device/shape/layout and infer output desc
-- public wrapper that calls `_gd_emit_checked()`
+Useful variants:
 
-Pattern:
-
-```c
-#include "../op_impl.h"
-#include "../meta_common.h"
-#include "gradients/ops.h"
-
-#include "../../core/internal.h"
-
-static gd_status my_op_meta(const gd_tensor_desc *const *inputs,
-                            int n_inputs,
-                            _gd_op_attrs *attrs,
-                            gd_tensor_desc *outputs,
-                            int *n_outputs)
-{
-    gd_status status = GD_OK;
-
-    (void)n_inputs;
-    (void)attrs;
-    status = _gd_meta_set_output_count(1, n_outputs);
-    if (status != GD_OK) {
-        return status;
-    }
-    return _gd_meta_unary_float(inputs[0], &outputs[0]);
-}
-
-const _gd_op_def _gd_opdef_my_op = {
-    .kind = _GD_OP_MY_OP,
-    .name = "my_op",
-    .min_inputs = 1,
-    .max_inputs = 1,
-    .n_outputs = 1,
-    .flags = GD_OPF_PUBLIC | GD_OPF_DIFF,
-    .meta = my_op_meta,
-};
-
-gd_status gd_my_op(gd_context *ctx, gd_tensor *x, gd_tensor **out)
-{
-    gd_tensor *inputs[1] = {x};
-    if (x == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_my_op argument is NULL");
-    }
-    *out = NULL;
-    return _gd_emit_checked(ctx, _GD_OP_MY_OP, inputs, 1, NULL, out, 1);
-}
+```sh
+build/tools/gradients-new-op debug_print --private --no-diff --cpu-only
+build/tools/gradients-new-op square --no-custom-bwd
+build/tools/gradients-new-op layer_norm --inputs 3
+build/tools/gradients-new-op my_op --dry-run
 ```
 
-`_GD_OP_MY_OP` appears after `make generated`; do not hand-edit generated files.
+Common files created for `build/tools/gradients-new-op my_op`:
 
-### 3. Add CPU reference support
+```text
+src/ops/my_op/core_my_op_fwd.c
+src/ops/my_op/cpu_my_op_fwd.c
+src/ops/my_op/grad_my_op.c
+src/ops/my_op/core_my_op_bwd.c
+src/ops/my_op/cpu_my_op_bwd.c
+src/ops/my_op/metal_my_op_fwd.m
+src/ops/my_op/metal_my_op_fwd.metal
+src/ops/my_op/metal_my_op_bwd.m
+src/ops/my_op/metal_my_op_bwd.metal
+```
 
-Create `src/ops/my_op/cpu_my_op_fwd.c` with `_gd_cpu_op _gd_cpu_op_my_op`.
-CPU ref should be simple, correct, and deterministic. Reuse helpers from
-`src/backends/cpu_ref/cpu_backend.h` when possible.
+It also patches public declarations/tests and Metal kernel mapping when needed.
 
-### 4. Add autograd rule if differentiable
+### Fill implementation
 
-Create `src/ops/my_op/grad_my_op.c` with `_gd_bwd_rule _gd_bwd_rule_my_op`.
-If op is not differentiable, omit `GD_OPF_DIFF` and no grad file needed.
+1. **Core/meta** (`core_*_fwd.c`, optional `core_*_bwd.c`)
+   - validate dtype/device/shape/layout/attrs
+   - infer output descs
+   - set `_gd_op_def` flags (`GD_OPF_PUBLIC`, `GD_OPF_DIFF`, internal bwd, etc.)
 
-### 5. Add non-CPU backend support
+2. **CPU reference** (`cpu_*.c`)
+   - put CPU run/kernel body in the per-op file
+   - keep it simple, correct, deterministic
+   - do not add new per-op bodies to `src/backends/cpu_ref/cpu_kernels.c`
 
-For Metal or future non-CPU backends (CUDA, Vulkan), prefer optimized implementations instead
-of direct CPU-shaped ports. If no optimized backend implementation exists, leave
-op unsupported and let CPU fallback handle it.
+3. **Autograd** (`grad_*.c`)
+   - if gradient composes from existing ops, emit those ops directly
+   - if gradient needs custom kernels, emit the generated `*_bwd` op
 
-Metal support usually needs:
+4. **Accelerated backends** (`metal_*.m`, `.metal` today)
+   - implement support checks with clear unsupported reasons
+   - implement host encoder and shader/MPS path
+   - prefer optimized backend kernels over CPU-shaped ports
 
-- `src/ops/my_op/metal_my_op_fwd.m` host capsule with `_gd_metal_op_my_op`
-- `src/ops/my_op/metal_my_op_fwd.metal` shader kernel when using custom shader
-- support checks that reject unsupported dtype/layout/shape with clear reason
+5. **Tests**
+   - shape/error checks
+   - CPU numerics
+   - autograd/backward numerics
+   - F16/BF16/etc. coverage if supported
+   - accelerated backend parity or explicit fallback behavior
 
-Use existing ops such as `add`, `matmul`, or `sdpa` as templates.
+### Regenerate and test
 
-### 6. Regenerate and test
+The scaffold tool runs this by default; run it manually after changing op files:
 
 ```sh
 make generated
+```
+
+Then build/test:
+
+```sh
 make test GD_ENABLE_METAL=0
 make test
 ```
 
-Also add focused tests under `tests/` for shape errors, CPU numerics, autograd
-(if any), and backend parity/fallback behavior.
+Check `build/generated/op_matrix.md` to verify core/grad/backend coverage.

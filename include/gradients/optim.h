@@ -57,6 +57,13 @@ typedef struct gd_param_group {
     float lr_scale;
 } gd_param_group;
 
+typedef struct gd_optimizer_step_options {
+    gd_tensor *lr_scalar;
+    gd_amp_scaler *scaler;
+    float max_norm;
+    gd_tensor **norm_out;
+} gd_optimizer_step_options;
+
 gd_status gd_adamw_create(gd_context *ctx,
                           gd_tensor **params,
                           int n_params,
@@ -69,6 +76,9 @@ gd_status gd_adamw_create_groups(gd_context *ctx,
                                  gd_optimizer **out);
 void gd_optimizer_destroy(gd_optimizer *optimizer);
 
+gd_status gd_optimizer_step_ex(gd_context *ctx,
+                               gd_optimizer *optimizer,
+                               const gd_optimizer_step_options *options);
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer);
 gd_status gd_optimizer_step_lr(gd_context *ctx,
                                gd_optimizer *optimizer,

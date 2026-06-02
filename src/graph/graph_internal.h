@@ -48,6 +48,9 @@ typedef struct _gd_op_attrs {
     float beta1;                 /* ADAMW */
     float beta2;                 /* ADAMW */
     float weight_decay;          /* ADAMW */
+    bool adamw_has_found_inf;    /* ADAMW: skip on AMP inf flag */
+    bool adamw_has_lr;           /* ADAMW: runtime LR tensor input */
+    bool adamw_has_refresh;      /* ADAMW: refresh public param from master */
     float atol;                  /* ASSERT_CLOSE */
     float rtol;                  /* ASSERT_CLOSE */
     bool has_reduce_to_desc;      /* REDUCE_TO: target descriptor present */

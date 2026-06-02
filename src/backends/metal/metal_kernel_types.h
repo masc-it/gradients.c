@@ -217,6 +217,7 @@ typedef struct gd_metal_clip_norm_params {
 typedef struct gd_metal_adamw_params {
     int numel;
     int use_lr_tensor;
+    int has_found_inf;
     float lr;
     float lr_scale;
     float beta1;

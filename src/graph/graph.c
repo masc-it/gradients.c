@@ -763,17 +763,13 @@ static int graph_node_mutates_input(const gd_graph *graph,
     case _GD_OP_AMP_CLIP_GRAD_NORM:
         return input_index >= 1;
     case _GD_OP_ADAMW_STEP:
-        return input_index == 0 || input_index == 2 || input_index == 3;
-    case _GD_OP_ADAMW_STEP_AMP:
         if (input_index == 0 || input_index == 2 || input_index == 3) {
             return 1;
         }
-        if (node->n_inputs == 8) {
-            return input_index == 7;
-        }
-        if (node->n_inputs == 7 && input_index == 6) {
-            const _gd_value *extra = &graph->values[node->inputs[6]];
-            return !(extra->desc.dtype == GD_DTYPE_F32 && extra->desc.ndim == 0);
+        if (node->attrs.adamw_has_refresh) {
+            int refresh_index = 5 + (node->attrs.adamw_has_found_inf ? 1 : 0) +
+                                (node->attrs.adamw_has_lr ? 1 : 0);
+            return input_index == refresh_index;
         }
         return 0;
     case _GD_OP_AMP_UNSCALE_GRAD:

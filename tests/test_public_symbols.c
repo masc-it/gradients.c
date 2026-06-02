@@ -140,6 +140,7 @@ GD_REF(gd_module_load, gd_status, (gd_module *, const char *, bool));
 GD_REF(gd_adamw_create, gd_status, (gd_context *, gd_tensor **, int, const gd_adamw_config *, gd_optimizer **));
 GD_REF(gd_adamw_create_groups, gd_status, (gd_context *, const gd_param_group *, int, const gd_adamw_config *, gd_optimizer **));
 GD_REF(gd_optimizer_destroy, void, (gd_optimizer *));
+GD_REF(gd_optimizer_step_ex, gd_status, (gd_context *, gd_optimizer *, const gd_optimizer_step_options *));
 GD_REF(gd_optimizer_step, gd_status, (gd_context *, gd_optimizer *));
 GD_REF(gd_optimizer_step_lr, gd_status, (gd_context *, gd_optimizer *, gd_tensor *));
 GD_REF(gd_optimizer_step_amp, gd_status, (gd_context *, gd_optimizer *, gd_amp_scaler *));

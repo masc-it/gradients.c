@@ -6,10 +6,14 @@ kernel void gd_adamw(device float *param                 [[buffer(0)]],
                      device float *v                     [[buffer(3)]],
                      device const float *step            [[buffer(4)]],
                      constant gd_metal_adamw_params &p    [[buffer(5)]],
-                     device const float *lr_tensor       [[buffer(6)]],
+                     device const atomic_uint *found_inf [[buffer(6)]],
+                     device const float *lr_tensor       [[buffer(7)]],
+                     device uchar *refresh               [[buffer(8)]],
                      uint gid                            [[thread_position_in_grid]])
 {
-    if ((int)gid >= p.numel) {
+    if ((int)gid >= p.numel ||
+        (p.has_found_inf != 0 &&
+         atomic_load_explicit(found_inf, memory_order_relaxed) != 0u)) {
         return;
     }
     float lr = (p.use_lr_tensor != 0 ? lr_tensor[0] : p.lr) * p.lr_scale;
@@ -28,4 +32,7 @@ kernel void gd_adamw(device float *param                 [[buffer(0)]],
     pp -= lr * p.weight_decay * pp;            /* decoupled weight decay */
     pp -= lr * mhat / (sqrt(vhat) + p.eps);
     param[gid] = pp;
+    if (p.refresh_dtype >= 0) {
+        gd_store_float(refresh, p.refresh_dtype, gid, pp);
+    }
 }

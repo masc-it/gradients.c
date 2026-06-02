@@ -80,6 +80,7 @@ static const expected_op g_expected_ops[] = {
     {_GD_OP_SDPA_VARLEN_BWD, "sdpa_varlen_bwd"},
     {_GD_OP_SLICE, "slice"},
     {_GD_OP_SLICE_BWD, "slice_bwd"},
+    {_GD_OP_RMS_NORM_QKV, "rms_norm_qkv"},
 };
 
 static int test_registry_contents(void)

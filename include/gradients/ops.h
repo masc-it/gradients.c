@@ -221,6 +221,20 @@ gd_status gd_concat(gd_context *ctx,
                     int dim,
                     gd_tensor **out);
 
+/* Fused pre-attention projection: norm = rms_norm(x, weight), then
+ * q/k/v = linear(norm, wq/wk/wv). Outputs are norm, q, k, v. */
+gd_status gd_rms_norm_qkv(gd_context *ctx,
+                          gd_tensor *x,
+                          gd_tensor *weight,
+                          gd_tensor *wq,
+                          gd_tensor *wk,
+                          gd_tensor *wv,
+                          float eps,
+                          gd_tensor **norm,
+                          gd_tensor **q,
+                          gd_tensor **k,
+                          gd_tensor **v);
+
 gd_status gd_backward(gd_context *ctx, gd_tensor *loss);
 gd_status gd_zero_grad(gd_context *ctx, gd_tensor **params, int n_params);
 

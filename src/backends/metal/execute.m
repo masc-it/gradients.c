@@ -4,15 +4,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Long GPT graphs run faster when submitted as a stream of small command
- * buffers instead of one monolithic buffer. On M-series GPUs, large command
- * buffers with repeated scratch-buffer hazards (notably long-context SDPA)
- * hit a scheduler/hazard-tracking cliff. Causal SDPA specializations need a
- * small chunks to stay on the fast sustained path for long training runs. The
- * default keeps enough adjacent MPS GEMMs together while avoiding the long-buffer
- * hazard cliff. Override with GD_METAL_CMD_CHUNK=0 to force the old single-buffer
- * path. */
-#define GD_METAL_DEFAULT_CMD_CHUNK 8
+/* Command-buffer chunking is an opt-in performance knob. The graph executor
+ * reuses one scratch arena across nodes; splitting a graph into multiple queued
+ * command buffers can expose cross-command scratch/MPS hazards on training
+ * graphs and produce non-finite F16 values. Keep correctness default as one
+ * command buffer. Set GD_METAL_CMD_CHUNK=N only for profiling known-safe graphs. */
+#define GD_METAL_DEFAULT_CMD_CHUNK 0
 
 static int metal_command_chunk_size(void)
 {

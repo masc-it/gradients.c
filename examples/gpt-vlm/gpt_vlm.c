@@ -63,6 +63,7 @@ typedef struct app_config {
     int attention_window;
     int text_bucket_multiple;
     int graph_cache_max;
+    int graph_cache_footprint_mb;
 } app_config;
 
 typedef struct packed_batch {
@@ -111,6 +112,7 @@ typedef struct train_graph_cache_entry {
     uint64_t runs;
     train_graph graph;
     materialized_batch inputs;
+    double footprint_mb;
 } train_graph_cache_entry;
 
 typedef struct train_graph_cache {
@@ -118,6 +120,8 @@ typedef struct train_graph_cache {
     int n_entries;
     int cap;
     int max_entries;
+    int footprint_limit_mb;
+    double avg_entry_footprint_mb;
     uint64_t builds;
     uint64_t hits;
     uint64_t evictions;
@@ -197,6 +201,39 @@ static double now_ms(void)
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
+static void format_eta(double seconds, char *out, size_t out_cap)
+{
+    uint64_t total;
+    uint64_t days;
+    uint64_t hours;
+    uint64_t minutes;
+    uint64_t secs;
+
+    if (out == NULL || out_cap == 0U) {
+        return;
+    }
+    if (!isfinite(seconds) || seconds < 0.0) {
+        seconds = 0.0;
+    }
+    total = (uint64_t)(seconds + 0.5);
+    days = total / 86400U;
+    hours = (total / 3600U) % 24U;
+    minutes = (total / 60U) % 60U;
+    secs = total % 60U;
+    if (days > 0U) {
+        (void)snprintf(out, out_cap, "%llud %lluh",
+                       (unsigned long long)days, (unsigned long long)hours);
+    } else if (hours > 0U) {
+        (void)snprintf(out, out_cap, "%lluh %02llum",
+                       (unsigned long long)hours, (unsigned long long)minutes);
+    } else if (minutes > 0U) {
+        (void)snprintf(out, out_cap, "%llum %02llus",
+                       (unsigned long long)minutes, (unsigned long long)secs);
+    } else {
+        (void)snprintf(out, out_cap, "%llus", (unsigned long long)secs);
+    }
+}
+
 static double current_footprint_mb(void)
 {
 #ifdef __APPLE__
@@ -274,7 +311,7 @@ static void usage(FILE *f)
     fprintf(f, "  --skip-batches N     advance sampler by N batches before step 1 (debug)\n");
     fprintf(f, "  --lr F               learning rate (default: 1e-4)\n");
     fprintf(f, "  --seed N             seed (default: 1234)\n\n");
-    fprintf(f, "Bucket/cache knobs: GD_VLM_TEXT_BUCKET_MULTIPLE (default 8), GD_VLM_GRAPH_CACHE_MAX (default 16).\n");
+    fprintf(f, "Bucket/cache knobs: GD_VLM_TEXT_BUCKET_MULTIPLE (default 8), GD_VLM_GRAPH_CACHE_MAX (default 16), GD_VLM_GRAPH_CACHE_FOOTPRINT_MB (default 0 disables).\n");
     fprintf(f, "Model knobs: GD_BENCH_DMODEL/LAYERS/HEADS/KV_HEADS/DFF and GD_BENCH_ATTN_WINDOW.\n");
     fprintf(f, "Hard requirements: dtype=f16, head_dim=64, prefix_len>0, sliding_window>0.\n");
 }
@@ -291,7 +328,7 @@ static void init_app(app_config *app)
     app->skip_batches = env_int("GD_VLM_SKIP_BATCHES", 0);
     app->seed = env_u64("GD_VLM_SEED", 1234U);
     app->lr = env_float("GD_VLM_LR", 1.0e-4F);
-    app->weight_decay = env_float("GD_VLM_WEIGHT_DECAY", 0.1F);
+    app->weight_decay = env_float("GD_VLM_WEIGHT_DECAY", 4.0e-3F);
     app->grad_clip = env_float("GD_VLM_GRAD_CLIP", 1.0F);
     app->d_model = env_int("GD_BENCH_DMODEL", 256);
     app->n_layers = env_int("GD_BENCH_LAYERS", 6);
@@ -301,6 +338,7 @@ static void init_app(app_config *app)
     app->attention_window = env_int("GD_BENCH_ATTN_WINDOW", 128);
     app->text_bucket_multiple = env_int("GD_VLM_TEXT_BUCKET_MULTIPLE", 8);
     app->graph_cache_max = env_int("GD_VLM_GRAPH_CACHE_MAX", 16);
+    app->graph_cache_footprint_mb = env_int("GD_VLM_GRAPH_CACHE_FOOTPRINT_MB", 0);
 }
 
 static int parse_args(int argc, char **argv, app_config *app)
@@ -663,7 +701,7 @@ static int debug_tensor_stats(gd_context *ctx, const char *name, gd_tensor *t, i
 static void param_debug_name(int index, char *buf, size_t cap)
 {
     static const char *per_layer[] = {
-        "ln1", "wq", "wk", "wv", "wo", "ln2", "w_gate", "w_up", "w_down"
+        "ln1", "wq", "wk", "wv", "wo", "b_wo", "ln2", "w_gate", "b_gate", "w_up", "w_down"
     };
     int rel;
     int layer;
@@ -676,16 +714,32 @@ static void param_debug_name(int index, char *buf, size_t cap)
         return;
     }
     if (index == 1) {
-        (void)snprintf(buf, cap, "wte");
+        (void)snprintf(buf, cap, "patch_proj.bias");
         return;
     }
     if (index == 2) {
+        (void)snprintf(buf, cap, "image_pos");
+        return;
+    }
+    if (index == 3) {
+        (void)snprintf(buf, cap, "img_norm");
+        return;
+    }
+    if (index == 4) {
+        (void)snprintf(buf, cap, "txt_norm");
+        return;
+    }
+    if (index == 5) {
+        (void)snprintf(buf, cap, "wte");
+        return;
+    }
+    if (index == 6) {
         (void)snprintf(buf, cap, "ln_f");
         return;
     }
-    rel = index - 3;
-    layer = rel / 9;
-    slot = rel % 9;
+    rel = index - 7;
+    layer = rel / 11;
+    slot = rel % 11;
     (void)snprintf(buf, cap, "blk.%d.%s", layer, per_layer[slot]);
 }
 
@@ -849,33 +903,58 @@ static float rand_normal(uint64_t *state)
     return u * sqrtf(-2.0F * logf(s) / s);
 }
 
-static int make_param(gd_context *ctx,
-                      gd_device device,
-                      const char *name,
-                      int64_t in_dim,
-                      int64_t out_dim,
-                      uint64_t *rng,
-                      gd_tensor **out)
+typedef enum vlm_param_init {
+    VLM_PARAM_NORMAL,
+    VLM_PARAM_UNIFORM,
+    VLM_PARAM_CONSTANT
+} vlm_param_init;
+
+static int make_f16_param(gd_context *ctx,
+                          gd_device device,
+                          const char *name,
+                          int ndim,
+                          const int64_t *sizes,
+                          vlm_param_init init,
+                          float scale,
+                          uint64_t *rng,
+                          gd_tensor **out)
 {
     gd_tensor_desc desc;
     gd_tensor *t = NULL;
-    int64_t sizes[2];
     uint16_t *buf = NULL;
-    int64_t n;
+    int64_t n = 1;
     int64_t i;
+    int d;
     (void)name;
-    sizes[0] = in_dim;
-    sizes[1] = out_dim;
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, device, 2, sizes, &desc));
+    if (ctx == NULL || sizes == NULL || out == NULL || ndim <= 0 || ndim > 4) {
+        return 1;
+    }
+    *out = NULL;
+    for (d = 0; d < ndim; ++d) {
+        if (sizes[d] <= 0 || n > INT64_MAX / sizes[d]) {
+            return 1;
+        }
+        n *= sizes[d];
+    }
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, device, ndim, sizes, &desc));
     CHECK_OK(gd_tensor_empty(ctx, &desc, &t));
-    n = in_dim * out_dim;
+    if ((uint64_t)n > (uint64_t)(SIZE_MAX / sizeof(uint16_t))) {
+        gd_tensor_release(t);
+        return 1;
+    }
     buf = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
     if (buf == NULL) {
         gd_tensor_release(t);
         return 1;
     }
     for (i = 0; i < n; ++i) {
-        buf[i] = f32_to_f16_bits(0.02F * rand_normal(rng));
+        float v = scale;
+        if (init == VLM_PARAM_NORMAL) {
+            v = scale * rand_normal(rng);
+        } else if (init == VLM_PARAM_UNIFORM) {
+            v = (2.0F * rand_uniform01(rng) - 1.0F) * scale;
+        }
+        buf[i] = f32_to_f16_bits(v);
     }
     CHECK_OK(gd_tensor_copy_from_cpu(ctx, t, buf, (size_t)n * sizeof(uint16_t)));
     free(buf);
@@ -1146,6 +1225,10 @@ static int build_train_graph(gd_context *ctx,
                              gd_device device,
                              gd_gpt *gpt,
                              gd_tensor *w_patch,
+                             gd_tensor *b_patch,
+                             gd_tensor *image_pos,
+                             gd_tensor *img_norm,
+                             gd_tensor *txt_norm,
                              gd_optimizer *opt,
                              gd_amp_scaler *scaler,
                              gd_tensor *lr_tensor,
@@ -1160,6 +1243,7 @@ static int build_train_graph(gd_context *ctx,
     gd_tensor *targets = NULL;
     gd_tensor *cu = NULL;
     gd_tensor *patch_embeds = NULL;
+    gd_tensor *text_embeds_raw = NULL;
     gd_tensor *text_embeds = NULL;
     gd_tensor *inputs = NULL;
     gd_tensor **seq_chunks = NULL;
@@ -1194,19 +1278,26 @@ static int build_train_graph(gd_context *ctx,
                          tok_sizes, &targets, &out->targets_in));
     CHECK_ZERO(add_input(ctx, out->graph, "cu_seqlens", GD_DTYPE_I32, device, 1,
                          cu_sizes, &cu, &out->cu_in));
-    CHECK_OK(gd_linear(ctx, patches, w_patch, NULL, &patch_embeds));
-    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, text_tokens, &text_embeds));
+    CHECK_OK(gd_linear(ctx, patches, w_patch, b_patch, &patch_embeds));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, text_tokens, &text_embeds_raw));
+    CHECK_OK(gd_rms_norm(ctx, text_embeds_raw, txt_norm, 1.0e-5F, &text_embeds));
     for (b = 0; b < batch->batch_size; ++b) {
         gd_tensor *p_slice = NULL;
+        gd_tensor *p_pos = NULL;
+        gd_tensor *p_norm = NULL;
         gd_tensor *t_slice = NULL;
         gd_tensor *parts[2];
         CHECK_OK(gd_slice(ctx, patch_embeds, 0, (int64_t)b * batch->prefix_len,
                           batch->prefix_len, &p_slice));
+        CHECK_OK(gd_add(ctx, p_slice, image_pos, &p_pos));
+        CHECK_OK(gd_rms_norm(ctx, p_pos, img_norm, 1.0e-5F, &p_norm));
         CHECK_OK(gd_slice(ctx, text_embeds, 0, text_cursor, batch->text_lens[b], &t_slice));
-        parts[0] = p_slice;
+        parts[0] = p_norm;
         parts[1] = t_slice;
         CHECK_OK(gd_concat(ctx, parts, 2, 0, &seq_chunks[b]));
         gd_tensor_release(p_slice);
+        gd_tensor_release(p_pos);
+        gd_tensor_release(p_norm);
         gd_tensor_release(t_slice);
         text_cursor += batch->text_lens[b];
     }
@@ -1247,6 +1338,7 @@ static int build_train_graph(gd_context *ctx,
     gd_tensor_release(targets);
     gd_tensor_release(cu);
     gd_tensor_release(patch_embeds);
+    gd_tensor_release(text_embeds_raw);
     gd_tensor_release(text_embeds);
     gd_tensor_release(inputs);
     for (b = 0; b < batch->batch_size; ++b) {
@@ -1299,13 +1391,16 @@ static void train_graph_cache_destroy(train_graph_cache *cache)
     memset(cache, 0, sizeof(*cache));
 }
 
-static int train_graph_cache_init(train_graph_cache *cache, int max_entries)
+static int train_graph_cache_init(train_graph_cache *cache,
+                                  int max_entries,
+                                  int footprint_limit_mb)
 {
-    if (cache == NULL || max_entries <= 0) {
+    if (cache == NULL || max_entries <= 0 || footprint_limit_mb < 0) {
         return 1;
     }
     memset(cache, 0, sizeof(*cache));
     cache->max_entries = max_entries;
+    cache->footprint_limit_mb = footprint_limit_mb;
     return 0;
 }
 
@@ -1328,11 +1423,15 @@ static train_graph_cache_entry *train_graph_cache_find(train_graph_cache *cache,
 
 static int train_graph_cache_evict_one(gd_context *ctx,
                                        gd_device device,
-                                       train_graph_cache *cache)
+                                       train_graph_cache *cache,
+                                       double *freed_mb)
 {
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
     int i;
+    if (freed_mb != NULL) {
+        *freed_mb = 0.0;
+    }
     if (cache == NULL || cache->n_entries <= 0) {
         return 1;
     }
@@ -1344,6 +1443,9 @@ static int train_graph_cache_evict_one(gd_context *ctx,
     }
     if (victim < 0) {
         return 1;
+    }
+    if (freed_mb != NULL) {
+        *freed_mb = cache->entries[victim].footprint_mb;
     }
     CHECK_OK(gd_synchronize(ctx, device));
     materialized_batch_destroy(&cache->entries[victim].inputs);
@@ -1357,13 +1459,38 @@ static int train_graph_cache_evict_one(gd_context *ctx,
     return 0;
 }
 
+static int train_graph_cache_trim_for_new_entry(gd_context *ctx,
+                                                gd_device device,
+                                                train_graph_cache *cache)
+{
+    double estimate = 0.0;
+
+    if (cache == NULL || cache->footprint_limit_mb <= 0 || cache->n_entries <= 0) {
+        return 0;
+    }
+    estimate = cache->avg_entry_footprint_mb > 1.0 ? cache->avg_entry_footprint_mb : 600.0;
+    {
+        double footprint = current_footprint_mb();
+        double projected = isfinite(footprint) ? footprint + estimate : 0.0;
+        while (cache->n_entries > 0 && projected > (double)cache->footprint_limit_mb) {
+            double freed_mb = 0.0;
+            CHECK_ZERO(train_graph_cache_evict_one(ctx, device, cache, &freed_mb));
+            if (freed_mb <= 1.0) {
+                break;
+            }
+            projected -= freed_mb;
+        }
+    }
+    return 0;
+}
+
 static int train_graph_cache_reserve(gd_context *ctx,
                                      gd_device device,
                                      train_graph_cache *cache)
 {
     train_graph_cache_entry *grown = NULL;
     if (cache->n_entries >= cache->max_entries) {
-        CHECK_ZERO(train_graph_cache_evict_one(ctx, device, cache));
+        CHECK_ZERO(train_graph_cache_evict_one(ctx, device, cache, NULL));
     }
     if (cache->n_entries < cache->cap) {
         return 0;
@@ -1391,6 +1518,10 @@ static int train_graph_cache_get(gd_context *ctx,
                                  gd_device device,
                                  gd_gpt *gpt,
                                  gd_tensor *w_patch,
+                                 gd_tensor *b_patch,
+                                 gd_tensor *image_pos,
+                                 gd_tensor *img_norm,
+                                 gd_tensor *txt_norm,
                                  gd_optimizer *opt,
                                  gd_amp_scaler *scaler,
                                  gd_tensor *lr_tensor,
@@ -1416,6 +1547,7 @@ static int train_graph_cache_get(gd_context *ctx,
         return 0;
     }
 
+    CHECK_ZERO(train_graph_cache_trim_for_new_entry(ctx, device, cache));
     CHECK_ZERO(train_graph_cache_reserve(ctx, device, cache));
     entry = &cache->entries[cache->n_entries];
     memset(entry, 0, sizeof(*entry));
@@ -1423,15 +1555,31 @@ static int train_graph_cache_get(gd_context *ctx,
     entry->text_bucket = batch->text_bucket;
     entry->last_used = step_id;
     entry->runs = 1U;
-    if (materialized_batch_create(ctx, device, batch, &entry->inputs) != 0 ||
-        materialized_batch_upload(ctx, batch, &entry->inputs) != 0 ||
-        build_train_graph(ctx, device, gpt, w_patch, opt, scaler, lr_tensor,
-                          batch, amp_enabled, grad_clip, &entry->graph) != 0 ||
-        bind_graph(&entry->graph, &entry->inputs) != 0) {
-        materialized_batch_destroy(&entry->inputs);
-        (void)destroy_train_graph(&entry->graph);
-        memset(entry, 0, sizeof(*entry));
-        return 1;
+    {
+        double footprint_before = current_footprint_mb();
+        double footprint_after = 0.0;
+        if (materialized_batch_create(ctx, device, batch, &entry->inputs) != 0 ||
+            materialized_batch_upload(ctx, batch, &entry->inputs) != 0 ||
+            build_train_graph(ctx, device, gpt, w_patch, b_patch, image_pos, img_norm,
+                              txt_norm, opt, scaler, lr_tensor, batch, amp_enabled,
+                              grad_clip, &entry->graph) != 0 ||
+            bind_graph(&entry->graph, &entry->inputs) != 0) {
+            materialized_batch_destroy(&entry->inputs);
+            (void)destroy_train_graph(&entry->graph);
+            memset(entry, 0, sizeof(*entry));
+            return 1;
+        }
+        footprint_after = current_footprint_mb();
+        if (isfinite(footprint_before) && isfinite(footprint_after) &&
+            footprint_after > footprint_before) {
+            entry->footprint_mb = footprint_after - footprint_before;
+            if (cache->avg_entry_footprint_mb <= 1.0) {
+                cache->avg_entry_footprint_mb = entry->footprint_mb;
+            } else {
+                cache->avg_entry_footprint_mb = 0.75 * cache->avg_entry_footprint_mb +
+                                                0.25 * entry->footprint_mb;
+            }
+        }
     }
     cache->n_entries += 1;
     cache->builds += 1U;
@@ -1454,6 +1602,10 @@ int main(int argc, char **argv)
     gd_gpt_config gpt_cfg;
     gd_gpt *gpt = NULL;
     gd_tensor *w_patch = NULL;
+    gd_tensor *b_patch = NULL;
+    gd_tensor *image_pos = NULL;
+    gd_tensor *img_norm = NULL;
+    gd_tensor *txt_norm = NULL;
     gd_tensor **gpt_params = NULL;
     gd_tensor **all_params = NULL;
     int n_gpt_params = 0;
@@ -1502,10 +1654,11 @@ int main(int argc, char **argv)
     if (app.epochs <= 0 || app.steps < 0 || app.batch_size <= 0 ||
         app.log_interval <= 0 || app.skip_batches < 0 ||
         app.text_bucket_multiple < 0 || app.graph_cache_max <= 0 ||
-        app.attention_window <= 0 || app.n_heads <= 0 || app.n_kv_heads <= 0 ||
+        app.graph_cache_footprint_mb < 0 || app.attention_window <= 0 ||
+        app.n_heads <= 0 || app.n_kv_heads <= 0 ||
         app.n_heads % app.n_kv_heads != 0 || app.d_model != app.n_heads * 64) {
         fprintf(stderr,
-                "invalid config: require epochs/batch/log/cache >0, steps>=0, bucket>=0, window>0, d_model=n_heads*64\n");
+                "invalid config: require epochs/batch/log/cache >0, steps>=0, bucket/cache_footprint>=0, window>0, d_model=n_heads*64\n");
         return 2;
     }
     CHECK_OK(gd_context_create(&ctx));
@@ -1576,7 +1729,8 @@ int main(int argc, char **argv)
     if (epoch_sampler_init(&sampler, n_samples, app.seed ^ UINT64_C(0xa5a5a5a5)) != 0) {
         goto cleanup;
     }
-    if (train_graph_cache_init(&graph_cache, app.graph_cache_max) != 0) {
+    if (train_graph_cache_init(&graph_cache, app.graph_cache_max,
+                               app.graph_cache_footprint_mb) != 0) {
         fprintf(stderr, "graph cache init failed\n");
         goto cleanup;
     }
@@ -1597,16 +1751,37 @@ int main(int argc, char **argv)
     init_rng = app.seed ^ UINT64_C(0xf00d1234);
     CHECK_OK(gd_gpt_create(ctx, &gpt_cfg, app.seed ^ UINT64_C(0xdeadbeef), &gpt));
     gd_gpt_set_training(gpt, true);
-    CHECK_ZERO(make_param(ctx, target, "patch_proj", patch_dim, app.d_model, &init_rng, &w_patch));
+    {
+        int64_t patch_proj_sizes[2] = {patch_dim, app.d_model};
+        int64_t patch_bias_sizes[1] = {app.d_model};
+        int64_t image_pos_sizes[2] = {prefix_len, app.d_model};
+        int64_t norm_sizes[1] = {app.d_model};
+        float patch_bound = 1.0F / sqrtf((float)patch_dim);
+        float mod_gamma = 1.0F / sqrtf((float)app.d_model);
+        CHECK_ZERO(make_f16_param(ctx, target, "patch_proj", 2, patch_proj_sizes,
+                                  VLM_PARAM_UNIFORM, patch_bound, &init_rng, &w_patch));
+        CHECK_ZERO(make_f16_param(ctx, target, "patch_proj.bias", 1, patch_bias_sizes,
+                                  VLM_PARAM_UNIFORM, patch_bound, &init_rng, &b_patch));
+        CHECK_ZERO(make_f16_param(ctx, target, "image_pos", 2, image_pos_sizes,
+                                  VLM_PARAM_NORMAL, 0.02F, &init_rng, &image_pos));
+        CHECK_ZERO(make_f16_param(ctx, target, "img_norm", 1, norm_sizes,
+                                  VLM_PARAM_CONSTANT, mod_gamma, &init_rng, &img_norm));
+        CHECK_ZERO(make_f16_param(ctx, target, "txt_norm", 1, norm_sizes,
+                                  VLM_PARAM_CONSTANT, mod_gamma, &init_rng, &txt_norm));
+    }
     CHECK_OK(gd_gpt_parameters(gpt, &gpt_params, &n_gpt_params));
-    n_params = n_gpt_params + 1;
+    n_params = n_gpt_params + 5;
     all_params = (gd_tensor **)calloc((size_t)n_params, sizeof(gd_tensor *));
     if (all_params == NULL) {
         fprintf(stderr, "param list allocation failed\n");
         goto cleanup;
     }
     all_params[0] = w_patch;
-    memcpy(&all_params[1], gpt_params, (size_t)n_gpt_params * sizeof(gd_tensor *));
+    all_params[1] = b_patch;
+    all_params[2] = image_pos;
+    all_params[3] = img_norm;
+    all_params[4] = txt_norm;
+    memcpy(&all_params[5], gpt_params, (size_t)n_gpt_params * sizeof(gd_tensor *));
     memset(&opt_cfg, 0, sizeof(opt_cfg));
     opt_cfg.lr = 0.0F;
     opt_cfg.beta1 = 0.9F;
@@ -1627,7 +1802,7 @@ int main(int argc, char **argv)
     memset(&lr_cfg, 0, sizeof(lr_cfg));
     lr_cfg.max_lr = app.lr;
     lr_cfg.min_lr = app.lr * 0.1F;
-    lr_cfg.warmup_steps = schedule_steps < 100 ? schedule_steps / 10 : 100;
+    lr_cfg.warmup_steps = (schedule_steps + 19) / 20;
     lr_cfg.total_steps = schedule_steps;
 
     printf("gpt_vlm\n");
@@ -1638,14 +1813,15 @@ int main(int argc, char **argv)
            app.d_model, app.n_layers, app.n_heads, app.n_kv_heads, app.d_ff);
     printf("  attention   : varlen causal prefix_len=%d sliding_window=%d max_text=%d\n",
            prefix_len, app.attention_window, max_text);
+    printf("  fusion      : patch_proj+bias + image_pos + modality RMSNorm(gamma=1/sqrt(d))\n");
     printf("  loss        : fused lm_cross_entropy (LMCE), logits not materialized\n");
     printf("  sampler     : random without replacement steps_per_epoch=%llu epochs=%d%s\n",
            (unsigned long long)steps_per_epoch, app.epochs,
            app.steps > 0 ? " steps_debug_cap=on" : "");
     printf("  training    : steps=%d lr_schedule_steps=%d batch=%d log_interval=%d\n",
            run_steps, schedule_steps, app.batch_size, app.log_interval);
-    printf("  graph_cache : max_entries=%d text_bucket_multiple=%d\n",
-           app.graph_cache_max, app.text_bucket_multiple);
+    printf("  graph_cache : max_entries=%d text_bucket_multiple=%d footprint_limit_mb=%d\n",
+           app.graph_cache_max, app.text_bucket_multiple, app.graph_cache_footprint_mb);
     printf("  optimized   : requires F16 && Dh==64 && causal && prefix_len>0 && sliding_window>0 (satisfied)\n");
     if (env_flag_enabled("GD_VLM_DEBUG")) {
         fprintf(stderr,
@@ -1692,7 +1868,8 @@ int main(int argc, char **argv)
         if (!forward_only) {
             CHECK_OK(gd_optimizer_zero_grad(ctx, opt));
         }
-        CHECK_ZERO(train_graph_cache_get(ctx, target, gpt, w_patch, opt, scaler, lr_tensor,
+        CHECK_ZERO(train_graph_cache_get(ctx, target, gpt, w_patch, b_patch, image_pos,
+                                         img_norm, txt_norm, opt, scaler, lr_tensor,
                                          &pb, 1, app.grad_clip, (uint64_t)step + 1U,
                                          &graph_cache, &entry));
         graph = &entry->graph;
@@ -1744,16 +1921,22 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         if (step == 0 || (step + 1) % app.log_interval == 0 || step + 1 == run_steps) {
-            double dt = (now_ms() - ts) / 1000.0;
-            printf("step %5d/%d epoch %d/%d sample=%llu B=%d loss %.5f lr %.4g packed_tokens=%d max_seq=%d text_tokens=%d bucket=%d graphs=%d/%llu tok/s %.1f grad_norm %.4g amp_scale %.4g %s\n",
-                   step + 1, run_steps, epoch_index + 1, app.epochs,
-                   (unsigned long long)epoch_offset, current_batch_size,
-                   (double)loss, (double)lr, pb.n_tokens, pb.max_seq, pb.n_text,
-                   pb.text_bucket, graph_cache.n_entries,
-                   (unsigned long long)graph_cache.builds,
+            double now = now_ms();
+            double dt = (now - ts) / 1000.0;
+            double elapsed = (now - t0) / 1000.0;
+            double eta = (step + 1) > 0 ? (elapsed / (double)(step + 1)) *
+                         (double)(run_steps - step - 1) : 0.0;
+            uint64_t batch_idx = ((uint64_t)app.batch_size > 0U ?
+                                  epoch_offset / (uint64_t)app.batch_size : 0U) + 1U;
+            char eta_buf[32];
+            format_eta(eta, eta_buf, sizeof(eta_buf));
+            printf("epoch %d/%d idx=%llu/%llu loss %.5f lr %.4g tok/s %.1f grad_norm %.4g eta %s\n",
+                   epoch_index + 1, app.epochs,
+                   (unsigned long long)batch_idx,
+                   (unsigned long long)steps_per_epoch,
+                   (double)loss, (double)lr,
                    dt > 0.0 ? (double)pb.n_tokens / dt : 0.0,
-                   (double)grad_norm, (double)gd_amp_scaler_scale(scaler),
-                   stepped ? "step" : (found_inf ? "skip(found_inf)" : "skip"));
+                   (double)grad_norm, eta_buf);
         }
         packed_batch_clear(&pb);
         if (env_flag_enabled("GD_VLM_DEBUG")) {
@@ -1776,6 +1959,10 @@ cleanup:
     gd_amp_scaler_destroy(scaler);
     gd_optimizer_destroy(opt);
     free(all_params);
+    gd_tensor_release(txt_norm);
+    gd_tensor_release(img_norm);
+    gd_tensor_release(image_pos);
+    gd_tensor_release(b_patch);
     gd_tensor_release(w_patch);
     gd_gpt_destroy(gpt);
     gd_dataset_destroy(ds);

@@ -173,6 +173,16 @@ typedef struct gd_metal_rmsnorm_params {
     int dtype; /* GD_METAL_DT_* input/weight/output dtype */
 } gd_metal_rmsnorm_params;
 
+typedef struct gd_metal_rms_norm_qkv_params {
+    int rows;
+    int last;
+    int q_cols;
+    int k_cols;
+    int v_cols;
+    float eps;
+    int dtype; /* GD_METAL_DT_* input/weight/output dtype */
+} gd_metal_rms_norm_qkv_params;
+
 /* cross_entropy: logits viewed as [outer, classes, inner], scalar mean loss.
  * Also used by cross_entropy_bwd. */
 typedef struct gd_metal_ce_params {

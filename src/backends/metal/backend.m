@@ -50,6 +50,7 @@ static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_SLICE, "gd_slice"},
     {_GD_OP_SLICE_BWD, "gd_slice_bwd"},
     {_GD_OP_CONCAT, "gd_concat"},
+    {_GD_OP_RMS_NORM_QKV, "gd_rms_norm_qkv"},
 };
 
 /* Kernels not mapped 1:1 to an op (looked up by name during encode). */
@@ -111,6 +112,7 @@ static const char *const g_metal_extra_kernels[] = {
     "gd_lmce_store_dx_f16",
     "gd_embedding_bwd_scatter",
     "gd_rms_norm_wbwd_reduce",
+    "gd_rms_norm_qkv_norm",
 };
 
 static bool env_flag_enabled(const char *name)

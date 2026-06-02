@@ -27,8 +27,10 @@ struct gd_gpt {
     gd_tensor **wk;
     gd_tensor **wv;
     gd_tensor **wo;
+    gd_tensor **b_wo;   /* [d] output projection bias */
     gd_tensor **ln2;
     gd_tensor **w_gate; /* powlu/swiglu gate / gelu fc */
+    gd_tensor **b_gate; /* [d_ff] gate/fc bias */
     gd_tensor **w_up;   /* powlu/swiglu value projection (NULL for gelu) */
     gd_tensor **w_down; /* powlu/swiglu/gelu down (proj) */
 };
@@ -130,11 +132,11 @@ static gd_status create_param(gd_gpt *g, const char *name, int ndim, const int64
 static gd_status alloc_layers(gd_gpt *g)
 {
     int L = g->cfg.n_layers;
-    gd_tensor ***arrays[9] = {&g->ln1, &g->wq, &g->wk, &g->wv, &g->wo,
-                              &g->ln2, &g->w_gate, &g->w_up, &g->w_down};
+    gd_tensor ***arrays[11] = {&g->ln1, &g->wq, &g->wk, &g->wv, &g->wo, &g->b_wo,
+                               &g->ln2, &g->w_gate, &g->b_gate, &g->w_up, &g->w_down};
     int i = 0;
 
-    for (i = 0; i < 9; ++i) {
+    for (i = 0; i < 11; ++i) {
         *arrays[i] = calloc((size_t)(L > 0 ? L : 1), sizeof(gd_tensor *));
         if (*arrays[i] == NULL) {
             return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate gpt layer arrays");
@@ -150,8 +152,8 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
     gd_gpt_config cfg;
     gd_status status = GD_OK;
     uint64_t rng = seed ? seed : 0x123456789ULL;
-    float wscale = 0.02f;
-    float residual_wscale = 0.02f;
+    float wscale = 1.0f;
+    float residual_wscale = 1.0f;
     int d = 0, dff = 0, Hq = 0, Hkv = 0, Dh = 0, V = 0, L = 0, l = 0;
     char name[64];
 
@@ -204,8 +206,10 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
         return _gd_error(GD_ERR_INVALID_ARGUMENT,
                          "invalid gpt config (need d_model==n_heads*head_dim, n_heads%n_kv_heads==0)");
     }
-    /* GPT-2-style init: normal(0, 0.02) for weights; residual output
-     * projections use 0.02/sqrt(2*n_layers) to control residual-path growth. */
+    /* Match dnn.c decoder init: normal(0, 1/sqrt(d_model)) for embeddings and
+     * input projections; residual output projections use /sqrt(2*n_layers) to
+     * control residual-path growth. */
+    wscale = 1.0F / sqrtf((float)d);
     residual_wscale = wscale / sqrtf(2.0F * (float)L);
 
     g = calloc(1u, sizeof(*g));
@@ -267,12 +271,21 @@ gd_status gd_gpt_create(gd_context *ctx, const gd_gpt_config *config,
             status = create_param(g, name, 2, s_wo, residual_wscale, 0, &rng, &g->wo[l]);
         }
         if (status == GD_OK) {
+            (void)snprintf(name, sizeof(name), "blk.%d.b_wo", l);
+            status = create_param(g, name, 1, s_d, 0.0f, 0, &rng, &g->b_wo[l]);
+        }
+        if (status == GD_OK) {
             (void)snprintf(name, sizeof(name), "blk.%d.ln2", l);
             status = create_param(g, name, 1, s_d, 0.0f, 1, &rng, &g->ln2[l]);
         }
         if (status == GD_OK) {
             (void)snprintf(name, sizeof(name), "blk.%d.w_gate", l);
             status = create_param(g, name, 2, s_in_ff, wscale, 0, &rng, &g->w_gate[l]);
+        }
+        if (status == GD_OK) {
+            int64_t s_ff[1] = {dff};
+            (void)snprintf(name, sizeof(name), "blk.%d.b_gate", l);
+            status = create_param(g, name, 1, s_ff, 0.0f, 0, &rng, &g->b_gate[l]);
         }
         if (status == GD_OK && cfg.mlp_kind != GD_GPT_MLP_GELU) {
             (void)snprintf(name, sizeof(name), "blk.%d.w_up", l);
@@ -304,8 +317,10 @@ void gd_gpt_destroy(gd_gpt *gpt)
     free(gpt->wk);
     free(gpt->wv);
     free(gpt->wo);
+    free(gpt->b_wo);
     free(gpt->ln2);
     free(gpt->w_gate);
+    free(gpt->b_gate);
     free(gpt->w_up);
     free(gpt->w_down);
     free(gpt);
@@ -357,7 +372,7 @@ gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
     no_decay_count = 1;
     for (l = 0; l < gpt->cfg.n_layers; ++l) {
         decay_count += gpt->w_up[l] != NULL ? 7 : 6;
-        no_decay_count += 2;
+        no_decay_count += 4;
     }
 
     groups = calloc(2U, sizeof(*groups));
@@ -387,8 +402,10 @@ gd_status gd_gpt_parameter_groups(gd_gpt *gpt,
         groups[0].params[decay_i++] = gpt->wk[l];
         groups[0].params[decay_i++] = gpt->wv[l];
         groups[0].params[decay_i++] = gpt->wo[l];
+        groups[1].params[no_decay_i++] = gpt->b_wo[l];
         groups[1].params[no_decay_i++] = gpt->ln2[l];
         groups[0].params[decay_i++] = gpt->w_gate[l];
+        groups[1].params[no_decay_i++] = gpt->b_gate[l];
         if (gpt->w_up[l] != NULL) {
             groups[0].params[decay_i++] = gpt->w_up[l];
         }
@@ -453,18 +470,16 @@ static gd_status attention_block(gd_context *ctx, gd_gpt *g, int l,
     gd_status s = GD_OK;
 
     *out_p = NULL;
-    s = gd_rms_norm(ctx, x, g->ln1[l], c->norm_eps, &n);
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wq[l], NULL, &qf); }
+    s = gd_rms_norm_qkv(ctx, x, g->ln1[l], g->wq[l], g->wk[l], g->wv[l],
+                        c->norm_eps, &n, &qf, &kf, &vf);
     if (s == GD_OK) { s = gd_tensor_reshape(qf, 4, q4, &q); }
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wk[l], NULL, &kf); }
     if (s == GD_OK) { s = gd_tensor_reshape(kf, 4, kv4, &k); }
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wv[l], NULL, &vf); }
     if (s == GD_OK) { s = gd_tensor_reshape(vf, 4, kv4, &v); }
     if (s == GD_OK) { s = gd_rope(ctx, q, positions, &rope, &qr); }
     if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
     if (s == GD_OK) { s = gd_sdpa(ctx, qr, kr, v, NULL, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 3, o3, &om); }
-    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], g->b_wo[l], &op); }
     if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
     if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
 
@@ -512,18 +527,16 @@ static gd_status attention_block_varlen(gd_context *ctx,
     gd_status s = GD_OK;
 
     *out_p = NULL;
-    s = gd_rms_norm(ctx, x, g->ln1[l], c->norm_eps, &n);
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wq[l], NULL, &qf); }
+    s = gd_rms_norm_qkv(ctx, x, g->ln1[l], g->wq[l], g->wk[l], g->wv[l],
+                        c->norm_eps, &n, &qf, &kf, &vf);
     if (s == GD_OK) { s = gd_tensor_reshape(qf, 3, q3, &q); }
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wk[l], NULL, &kf); }
     if (s == GD_OK) { s = gd_tensor_reshape(kf, 3, kv3, &k); }
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->wv[l], NULL, &vf); }
     if (s == GD_OK) { s = gd_tensor_reshape(vf, 3, kv3, &v); }
     if (s == GD_OK) { s = gd_rope(ctx, q, positions, &rope, &qr); }
     if (s == GD_OK) { s = gd_rope(ctx, k, positions, &rope, &kr); }
     if (s == GD_OK) { s = gd_sdpa_varlen(ctx, qr, kr, v, cu_seqlens, &sdpa, &o); }
     if (s == GD_OK) { s = gd_tensor_reshape(o, 2, o2, &om); }
-    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], NULL, &op); }
+    if (s == GD_OK) { s = gd_linear(ctx, om, g->wo[l], g->b_wo[l], &op); }
     if (s == GD_OK) { s = gpt_dropout(ctx, g, op, UINT64_C(0x1000) + (uint64_t)l, &drop); }
     if (s == GD_OK) { s = gd_add(ctx, x, drop, &out); }
 
@@ -555,7 +568,7 @@ static gd_status mlp_block(gd_context *ctx, gd_gpt *g, int l, gd_tensor *h,
 
     *out_p = NULL;
     s = gd_rms_norm(ctx, h, g->ln2[l], c->norm_eps, &n);
-    if (s == GD_OK) { s = gd_linear(ctx, n, g->w_gate[l], NULL, &gate); }
+    if (s == GD_OK) { s = gd_linear(ctx, n, g->w_gate[l], g->b_gate[l], &gate); }
     if (c->mlp_kind == GD_GPT_MLP_POWLU) {
         if (s == GD_OK) { s = gd_linear(ctx, n, g->w_up[l], NULL, &up); }
         if (s == GD_OK) { s = gd_powlu(ctx, up, gate, c->powlu_m, &hh); }

@@ -398,7 +398,7 @@ static int test_gpt_parameter_groups(gd_context *ctx)
     CHECK_TRUE(n_groups == 2);
     CHECK_TRUE(groups[0].n_params + groups[1].n_params == n_params);
     CHECK_TRUE(groups[0].n_params == 15);
-    CHECK_TRUE(groups[1].n_params == 5);
+    CHECK_TRUE(groups[1].n_params == 9);
     CHECK_TRUE(close_to(groups[0].weight_decay, 0.1F));
     CHECK_TRUE(close_to(groups[1].weight_decay, 0.0F));
     CHECK_OK(gd_adamw_create_groups(ctx, groups, n_groups, &ocfg, &opt));

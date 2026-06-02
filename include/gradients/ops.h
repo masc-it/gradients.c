@@ -94,9 +94,9 @@ gd_status gd_cross_entropy_ex(gd_context *ctx,
                               gd_tensor *targets,
                               gd_tensor **loss);
 
-/* Fused tied-LM-head cross entropy. Computes mean CE of
- * logits = hidden @ weight^T without materializing logits. hidden is [..., D],
- * weight is [V, D], targets has shape hidden.shape without the last dim. */
+/* Fused LM-head cross entropy. Computes mean CE of logits = hidden @ weight^T
+ * without materializing logits. hidden is [..., D], weight is [V, D], targets
+ * has shape hidden.shape without the last dim. */
 gd_status gd_lm_cross_entropy(gd_context *ctx,
                               gd_tensor *hidden,
                               gd_tensor *weight,

@@ -100,7 +100,7 @@ static gd_status matmul_encode(_gd_metal_encode_ctx *ctx)
      * broadcasted or offset/non-contiguous F32 shapes. F16 never uses the
      * portable F32 kernel; planning fails if no MPS plan exists. */
     if (mps != nil) {
-        return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, mps);
+        return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, exe, mps);
     }
 
     const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;

@@ -1,5 +1,18 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int gd_vlm_debug_metal_enabled(void)
+{
+    const char *v = getenv("GD_VLM_DEBUG_METAL");
+    if (v == NULL || v[0] == '\0') {
+        return 0;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
+
 static bool linear_dtype_supported(gd_dtype dtype)
 {
     return dtype == GD_DTYPE_F32 || dtype == GD_DTYPE_F16;
@@ -92,7 +105,20 @@ static gd_status linear_encode(_gd_metal_encode_ctx *ctx)
      * kernel for unsupported F32 shapes (bias, offsets, non-contiguous layouts).
      * F16 never uses the portable F32 kernel; planning fails if no MPS plan exists. */
     if (mps != nil) {
-        return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, mps);
+        if (gd_vlm_debug_metal_enabled()) {
+            const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;
+            const gd_tensor_desc *x_desc = &exe->graph->values[node->inputs[0]].desc;
+            const gd_tensor_desc *w_desc = &exe->graph->values[node->inputs[1]].desc;
+            int in_features = (int)x_desc->sizes[x_desc->ndim - 1];
+            int rows = in_features > 0 ? (int)(_gd_metal_desc_numel(x_desc) / in_features) : 0;
+            fprintf(stderr,
+                    "vlm_debug_metal node=%d linear_mps rows=%d in=%d out=%d x_dtype=%s w_dtype=%s out_dtype=%s trans_b=%d\n",
+                    ctx->node_id, rows, in_features,
+                    (int)out_desc->sizes[out_desc->ndim - 1], gd_dtype_name(x_desc->dtype),
+                    gd_dtype_name(w_desc->dtype), gd_dtype_name(out_desc->dtype),
+                    node->attrs.trans_b ? 1 : 0);
+        }
+        return _gd_metal_encode_mps_gemm(ctx->command_buffer, ctx->encoder, exe, mps);
     }
 
     const gd_tensor_desc *out_desc = &exe->graph->values[node->outputs[0]].desc;

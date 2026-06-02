@@ -1,5 +1,7 @@
 #import "metal_op.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 /* Long GPT graphs run faster when submitted as a stream of small command
@@ -44,6 +46,110 @@ static bool metal_has_more_encoded_nodes(const _gd_executable *exe, int start, i
         }
     }
     return false;
+}
+
+static bool metal_node_uses_mps(const _gd_executable *exe, int node_id)
+{
+    return exe != NULL && exe->node_mps != NULL && node_id >= 0 &&
+           node_id < exe->n_plan && exe->node_mps[node_id] != NULL;
+}
+
+static bool metal_next_encoded_node_uses_mps(const _gd_executable *exe, int start, int end)
+{
+    int i = 0;
+
+    if (exe == NULL || exe->graph == NULL) {
+        return false;
+    }
+    for (i = start; i <= end && i < exe->graph->n_nodes; ++i) {
+        if (!exe->node_absorbed[i]) {
+            return metal_node_uses_mps(exe, i);
+        }
+    }
+    return false;
+}
+
+static bool metal_trace_check_finite_enabled(void)
+{
+    const char *v = getenv("GD_METAL_TRACE_FINITE");
+    return v != NULL && v[0] != '\0' && v[0] != '0';
+}
+
+static bool metal_f16_bits_finite(uint16_t h)
+{
+    return (h & UINT16_C(0x7c00)) != UINT16_C(0x7c00);
+}
+
+static gd_status metal_debug_check_value_finite(_gd_executable *exe, int node_id, int value_id)
+{
+    const _gd_node *node = NULL;
+    const gd_tensor_desc *desc = NULL;
+    id<MTLBuffer> buffer = nil;
+    const unsigned char *base = NULL;
+    size_t offset = 0U;
+    int64_t n = 0;
+    int64_t i = 0;
+
+    if (exe == NULL || exe->graph == NULL || value_id < 0 || value_id >= exe->n_values) {
+        return GD_OK;
+    }
+    node = &exe->graph->nodes[node_id];
+    desc = &exe->graph->values[value_id].desc;
+    if (desc->dtype != GD_DTYPE_F16 && desc->dtype != GD_DTYPE_F32) {
+        return GD_OK;
+    }
+    n = _gd_metal_desc_numel(desc);
+    if (n <= 0) {
+        return GD_OK;
+    }
+    buffer = _gd_metal_value_buffer(exe, value_id);
+    if (buffer == nil || buffer.contents == NULL) {
+        return GD_OK;
+    }
+    offset = desc->storage_offset_bytes > 0 ? (size_t)desc->storage_offset_bytes : 0U;
+    base = (const unsigned char *)buffer.contents + offset;
+    if (desc->dtype == GD_DTYPE_F16) {
+        const uint16_t *p = (const uint16_t *)base;
+        for (i = 0; i < n; ++i) {
+            if (!metal_f16_bits_finite(p[i])) {
+                fprintf(stderr,
+                        "metal_trace_nonfinite node=%d op=%s value=%d dtype=%s n=%lld first=%lld bits=0x%04x\n",
+                        node_id, _gd_op_kind_name(node->op), value_id, gd_dtype_name(desc->dtype),
+                        (long long)n, (long long)i, (unsigned)p[i]);
+                return _gd_error(GD_ERR_BACKEND, "metal trace finite check found non-finite F16");
+            }
+        }
+    } else {
+        const float *p = (const float *)base;
+        for (i = 0; i < n; ++i) {
+            if (!isfinite(p[i])) {
+                fprintf(stderr,
+                        "metal_trace_nonfinite node=%d op=%s value=%d dtype=%s n=%lld first=%lld value=%.9g\n",
+                        node_id, _gd_op_kind_name(node->op), value_id, gd_dtype_name(desc->dtype),
+                        (long long)n, (long long)i, (double)p[i]);
+                return _gd_error(GD_ERR_BACKEND, "metal trace finite check found non-finite F32");
+            }
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status metal_debug_check_node_outputs_finite(_gd_executable *exe, int node_id)
+{
+    const _gd_node *node = NULL;
+    int j = 0;
+
+    if (exe == NULL || exe->graph == NULL || node_id < 0 || node_id >= exe->graph->n_nodes) {
+        return GD_OK;
+    }
+    node = &exe->graph->nodes[node_id];
+    for (j = 0; j < node->n_outputs; ++j) {
+        gd_status status = metal_debug_check_value_finite(exe, node_id, node->outputs[j]);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    return GD_OK;
 }
 
 static bool metal_needs_stage_now(const _gd_executable *exe)
@@ -335,6 +441,12 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                 if (cmd.status == MTLCommandBufferStatusError) {
                     return _gd_error(GD_ERR_BACKEND, "metal trace command buffer failed");
                 }
+                if (metal_trace_check_finite_enabled()) {
+                    status = metal_debug_check_node_outputs_finite(exe, i);
+                    if (status != GD_OK) {
+                        return status;
+                    }
+                }
             }
             _gd_profile_record_op_time(self->ctx, self, (int)node->op,
                                        _gd_profile_now_ns() - op_start);
@@ -386,7 +498,9 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                 }
                 encoded_in_cmd++;
                 if (chunk_size > 0 && encoded_in_cmd >= chunk_size &&
-                    metal_has_more_encoded_nodes(exe, i + 1, capped_last)) {
+                    metal_has_more_encoded_nodes(exe, i + 1, capped_last) &&
+                    !metal_node_uses_mps(exe, i) &&
+                    !metal_next_encoded_node_uses_mps(exe, i + 1, capped_last)) {
                     [enc endEncoding];
                     [cmd commit];
                     [st.inFlightBuffers addObject:cmd];

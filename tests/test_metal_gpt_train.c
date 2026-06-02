@@ -59,6 +59,24 @@ static gd_gpt_config tiny_config(void)
     return c;
 }
 
+static int file_contains(const char *path, const char *needle)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    int found = 0;
+    if (f == NULL) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            found = 1;
+            break;
+        }
+    }
+    (void)fclose(f);
+    return found;
+}
+
 static gd_status make_inputs(gd_context *ctx, gd_tensor **tokens, gd_tensor **pos,
                              gd_tensor **targets)
 {
@@ -196,6 +214,67 @@ static int test_inputs_embeds_api(gd_context *ctx, gd_tensor *tokens,
     CHECK_OK(gd_graph_compare(g, CPU, METAL, &opts));
     CHECK_OK(gd_graph_destroy(g));
     gd_gpt_destroy(gpt);
+    return 0;
+}
+
+static int test_varlen_loss_uses_lmce(gd_context *ctx, gd_tensor *tokens,
+                                      gd_tensor *pos, gd_tensor *targets)
+{
+    const char *dump_path = "/tmp/gpt_varlen_lmce.dump";
+    gd_gpt *gpt = NULL;
+    gd_gpt_config cfg = tiny_config();
+    gd_graph *g = NULL;
+    gd_tensor *cu = NULL;
+    gd_tensor *embeds = NULL;
+    gd_tensor *packed = NULL;
+    gd_tensor *flat_pos = NULL;
+    gd_tensor *flat_targets = NULL;
+    gd_tensor *loss = NULL;
+    gd_tensor_desc d;
+    gd_gpt_forward_config fwd = {0};
+    int64_t cu_shape[1] = {2};
+    int64_t packed_shape[2] = {GPT_T, 16};
+    int64_t flat_shape[1] = {GPT_T};
+    int32_t cu_data[2] = {0, GPT_T};
+    float loss_value = 0.0F;
+
+    cfg.tie_embeddings = false; /* exercises untied [V,D] head through LMCE too */
+    cfg.attention_window = 3;
+    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, CPU, 1, cu_shape, &d));
+    CHECK_OK(gd_tensor_empty(ctx, &d, &cu));
+    CHECK_OK(gd_tensor_copy_from_cpu(ctx, cu, cu_data, sizeof(cu_data)));
+    CHECK_OK(gd_gpt_create(ctx, &cfg, GPT_SEED, &gpt));
+    fwd.prefix_len = 2;
+    fwd.max_seqlen = GPT_T;
+
+    CHECK_OK(gd_graph_create(ctx, &g));
+    CHECK_OK(gd_graph_begin(ctx, g));
+    CHECK_OK(gd_gpt_embed_tokens(ctx, gpt, tokens, &embeds));
+    CHECK_OK(gd_tensor_reshape(embeds, 2, packed_shape, &packed));
+    CHECK_OK(gd_tensor_reshape(pos, 1, flat_shape, &flat_pos));
+    CHECK_OK(gd_tensor_reshape(targets, 1, flat_shape, &flat_targets));
+    CHECK_OK(gd_gpt_forward_embeds_varlen_loss(ctx, gpt, packed, flat_pos, cu,
+                                               flat_targets, &fwd, &loss));
+    CHECK_OK(gd_graph_end(ctx));
+    CHECK_OK(gd_graph_dump(g, GD_DUMP_TEXT, dump_path));
+    CHECK_TRUE(file_contains(dump_path, "op=sdpa_varlen"));
+    CHECK_TRUE(file_contains(dump_path, "op=lm_cross_entropy"));
+    CHECK_TRUE(!file_contains(dump_path, "op=cross_entropy"));
+    CHECK_OK(gd_graph_compile(g, CPU));
+    CHECK_OK(gd_graph_run(g));
+    CHECK_OK(gd_synchronize(ctx, CPU));
+    CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &loss_value, sizeof(loss_value)));
+    CHECK_TRUE(isfinite(loss_value));
+
+    gd_tensor_release(loss);
+    gd_tensor_release(flat_targets);
+    gd_tensor_release(flat_pos);
+    gd_tensor_release(packed);
+    gd_tensor_release(embeds);
+    gd_tensor_release(cu);
+    CHECK_OK(gd_graph_destroy(g));
+    gd_gpt_destroy(gpt);
+    (void)remove(dump_path);
     return 0;
 }
 
@@ -490,6 +569,7 @@ int main(void)
     }
 
     rc |= test_overfit(ctx, tokens, pos, targets); /* CPU-only, always runs */
+    rc |= test_varlen_loss_uses_lmce(ctx, tokens, pos, targets);
     {
         float loss_cpu = 0.0f;
         rc |= collect_f16_forward_loss(ctx, CPU, tokens, pos, targets, &loss_cpu);

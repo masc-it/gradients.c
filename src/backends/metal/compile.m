@@ -7,8 +7,17 @@ void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
     if (exe == NULL) {
         return;
     }
+    @autoreleasepool {
     /* Ensure no in-flight command buffer still references these buffers. */
     (void)_gd_metal_synchronize(self);
+    if (exe->node_mps != NULL) {
+        for (i = 0; i < exe->n_plan; ++i) {
+            if (exe->node_mps[i] != NULL) {
+                CFRelease(exe->node_mps[i]);
+            }
+        }
+        free(exe->node_mps);
+    }
     if (exe->values != NULL) {
         for (i = 0; i < exe->n_values; ++i) {
             gd_storage_release(exe->values[i].storage);
@@ -20,19 +29,12 @@ void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe->node_pso);
     free(exe->node_pso2);
     free(exe->node_pso3);
-    if (exe->node_mps != NULL) {
-        for (i = 0; i < exe->n_plan; ++i) {
-            if (exe->node_mps[i] != NULL) {
-                CFRelease(exe->node_mps[i]);
-            }
-        }
-        free(exe->node_mps);
-    }
     free(exe->node_absorbed);
     free(exe->node_fused_src);
     free(exe->node_scratch_bytes);
     gd_storage_release(exe->scratch_arena);
     free(exe);
+    }
 }
 
 static bool can_alias_copy_value(const gd_graph *graph, const _gd_node *node)
@@ -272,36 +274,38 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
         }
         memset(exe->node_fused_src, 0xFF, (size_t)graph->n_nodes * sizeof(*exe->node_fused_src)); /* -1 */
         for (j = 0; j < graph->n_nodes; ++j) {
-            const _gd_node *node = &graph->nodes[j];
-            const _gd_metal_op *op = _gd_metal_op_for(node->op);
-            _gd_metal_plan_ctx plan_ctx;
+            @autoreleasepool {
+                const _gd_node *node = &graph->nodes[j];
+                const _gd_metal_op *op = _gd_metal_op_for(node->op);
+                _gd_metal_plan_ctx plan_ctx;
 
-            if (op == NULL || op->encode == NULL) {
-                char msg[112];
-                (void)snprintf(msg, sizeof(msg), "metal has no host entry for op '%s'",
-                               _gd_op_kind_name(node->op));
-                status = _gd_error(GD_ERR_UNSUPPORTED, msg);
-                goto fail;
-            }
-            plan_ctx = (_gd_metal_plan_ctx){
-                .backend = self,
-                .state = st,
-                .graph = graph,
-                .exe = exe,
-                .node = node,
-                .node_id = j,
-            };
-            status = op->support != NULL ? op->support(&plan_ctx)
-                                         : _gd_metal_support_default(&plan_ctx);
-            if (status != GD_OK) {
-                goto fail;
-            }
-            status = op->plan != NULL ? op->plan(&plan_ctx) : _gd_metal_plan_default(&plan_ctx);
-            if (status != GD_OK) {
-                goto fail;
-            }
-            if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
-                scratch_max_bytes = exe->node_scratch_bytes[j];
+                if (op == NULL || op->encode == NULL) {
+                    char msg[112];
+                    (void)snprintf(msg, sizeof(msg), "metal has no host entry for op '%s'",
+                                   _gd_op_kind_name(node->op));
+                    status = _gd_error(GD_ERR_UNSUPPORTED, msg);
+                    goto fail;
+                }
+                plan_ctx = (_gd_metal_plan_ctx){
+                    .backend = self,
+                    .state = st,
+                    .graph = graph,
+                    .exe = exe,
+                    .node = node,
+                    .node_id = j,
+                };
+                status = op->support != NULL ? op->support(&plan_ctx)
+                                             : _gd_metal_support_default(&plan_ctx);
+                if (status != GD_OK) {
+                    goto fail;
+                }
+                status = op->plan != NULL ? op->plan(&plan_ctx) : _gd_metal_plan_default(&plan_ctx);
+                if (status != GD_OK) {
+                    goto fail;
+                }
+                if (exe->node_scratch_bytes[j] > scratch_max_bytes) {
+                    scratch_max_bytes = exe->node_scratch_bytes[j];
+                }
             }
         }
         if (scratch_max_bytes > 0U) {

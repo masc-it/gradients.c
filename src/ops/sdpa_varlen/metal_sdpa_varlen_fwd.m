@@ -1,5 +1,18 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int gd_vlm_debug_metal_enabled(void)
+{
+    const char *v = getenv("GD_VLM_DEBUG_METAL");
+    if (v == NULL || v[0] == '\0') {
+        return 0;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
+
 static void fill_sdpa_varlen_params(gd_metal_sdpa_varlen_params *p,
                                     const gd_tensor_desc *q,
                                     const gd_tensor_desc *k,
@@ -62,6 +75,12 @@ static gd_status sdpa_varlen_support(const _gd_metal_plan_ctx *ctx)
 static bool sdpa_varlen_use_f16_dh64_prefix_window(const gd_tensor_desc *q,
                                                     const _gd_node *node)
 {
+    const char *fast = getenv("GD_METAL_SDPA_VARLEN_FAST");
+    if (fast != NULL && (strcmp(fast, "0") == 0 || strcmp(fast, "false") == 0 ||
+                         strcmp(fast, "FALSE") == 0 || strcmp(fast, "off") == 0 ||
+                         strcmp(fast, "OFF") == 0)) {
+        return false;
+    }
     return q->dtype == GD_DTYPE_F16 && q->sizes[2] == 64 && node->attrs.causal != 0 &&
            node->attrs.prefix_len > 0 && node->attrs.sliding_window > 0;
 }
@@ -111,6 +130,13 @@ static gd_status sdpa_varlen_encode(_gd_metal_encode_ctx *ctx)
             return _gd_error(GD_ERR_BACKEND, "metal sdpa_varlen f16 Dh64 pipeline missing");
         }
         groups = (NSUInteger)(p.B * p.Hq * n_qb);
+        if (gd_vlm_debug_metal_enabled()) {
+            fprintf(stderr,
+                    "vlm_debug_metal node=%d sdpa_varlen_fwd fast=1 tokens=%d B=%d Hq=%d Hkv=%d Dh=%d max_seq=%d n_qb=%d prefix=%d window=%d groups=%llu dtype=%d\n",
+                    ctx->node_id, p.total_tokens, p.B, p.Hq, p.Hkv, p.Dh,
+                    p.max_seqlen, n_qb, p.prefix_len, p.window,
+                    (unsigned long long)groups, p.dtype);
+        }
         [enc setComputePipelineState:fast_pso];
         [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
         [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];
@@ -125,6 +151,13 @@ static gd_status sdpa_varlen_encode(_gd_metal_encode_ctx *ctx)
         return GD_OK;
     }
     groups = (NSUInteger)(p.B * p.Hq * p.n_qb_max);
+    if (gd_vlm_debug_metal_enabled()) {
+        fprintf(stderr,
+                "vlm_debug_metal node=%d sdpa_varlen_fwd fast=0 tokens=%d B=%d Hq=%d Hkv=%d Dh=%d max_seq=%d n_qb=%d prefix=%d window=%d groups=%llu dtype=%d\n",
+                ctx->node_id, p.total_tokens, p.B, p.Hq, p.Hkv, p.Dh,
+                p.max_seqlen, p.n_qb_max, p.prefix_len, p.window,
+                (unsigned long long)groups, p.dtype);
+    }
     [enc setComputePipelineState:pso];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[0]) offset:0 atIndex:0];
     [enc setBuffer:_gd_metal_value_buffer(exe, node->inputs[1]) offset:0 atIndex:1];

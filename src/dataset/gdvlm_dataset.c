@@ -227,6 +227,10 @@ static gd_status gd_gdvlm_shard_open(const char *path,
         gd_gdvlm_shard_close(out);
         return _gd_error(GD_ERR_IO, "failed to mmap gdvlm shard");
     }
+    /* mmap keeps mapping alive after fd close. Avoid exhausting macOS default
+     * open-file limits on large split datasets (ImageNet has hundreds shards). */
+    (void)close(out->fd);
+    out->fd = -1;
     out->payload = out->map + out->header.payload_offset;
     out->payload_len = out->map_len - (size_t)out->header.payload_offset;
     out->path = gd_gdvlm_strdup(path);

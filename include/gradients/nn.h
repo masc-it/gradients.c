@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 /* Decoder-only transformer (GPT) assembled from core ops. Pure composition:
- * embedding -> [pre-norm attention + MLP] x L -> final norm -> (tied) LM head.
+ * embedding -> [pre-norm attention + MLP] x L -> final norm -> LM head.
  * Parameters are materialized, deterministically initialized from `seed`, and
  * collected for the optimizer via gd_gpt_parameters. */
 
@@ -68,10 +68,12 @@ typedef struct gd_gpt_forward_config {
     int prefix_len;
     bool has_ignore_index;
     int ignore_index;
+    int max_seqlen; /* varlen only: 0 => packed token count */
 } gd_gpt_forward_config;
 
-/* Token embedding lookup only: tokens int32/int64 [B,T] -> embeds [B,T,d_model].
- * The returned tensor is suitable for gd_gpt_forward_embeds*. */
+/* Token embedding lookup only: tokens int32/int64 with any shape -> embeds
+ * tokens.shape + [d_model]. The returned tensor is suitable for
+ * gd_gpt_forward_embeds*. */
 gd_status gd_gpt_embed_tokens(gd_context *ctx, gd_gpt *gpt,
                               gd_tensor *tokens, gd_tensor **embeds_out);
 
@@ -82,6 +84,19 @@ gd_status gd_gpt_decode_embeds(gd_context *ctx, gd_gpt *gpt,
                                gd_tensor *inputs_embeds, gd_tensor *positions,
                                const gd_gpt_forward_config *config,
                                gd_tensor **hidden_out);
+
+/* Packed variable-length decoder. inputs_embeds is [N,d_model], positions is
+ * I32/I64 [N], and cu_seqlens is I32 [B+1]. Attention uses gd_sdpa_varlen so
+ * padded tokens are not materialized/visited. Set prefix_len>0,
+ * attention_window>0, param_dtype=F16, and head_dim=64 to hit optimized Metal
+ * prefix-window kernels. */
+gd_status gd_gpt_decode_embeds_varlen(gd_context *ctx,
+                                      gd_gpt *gpt,
+                                      gd_tensor *inputs_embeds,
+                                      gd_tensor *positions,
+                                      gd_tensor *cu_seqlens,
+                                      const gd_gpt_forward_config *config,
+                                      gd_tensor **hidden_out);
 
 /* Records the forward pass into the active graph. `tokens` is int32 [B,T];
  * `positions` is int32 [B,T] (RoPE/causal positions). Produces logits[B,T,V]
@@ -95,8 +110,7 @@ gd_status gd_gpt_forward_embeds(gd_context *ctx, gd_gpt *gpt,
                                 const gd_gpt_forward_config *config,
                                 gd_tensor **logits_out);
 
-/* Records forward + mean CE loss. For tied embeddings this may use a fused
- * LM-head CE op that avoids materializing logits. */
+/* Records forward + mean CE loss via fused LMCE, avoiding materialized logits. */
 gd_status gd_gpt_forward_loss(gd_context *ctx, gd_gpt *gpt,
                               gd_tensor *tokens, gd_tensor *positions,
                               gd_tensor *targets, gd_tensor **loss_out);
@@ -106,6 +120,15 @@ gd_status gd_gpt_forward_embeds_loss(gd_context *ctx, gd_gpt *gpt,
                                      gd_tensor *targets,
                                      const gd_gpt_forward_config *config,
                                      gd_tensor **loss_out);
+
+gd_status gd_gpt_forward_embeds_varlen_loss(gd_context *ctx,
+                                            gd_gpt *gpt,
+                                            gd_tensor *inputs_embeds,
+                                            gd_tensor *positions,
+                                            gd_tensor *cu_seqlens,
+                                            gd_tensor *targets,
+                                            const gd_gpt_forward_config *config,
+                                            gd_tensor **loss_out);
 
 #ifdef __cplusplus
 }

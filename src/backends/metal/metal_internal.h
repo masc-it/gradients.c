@@ -28,11 +28,20 @@
 @property (strong) id<MTLCommandBuffer> inFlight;
 @property (strong) NSMutableArray<id<MTLCommandBuffer>> *inFlightBuffers;
 @property (strong) NSMutableArray<NSValue *> *pendingExes;
+@property (strong) NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *bufferPool;
+@property NSUInteger bufferPoolBytes;
+@property NSUInteger bufferPoolMaxBytes;
 @property BOOL useMPS;
 @end
 
 @interface GDMPSGemmPlan : NSObject
 @property (strong) MPSMatrixMultiplication *kernel;
+@property int leftValue;
+@property int rightValue;
+@property int resultValue;
+@property (strong) MPSMatrixDescriptor *leftDescriptor;
+@property (strong) MPSMatrixDescriptor *rightDescriptor;
+@property (strong) MPSMatrixDescriptor *resultDescriptor;
 @property (strong) MPSMatrix *left;
 @property (strong) MPSMatrix *right;
 @property (strong) MPSMatrix *result;
@@ -148,6 +157,7 @@ gd_status _gd_metal_encode_mps_mm(id<MTLCommandBuffer> cmd,
                                   double beta);
 gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
                                     __strong id<MTLComputeCommandEncoder> *enc,
+                                    _gd_executable *exe,
                                     GDMPSGemmPlan *plan);
 
 gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc,

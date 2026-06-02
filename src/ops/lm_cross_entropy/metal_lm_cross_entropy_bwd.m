@@ -1,5 +1,18 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int gd_vlm_debug_metal_enabled(void)
+{
+    const char *v = getenv("GD_VLM_DEBUG_METAL");
+    if (v == NULL || v[0] == '\0') {
+        return 0;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
+
 static gd_status lm_cross_entropy_bwd_support(const _gd_metal_plan_ctx *ctx)
 {
     gd_status status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
@@ -119,6 +132,13 @@ static gd_status lm_cross_entropy_bwd_encode(_gd_metal_encode_ctx *ctx)
     }
     if (has_ignore_index && count_pso == nil) {
         return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy_bwd count kernel missing");
+    }
+    if (gd_vlm_debug_metal_enabled()) {
+        fprintf(stderr,
+                "vlm_debug_metal node=%d lmce_bwd rows=%d D=%d V=%d chunk=%d x_dtype=%s dx_dtype=%s dw_dtype=%s ignore=%d ignore_index=%d\n",
+                ctx->node_id, rows, D, V, chunk_max, gd_dtype_name(x_desc->dtype),
+                gd_dtype_name(dx_desc->dtype), gd_dtype_name(dw_desc->dtype),
+                has_ignore_index, ignore_index);
     }
     if (has_ignore_index) {
         gd_metal_ce_params cp = {1, 1, V, rows, GD_METAL_DT_F32,

@@ -133,9 +133,11 @@ GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
 GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
 GPT_LM_SRC := $(EXAMPLE_DIR)/gpt-lm/gpt_lm.c
 GPT_LM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-lm/gpt_lm
+GPT_VLM_SRC := $(EXAMPLE_DIR)/gpt-vlm/gpt_vlm.c
+GPT_VLM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-vlm/gpt_vlm
 
 # ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt gpt-lm bench-gpt gpt-bench _gpt_bench_run sdpa-bench _sdpa_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
+.PHONY: help all build check test tests mlp gpt gpt-lm gpt-vlm bench-gpt gpt-bench _gpt_bench_run sdpa-bench _sdpa_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c commands:'
@@ -147,6 +149,7 @@ help:
 	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
 	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
 	@printf '%s\n' '  make gpt-lm      build library + real GPT-LM trainer (pass GPT_LM_ARGS=...)'
+	@printf '%s\n' '  make gpt-vlm     build library + GPT-VLM trainer (pass GPT_VLM_ARGS=...)'
 	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
 	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
 	@printf '%s\n' '  make sdpa-bench  release build, then run raw SDPA profiling harness (GD_DEVICE, GD_BENCH_*)'
@@ -205,6 +208,15 @@ else
 gpt-lm: $(LIB) $(METALLIB) $(GPT_LM_BIN)
 	@printf '[gpt-lm] run %s %s\n' '$(GPT_LM_BIN)' '$(GPT_LM_ARGS)'
 	@$(GPT_LM_BIN) $(GPT_LM_ARGS)
+endif
+
+ifeq ($(wildcard $(GPT_VLM_SRC)),)
+gpt-vlm: build
+	@printf '[gpt-vlm] missing %s; skipped\n' '$(GPT_VLM_SRC)'
+else
+gpt-vlm: $(LIB) $(METALLIB) $(GPT_VLM_BIN)
+	@printf '[gpt-vlm] run %s %s\n' '$(GPT_VLM_BIN)' '$(GPT_VLM_ARGS)'
+	@$(GPT_VLM_BIN) $(GPT_VLM_ARGS)
 endif
 
 bench-gpt:

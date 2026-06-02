@@ -61,6 +61,25 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
                 out_rows_desc = (NSUInteger)result_rows;
                 out_cols_desc = (NSUInteger)result_cols;
                 ok = true;
+            } else if (op == _GD_OP_MATMUL && a_desc->ndim == 2 && b_desc->ndim == 2 &&
+                       out_desc->ndim == 2) {
+                int a_rows_i = (int)a_desc->sizes[0];
+                int a_cols_i = (int)a_desc->sizes[1];
+                int b_rows_i = (int)b_desc->sizes[0];
+                int b_cols_i = (int)b_desc->sizes[1];
+                trans_left = node->attrs.trans_a ? true : false;
+                inner = trans_left ? a_rows_i : a_cols_i;
+                result_rows = trans_left ? a_cols_i : a_rows_i;
+                result_cols = trans_right ? b_rows_i : b_cols_i;
+                a_rows_desc = (NSUInteger)a_rows_i;
+                a_cols_desc = (NSUInteger)a_cols_i;
+                b_rows_desc = (NSUInteger)b_rows_i;
+                b_cols_desc = (NSUInteger)b_cols_i;
+                out_rows_desc = (NSUInteger)out_desc->sizes[0];
+                out_cols_desc = (NSUInteger)out_desc->sizes[1];
+                ok = inner == (trans_right ? b_cols_i : b_rows_i) &&
+                     out_desc->sizes[0] == result_rows &&
+                     out_desc->sizes[1] == result_cols;
             } else if (op == _GD_OP_MATMUL && !node->attrs.trans_a && b_desc->ndim == 2) {
                 int a_cols_i = (int)a_desc->sizes[a_desc->ndim - 1];
                 int b_rows_i = (int)b_desc->sizes[0];
@@ -150,20 +169,14 @@ gd_status _gd_metal_plan_mps_gemm(_gd_metal_plan_ctx *ctx)
                     beta:0.0];
                 plan.kernel.batchStart = 0U;
                 plan.kernel.batchSize = batch;
-                plan.left = [[MPSMatrix alloc]
-                    initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[0]].storage)
-                            offset:0
-                        descriptor:ad];
-                plan.right = [[MPSMatrix alloc]
-                    initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->inputs[1]].storage)
-                            offset:0
-                        descriptor:bd];
-                plan.result = [[MPSMatrix alloc]
-                    initWithBuffer:(__bridge id<MTLBuffer>)_gd_storage_handle(exe->values[node->outputs[0]].storage)
-                            offset:0
-                        descriptor:od];
-                if (plan.kernel != nil && plan.left != nil && plan.right != nil &&
-                    plan.result != nil) {
+                plan.leftValue = node->inputs[0];
+                plan.rightValue = node->inputs[1];
+                plan.resultValue = node->outputs[0];
+                plan.leftDescriptor = ad;
+                plan.rightDescriptor = bd;
+                plan.resultDescriptor = od;
+                if (plan.kernel != nil && plan.leftDescriptor != nil &&
+                    plan.rightDescriptor != nil && plan.resultDescriptor != nil) {
                     exe->node_mps[j] = (void *)CFBridgingRetain(plan);
                 }
             }

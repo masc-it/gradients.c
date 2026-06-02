@@ -1,5 +1,76 @@
 #import "metal_internal.h"
 
+/* Reuse transient Metal buffers across dynamic graphs. MTLBuffer allocation churn
+ * can grow process footprint enough for MPS F16 GEMMs to return NaNs. Size
+ * classes keep ragged batches reusable without global padding. */
+#define GD_METAL_BUFFER_POOL_MIN_CLASS ((NSUInteger)4096U)
+#define GD_METAL_BUFFER_POOL_SMALL_MAX ((NSUInteger)1048576U)
+#define GD_METAL_BUFFER_POOL_LARGE_GRAN ((NSUInteger)1048576U)
+
+static NSUInteger metal_buffer_pool_size_class(size_t nbytes)
+{
+    NSUInteger n = (NSUInteger)nbytes;
+    NSUInteger c = GD_METAL_BUFFER_POOL_MIN_CLASS;
+
+    if (n <= c) {
+        return c;
+    }
+    if (n <= GD_METAL_BUFFER_POOL_SMALL_MAX) {
+        while (c < n && c <= (NSUIntegerMax / (NSUInteger)2U)) {
+            c *= (NSUInteger)2U;
+        }
+        return c;
+    }
+    if (n > NSUIntegerMax - (GD_METAL_BUFFER_POOL_LARGE_GRAN - (NSUInteger)1U)) {
+        return n;
+    }
+    return ((n + GD_METAL_BUFFER_POOL_LARGE_GRAN - (NSUInteger)1U) /
+            GD_METAL_BUFFER_POOL_LARGE_GRAN) * GD_METAL_BUFFER_POOL_LARGE_GRAN;
+}
+
+static bool metal_buffer_pool_has_inflight(GDMetalState *st)
+{
+    return st.inFlight != nil || st.inFlightBuffers.count > 0U;
+}
+
+static void metal_buffer_pool_evict_one_locked(GDMetalState *st)
+{
+    NSNumber *evict_key = nil;
+    NSMutableArray<id<MTLBuffer>> *evict_bucket = nil;
+    id<MTLBuffer> evict = nil;
+
+    for (NSNumber *key in st.bufferPool) {
+        NSMutableArray<id<MTLBuffer>> *bucket = st.bufferPool[key];
+        if (bucket.count > 0U) {
+            evict_key = key;
+            evict_bucket = bucket;
+            break;
+        }
+    }
+    if (evict_bucket == nil) {
+        st.bufferPoolBytes = 0U;
+        return;
+    }
+    evict = evict_bucket.lastObject;
+    [evict_bucket removeLastObject];
+    if (evict.length <= st.bufferPoolBytes) {
+        st.bufferPoolBytes -= evict.length;
+    } else {
+        st.bufferPoolBytes = 0U;
+    }
+    if (evict_bucket.count == 0U && evict_key != nil) {
+        [st.bufferPool removeObjectForKey:evict_key];
+    }
+}
+
+static void metal_buffer_pool_trim_for_locked(GDMetalState *st, NSUInteger needed)
+{
+    while (st.bufferPoolBytes > 0U && needed <= st.bufferPoolMaxBytes &&
+           st.bufferPoolBytes > st.bufferPoolMaxBytes - needed) {
+        metal_buffer_pool_evict_one_locked(st);
+    }
+}
+
 gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc,
                                      void **handle_out)
 {
@@ -13,22 +84,74 @@ gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc
         return _gd_error(GD_ERR_UNSUPPORTED, "metal storage supports unified/host memory in v1");
     }
 
-    id<MTLBuffer> buffer = [st.device newBufferWithLength:desc->nbytes
-                                                  options:MTLResourceStorageModeShared];
-    if (buffer == nil) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "MTLBuffer allocation failed");
+    {
+        NSUInteger class_nbytes = metal_buffer_pool_size_class(desc->nbytes);
+        id<MTLBuffer> buffer = nil;
+
+        if (st.bufferPoolMaxBytes > 0U && class_nbytes <= st.bufferPoolMaxBytes) {
+            NSNumber *key = @(class_nbytes);
+            @synchronized(st) {
+                NSMutableArray<id<MTLBuffer>> *bucket = st.bufferPool[key];
+                if (bucket.count > 0U) {
+                    buffer = bucket.lastObject;
+                    [bucket removeLastObject];
+                    if (buffer.length <= st.bufferPoolBytes) {
+                        st.bufferPoolBytes -= buffer.length;
+                    } else {
+                        st.bufferPoolBytes = 0U;
+                    }
+                    if (bucket.count == 0U) {
+                        [st.bufferPool removeObjectForKey:key];
+                    }
+                }
+            }
+        }
+        if (buffer == nil) {
+            buffer = [st.device newBufferWithLength:class_nbytes
+                                            options:MTLResourceStorageModeShared];
+            if (buffer == nil) {
+                return _gd_error(GD_ERR_OUT_OF_MEMORY, "MTLBuffer allocation failed");
+            }
+        }
+        memset(buffer.contents, 0, desc->nbytes);
+        *handle_out = (__bridge_retained void *)buffer;
     }
-    memset(buffer.contents, 0, desc->nbytes);
-    *handle_out = (__bridge_retained void *)buffer;
     return GD_OK;
 }
 
 void _gd_metal_storage_free(_gd_backend *self, void *handle)
 {
-    (void)self;
     if (handle != NULL) {
         id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle; /* ARC releases */
-        (void)buffer;
+        GDMetalState *st = nil;
+
+        if (self == NULL || self->impl == NULL) {
+            return;
+        }
+        st = _gd_metal_state(self);
+        if (st.bufferPoolMaxBytes == 0U || buffer.length > st.bufferPoolMaxBytes) {
+            return;
+        }
+        @synchronized(st) {
+            /* Only recycle buffers when no queued command buffer can still read
+             * them. Otherwise let ARC release; Metal retains resources needed by
+             * in-flight command buffers. */
+            if (metal_buffer_pool_has_inflight(st)) {
+                return;
+            }
+            metal_buffer_pool_trim_for_locked(st, buffer.length);
+            if (buffer.length <= st.bufferPoolMaxBytes &&
+                st.bufferPoolBytes <= st.bufferPoolMaxBytes - buffer.length) {
+                NSNumber *key = @(buffer.length);
+                NSMutableArray<id<MTLBuffer>> *bucket = st.bufferPool[key];
+                if (bucket == nil) {
+                    bucket = [NSMutableArray array];
+                    st.bufferPool[key] = bucket;
+                }
+                [bucket addObject:buffer];
+                st.bufferPoolBytes += buffer.length;
+            }
+        }
     }
 }
 

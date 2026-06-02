@@ -52,6 +52,8 @@ Loss convention for loader/training:
 - image prefix tokens: `196`
 - causal attention with `prefix_len=196`
 - loss mask ignores image prefix; text suffix only
+- trainer packs `[image patches + label text]` per sample into one flattened token stream and feeds `cu_seqlens` into `gd_sdpa_varlen`, so padding is not processed by attention
+- fast path requires `dtype=f16`, `Dh=64`, `causal=true`, `prefix_len>0`, and `attention_window>0`
 
 C runtime loader:
 
@@ -76,3 +78,13 @@ Batch fields:
 - `tokens`, `targets`, `positions` i32 `[B, T]`
 - `loss_mask` f32 `[B, T]`
 - `prefix_len`, `text_len`, `label_id` i32 `[B]`
+
+Trainer:
+
+```sh
+GD_DEVICE=metal GD_METAL_MPS=1 make gpt-vlm GPT_VLM_ARGS="--data-dir /Volumes/Lexar/datasets/visual-layer_imagenet-1k-vl-enriched-gradients-224-16patch --epochs 1 --batch-size 8 --log-interval 100"
+```
+
+`--epochs` uses a random sampler without replacement and reshuffles each epoch. `--steps N` is a debug cap over the epoch run.
+
+Defaults keep `d_model = n_heads * 64`, `param_dtype = f16`, and `attention_window > 0`, ensuring optimized varlen prefix-window SDPA selection when running on Metal/MPS.

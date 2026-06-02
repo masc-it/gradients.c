@@ -28,24 +28,19 @@ static gd_status matmul_grad_product(_gd_bwd_ctx *b,
 
     if (value_needs_f32_grad(b, target_id)) {
         local.compute.compute_dtype = GD_DTYPE_F32;
-        if (gd_tensor_dtype(lhs) == GD_DTYPE_F16 && gd_tensor_dtype(rhs) == GD_DTYPE_F16) {
-            /* Internal sentinel: request F32 output without F16->F32 input casts. */
-            local.compute.accum_dtype = GD_DTYPE_INVALID;
-        } else {
-            local.compute.accum_dtype = GD_DTYPE_F32;
-            if (gd_tensor_dtype(lhs) != GD_DTYPE_F32) {
-                status = gd_cast(_gd_bwd_context(b), lhs, GD_DTYPE_F32, &lc);
-                if (status != GD_OK) { return status; }
-                l = lc;
+        local.compute.accum_dtype = GD_DTYPE_F32;
+        if (gd_tensor_dtype(lhs) != GD_DTYPE_F32) {
+            status = gd_cast(_gd_bwd_context(b), lhs, GD_DTYPE_F32, &lc);
+            if (status != GD_OK) { return status; }
+            l = lc;
+        }
+        if (gd_tensor_dtype(rhs) != GD_DTYPE_F32) {
+            status = gd_cast(_gd_bwd_context(b), rhs, GD_DTYPE_F32, &rc);
+            if (status != GD_OK) {
+                gd_tensor_release(lc);
+                return status;
             }
-            if (gd_tensor_dtype(rhs) != GD_DTYPE_F32) {
-                status = gd_cast(_gd_bwd_context(b), rhs, GD_DTYPE_F32, &rc);
-                if (status != GD_OK) {
-                    gd_tensor_release(lc);
-                    return status;
-                }
-                r = rc;
-            }
+            r = rc;
         }
     }
     status = gd_matmul_ex(_gd_bwd_context(b), &local, l, r, out);

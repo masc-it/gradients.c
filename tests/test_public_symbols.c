@@ -174,10 +174,12 @@ GD_REF(gd_gpt_parameter_groups, gd_status, (gd_gpt *, float, gd_param_group **, 
 GD_REF(gd_gpt_parameter_groups_free, void, (gd_param_group *, int));
 GD_REF(gd_gpt_embed_tokens, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor **));
 GD_REF(gd_gpt_decode_embeds, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
+GD_REF(gd_gpt_decode_embeds_varlen, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 GD_REF(gd_gpt_forward, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor **));
 GD_REF(gd_gpt_forward_embeds, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 GD_REF(gd_gpt_forward_loss, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor **));
 GD_REF(gd_gpt_forward_embeds_loss, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
+GD_REF(gd_gpt_forward_embeds_varlen_loss, gd_status, (gd_context *, gd_gpt *, gd_tensor *, gd_tensor *, gd_tensor *, gd_tensor *, const gd_gpt_forward_config *, gd_tensor **));
 
 /* tokenizer.h */
 GD_REF(gd_bpe_tokenizer_train, gd_status, (const char **, int, const gd_bpe_train_config *, gd_tokenizer **));

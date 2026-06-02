@@ -1,5 +1,18 @@
 #import "../../backends/metal/metal_op.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int gd_vlm_debug_metal_enabled(void)
+{
+    const char *v = getenv("GD_VLM_DEBUG_METAL");
+    if (v == NULL || v[0] == '\0') {
+        return 0;
+    }
+    return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
+}
+
 static gd_status lm_cross_entropy_support(const _gd_metal_plan_ctx *ctx)
 {
     gd_status status = _gd_op_validate_arity(ctx->node->op, ctx->node->n_inputs,
@@ -89,6 +102,12 @@ static gd_status lm_cross_entropy_encode(_gd_metal_encode_ctx *ctx)
     if (scratch == nil || fwd_pso == nil || loss_pso == nil || reduce_pso == nil ||
         rows <= 0 || D <= 0 || V <= 0) {
         return _gd_error(GD_ERR_BACKEND, "metal lm_cross_entropy plan missing");
+    }
+    if (gd_vlm_debug_metal_enabled()) {
+        fprintf(stderr,
+                "vlm_debug_metal node=%d lmce_fwd rows=%d D=%d V=%d chunk=%d dtype=%s ignore=%d ignore_index=%d\n",
+                ctx->node_id, rows, D, V, chunk_max, gd_dtype_name(x_desc->dtype),
+                has_ignore_index, ignore_index);
     }
 
     for (int c0 = 0; c0 < V; c0 += chunk_max) {

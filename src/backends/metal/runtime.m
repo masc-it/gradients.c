@@ -238,12 +238,38 @@ void _gd_metal_dispatch_reduce_groups(id<MTLComputeCommandEncoder> enc, NSUInteg
 
 gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
                                  __strong id<MTLComputeCommandEncoder> *enc,
+                                 _gd_executable *exe,
                                  GDMPSGemmPlan *plan)
 {
-    if (cmd == nil || enc == NULL || *enc == nil || plan == nil || plan.kernel == nil ||
-        plan.left == nil || plan.right == nil || plan.result == nil) {
+    id<MTLBuffer> left_buffer = nil;
+    id<MTLBuffer> right_buffer = nil;
+    id<MTLBuffer> result_buffer = nil;
+    MPSMatrix *left = nil;
+    MPSMatrix *right = nil;
+    MPSMatrix *result = nil;
+
+    if (cmd == nil || enc == NULL || *enc == nil || exe == NULL || plan == nil ||
+        plan.kernel == nil || plan.leftDescriptor == nil || plan.rightDescriptor == nil ||
+        plan.resultDescriptor == nil || plan.leftValue < 0 || plan.rightValue < 0 ||
+        plan.resultValue < 0 || plan.leftValue >= exe->n_values ||
+        plan.rightValue >= exe->n_values || plan.resultValue >= exe->n_values) {
         return _gd_error(GD_ERR_BACKEND, "invalid MPS GEMM encode");
     }
+    left_buffer = _gd_metal_value_buffer(exe, plan.leftValue);
+    right_buffer = _gd_metal_value_buffer(exe, plan.rightValue);
+    result_buffer = _gd_metal_value_buffer(exe, plan.resultValue);
+    if (left_buffer == nil || right_buffer == nil || result_buffer == nil) {
+        return _gd_error(GD_ERR_BACKEND, "invalid MPS GEMM buffers");
+    }
+    left = [[MPSMatrix alloc] initWithBuffer:left_buffer offset:0 descriptor:plan.leftDescriptor];
+    right = [[MPSMatrix alloc] initWithBuffer:right_buffer offset:0 descriptor:plan.rightDescriptor];
+    result = [[MPSMatrix alloc] initWithBuffer:result_buffer offset:0 descriptor:plan.resultDescriptor];
+    if (left == nil || right == nil || result == nil) {
+        return _gd_error(GD_ERR_BACKEND, "failed to create MPS GEMM matrices");
+    }
+    plan.left = left;
+    plan.right = right;
+    plan.result = result;
     [*enc endEncoding];
     *enc = nil;
     [plan.kernel encodeToCommandBuffer:cmd

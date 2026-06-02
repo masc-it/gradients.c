@@ -1,5 +1,7 @@
 #import "metal_internal.h"
 
+#include <stdlib.h>
+
 static const gd_metal_kernel_entry g_metal_kernels[] = {
     {_GD_OP_ADD, "gd_add"},
     {_GD_OP_MUL, "gd_mul"},
@@ -131,6 +133,24 @@ static NSString *resolve_metallib_path(void)
     return @"build/gradients.metallib";
 }
 
+static NSUInteger metal_buffer_pool_max_bytes(void)
+{
+    const char *v = getenv("GD_METAL_BUFFER_POOL_MB");
+    char *end = NULL;
+    unsigned long mb = 1024UL;
+
+    if (v != NULL && v[0] != '\0') {
+        mb = strtoul(v, &end, 10);
+        if (end == v || *end != '\0') {
+            mb = 1024UL;
+        }
+    }
+    if (mb > (unsigned long)(NSUIntegerMax / (1024UL * 1024UL))) {
+        return NSUIntegerMax;
+    }
+    return (NSUInteger)mb * 1024U * 1024U;
+}
+
 static gd_status _gd_metal_init(_gd_backend *self, gd_context *ctx, int device_index)
 {
     @autoreleasepool {
@@ -165,6 +185,9 @@ static gd_status _gd_metal_init(_gd_backend *self, gd_context *ctx, int device_i
         st.inFlight = nil;
         st.inFlightBuffers = [NSMutableArray array];
         st.pendingExes = [NSMutableArray array];
+        st.bufferPool = [NSMutableDictionary dictionary];
+        st.bufferPoolBytes = 0U;
+        st.bufferPoolMaxBytes = metal_buffer_pool_max_bytes();
         st.useMPS = env_flag_enabled("GD_METAL_MPS") ? YES : NO;
 
         for (k = 0; k < sizeof(g_metal_kernels) / sizeof(g_metal_kernels[0]); ++k) {
@@ -213,6 +236,8 @@ static void _gd_metal_shutdown(_gd_backend *self)
         st.inFlight = nil;
         [st.inFlightBuffers removeAllObjects];
         [st.pendingExes removeAllObjects];
+        [st.bufferPool removeAllObjects];
+        st.bufferPoolBytes = 0U;
         self->impl = NULL;
     }
 }

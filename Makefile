@@ -1,179 +1,92 @@
-# gradients.c Makefile
-# Primary commands build first, then run their workload.
-# Examples:
-#   make test        # build lib + tests, then run tests
-#   make mlp         # build lib + examples/mlp/mlp, then run MLP example
-#   make check       # build, run docs/size checks, run tests
+# gradients.c v2 Makefile
 
 SHELL := /bin/bash
 
-# Default to parallel builds. Override with `make MAKE_JOBS=1 ...` for serial,
-# or pass an explicit `-jN` to make. Recursive makes inherit jobserver tokens.
-DEFAULT_JOBS := $(shell { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; } | tail -n 1)
-MAKE_JOBS ?= $(DEFAULT_JOBS)
-ifneq ($(MAKE_JOBS),1)
-ifeq ($(filter -j%,$(MAKEFLAGS))$(findstring jobserver,$(MAKEFLAGS)),)
-MAKEFLAGS += -j$(MAKE_JOBS)
-endif
-endif
-
-# ----- Project layout -------------------------------------------------------
-BUILD_DIR := build
+BUILD_DIR ?= build
 INCLUDE_DIR := include
 SRC_DIR := src
 TEST_DIR := tests
-EXAMPLE_DIR := examples
-TOOL_DIR := tools
+PROBE_DIR := probes
 DOCS_DIR := docs
 
 LIB_NAME := gradients
 LIB := $(BUILD_DIR)/lib$(LIB_NAME).a
+CONFIG_STAMP := $(BUILD_DIR)/.build-config
 
-# ----- Toolchain ------------------------------------------------------------
 CC ?= cc
+OBJC ?= clang
 AR ?= ar
 RM := rm -rf
 
 CPPFLAGS ?= -I$(INCLUDE_DIR)
-CPPFLAGS += -I$(BUILD_DIR)/generated
 CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
           -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
           -Wmissing-prototypes -Wno-unused-parameter
-BENCH_CFLAGS ?= -std=c11 -O3 -ffast-math -DNDEBUG -Wall -Wextra -Wpedantic -Werror \
-                -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
-                -Wmissing-prototypes -Wno-unused-parameter
 LDFLAGS ?=
-LDLIBS ?= -lm
-LDLIBS += -pthread
+LDLIBS ?=
+PROBE_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Wpedantic
 
-# Override from CLI when needed:
-#   make test CFLAGS='-std=c11 -O2 -g -Wall'
+SAN_FLAGS :=
+ifeq ($(SAN),1)
+SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+CFLAGS += $(SAN_FLAGS)
+PROBE_CFLAGS += $(SAN_FLAGS)
+LDFLAGS += -fsanitize=address,undefined
+endif
 
-# ----- Platform / Metal toolchain -------------------------------------------
 UNAME_S := $(shell uname -s)
-METAL_DIR := $(SRC_DIR)/backends/metal
 
-# Metal builds only on macOS; default on there, off elsewhere. Override with
-# `make GD_ENABLE_METAL=0` to force a CPU-only build on macOS.
 ifeq ($(UNAME_S),Darwin)
-GD_ENABLE_METAL ?= 1
-else
-GD_ENABLE_METAL ?= 0
-endif
-
-METALLIB :=
-
-# ----- Source discovery -----------------------------------------------------
-ifeq ($(GD_ENABLE_METAL),1)
-SRC := $(shell find $(SRC_DIR) -type f -name '*.c' 2>/dev/null | sort)
-MSRC := $(shell { find $(METAL_DIR) -type f -name '*.m' 2>/dev/null; \
-                 find $(SRC_DIR)/ops -type f -name 'metal_*.m' 2>/dev/null; } | sort)
-METAL_SHADERS := $(shell find $(SRC_DIR) -type f -name '*.metal' 2>/dev/null | sort)
-# Let C/Obj-C sources conditionally compile the Metal registration path.
 CPPFLAGS += -DGD_ENABLE_METAL=1
-OBJCFLAGS := $(CPPFLAGS) $(CFLAGS) -fobjc-arc -x objective-c
-LDLIBS += -framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore
-# The .metal shader compiler ships with full Xcode, not the Command Line Tools.
-# Compile shaders only when it is present; the Obj-C path still builds without it.
-METAL_TOOL := $(shell xcrun --find metal 2>/dev/null)
-ifneq ($(strip $(METAL_SHADERS)),)
-ifneq ($(strip $(METAL_TOOL)),)
-METALLIB := $(BUILD_DIR)/gradients.metallib
-endif
-endif
+SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/null/*' 2>/dev/null | sort)
+MSRC := $(shell find $(SRC_DIR) -type f -name '*.m' 2>/dev/null | sort)
+OBJCFLAGS ?= $(CPPFLAGS) -O0 -g3 -Wall -Wextra -Werror -fobjc-arc $(SAN_FLAGS)
+LDLIBS += -framework Foundation -framework Metal
 else
-# Exclude the Metal backend entirely on non-macOS / disabled builds.
-SRC := $(shell find $(SRC_DIR) -type f -name '*.c' -not -path '$(METAL_DIR)/*' 2>/dev/null | sort)
+CPPFLAGS += -DGD_ENABLE_METAL=0
+SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/metal/*' 2>/dev/null | sort)
 MSRC :=
-METAL_SHADERS :=
 endif
 
-MOBJ := $(patsubst %.m,$(BUILD_DIR)/%.o,$(MSRC))
-OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC)) $(MOBJ)
+OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC)) $(patsubst %.m,$(BUILD_DIR)/%.o,$(MSRC))
 DEP := $(OBJ:.o=.d)
 
-# ----- Generated operator registry inputs -----------------------------------
-OP_CORE_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/core_*.c))
-OP_GRAD_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/grad_*.c))
-CPU_OP_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/cpu_*.c))
-METAL_OP_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.m))
-METAL_OP_SHADER_FILES := $(sort $(wildcard $(SRC_DIR)/ops/*/metal_*.metal))
-
-GENERATED_DIR := $(BUILD_DIR)/generated
-CONFIG_STAMP := $(BUILD_DIR)/.build-config
-GEN_OPS_BIN := $(BUILD_DIR)/tools/gen_ops
-GEN_OPS_STAMP := $(GENERATED_DIR)/.gen_ops.stamp
-GENERATED_FILES := \
-  $(GENERATED_DIR)/op_kind.h \
-  $(GENERATED_DIR)/op_registry.inc \
-  $(GENERATED_DIR)/bwd_registry.inc \
-  $(GENERATED_DIR)/cpu_registry.inc \
-  $(GENERATED_DIR)/metal_registry.inc \
-  $(GENERATED_DIR)/metal_shaders.mk \
-  $(GENERATED_DIR)/op_matrix.md
-
-# Profiling harnesses, not correctness tests: exclude them from the
-# auto-discovered test runner (build/run via `make gpt-bench` / `make sdpa-bench`).
-GPT_BENCH_SRC := $(TEST_DIR)/gpt_bench.c
-GPT_BENCH_BIN := $(BUILD_DIR)/$(TEST_DIR)/gpt_bench
-SDPA_BENCH_SRC := $(TEST_DIR)/sdpa_bench.c
-SDPA_BENCH_BIN := $(BUILD_DIR)/$(TEST_DIR)/sdpa_bench
-TEST_SRC := $(filter-out $(GPT_BENCH_SRC) $(SDPA_BENCH_SRC),\
-             $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort))
+TEST_SRC := $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort)
 TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 
-EXAMPLE_SRC := $(shell find $(EXAMPLE_DIR) -type f -name '*.c' 2>/dev/null | sort)
-EXAMPLE_BINS := $(patsubst %.c,$(BUILD_DIR)/%,$(EXAMPLE_SRC))
-TOOL_SRC := $(shell find $(TOOL_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort)
-TOOL_BINS := $(patsubst %.c,$(BUILD_DIR)/%,$(TOOL_SRC))
+FOUNDATION_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_foundation_probe
+METAL_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_metal_arena_probe
 
-MLP_SRC := $(EXAMPLE_DIR)/mlp/mlp.c
-MLP_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/mlp/mlp
-GPT_SRC := $(EXAMPLE_DIR)/gpt/gpt.c
-GPT_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt/gpt
-GPT_LM_SRC := $(EXAMPLE_DIR)/gpt-lm/gpt_lm.c
-GPT_LM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-lm/gpt_lm
-GPT_VLM_SRC := $(EXAMPLE_DIR)/gpt-vlm/gpt_vlm.c
-GPT_VLM_BIN := $(BUILD_DIR)/$(EXAMPLE_DIR)/gpt-vlm/gpt_vlm
-
-# ----- Public commands ------------------------------------------------------
-.PHONY: help all build check test tests mlp gpt gpt-lm gpt-vlm bench-gpt gpt-bench _gpt_bench_run sdpa-bench _sdpa_bench_run examples tools docs-check size-check-report size-check generated clean list FORCE
+.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe clean list FORCE
 
 help:
-	@printf '%s\n' 'gradients.c commands:'
-	@printf '%s\n' '  make build       build library'
-	@printf '%s\n' '  make test        build library + tests, then run all tests'
-	@printf '%s\n' '  make check       build, run docs check, then run tests'
-	@printf '%s\n' '  make size-check  warn >800 LOC and fail >1000 LOC'
-	@printf '%s\n' '  make generated   regenerate operator registry scaffolding'
-	@printf '%s\n' '  make mlp         build library + MLP example, then run it'
-	@printf '%s\n' '  make gpt         build library + GPT example, then run it (GD_DEVICE=metal for GPU)'
-	@printf '%s\n' '  make gpt-lm      build library + real GPT-LM trainer (pass GPT_LM_ARGS=...)'
-	@printf '%s\n' '  make gpt-vlm     build library + GPT-VLM trainer (pass GPT_VLM_ARGS=...)'
-	@printf '%s\n' '  make bench-gpt   release build under build-release/, then run GPT example'
-	@printf '%s\n' '  make gpt-bench   release build, then run GPT profiling harness (GD_DEVICE, GD_BENCH_*)'
-	@printf '%s\n' '  make sdpa-bench  release build, then run raw SDPA profiling harness (GD_DEVICE, GD_BENCH_*)'
-	@printf '%s\n' '  make examples    build library + all examples, then run all examples'
-	@printf '%s\n' '  make tools       build command-line tools'
-	@printf '%s\n' '  make docs-check  build, then validate docs links/references'
-	@printf '%s\n' '  make list        show discovered source/test/example files'
-	@printf '%s\n' '  make clean       remove build artifacts'
-	@printf '%s\n' ''
-	@printf '%s\n' 'Parallelism: default MAKE_JOBS=$(MAKE_JOBS); use MAKE_JOBS=1 or -jN to override.'
-	@printf '%s\n' ''
-	@printf '%s\n' 'Primary run commands intentionally build first.'
+	@printf '%s\n' 'gradients.c v2 commands:'
+	@printf '%s\n' '  make build             build static library'
+	@printf '%s\n' '  make test              build + run C tests'
+	@printf '%s\n' '  make check             docs-check + tests + foundation probe'
+	@printf '%s\n' '  make probes            run standalone foundation probe'
+	@printf '%s\n' '  make metal-probe       build + run Metal probe on macOS'
+	@printf '%s\n' '  make SAN=1 check       sanitizer build'
+	@printf '%s\n' '  make list              show discovered files'
+	@printf '%s\n' '  make clean             remove build dir'
 
 all: check
 
-build: $(LIB) $(METALLIB)
-	@printf '[build] ok (metal=%s)\n' '$(GD_ENABLE_METAL)'
+build: $(LIB)
+	@printf '[build] %s\n' '$(LIB)'
 
-check: build docs-check test tools
+check: docs-check test foundation-probe
 	@printf '[check] ok\n'
+
+docs-check:
+	@test -f $(DOCS_DIR)/design_spec.md
+	@grep -q '^## Memory model' $(DOCS_DIR)/design_spec.md
+	@grep -q 'sealed' $(DOCS_DIR)/design_spec.md
+	@printf '[docs-check] ok\n'
 
 test tests: build $(TEST_BINS)
 ifeq ($(strip $(TEST_BINS)),)
-	@printf '[test] no tests found under %s/ yet\n' '$(TEST_DIR)'
+	@printf '[test] no tests found\n'
 else
 	@set -euo pipefail; \
 	for t in $(TEST_BINS); do \
@@ -183,157 +96,38 @@ else
 endif
 	@printf '[test] ok\n'
 
-mlp: build
-ifeq ($(wildcard $(MLP_SRC)),)
-	@printf '[mlp] missing %s; skipped\n' '$(MLP_SRC)'
+probes: foundation-probe
+
+foundation-probe: $(FOUNDATION_PROBE)
+	@printf '[probe] %s\n' '$(FOUNDATION_PROBE)'
+	@$(FOUNDATION_PROBE)
+
+ifeq ($(UNAME_S),Darwin)
+metal-probe: $(METAL_PROBE)
+	@printf '[probe] %s\n' '$(METAL_PROBE)'
+	@$(METAL_PROBE)
 else
-	@$(MAKE) --no-print-directory $(MLP_BIN)
-	@printf '[mlp] run %s\n' '$(MLP_BIN)'
-	@$(MLP_BIN)
+metal-probe:
+	@printf '[metal-probe] skipped: macOS required\n'
 endif
-
-gpt: build
-ifeq ($(wildcard $(GPT_SRC)),)
-	@printf '[gpt] missing %s; skipped\n' '$(GPT_SRC)'
-else
-	@$(MAKE) --no-print-directory $(GPT_BIN)
-	@printf '[gpt] run %s (GD_DEVICE=%s)\n' '$(GPT_BIN)' '$(GD_DEVICE)'
-	@$(GPT_BIN)
-endif
-
-ifeq ($(wildcard $(GPT_LM_SRC)),)
-gpt-lm: build
-	@printf '[gpt-lm] missing %s; skipped\n' '$(GPT_LM_SRC)'
-else
-gpt-lm: $(LIB) $(METALLIB) $(GPT_LM_BIN)
-	@printf '[gpt-lm] run %s %s\n' '$(GPT_LM_BIN)' '$(GPT_LM_ARGS)'
-	@$(GPT_LM_BIN) $(GPT_LM_ARGS)
-endif
-
-ifeq ($(wildcard $(GPT_VLM_SRC)),)
-gpt-vlm: build
-	@printf '[gpt-vlm] missing %s; skipped\n' '$(GPT_VLM_SRC)'
-else
-gpt-vlm: $(LIB) $(METALLIB) $(GPT_VLM_BIN)
-	@printf '[gpt-vlm] run %s %s\n' '$(GPT_VLM_BIN)' '$(GPT_VLM_ARGS)'
-	@$(GPT_VLM_BIN) $(GPT_VLM_ARGS)
-endif
-
-bench-gpt:
-	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' gpt
-
-# Release-built GPT profiling harness. Honors GD_DEVICE and GD_BENCH_* env knobs.
-gpt-bench:
-	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' _gpt_bench_run
-
-_gpt_bench_run: build $(GPT_BENCH_BIN)
-	@printf '[gpt-bench] run %s (GD_DEVICE=%s)\n' '$(GPT_BENCH_BIN)' '$(GD_DEVICE)'
-	@GRADIENTS_METALLIB=$(BUILD_DIR)/gradients.metallib $(GPT_BENCH_BIN)
-
-sdpa-bench:
-	@$(MAKE) --no-print-directory BUILD_DIR=build-release CFLAGS='$(BENCH_CFLAGS)' _sdpa_bench_run
-
-_sdpa_bench_run: build $(SDPA_BENCH_BIN)
-	@printf '[sdpa-bench] run %s (GD_DEVICE=%s)\n' '$(SDPA_BENCH_BIN)' '$(GD_DEVICE)'
-	@GRADIENTS_METALLIB=$(BUILD_DIR)/gradients.metallib $(SDPA_BENCH_BIN)
-
-examples: build $(EXAMPLE_BINS)
-ifeq ($(strip $(EXAMPLE_BINS)),)
-	@printf '[examples] no examples found under %s/ yet\n' '$(EXAMPLE_DIR)'
-else
-	@set -euo pipefail; \
-	for x in $(EXAMPLE_BINS); do \
-		printf '[example] %s\n' "$$x"; \
-		"$$x"; \
-	done
-endif
-	@printf '[examples] ok\n'
-
-tools: build $(TOOL_BINS)
-ifeq ($(strip $(TOOL_BINS)),)
-	@printf '[tools] no tools found under %s/ yet\n' '$(TOOL_DIR)'
-else
-	@printf '[tools] built %s\n' '$(TOOL_BINS)'
-endif
-
-docs-check: build
-	@test -f $(DOCS_DIR)/design_spec.md
-	@test -f $(DOCS_DIR)/plan_mlp.md
-	@grep -q 'design_spec.md' $(DOCS_DIR)/plan_mlp.md
-	@grep -q '/Users/mascit/projects/dnn.c/' $(DOCS_DIR)/plan_mlp.md
-	@printf '[docs-check] ok\n'
-
-size-check-report:
-	@set -euo pipefail; \
-	found=0; \
-	while IFS= read -r f; do \
-		n=$$(wc -l < "$$f" | tr -d ' '); \
-		if (( n > 1000 )); then \
-			printf 'size-check-report: FAIL-threshold %s has %s lines\n' "$$f" "$$n"; \
-			found=1; \
-		elif (( n > 800 )); then \
-			printf 'size-check-report: WARN-threshold %s has %s lines\n' "$$f" "$$n"; \
-			found=1; \
-		fi; \
-	done < <(find $(SRC_DIR) $(INCLUDE_DIR) -type f \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.metal' -o -name '*.cu' \) | sort); \
-	if (( found == 0 )); then printf '[size-check-report] no files over 800 LOC\n'; fi
-
-size-check:
-	@set -euo pipefail; \
-	fail=0; \
-	while IFS= read -r f; do \
-		n=$$(wc -l < "$$f" | tr -d ' '); \
-		if (( n > 1000 )); then \
-			printf 'size-check: FAIL %s has %s lines (>1000)\n' "$$f" "$$n"; \
-			fail=1; \
-		elif (( n > 800 )); then \
-			printf 'size-check: WARN %s has %s lines\n' "$$f" "$$n"; \
-		fi; \
-	done < <(find $(SRC_DIR) $(INCLUDE_DIR) -type f \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.metal' -o -name '*.cu' \) | sort); \
-	exit $$fail
 
 list:
 	@printf 'SRC:\n%s\n' '$(SRC)'
 	@printf 'TEST_SRC:\n%s\n' '$(TEST_SRC)'
-	@printf 'EXAMPLE_SRC:\n%s\n' '$(EXAMPLE_SRC)'
-	@printf 'TOOL_SRC:\n%s\n' '$(TOOL_SRC)'
+	@printf 'MSRC:\n%s\n' '$(MSRC)'
 	@printf 'OBJ:\n%s\n' '$(OBJ)'
 	@printf 'TEST_BINS:\n%s\n' '$(TEST_BINS)'
-	@printf 'EXAMPLE_BINS:\n%s\n' '$(EXAMPLE_BINS)'
-	@printf 'TOOL_BINS:\n%s\n' '$(TOOL_BINS)'
 
 clean:
 	@$(RM) $(BUILD_DIR)
 	@printf '[clean] removed %s\n' '$(BUILD_DIR)'
-
-# ----- Build rules ----------------------------------------------------------
-generated: $(GEN_OPS_STAMP)
-	@printf '[generated] ok\n'
-
-$(GEN_OPS_BIN): tools/gen_ops.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $<
-
-$(GEN_OPS_STAMP): $(GEN_OPS_BIN) $(OP_CORE_FILES) $(OP_GRAD_FILES) $(CPU_OP_FILES) $(METAL_OP_FILES) $(METAL_OP_SHADER_FILES)
-	@mkdir -p $(GENERATED_DIR)
-	@$< \
-	  --out $(GENERATED_DIR) \
-	  --core $(OP_CORE_FILES) \
-	  --grad $(OP_GRAD_FILES) \
-	  --cpu $(CPU_OP_FILES) \
-	  --metal $(METAL_OP_FILES) \
-	  --metal-shaders $(METAL_OP_SHADER_FILES)
-	@touch $@
-
-$(GENERATED_FILES): $(GEN_OPS_STAMP)
-	@test -f $@
 
 FORCE:
 
 $(CONFIG_STAMP): FORCE
 	@mkdir -p $(@D)
 	@tmp="$@.tmp"; \
-	printf 'GD_ENABLE_METAL=%s\n' '$(GD_ENABLE_METAL)' > "$$tmp"; \
+	printf 'SAN=%s\nUNAME_S=%s\nCFLAGS=%s\nOBJCFLAGS=%s\n' '$(SAN)' '$(UNAME_S)' '$(CFLAGS)' '$(OBJCFLAGS)' > "$$tmp"; \
 	if ! test -f "$@" || ! cmp -s "$$tmp" "$@"; then \
 		mv "$$tmp" "$@"; \
 	else \
@@ -343,39 +137,28 @@ $(CONFIG_STAMP): FORCE
 $(LIB): $(CONFIG_STAMP) $(OBJ)
 	@mkdir -p $(@D)
 	@$(RM) $@
-ifeq ($(strip $(OBJ)),)
-	@printf '[lib] no source files found under %s/; creating placeholder archive\n' '$(SRC_DIR)'
-	@printf '!<arch>\n' > $@
-else
 	$(AR) rcs $@ $(OBJ)
-endif
 
-$(BUILD_DIR)/%.o: %.c $(GEN_OPS_STAMP) $(CONFIG_STAMP)
+$(BUILD_DIR)/%.o: %.c $(CONFIG_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: %.m $(GEN_OPS_STAMP) $(CONFIG_STAMP)
+$(BUILD_DIR)/%.o: %.m $(CONFIG_STAMP)
 	@mkdir -p $(@D)
-	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
-
-$(BUILD_DIR)/%.air: %.metal $(METAL_DIR)/metal_common.metal $(METAL_DIR)/metal_kernel_types.h
-	@mkdir -p $(@D)
-	xcrun -sdk macosx metal -I$(METAL_DIR) -c $< -o $@
-
-$(METALLIB): $(patsubst %.metal,$(BUILD_DIR)/%.air,$(METAL_SHADERS))
-	@mkdir -p $(@D)
-	xcrun -sdk macosx metallib $^ -o $@
+	$(OBJC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/$(TEST_DIR)/%: $(TEST_DIR)/%.c $(LIB)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
-$(BUILD_DIR)/$(EXAMPLE_DIR)/%: $(EXAMPLE_DIR)/%.c $(LIB)
+$(FOUNDATION_PROBE): $(PROBE_DIR)/v2_foundation_probe.c $(CONFIG_STAMP)
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(PROBE_CFLAGS) $< $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/$(TOOL_DIR)/%: $(TOOL_DIR)/%.c $(LIB)
+$(METAL_PROBE): $(PROBE_DIR)/v2_metal_arena_probe.m $(CONFIG_STAMP)
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+	$(OBJC) -fobjc-arc -Wall -Wextra -Werror \
+	  -framework Foundation -framework Metal -framework MetalPerformanceShaders \
+	  $< -o $@
 
 -include $(DEP)

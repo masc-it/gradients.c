@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -56,6 +57,7 @@ typedef struct gd_metal_kernel_entry {
 #define GD_METAL_CLIP_NORM_TG 256
 #define GD_METAL_CLIP_NORM_ITEMS 4
 #define GD_METAL_CLIP_NORM_CHUNK (GD_METAL_CLIP_NORM_TG * GD_METAL_CLIP_NORM_ITEMS)
+#define GD_METAL_SCRATCH_RING_SLOTS 2U
 
 typedef struct gd_metal_sdpa_bwd_layout {
     int64_t stats_off;
@@ -86,6 +88,16 @@ typedef struct gd_metal_value {
     uint64_t staged_version;
 } gd_metal_value;
 
+typedef struct gd_metal_scratch_slot {
+    gd_storage *storage;
+    size_t bytes;
+    atomic_bool busy;
+    atomic_bool completed;
+    atomic_uint_fast64_t generation;
+    atomic_uint refcount;
+    void *owner_cmd; /* unretained; command buffers are retained by GDMetalState. */
+} gd_metal_scratch_slot;
+
 struct _gd_executable {
     const gd_graph *graph;
     int n_values;
@@ -98,8 +110,10 @@ struct _gd_executable {
     void **node_pso3;
     void **node_mps;
     size_t *node_scratch_bytes;
-    gd_storage *scratch_arena;
-    size_t scratch_arena_bytes;
+    gd_metal_scratch_slot **scratch_slots;
+    size_t scratch_slot_count;
+    size_t scratch_next_slot;
+    size_t scratch_arena_bytes; /* bytes per scratch slot */
     uint8_t *node_absorbed;
     int *node_fused_src;
     uint64_t run_id;
@@ -160,6 +174,9 @@ gd_status _gd_metal_encode_mps_gemm(id<MTLCommandBuffer> cmd,
                                     __strong id<MTLComputeCommandEncoder> *enc,
                                     _gd_executable *exe,
                                     GDMPSGemmPlan *plan);
+
+void _gd_metal_scratch_slot_retain(gd_metal_scratch_slot *slot);
+void _gd_metal_scratch_slot_release(gd_metal_scratch_slot *slot);
 
 gd_status _gd_metal_storage_alloc(_gd_backend *self, const gd_storage_desc *desc,
                                   void **handle_out);

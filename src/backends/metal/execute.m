@@ -4,12 +4,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Command-buffer chunking is an opt-in performance knob. The graph executor
- * reuses one scratch arena across nodes; splitting a graph into multiple queued
- * command buffers can expose cross-command scratch/MPS hazards on training
- * graphs and produce non-finite F16 values. Keep correctness default as one
- * command buffer. Set GD_METAL_CMD_CHUNK=N only for profiling known-safe graphs. */
-#define GD_METAL_DEFAULT_CMD_CHUNK 0
+/* Command-buffer chunking defaults to two encoded nodes per command buffer.
+ * Scratch uses a per-command-buffer ring, so scratch-using chunks no longer
+ * alias while they are in flight. Set GD_METAL_CMD_CHUNK=0 to force one
+ * command buffer for debugging broader transient value-slot hazards. */
+#define GD_METAL_DEFAULT_CMD_CHUNK 2
 
 static int metal_command_chunk_size(void)
 {
@@ -64,6 +63,198 @@ static bool metal_next_encoded_node_uses_mps(const _gd_executable *exe, int star
         }
     }
     return false;
+}
+
+static int metal_next_chunk_end(const _gd_executable *exe, int start, int end, int chunk_size)
+{
+    int i = 0;
+    int encoded = 0;
+
+    if (exe == NULL || exe->graph == NULL || chunk_size <= 0) {
+        return end;
+    }
+    for (i = start; i <= end && i < exe->graph->n_nodes; ++i) {
+        if (exe->node_absorbed[i]) {
+            continue;
+        }
+        encoded++;
+        if (encoded >= chunk_size && metal_has_more_encoded_nodes(exe, i + 1, end) &&
+            !metal_node_uses_mps(exe, i) &&
+            !metal_next_encoded_node_uses_mps(exe, i + 1, end)) {
+            return i;
+        }
+    }
+    return end;
+}
+
+static size_t metal_chunk_max_scratch(const _gd_executable *exe, int start, int end)
+{
+    size_t max_bytes = 0U;
+    int i = 0;
+
+    if (exe == NULL || exe->graph == NULL || exe->node_scratch_bytes == NULL) {
+        return 0U;
+    }
+    for (i = start; i <= end && i < exe->graph->n_nodes; ++i) {
+        if (!exe->node_absorbed[i] && exe->node_scratch_bytes[i] > max_bytes) {
+            max_bytes = exe->node_scratch_bytes[i];
+        }
+    }
+    return max_bytes;
+}
+
+static gd_status metal_command_buffer_error(id<MTLCommandBuffer> cmd, const char *fallback)
+{
+    const char *reason = fallback;
+
+    if (cmd != nil && cmd.error != nil && cmd.error.localizedDescription != nil) {
+        reason = cmd.error.localizedDescription.UTF8String;
+    }
+    return _gd_error(GD_ERR_BACKEND, reason != NULL ? reason : "metal command buffer failed");
+}
+
+static bool metal_scratch_slot_is_free(gd_metal_scratch_slot *slot, size_t bytes)
+{
+    if (slot == NULL || slot->storage == NULL || slot->bytes < bytes) {
+        return false;
+    }
+    return !atomic_load_explicit(&slot->busy, memory_order_acquire) &&
+           atomic_load_explicit(&slot->completed, memory_order_acquire);
+}
+
+static void metal_scratch_reserve_slot(_gd_executable *exe,
+                                       size_t index,
+                                       gd_metal_scratch_slot **slot_out)
+{
+    gd_metal_scratch_slot *slot = exe->scratch_slots[index];
+    uint_fast64_t generation = atomic_load_explicit(&slot->generation,
+                                                    memory_order_acquire) + 1U;
+
+    if (generation == 0U) {
+        generation = 1U;
+    }
+    slot->owner_cmd = NULL;
+    atomic_store_explicit(&slot->generation, generation, memory_order_release);
+    atomic_store_explicit(&slot->completed, false, memory_order_release);
+    atomic_store_explicit(&slot->busy, true, memory_order_release);
+    exe->scratch_next_slot = (index + 1U) % exe->scratch_slot_count;
+    *slot_out = slot;
+}
+
+static void metal_scratch_release_reservation(gd_metal_scratch_slot *slot)
+{
+    if (slot != NULL) {
+        slot->owner_cmd = NULL;
+        atomic_store_explicit(&slot->completed, true, memory_order_release);
+        atomic_store_explicit(&slot->busy, false, memory_order_release);
+    }
+}
+
+static gd_status metal_scratch_wait_slot(_gd_backend *self, gd_metal_scratch_slot *slot)
+{
+    id<MTLCommandBuffer> owner = nil;
+    uint_fast64_t generation = 0U;
+    gd_status status = GD_OK;
+
+    if (slot == NULL) {
+        return _gd_error(GD_ERR_INVALID_STATE, "metal scratch slot is NULL");
+    }
+    generation = atomic_load_explicit(&slot->generation, memory_order_acquire);
+    owner = (__bridge id<MTLCommandBuffer>)slot->owner_cmd;
+    if (owner != nil) {
+        uint64_t start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
+        [owner waitUntilCompleted];
+        if (start != 0U) {
+            _gd_profile_record_event(self->ctx, self, _GD_PROFILE_EVENT_WAIT,
+                                     _gd_profile_now_ns() - start, 0U, 1U);
+        }
+        if (owner.status == MTLCommandBufferStatusError) {
+            status = metal_command_buffer_error(owner, "metal scratch owner command buffer failed");
+        }
+    }
+    if (atomic_load_explicit(&slot->generation, memory_order_acquire) == generation) {
+        slot->owner_cmd = NULL;
+        atomic_store_explicit(&slot->completed, true, memory_order_release);
+        atomic_store_explicit(&slot->busy, false, memory_order_release);
+    }
+    return status;
+}
+
+static gd_status metal_scratch_acquire(_gd_backend *self,
+                                       _gd_executable *exe,
+                                       size_t bytes,
+                                       gd_metal_scratch_slot **slot_out)
+{
+    size_t count = 0U;
+    size_t start = 0U;
+    size_t pass = 0U;
+
+    *slot_out = NULL;
+    if (bytes == 0U) {
+        return GD_OK;
+    }
+    if (exe == NULL || exe->scratch_slots == NULL || exe->scratch_slot_count == 0U) {
+        return _gd_error(GD_ERR_BACKEND, "metal scratch ring missing");
+    }
+    count = exe->scratch_slot_count;
+    start = exe->scratch_next_slot < count ? exe->scratch_next_slot : 0U;
+    for (pass = 0U; pass < count; ++pass) {
+        size_t index = (start + pass) % count;
+        gd_metal_scratch_slot *slot = exe->scratch_slots[index];
+
+        if (metal_scratch_slot_is_free(slot, bytes)) {
+            metal_scratch_reserve_slot(exe, index, slot_out);
+            return GD_OK;
+        }
+    }
+    for (pass = 0U; pass < count; ++pass) {
+        size_t index = (start + pass) % count;
+        gd_metal_scratch_slot *slot = exe->scratch_slots[index];
+        gd_status status = GD_OK;
+
+        if (slot == NULL || slot->bytes < bytes) {
+            continue;
+        }
+        status = metal_scratch_wait_slot(self, slot);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (metal_scratch_slot_is_free(slot, bytes)) {
+            metal_scratch_reserve_slot(exe, index, slot_out);
+            return GD_OK;
+        }
+    }
+    return _gd_error(GD_ERR_BACKEND, "metal scratch slot too small");
+}
+
+static id<MTLBuffer> metal_scratch_slot_buffer(gd_metal_scratch_slot *slot)
+{
+    if (slot == NULL || slot->storage == NULL) {
+        return nil;
+    }
+    return (__bridge id<MTLBuffer>)_gd_storage_handle(slot->storage);
+}
+
+static void metal_scratch_commit_slot(gd_metal_scratch_slot *slot, id<MTLCommandBuffer> cmd)
+{
+    uint_fast64_t generation = 0U;
+
+    if (slot == NULL || cmd == nil) {
+        return;
+    }
+    generation = atomic_load_explicit(&slot->generation, memory_order_acquire);
+    slot->owner_cmd = (__bridge void *)cmd;
+    atomic_store_explicit(&slot->completed, false, memory_order_release);
+    atomic_store_explicit(&slot->busy, true, memory_order_release);
+    _gd_metal_scratch_slot_retain(slot);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)b;
+        if (atomic_load_explicit(&slot->generation, memory_order_acquire) == generation) {
+            atomic_store_explicit(&slot->completed, true, memory_order_release);
+            atomic_store_explicit(&slot->busy, false, memory_order_release);
+        }
+        _gd_metal_scratch_slot_release(slot);
+    }];
 }
 
 static bool metal_trace_check_finite_enabled(void)
@@ -414,13 +605,18 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
             pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
             pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
             id<MTLComputePipelineState> pso3 = (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
+            gd_metal_scratch_slot *scratch_slot = NULL;
             id<MTLBuffer> scratch = nil;
             if (exe->node_scratch_bytes[i] > 0U) {
-                if (exe->scratch_arena == NULL ||
-                    exe->node_scratch_bytes[i] > exe->scratch_arena_bytes) {
-                    return _gd_error(GD_ERR_BACKEND, "metal scratch arena too small");
+                status = metal_scratch_acquire(self, exe, exe->node_scratch_bytes[i], &scratch_slot);
+                if (status != GD_OK) {
+                    return status;
                 }
-                scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
+                scratch = metal_scratch_slot_buffer(scratch_slot);
+                if (scratch == nil) {
+                    metal_scratch_release_reservation(scratch_slot);
+                    return _gd_error(GD_ERR_BACKEND, "metal scratch buffer missing");
+                }
             }
             uint64_t op_start = _gd_profile_now_ns();
             @autoreleasepool {
@@ -430,13 +626,21 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
                                              scratch);
                 if (status != GD_OK) {
                     [enc endEncoding];
+                    metal_scratch_release_reservation(scratch_slot);
                     return status;
                 }
                 [enc endEncoding];
+                metal_scratch_commit_slot(scratch_slot, cmd);
                 [cmd commit];
                 [cmd waitUntilCompleted];
+                if (scratch_slot != NULL) {
+                    status = metal_scratch_wait_slot(self, scratch_slot);
+                    if (status != GD_OK) {
+                        return status;
+                    }
+                }
                 if (cmd.status == MTLCommandBufferStatusError) {
-                    return _gd_error(GD_ERR_BACKEND, "metal trace command buffer failed");
+                    return metal_command_buffer_error(cmd, "metal trace command buffer failed");
                 }
                 if (metal_trace_check_finite_enabled()) {
                     status = metal_debug_check_node_outputs_finite(exe, i);
@@ -462,55 +666,67 @@ static gd_status metal_execute_range(_gd_backend *self, _gd_executable *exe, int
     {
         uint64_t encode_start = _gd_profile_enabled(self->ctx) ? _gd_profile_now_ns() : 0U;
         int chunk_size = metal_command_chunk_size();
-        int encoded_in_cmd = 0;
         int capped_last = last_node < exe->graph->n_nodes ? last_node : exe->graph->n_nodes - 1;
         @autoreleasepool {
-            id<MTLCommandBuffer> cmd = [st.queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            int chunk_start = 0;
 
-            for (i = 0; i <= last_node && i < exe->graph->n_nodes; ++i) {
-                id<MTLComputePipelineState> pso;
-                if (exe->node_absorbed[i]) {
-                    continue; /* encoded by its fusion group head */
-                }
-                pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
-                id<MTLComputePipelineState> pso2 =
-                    (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
-                id<MTLComputePipelineState> pso3 =
-                    (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
-                id<MTLBuffer> scratch = nil;
-                if (exe->node_scratch_bytes[i] > 0U) {
-                    if (exe->scratch_arena == NULL ||
-                        exe->node_scratch_bytes[i] > exe->scratch_arena_bytes) {
-                        [enc endEncoding];
-                        return _gd_error(GD_ERR_BACKEND, "metal scratch arena too small");
+            for (chunk_start = 0; chunk_start <= capped_last;) {
+                int chunk_end = metal_next_chunk_end(exe, chunk_start, capped_last, chunk_size);
+                size_t chunk_scratch = metal_chunk_max_scratch(exe, chunk_start, chunk_end);
+                gd_metal_scratch_slot *scratch_slot = NULL;
+                id<MTLBuffer> scratch_buffer = nil;
+                id<MTLCommandBuffer> cmd = nil;
+                id<MTLComputeCommandEncoder> enc = nil;
+
+                if (chunk_scratch > 0U) {
+                    status = metal_scratch_acquire(self, exe, chunk_scratch, &scratch_slot);
+                    if (status != GD_OK) {
+                        return status;
                     }
-                    scratch = (__bridge id<MTLBuffer>)_gd_storage_handle(exe->scratch_arena);
+                    scratch_buffer = metal_scratch_slot_buffer(scratch_slot);
+                    if (scratch_buffer == nil) {
+                        metal_scratch_release_reservation(scratch_slot);
+                        return _gd_error(GD_ERR_BACKEND, "metal scratch buffer missing");
+                    }
                 }
-                status = encode_planned_node(self, st, cmd, &enc, exe, i, pso, pso2, pso3,
-                                             scratch);
-                if (status != GD_OK) {
-                    [enc endEncoding];
-                    return status;
+                cmd = [st.queue commandBuffer];
+                enc = [cmd computeCommandEncoder];
+                for (i = chunk_start; i <= chunk_end && i < exe->graph->n_nodes; ++i) {
+                    id<MTLComputePipelineState> pso;
+                    id<MTLComputePipelineState> pso2;
+                    id<MTLComputePipelineState> pso3;
+                    id<MTLBuffer> scratch = nil;
+
+                    if (exe->node_absorbed[i]) {
+                        continue; /* encoded by its fusion group head */
+                    }
+                    pso = (__bridge id<MTLComputePipelineState>)exe->node_pso[i];
+                    pso2 = (__bridge id<MTLComputePipelineState>)exe->node_pso2[i];
+                    pso3 = (__bridge id<MTLComputePipelineState>)exe->node_pso3[i];
+                    if (exe->node_scratch_bytes[i] > 0U) {
+                        if (scratch_slot == NULL ||
+                            exe->node_scratch_bytes[i] > scratch_slot->bytes) {
+                            [enc endEncoding];
+                            metal_scratch_release_reservation(scratch_slot);
+                            return _gd_error(GD_ERR_BACKEND, "metal scratch slot too small");
+                        }
+                        scratch = scratch_buffer;
+                    }
+                    status = encode_planned_node(self, st, cmd, &enc, exe, i, pso, pso2, pso3,
+                                                 scratch);
+                    if (status != GD_OK) {
+                        [enc endEncoding];
+                        metal_scratch_release_reservation(scratch_slot);
+                        return status;
+                    }
                 }
-                encoded_in_cmd++;
-                if (chunk_size > 0 && encoded_in_cmd >= chunk_size &&
-                    metal_has_more_encoded_nodes(exe, i + 1, capped_last) &&
-                    !metal_node_uses_mps(exe, i) &&
-                    !metal_next_encoded_node_uses_mps(exe, i + 1, capped_last)) {
-                    [enc endEncoding];
-                    [cmd commit];
-                    [st.inFlightBuffers addObject:cmd];
-                    st.inFlight = cmd;
-                    cmd = [st.queue commandBuffer];
-                    enc = [cmd computeCommandEncoder];
-                    encoded_in_cmd = 0;
-                }
+                [enc endEncoding];
+                metal_scratch_commit_slot(scratch_slot, cmd);
+                [cmd commit];
+                [st.inFlightBuffers addObject:cmd];
+                st.inFlight = cmd;
+                chunk_start = chunk_end + 1;
             }
-            [enc endEncoding];
-            [cmd commit];
-            [st.inFlightBuffers addObject:cmd];
-            st.inFlight = cmd;
         }
         if (encode_start != 0U) {
             uint64_t count = 0U;

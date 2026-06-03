@@ -3,6 +3,7 @@
 void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
 {
     int i = 0;
+    size_t s = 0U;
 
     if (exe == NULL) {
         return;
@@ -32,7 +33,12 @@ void _gd_metal_executable_free(_gd_backend *self, _gd_executable *exe)
     free(exe->node_absorbed);
     free(exe->node_fused_src);
     free(exe->node_scratch_bytes);
-    gd_storage_release(exe->scratch_arena);
+    if (exe->scratch_slots != NULL) {
+        for (s = 0U; s < exe->scratch_slot_count; ++s) {
+            _gd_metal_scratch_slot_release(exe->scratch_slots[s]);
+        }
+        free(exe->scratch_slots);
+    }
     free(exe);
     }
 }
@@ -345,13 +351,40 @@ gd_status _gd_metal_compile(_gd_backend *self, gd_graph *graph, _gd_executable *
             }
         }
         if (scratch_max_bytes > 0U) {
-            gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
-                                     scratch_max_bytes, sizeof(float)};
-            status = gd_storage_create(graph->ctx, &sdesc, &exe->scratch_arena);
-            if (status != GD_OK) {
+            size_t s = 0U;
+
+            exe->scratch_slot_count = GD_METAL_SCRATCH_RING_SLOTS;
+            exe->scratch_slots = calloc(exe->scratch_slot_count, sizeof(*exe->scratch_slots));
+            if (exe->scratch_slots == NULL) {
+                status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal scratch ring");
                 goto fail;
             }
             exe->scratch_arena_bytes = scratch_max_bytes;
+            for (s = 0U; s < exe->scratch_slot_count; ++s) {
+                gd_storage_desc sdesc = {{GD_DEVICE_METAL, self->device_index}, GD_MEM_UNIFIED,
+                                         scratch_max_bytes, sizeof(float)};
+                gd_storage *storage = NULL;
+                gd_metal_scratch_slot *slot = NULL;
+
+                status = gd_storage_create(graph->ctx, &sdesc, &storage);
+                if (status != GD_OK) {
+                    goto fail;
+                }
+                slot = calloc(1U, sizeof(*slot));
+                if (slot == NULL) {
+                    gd_storage_release(storage);
+                    status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate metal scratch slot");
+                    goto fail;
+                }
+                slot->storage = storage;
+                slot->bytes = scratch_max_bytes;
+                atomic_init(&slot->busy, false);
+                atomic_init(&slot->completed, true);
+                atomic_init(&slot->generation, 0U);
+                atomic_init(&slot->refcount, 1U);
+                slot->owner_cmd = NULL;
+                exe->scratch_slots[s] = slot;
+            }
         }
         _gd_metal_plan_fusions(self, graph, exe);
     }

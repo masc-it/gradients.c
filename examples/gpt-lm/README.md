@@ -1,8 +1,5 @@
 # GPT-LM real training example
 
-Runs first real text LM training path from `docs/plan_gpt_preparation.md`.
-Generation/KV cache intentionally skipped.
-
 ## Build
 
 ```bash

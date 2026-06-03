@@ -1,2 +1,0 @@
-# No source files are allowlisted.
-# size-check hard-fails any source file over 1000 LOC.

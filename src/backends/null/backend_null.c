@@ -70,6 +70,34 @@ bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer)
     return false;
 }
 
+gd_status gd_backend_upload(gd_backend *backend,
+                            gd_backend_buffer *buffer,
+                            size_t offset,
+                            const void *src,
+                            size_t nbytes)
+{
+    (void)backend;
+    (void)buffer;
+    (void)offset;
+    (void)src;
+    (void)nbytes;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_download(gd_backend *backend,
+                              gd_backend_buffer *buffer,
+                              size_t offset,
+                              void *dst,
+                              size_t nbytes)
+{
+    (void)backend;
+    (void)buffer;
+    (void)offset;
+    (void)dst;
+    (void)nbytes;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)
 {
     (void)backend;

@@ -143,9 +143,10 @@ Future Vulkan/other backends follow the same logical arena contract: large backe
 
 Host-visible access is explicit:
 
-- `gd_upload` copies host bytes into a compute tensor or arena region.
-- `gd_download` copies compute tensor bytes into host memory.
-- blocking tensor reads/writes are convenience wrappers over upload/download plus required waits.
+- `gd_span_upload` / `gd_span_download` copy host bytes to/from an arena span byte range.
+- `gd_upload` / `gd_download` copy full contiguous tensor payloads to/from host memory.
+- blocking `gd_tensor_write` / `gd_tensor_read` are convenience wrappers over upload/download plus required waits.
+- transfer helpers wait relevant arena-slot or conservative persistent-storage fences before accessing bytes.
 - checkpoint save/load uses the same transfer path, not raw compute-tensor host pointers.
 
 GPU `scratch` and `data` reuse is protected by ring-buffered arena slots and backend completion fences/events.
@@ -171,6 +172,14 @@ Views allocate only a tensor header. They share the base allocation span and cha
 `contiguous` is explicit and allocates a packed output.
 
 Foundation C descriptors are caller/storage-owned structs: `gd_tensor_empty` allocates arena storage and fills a concrete descriptor; `gd_tensor_slice` produces a view descriptor over the same base allocation; `gd_tensor_validate` checks arena kind, slot, generation, buffer identity, and logical byte span. The foundation `gd_tensor_contiguous` path allocates packed output storage/metadata only; backend copy/materialization kernels are separate op work and no core path performs an implicit contiguous copy.
+
+Tensor creation helpers are explicit about initialization:
+
+- `gd_tensor_empty(...)` allocates storage and does not promise contents.
+- `gd_tensor_zeros(...)` allocates then enqueues a backend zero-fill.
+- `gd_tensor_ones(...)` allocates then enqueues a dtype-aware backend fill-one kernel.
+- `gd_tensor_rand_uniform(...)` / `gd_tensor_rand_normal(...)` allocate then enqueue backend RNG kernels using explicit seed/state. They must not use C `rand()` or CPU-filled tensor bytes for normal training paths.
+- in-place forms (`gd_tensor_zero_`, `gd_tensor_fill_`, `gd_tensor_rand_uniform_`, `gd_tensor_rand_normal_`) are ordered backend ops, allocate no tensor storage, and obey arena generation/fence rules.
 
 Leaf tensors may require gradients.
 

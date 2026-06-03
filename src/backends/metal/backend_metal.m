@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 struct gd_backend {
     void *device;
@@ -144,6 +145,46 @@ void *gd_backend_buffer_host_ptr(gd_backend_buffer *buffer)
 bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer)
 {
     return buffer != NULL;
+}
+
+gd_status gd_backend_upload(gd_backend *backend,
+                            gd_backend_buffer *buffer,
+                            size_t offset,
+                            const void *src,
+                            size_t nbytes)
+{
+    unsigned char *dst;
+    (void)backend;
+    if (buffer == NULL || src == NULL || nbytes == 0U ||
+        offset > buffer->nbytes || nbytes > buffer->nbytes - offset) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (unsigned char *)[gd_metal_buffer(buffer) contents];
+    if (dst == NULL) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    memcpy(dst + offset, src, nbytes);
+    return GD_OK;
+}
+
+gd_status gd_backend_download(gd_backend *backend,
+                              gd_backend_buffer *buffer,
+                              size_t offset,
+                              void *dst,
+                              size_t nbytes)
+{
+    unsigned char *src;
+    (void)backend;
+    if (buffer == NULL || dst == NULL || nbytes == 0U ||
+        offset > buffer->nbytes || nbytes > buffer->nbytes - offset) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    src = (unsigned char *)[gd_metal_buffer(buffer) contents];
+    if (src == NULL) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    memcpy(dst, src + offset, nbytes);
+    return GD_OK;
 }
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)

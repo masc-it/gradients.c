@@ -32,6 +32,17 @@ size_t gd_backend_buffer_nbytes(const gd_backend_buffer *buffer);
 void *gd_backend_buffer_host_ptr(gd_backend_buffer *buffer);
 bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer);
 
+gd_status gd_backend_upload(gd_backend *backend,
+                            gd_backend_buffer *buffer,
+                            size_t offset,
+                            const void *src,
+                            size_t nbytes);
+gd_status gd_backend_download(gd_backend *backend,
+                              gd_backend_buffer *buffer,
+                              size_t offset,
+                              void *dst,
+                              size_t nbytes);
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);
 bool gd_backend_fence_is_complete(gd_backend_fence *fence);

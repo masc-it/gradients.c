@@ -86,6 +86,11 @@ gd_status gd_context_set_error(gd_context *ctx, gd_status status, const char *me
     return status;
 }
 
+gd_backend *gd_context_backend(gd_context *ctx)
+{
+    return ctx != NULL ? ctx->backend.backend : NULL;
+}
+
 static void *gd_heap_alloc(size_t nbytes)
 {
     void *ptr;
@@ -194,7 +199,6 @@ static gd_status gd_arena_alloc(gd_context *ctx,
     if (off > arena->capacity || nbytes > arena->capacity - off) {
         return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "arena out of memory");
     }
-    memset(arena->base + off, 0, nbytes);
     arena->offset = off + nbytes;
     if (arena->offset > arena->watermark) {
         arena->watermark = arena->offset;
@@ -285,6 +289,18 @@ static gd_status gd_backend_wait_until(gd_context *ctx, uint64_t sequence)
     ctx->backend.waits += 1U;
     gd_pending_release_completed(ctx);
     return GD_OK;
+}
+
+gd_status gd_context_synchronize(gd_context *ctx)
+{
+    if (ctx == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->backend.next_fence == 0U ||
+        gd_fence_sequence_is_complete(ctx, ctx->backend.next_fence)) {
+        return GD_OK;
+    }
+    return gd_backend_wait_until(ctx, ctx->backend.next_fence);
 }
 
 static gd_status gd_backend_record(gd_context *ctx, uint64_t *out_sequence)
@@ -474,6 +490,30 @@ gd_status gd_context_validate_span(gd_context *ctx, const gd_span *span, const c
                             message != NULL ? message : "span is stale");
     }
     return GD_OK;
+}
+
+gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span)
+{
+    gd_status st;
+    uint64_t fence = 0U;
+    if (ctx == NULL || span == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_context_validate_span(ctx, span, "span is stale");
+    if (st != GD_OK) {
+        return st;
+    }
+    if (span->arena == GD_ARENA_SCRATCH) {
+        fence = ctx->scratch.slot_fences[(uint32_t)span->slot];
+    } else if (span->arena == GD_ARENA_DATA) {
+        fence = ctx->data.slot_fences[(uint32_t)span->slot];
+    } else {
+        return gd_context_synchronize(ctx);
+    }
+    if (fence == 0U || gd_fence_sequence_is_complete(ctx, fence)) {
+        return GD_OK;
+    }
+    return gd_backend_wait_until(ctx, fence);
 }
 
 static bool gd_state_object_live(const gd_context *ctx, const gd_state_object *object)

@@ -56,52 +56,103 @@ Model code is normal C code calling tensor ops.
 
 ## Memory model
 
-Use four bump allocators per context.
+Memory management is a core API contract, not an optimization detail.
 
-| Arena | Lifetime | Contents |
-| --- | --- | --- |
-| `params` | model lifetime | model structs, weights, leaf grads, optimizer state |
-| `state` / `state_arena` | explicit runtime-state lifetime | KV caches, recurrent state, generation buffers, long-lived non-checkpoint workspaces |
-| `scratch` | one training step or eval/infer call | activations, temporary outputs, tape entries, saved tensors, workspaces |
-| `data` | one batch | decoded samples, token/image buffers, input tensors |
+v2 uses fixed-capacity arenas selected up front from model/batch config and prior watermarks. Arenas may be resized by rebuilding context/model state, but they do not grow with heap allocation inside train/eval/infer scopes.
+
+There are two allocation planes:
+
+- host metadata plane: C structs, module metadata, tensor descriptors, tape entries, names, manifests
+- backend storage plane: tensor bytes in backend buffers, addressed by arena + byte offset
+
+A tensor descriptor may live in one arena while its storage lives in another, but descriptor lifetime must not exceed storage lifetime unless it is only a persistent handle that is revalidated before use.
+
+Use four logical arenas per context.
+
+| Arena | Lifetime | Contents | Reset policy |
+| --- | --- | --- | --- |
+| `params` | model / optimizer lifetime | model structs, parameter descriptors/storage, persistent buffers, leaf grads, optimizer slots, scaler/scheduler state | never resets during training; sealed after init |
+| `state` / `state_arena` | explicit runtime-state lifetime | KV caches, recurrent state, generation buffers, long-lived non-checkpoint workspaces | object-level reset/reuse only |
+| `scratch` | one train/eval/infer scope | activations, temporary outputs, tape entries, saved tensors, workspaces, temporary grads | ring slot reset at `gd_begin` |
+| `data` | one batch / input scope | decoded samples, token/image buffers, input tensor descriptors/storage | ring slot reset at `gd_begin` |
 
 No tensor owns memory with `malloc`.
 
 No op frees memory.
 
-Arena reset is lifecycle control.
+No op performs heap allocation in the step hot path. All per-op tensor descriptors, tape entries, temporaries, and workspaces come from `scratch` unless an API explicitly says otherwise.
 
-`params` never resets during training.
+Arena allocation returns an aligned span: backend buffer handle, actual byte offset after alignment, size, arena kind, slot index when ring-backed, and generation. Code must never infer a tensor storage offset from the pre-alignment bump pointer.
 
-`state` resets only on explicit model/session/cache reset and is not checkpointed unless caller requests it.
+Each arena tracks capacity, current offset, high watermark, required alignment, and generation. Debug builds should poison or generation-check reset slots when possible.
 
-`state` objects record last-use backend fences when mutated or read by async work. Resetting/reusing a state object waits for its fence or allocates a fresh state block.
+Out-of-memory returns `GD_ERR_OUT_OF_MEMORY` and sets context error state. It must not partially publish a tensor descriptor. Recovery is scope abort / context reset / rebuild with larger arenas.
 
-`scratch` and `data` are ring-buffered on async GPUs. Reset advances to a free ring slot; runtime waits only if every slot is still in flight.
+### Persistent memory
 
-Out-of-memory returns `GD_ERR_OUT_OF_MEMORY`.
+`params` allocation is allowed during model construction, parameter/buffer registration, optimizer construction, scaler/scheduler creation, and checkpoint load that rebuilds state.
 
-Debug builds may optionally assert on arena misuse.
+After init, `params` is sealed. Training steps may mutate parameter, grad, and optimizer storage in place, but may not allocate new `params` memory.
 
-## Device memory
+Leaf grad buffers are persistent by default and live beside parameters/optimizer slots. `gd_optimizer_zero_grad` enqueues device fills/memsets and allocates nothing.
+
+Optimizer state dtype and placement are explicit. Adam-family moments use FP32 storage/accumulation even when parameter/grad storage is F16/BF16.
+
+### Runtime state memory
+
+`state_arena` is for caller-visible runtime state, not temporary activations.
+
+State objects are handles containing name, offset, size, dtype/layout metadata as needed, generation, and last-use backend fence.
+
+When async work reads or mutates a state object, runtime records the command fence on that object.
+
+Reset/reuse of an in-flight state object must either:
+
+- wait for the object's last-use fence, then reuse the same block, or
+- allocate a fresh state block and update the object handle without waiting.
+
+Whole `state_arena` reset is only valid for explicit session/model/cache teardown after all object fences are complete. Runtime state is not saved in training checkpoints unless caller opts into a separate application-level state save.
+
+### Scratch/data rings and scope lifecycle
+
+`scratch` and `data` are ring-buffered on async GPU backends.
+
+`gd_begin(ctx, mode)` selects completed `scratch` and `data` slots, resets their bump offsets, bumps slot generations, prepares tape when training, and opens an ordered backend scope.
+
+If no slot is complete, `gd_begin` waits for the oldest in-flight slot only. It must not call global synchronize as normal lifecycle.
+
+`gd_end(ctx)` closes tape, submits queued backend work as needed, and records the resulting fence on every ring slot and state object touched by the scope.
+
+A tensor descriptor or view that references a ring slot is valid only until that slot is reset. Debug descriptors store arena kind, slot index, and generation so stale use can be caught when the descriptor is still reachable.
+
+Ring defaults for the 256 hidden / 4 head / T=512 Metal profile are `scratch = 3 x 64 MiB` and `data = 3 x 8 MiB`. These are defaults, not ABI; watermarks drive tuning.
+
+### Device memory
 
 Arenas are device-aware.
 
-Host arenas exist only for data loading, staging, checkpoints, and scalar configuration.
+Compute storage lives in backend compute buffers. Tensor storage is buffer + allocation byte offset + view byte offset, not a separate allocation.
 
-Compute tensors live in GPU arenas.
+Core code must not assume a compute tensor has a CPU-addressable pointer. Generic runtime code may inspect descriptors but may not dereference compute storage.
 
-Metal arenas are large shared/private buffers or heaps, split into ring slots for `scratch` and `data`.
+Metal tensor arenas use `MTLResourceStorageModeShared` buffers only. No Metal tensor arena uses `Private` storage or staging copies. Metal shared storage permits direct CPU writes/readbacks after relevant command-buffer waits; this is the Metal transfer implementation, not a portable core semantic.
 
-Future CUDA/Vulkan backends follow same arena contract.
+CUDA tensor arenas use device allocations by default, via `cudaMalloc`, CUDA driver allocation, or a backend memory pool. CUDA hot tensors are not host-visible. CUDA host writes/readbacks use explicit upload/download operations through pinned staging memory or caller-owned host buffers on an ordered stream. `cudaMallocManaged` or mapped pinned memory may exist as opt-in debug/bringup modes, but they are not the v2 performance contract.
 
-Tensor storage is arena plus byte offset, not separate allocation.
+Future Vulkan/other backends follow the same logical arena contract: large backend buffers, tensor storage as arena plus byte offset, ring slots for `scratch` and `data`, and explicit backend fences/events. They do not need shared host/device memory.
+
+Host-visible access is explicit:
+
+- `gd_upload` copies host bytes into a compute tensor or arena region.
+- `gd_download` copies compute tensor bytes into host memory.
+- blocking tensor reads/writes are convenience wrappers over upload/download plus required waits.
+- checkpoint save/load uses the same transfer path, not raw compute-tensor host pointers.
 
 GPU `scratch` and `data` reuse is protected by ring-buffered arena slots and backend completion fences/events.
 
-Scope end records fences for arena slots used by that scope. Scope begin advances to completed slots; if the ring is exhausted, it waits for the oldest slot.
+Backend owns pending command buffers/events until every arena slot and state object that references them has observed completion or released the fence.
 
-Global `gd_synchronize` is not part of normal arena lifecycle.
+Global `gd_synchronize` is for explicit user/debug/checkpoint boundaries, not normal arena lifecycle.
 
 Small scalar kernel inputs such as cache start positions, sequence lengths in lockstep decode, dropout flags, and scaling constants are passed as by-value op attrs / uniforms where possible, not as mutable host-written GPU tensors.
 
@@ -111,11 +162,11 @@ Small scalar kernel inputs such as cache start positions, sequence lengths in lo
 
 There are no virtual graph tensors.
 
-Tensor descriptor stores dtype, device, rank, shape, strides, layout, and offset.
+Tensor descriptor stores dtype, device, rank, shape, strides, layout, arena/storage reference, allocation byte span, view byte offset, and debug lifetime generation.
 
-Views allocate only a tensor header.
+Views allocate only a tensor header. They share the base allocation span and change view offset/shape/strides only.
 
-`reshape`, `slice`, and `transpose` are metadata ops when legal.
+`reshape`, `slice`, and `transpose` are metadata ops when legal. They must prove the resulting logical byte span stays inside the base allocation.
 
 `contiguous` is explicit and allocates a packed output.
 
@@ -267,15 +318,31 @@ There is no CPU execution path.
 
 If target backend lacks an op, execution fails.
 
-Blocking CPU reads, checkpoint writes, and explicit `gd_synchronize` wait for relevant queued backend work and make requested bytes visible.
+Blocking CPU reads, blocking CPU writes, upload/download transfers, checkpoint writes, and explicit `gd_synchronize` wait for relevant queued backend work and make requested bytes visible.
 
 Correctness is checked against PyTorch reference scripts, not CPU kernels.
+
+## Backend portability abstractions
+
+Core v2 depends on a small backend portability layer before CUDA is added.
+
+Required abstractions:
+
+- `gd_backend_stream`: ordered scope execution lane. Metal maps this to a command buffer/queue. CUDA maps this to a `cudaStream_t` plus recorded events.
+- `gd_fence`: completion token with query/wait/error behavior. Metal maps this to a retained `id<MTLCommandBuffer>`. CUDA maps this to `cudaEvent_t`.
+- `gd_buffer`: backend allocation handle plus size, memory kind, device pointer, optional host pointer, and alignment. Metal shared buffers expose host pointers. CUDA device buffers normally do not.
+- `gd_arena` / `gd_ring_arena`: bump allocation over `gd_buffer`, aligned span returns, capacity/offset/watermark tracking, freeze/seal state, generations, ring-slot selection, and slot-fence retention.
+- `gd_transfer`: upload/download/read/write path that hides Metal direct shared access versus CUDA staged copies.
+- `gd_kernel`: backend kernel/module/pipeline handle plus argument packing, by-value uniforms, grid/block or threadgroup launch dimensions, and optional dynamic shared/threadgroup memory.
+- `gd_matmul`: backend matmul descriptor for dtype, accumulation dtype, transpose/layout, row strides, batch strides, pointer offsets/origins, and epilogue support. Metal maps to MPS or custom kernels. CUDA maps to cuBLAS/cuBLASLt or custom kernels.
+
+No generic runtime code may dereference compute tensor storage directly. Only backend implementations and transfer helpers may turn a `gd_buffer` plus offset into an address.
 
 ## API shape
 
 Context owns arenas, backend state, current scope, tape, grad mode, RNG, and error state.
 
-Constructors take a persistent arena implicitly through context.
+Model/optimizer/scaler/scheduler constructors allocate persistent metadata/storage from `params` through context before `params` is sealed.
 
 Forward ops take context and tensors.
 
@@ -302,9 +369,9 @@ gd_topk_sample(ctx, logits, rng_state, next_tokens);
 gd_end(ctx);
 ```
 
-`gd_begin(ctx, mode)` advances `scratch`/`data` ring slots, prepares tape when training, and opens a backend command batch/stream scope.
+`gd_begin(ctx, mode)` advances `scratch`/`data` ring slots to completed generations, prepares tape when training, and opens a backend command batch/stream scope. If the ring is exhausted, it waits for the oldest slot only.
 
-`gd_end(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects used by the scope.
+`gd_end(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects used by the scope. It does not reset `params` or `state`.
 
 `gd_optimizer_zero_grad(ctx, opt)` is explicit so callers can choose gradient accumulation by omitting it.
 
@@ -493,6 +560,8 @@ gd_param_group groups[] = {
 
 Parameter groups support per-group learning-rate multipliers, weight decay, trainable flags, and freeze/unfreeze. Collection must deduplicate tied tensors, e.g. GPT token embedding tied to LM head weight.
 
+Tied-weight param-group policy is canonical-owner wins. The first registered path for a tensor defines its optimizer group and slot identity; later paths are aliases recorded for checkpoint/debug metadata. If an alias path matches a different param group, collection reports it as an alias/group conflict in debug/strict mode, but it must not create a second optimizer entry.
+
 Checkpoint loading supports strict and partial modes. Partial mode allows adding/removing named heads while loading a shared backbone.
 
 Decoder-only transformer KV cache design:
@@ -572,11 +641,22 @@ Every fused op compares against PyTorch reference composition.
 
 Memory tests verify no heap allocation in step hot path.
 
+Arena tests verify aligned span offsets, OOM status returns, watermark tracking, reset generations, and sealed `params` rejecting late allocations.
+
 Arena watermark tests report peak `params`, `state`, `scratch`, and `data` usage.
 
-Ring-buffer tests verify `scratch` and `data` are not reused before backend fences complete.
+Ring-buffer tests verify `scratch` and `data` are not reused before backend fences complete and slot generations bump before reuse.
 
 State reset tests verify KV cache/state objects wait or allocate fresh blocks before reuse.
+
+Backend portability tests verify:
+
+- generic runtime code never dereferences compute tensor storage directly
+- Metal shared buffers satisfy upload/download/read/write semantics without staging copies
+- CUDA uses explicit upload/download staging for host access and never requires host-visible hot tensors
+- ring slots are guarded by backend fences: Metal command buffers and CUDA events
+- state-object reset waits on backend fences before reuse
+- matmul abstraction covers byte offsets, padded row strides, strided batches, sliced/origin operands, and same-stream GEMM-to-kernel ordering
 
 Checkpoint tests verify:
 
@@ -620,7 +700,7 @@ Remove public graph/runner APIs from v2 core.
 
 Remove virtual tensor state.
 
-Replace storage refcount churn with arena offsets.
+Replace storage refcount churn with arena offsets, explicit lifetimes, aligned spans, and generation/fence validation.
 
 Keep op capsules and generated registries.
 
@@ -632,6 +712,8 @@ Build the decoder-only text GPT first: training, prefill, decode, KV cache, AMP,
 
 Build early-fusion decoder-only VLM next: image-prefix concat, optimized varlen prefix-window training attention, suffix LMCE, cached prefill/decode.
 
-Add CUDA BF16 eager dispatch after Metal path is stable.
+Extract and lock the backend portability layer: `gd_buffer`, `gd_fence`, `gd_backend_stream`, `gd_transfer`, `gd_kernel`, `gd_matmul`, and arena/ring abstractions.
+
+Add CUDA BF16 eager dispatch after Metal path and portability layer are stable.
 
 Then rebuild GPT/VLM examples as plain C models on eager ops.

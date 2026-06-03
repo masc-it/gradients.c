@@ -1,0 +1,110 @@
+# v2 probe TODO
+
+Stress workloads to validate v2 design before consolidation.
+
+## Findings so far
+
+- Metal tensor arenas are shared-only. Private storage/staging path removed.
+- ML stress probes use F16 tensor storage; FP32 remains only for CPU reference math, accumulators, optimizer/sensitive future probes.
+- Foundation memory contract now tracks aligned spans, reset generations, sealed params, descriptor/storage lifetimes, and no scoped hot-path heap allocation.
+- Fixed probe F32→F16 conversion rounding-carry bug; values near exponent boundaries like `0.124987` must round to `0.125`, not `0.0625`.
+- Best 256h4 defaults: shared storage, tracked hazards, 256B suballoc alignment, compact MPS-recommended `rowBytes`, tight `matrixBytes`.
+- Recommended 256h4 ring defaults: scratch 3 slots x 64 MiB, data 3 slots x 8 MiB.
+- Ring depth/capacity affects OOM and wait frequency, not GEMM throughput directly.
+- Padding row strides or batched matrix gaps gives no reliable win and can hurt small H=256 shapes.
+- Generic MPS batched GEMM is acceptable for layout validation, but skinny attention-V shapes underutilize MPS; custom `sdpa_varlen` remains needed.
+
+## Device memory / MPS layout
+
+- [x] Batched MPS matmul
+  - `[B,M,K] x [B,K,N] -> [B,M,N]`
+  - use `MPSMatrixDescriptor` with `matrices` / `matrixBytes`
+  - validate batched strides, matrix offsets, arena suballocations
+  - includes batched attention-like F16 perf benchmark
+
+- [x] Strided/sliced MPS matmul
+  - rowBytes larger than compact row
+  - use MPS matrix origins where possible
+  - validate non-contiguous view semantics and MPS origin mapping
+  - finding: `MPSMatrixMultiplication` origins use `MTLOriginMake(row, column, 0)`, not `(column, row, 0)`
+
+## Transformer block pieces
+
+- [x] Linear + bias + activation in one command buffer
+  - MPS matmul then custom Metal bias/GELU kernel
+  - validate MPS + custom kernels interleave without command boundary
+  - finding: MPS encode followed by custom compute encoder in same command buffer preserves order and works with shared arena offsets
+  - finding: device tensors should be F16; CPU reference computes in FP32 then rounds to F16 for comparison
+
+- [ ] Fused-ish MLP block
+  - `gate_up = X @ Wgu`
+  - custom SiLU/gate split kernel
+  - `down = hidden @ Wd`
+  - validate multiple large scratch allocations in one scope
+
+- [ ] QKV projection + split views
+  - `X @ Wqkv -> [M,3D]`
+  - metadata views for q/k/v slices
+  - custom kernel reads q/k/v slice offsets without copies
+
+- [x] RMSNorm / LayerNorm row reductions
+  - D = 256 / 512 / 768
+  - FP32 accumulators, F16 storage
+  - validate row-wise reduction pattern and numeric stability
+  - finding: 256-thread row reductions pass for D=256/512/768 with padded rowBytes and shared arena offsets
+
+## VLM-specific layout
+
+- [ ] Concat + suffix slice
+  - image prefix + text suffix -> compact hidden
+  - suffix slice view passed to LMCE-shape checker kernel
+  - validate VLM layout without suffix contiguous copy
+
+- [ ] Suffix CE / LMCE toy kernel
+  - suffix-only logits/loss on small vocab
+  - no full `[B,img_tokens+text_tokens,V]` materialization
+  - validate prefix hidden receives zero LMCE gradient contribution
+
+## Embedding / tied weights
+
+- [ ] Embedding gather
+  - token IDs in shared data
+  - embedding weights in shared params
+  - gather to scratch
+  - validate integer data + random access into shared params
+
+- [ ] Embedding backward scatter-add with duplicates
+  - repeated token IDs
+  - custom scatter-add grad accumulation
+  - validate additive grad semantics for tied embeddings
+
+## KV cache / generation state
+
+- [ ] KV cache append + decode read
+  - K/V cache in `state_arena`
+  - write at by-value `start_pos`
+  - read prefix/window positions
+  - validate state side effects and no mutable cache-pos tensor
+
+- [ ] State reset with real KV workload in flight
+  - replace spin-only state fence test with KV append/read workload
+  - validate command-buffer retention and state-object fences
+
+- [ ] Device-side argmax / top-k sample
+  - logits in scratch
+  - next token in state/data
+  - no CPU readback
+  - validate generation loop output path
+
+## Training control / persistent state
+
+- [ ] Toy AdamW optimizer kernel
+  - param, grad, m, v in params arena
+  - FP32 optimizer slots, low-precision param/grad
+  - validate persistent in-place writes
+
+- [ ] Multi-head loss sum
+  - two scalar losses in scratch
+  - weighted sum kernel
+  - one total scalar for backward seed
+  - validate multi-loss flow shape

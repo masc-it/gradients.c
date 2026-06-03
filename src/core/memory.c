@@ -1,6 +1,7 @@
 #include <gradients/memory.h>
 
 #include "backend.h"
+#include "memory_internal.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -71,6 +72,11 @@ static bool gd_is_power_of_two(size_t v)
 }
 
 static gd_status gd_set_error(gd_context *ctx, gd_status status, const char *message)
+{
+    return gd_context_set_error(ctx, status, message);
+}
+
+gd_status gd_context_set_error(gd_context *ctx, gd_status status, const char *message)
 {
     if (ctx != NULL) {
         ctx->status = status;
@@ -415,6 +421,61 @@ static gd_arena *gd_ring_current_arena(gd_ring_arena *ring)
     return &ring->slots[ring->current];
 }
 
+static const gd_arena *gd_context_span_arena(const gd_context *ctx, const gd_span *span)
+{
+    if (ctx == NULL || span == NULL) {
+        return NULL;
+    }
+    switch (span->arena) {
+    case GD_ARENA_PARAMS:
+        return span->slot == -1 ? &ctx->params : NULL;
+    case GD_ARENA_STATE:
+        return span->slot == -1 ? &ctx->state : NULL;
+    case GD_ARENA_SCRATCH:
+        if (span->slot < 0 || (uint32_t)span->slot >= ctx->scratch.n_slots) {
+            return NULL;
+        }
+        return &ctx->scratch.slots[span->slot];
+    case GD_ARENA_DATA:
+        if (span->slot < 0 || (uint32_t)span->slot >= ctx->data.n_slots) {
+            return NULL;
+        }
+        return &ctx->data.slots[span->slot];
+    default:
+        return NULL;
+    }
+}
+
+bool gd_context_span_is_live(const gd_context *ctx, const gd_span *span)
+{
+    const gd_arena *arena = gd_context_span_arena(ctx, span);
+    if (arena == NULL || span == NULL || span->nbytes == 0U) {
+        return false;
+    }
+    if (span->generation != arena->generation || span->buffer != arena->buffer) {
+        return false;
+    }
+    if (span->offset > arena->capacity || span->nbytes > arena->capacity - span->offset) {
+        return false;
+    }
+    if (arena->base != NULL && span->host_ptr != arena->base + span->offset) {
+        return false;
+    }
+    return true;
+}
+
+gd_status gd_context_validate_span(gd_context *ctx, const gd_span *span, const char *message)
+{
+    if (ctx == NULL || span == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_context_span_is_live(ctx, span)) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE,
+                            message != NULL ? message : "span is stale");
+    }
+    return GD_OK;
+}
+
 static bool gd_state_object_live(const gd_context *ctx, const gd_state_object *object)
 {
     if (ctx == NULL || object == NULL || object->span.arena != GD_ARENA_STATE ||
@@ -643,6 +704,29 @@ gd_status gd_alloc_data(gd_context *ctx, size_t nbytes, size_t alignment, gd_spa
 {
     return gd_alloc_from_ring(ctx, &ctx->data, nbytes, alignment, out,
                               "data allocation requires active scope");
+}
+
+gd_status gd_context_alloc_span(gd_context *ctx,
+                                gd_arena_kind arena,
+                                size_t nbytes,
+                                size_t alignment,
+                                gd_span *out)
+{
+    if (ctx == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    switch (arena) {
+    case GD_ARENA_PARAMS:
+        return gd_alloc_params(ctx, nbytes, alignment, out);
+    case GD_ARENA_STATE:
+        return gd_alloc_state(ctx, nbytes, alignment, out);
+    case GD_ARENA_SCRATCH:
+        return gd_alloc_scratch(ctx, nbytes, alignment, out);
+    case GD_ARENA_DATA:
+        return gd_alloc_data(ctx, nbytes, alignment, out);
+    default:
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid arena kind");
+    }
 }
 
 gd_status gd_state_object_create(gd_context *ctx,

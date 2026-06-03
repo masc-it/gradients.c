@@ -170,6 +170,8 @@ Views allocate only a tensor header. They share the base allocation span and cha
 
 `contiguous` is explicit and allocates a packed output.
 
+Foundation C descriptors are caller/storage-owned structs: `gd_tensor_empty` allocates arena storage and fills a concrete descriptor; `gd_tensor_slice` produces a view descriptor over the same base allocation; `gd_tensor_validate` checks arena kind, slot, generation, buffer identity, and logical byte span. The foundation `gd_tensor_contiguous` path allocates packed output storage/metadata only; backend copy/materialization kernels are separate op work and no core path performs an implicit contiguous copy.
+
 Leaf tensors may require gradients.
 
 Leaf grad buffers live in persistent memory, `params` by default, with parameter/optimizer lifetime.

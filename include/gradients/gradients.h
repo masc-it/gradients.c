@@ -3,5 +3,6 @@
 
 #include <gradients/status.h>
 #include <gradients/memory.h>
+#include <gradients/tensor.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

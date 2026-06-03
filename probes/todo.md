@@ -7,6 +7,7 @@ Stress workloads to validate v2 design before consolidation.
 - Metal tensor arenas are shared-only. Private storage/staging path removed.
 - ML stress probes use F16 tensor storage; FP32 remains only for CPU reference math, accumulators, optimizer/sensitive future probes.
 - Foundation memory contract now tracks aligned spans, reset generations, sealed params, descriptor/storage lifetimes, and no scoped hot-path heap allocation.
+- Library tensor descriptor foundation now mirrors probe semantics: dtype/shape/strides, storage span + view offset, slice views, explicit contiguous output allocation, and stale ring generation validation.
 - Fixed probe F32→F16 conversion rounding-carry bug; values near exponent boundaries like `0.124987` must round to `0.125`, not `0.0625`.
 - Best 256h4 defaults: shared storage, tracked hazards, 256B suballoc alignment, compact MPS-recommended `rowBytes`, tight `matrixBytes`.
 - Recommended 256h4 ring defaults: scratch 3 slots x 64 MiB, data 3 slots x 8 MiB.

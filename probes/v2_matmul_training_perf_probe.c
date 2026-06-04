@@ -245,12 +245,18 @@ typedef struct perf_model {
     gd_tensor w_gate;
     gd_tensor w_up;
     gd_tensor w_down;
+    gd_tensor b_qkv;
+    gd_tensor b_proj;
+    gd_tensor b_gate;
+    gd_tensor b_up;
+    gd_tensor b_down;
     int64_t tokens;
     int64_t hidden;
     int64_t intermediate;
     int64_t heads;
     int64_t head_dim;
     uint32_t matmuls;
+    uint32_t bias_reductions;
     double forward_flops;
     double backward_flops;
     size_t params_bytes;
@@ -306,6 +312,15 @@ static bool perf_tensor_bytes_2d(int64_t rows, int64_t cols, size_t *out)
     return true;
 }
 
+static bool perf_tensor_bytes_1d(int64_t count, size_t *out)
+{
+    if (out == NULL || count <= 0 || (uint64_t)count > (uint64_t)(SIZE_MAX / 2U)) {
+        return false;
+    }
+    *out = (size_t)count * 2U;
+    return true;
+}
+
 static double perf_matmul_flops(int64_t m, int64_t k, int64_t n)
 {
     return 2.0 * (double)m * (double)k * (double)n;
@@ -333,6 +348,11 @@ static bool perf_model_plan(const perf_case *shape, perf_model *model)
     size_t w_gate;
     size_t w_up;
     size_t w_down;
+    size_t b_qkv;
+    size_t b_proj;
+    size_t b_gate;
+    size_t b_up;
+    size_t b_down;
     size_t y_qkv;
     size_t y_proj;
     size_t y_gate;
@@ -366,6 +386,11 @@ static bool perf_model_plan(const perf_case *shape, perf_model *model)
         !perf_tensor_bytes_2d(shape->hidden, shape->intermediate, &w_gate) ||
         !perf_tensor_bytes_2d(shape->hidden, shape->intermediate, &w_up) ||
         !perf_tensor_bytes_2d(shape->intermediate, shape->hidden, &w_down) ||
+        !perf_tensor_bytes_1d(3 * shape->hidden, &b_qkv) ||
+        !perf_tensor_bytes_1d(shape->hidden, &b_proj) ||
+        !perf_tensor_bytes_1d(shape->intermediate, &b_gate) ||
+        !perf_tensor_bytes_1d(shape->intermediate, &b_up) ||
+        !perf_tensor_bytes_1d(shape->hidden, &b_down) ||
         !perf_tensor_bytes_2d(shape->tokens, 3 * shape->hidden, &y_qkv) ||
         !perf_tensor_bytes_2d(shape->tokens, shape->hidden, &y_proj) ||
         !perf_tensor_bytes_2d(shape->tokens, shape->intermediate, &y_gate) ||
@@ -382,7 +407,12 @@ static bool perf_model_plan(const perf_case *shape, perf_model *model)
     if (!perf_add_size(w_qkv, w_proj, &tmp) ||
         !perf_add_size(tmp, w_gate, &tmp) ||
         !perf_add_size(tmp, w_up, &tmp) ||
-        !perf_add_size(tmp, w_down, &model->params_bytes) ||
+        !perf_add_size(tmp, w_down, &tmp) ||
+        !perf_add_size(tmp, b_qkv, &tmp) ||
+        !perf_add_size(tmp, b_proj, &tmp) ||
+        !perf_add_size(tmp, b_gate, &tmp) ||
+        !perf_add_size(tmp, b_up, &tmp) ||
+        !perf_add_size(tmp, b_down, &model->params_bytes) ||
         !perf_add_size(head_q, head_kt, &one_head_scratch) ||
         !perf_add_size(one_head_scratch, head_scores, &one_head_scratch) ||
         !perf_add_size(one_head_scratch, head_v, &one_head_scratch) ||
@@ -399,16 +429,22 @@ static bool perf_model_plan(const perf_case *shape, perf_model *model)
         return false;
     }
     bwd_scratch = model->scratch_bytes;
+    model->bias_reductions = 5U;
     if (!perf_add_matmul_backward_scratch(bwd_scratch, shape->tokens, shape->hidden,
                                           3 * shape->hidden, &bwd_scratch) ||
+        !perf_add_size(bwd_scratch, b_qkv, &bwd_scratch) ||
         !perf_add_matmul_backward_scratch(bwd_scratch, shape->tokens, shape->hidden,
                                           shape->hidden, &bwd_scratch) ||
+        !perf_add_size(bwd_scratch, b_proj, &bwd_scratch) ||
         !perf_add_matmul_backward_scratch(bwd_scratch, shape->tokens, shape->hidden,
                                           shape->intermediate, &bwd_scratch) ||
+        !perf_add_size(bwd_scratch, b_gate, &bwd_scratch) ||
         !perf_add_matmul_backward_scratch(bwd_scratch, shape->tokens, shape->hidden,
                                           shape->intermediate, &bwd_scratch) ||
+        !perf_add_size(bwd_scratch, b_up, &bwd_scratch) ||
         !perf_add_matmul_backward_scratch(bwd_scratch, shape->tokens, shape->intermediate,
-                                          shape->hidden, &bwd_scratch)) {
+                                          shape->hidden, &bwd_scratch) ||
+        !perf_add_size(bwd_scratch, b_down, &bwd_scratch)) {
         return false;
     }
     for (int64_t h = 0; h < shape->heads; ++h) {
@@ -469,6 +505,9 @@ static bool perf_model_init(gd_context *ctx, const perf_case *shape, perf_model 
     int64_t proj_shape[2];
     int64_t gate_shape[2];
     int64_t down_shape[2];
+    int64_t qkv_bias_shape[1];
+    int64_t proj_bias_shape[1];
+    int64_t gate_bias_shape[1];
     if (!perf_model_plan(shape, model)) {
         fprintf(stderr, "[PERF][FAIL] invalid/overflowing profile shape %s\n", shape->name);
         return false;
@@ -481,6 +520,9 @@ static bool perf_model_init(gd_context *ctx, const perf_case *shape, perf_model 
     gate_shape[1] = shape->intermediate;
     down_shape[0] = shape->intermediate;
     down_shape[1] = shape->hidden;
+    qkv_bias_shape[0] = 3 * shape->hidden;
+    proj_bias_shape[0] = shape->hidden;
+    gate_bias_shape[0] = shape->intermediate;
     PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
                                                 qkv_shape, 256U, 101U,
                                                 -0.02f, 0.02f, &model->w_qkv));
@@ -496,6 +538,21 @@ static bool perf_model_init(gd_context *ctx, const perf_case *shape, perf_model 
     PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
                                                 down_shape, 256U, 105U,
                                                 -0.02f, 0.02f, &model->w_down));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
+                                                qkv_bias_shape, 256U, 106U,
+                                                -0.02f, 0.02f, &model->b_qkv));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
+                                                proj_bias_shape, 256U, 107U,
+                                                -0.02f, 0.02f, &model->b_proj));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
+                                                gate_bias_shape, 256U, 108U,
+                                                -0.02f, 0.02f, &model->b_gate));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
+                                                gate_bias_shape, 256U, 109U,
+                                                -0.02f, 0.02f, &model->b_up));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
+                                                proj_bias_shape, 256U, 110U,
+                                                -0.02f, 0.02f, &model->b_down));
     PERF_REQUIRE_OK(ctx, gd_context_seal_params(ctx));
     return true;
 }
@@ -513,6 +570,26 @@ static bool perf_matmul_step(gd_context *ctx,
         PERF_REQUIRE_OK(ctx, gd_matmul_backward(ctx, x, w, out, &dx, &dw));
         (void)dx;
         (void)dw;
+    }
+    return true;
+}
+
+static bool perf_linear_step(gd_context *ctx,
+                             const gd_tensor *x,
+                             const gd_tensor *w,
+                             const gd_tensor *bias,
+                             bool include_backward,
+                             gd_tensor *out)
+{
+    gd_tensor dx;
+    gd_tensor dw;
+    gd_tensor db;
+    PERF_REQUIRE_OK(ctx, gd_linear(ctx, x, w, bias, out));
+    if (include_backward) {
+        PERF_REQUIRE_OK(ctx, gd_linear_backward(ctx, x, w, bias, out, &dx, &dw, &db));
+        (void)dx;
+        (void)dw;
+        (void)db;
     }
     return true;
 }
@@ -540,7 +617,7 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
     head_v_shape[1] = model->head_dim;
     PERF_REQUIRE_OK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
     PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    if (!perf_matmul_step(ctx, &x, &model->w_qkv, include_backward, &qkv)) {
+    if (!perf_linear_step(ctx, &x, &model->w_qkv, &model->b_qkv, include_backward, &qkv)) {
         return false;
     }
     for (h = 0; h < model->heads; ++h) {
@@ -563,16 +640,16 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
         }
         (void)head_ctx;
     }
-    if (!perf_matmul_step(ctx, &x, &model->w_proj, include_backward, &proj)) {
+    if (!perf_linear_step(ctx, &x, &model->w_proj, &model->b_proj, include_backward, &proj)) {
         return false;
     }
-    if (!perf_matmul_step(ctx, &x, &model->w_gate, include_backward, &gate)) {
+    if (!perf_linear_step(ctx, &x, &model->w_gate, &model->b_gate, include_backward, &gate)) {
         return false;
     }
-    if (!perf_matmul_step(ctx, &x, &model->w_up, include_backward, &up)) {
+    if (!perf_linear_step(ctx, &x, &model->w_up, &model->b_up, include_backward, &up)) {
         return false;
     }
-    if (!perf_matmul_step(ctx, &up, &model->w_down, include_backward, &down)) {
+    if (!perf_linear_step(ctx, &up, &model->w_down, &model->b_down, include_backward, &down)) {
         return false;
     }
     PERF_REQUIRE_OK(ctx, gd_end(ctx));
@@ -795,7 +872,7 @@ static bool perf_run_profile(const perf_case *shape,
     flops = plan.forward_flops + (include_backward ? plan.backward_flops : 0.0);
     matmul_calls = plan.matmuls * (include_backward ? 3U : 1U);
     active_scratch_bytes = include_backward ? plan.backward_scratch_bytes : plan.scratch_bytes;
-    printf("[PERF] profile=%s workload=%s tokens=%lld hidden=%lld heads=%lld head_dim=%lld intermediate=%lld forward_matmuls=%" PRIu32 " matmul_calls=%" PRIu32 " flops=%.3fG forward_flops=%.3fG params=%.1fMB scratch_slot=%.1fMB data_slot=%.1fMB ring_slots=%" PRIu32 "\n",
+    printf("[PERF] profile=%s workload=%s tokens=%lld hidden=%lld heads=%lld head_dim=%lld intermediate=%lld forward_matmuls=%" PRIu32 " matmul_calls=%" PRIu32 " bias_reductions=%" PRIu32 " flops=%.3fG forward_flops=%.3fG params=%.1fMB scratch_slot=%.1fMB data_slot=%.1fMB ring_slots=%" PRIu32 "\n",
            shape->name,
            workload,
            (long long)shape->tokens,
@@ -805,6 +882,7 @@ static bool perf_run_profile(const perf_case *shape,
            (long long)shape->intermediate,
            plan.matmuls,
            matmul_calls,
+           include_backward ? plan.bias_reductions : 0U,
            flops / 1.0e9,
            plan.forward_flops / 1.0e9,
            (double)cfg.params_bytes / PERF_MB,
@@ -962,7 +1040,7 @@ int main(void)
            totals.matmul_backward_ready ? "partial" : "no",
            totals.matmul_backward_ready ? "autograd_optimizer_amp_not_covered_by_probe" :
                                           "matmul_backward_not_implemented");
-    printf("[PERF][REPORT] kernel_path=metal_metallib_f16_reg_tiled_simdgroup_gemm_nt_tn_backward\n");
+    printf("[PERF][REPORT] kernel_path=metal_metallib_f16_reg_tiled_simdgroup_gemm_linear_bias_reduce\n");
     printf("[PERF][REPORT] interpretation=%s_wall_time_includes_current_public_api_overheads\n",
            include_backward ? "fwd_bwd" : "forward_only");
     printf("v2_matmul_training_perf_probe: summary profiles=%" PRIu32 " fail=%" PRIu32 " warn=%" PRIu32 "\n",

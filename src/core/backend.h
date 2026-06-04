@@ -96,6 +96,10 @@ gd_status gd_backend_linear(gd_backend *backend,
                             const gd_backend_matrix_view *w,
                             const gd_backend_vector_view *bias,
                             const gd_backend_matrix_view *y);
+/* y[col] = sum_rows x[row, col]. */
+gd_status gd_backend_reduce_rows(gd_backend *backend,
+                                 const gd_backend_matrix_view *x,
+                                 const gd_backend_vector_view *y);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

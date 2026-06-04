@@ -196,6 +196,16 @@ gd_status gd_backend_linear(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_reduce_rows(gd_backend *backend,
+                                 const gd_backend_matrix_view *x,
+                                 const gd_backend_vector_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)
 {
     (void)backend;

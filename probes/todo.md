@@ -10,7 +10,7 @@ Stress workloads to validate v2 design before consolidation.
 - Library tensor descriptor foundation now mirrors probe semantics: dtype/shape/strides, storage span + view offset, slice views, explicit contiguous output allocation, and stale ring generation validation.
 - Library transfer foundation uses backend upload/download helpers over spans/tensors; Metal implementation touches shared storage inside backend only and waits relevant slot/persistent fences.
 - Library tensor init helpers now use Metal command-scope kernels: `empty` is uninitialized, `zeros`/`ones` are backend fills, `rand`/`rand_uniform` are deterministic backend RNG fills.
-- Library op capsules started with `matmul` and `linear`: forward uses MPS GEMM, linear bias epilogue is a same-command Metal kernel, backward APIs currently return `GD_ERR_NOT_IMPLEMENTED` without publishing grads.
+- Library op capsules started with `matmul` and `linear`: forward/backward now use metallib-backed custom F16 GEMM kernels; linear has optional fused bias epilogue plus bias-gradient reduction.
 - Fixed probe F32→F16 conversion rounding-carry bug; values near exponent boundaries like `0.124987` must round to `0.125`, not `0.0625`.
 - Best 256h4 defaults: shared storage, tracked hazards, 256B suballoc alignment, compact MPS-recommended `rowBytes`, tight `matrixBytes`.
 - Recommended 256h4 ring defaults: scratch 3 slots x 64 MiB, data 3 slots x 8 MiB.

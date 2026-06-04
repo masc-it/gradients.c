@@ -10,7 +10,7 @@ static gd_status gd_linear_validate(gd_context *ctx,
                                     const gd_tensor *bias)
 {
     gd_status st;
-    if (ctx == NULL || x == NULL || w == NULL || bias == NULL) {
+    if (ctx == NULL || x == NULL || w == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_tensor_validate(ctx, x);
@@ -21,18 +21,22 @@ static gd_status gd_linear_validate(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_validate(ctx, bias);
-    if (st != GD_OK) {
-        return st;
+    if (bias != NULL) {
+        st = gd_tensor_validate(ctx, bias);
+        if (st != GD_OK) {
+            return st;
+        }
     }
-    if (x->dtype != GD_DTYPE_F16 || w->dtype != GD_DTYPE_F16 || bias->dtype != GD_DTYPE_F16) {
+    if (x->dtype != GD_DTYPE_F16 || w->dtype != GD_DTYPE_F16 ||
+        (bias != NULL && bias->dtype != GD_DTYPE_F16)) {
         return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "linear currently supports f16 tensors only");
     }
-    if (x->rank != 2U || w->rank != 2U || bias->rank != 1U ||
-        x->shape[1] != w->shape[0] || bias->shape[0] != w->shape[1]) {
+    if (x->rank != 2U || w->rank != 2U || (bias != NULL && bias->rank != 1U) ||
+        x->shape[1] != w->shape[0] || (bias != NULL && bias->shape[0] != w->shape[1])) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "linear shape mismatch");
     }
-    if (x->strides[1] != 1 || w->strides[1] != 1 || bias->strides[0] != 1) {
+    if (x->strides[1] != 1 || w->strides[1] != 1 ||
+        (bias != NULL && bias->strides[0] != 1)) {
         return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "linear requires row-strided inputs");
     }
     return GD_OK;
@@ -54,7 +58,7 @@ gd_status gd_linear(gd_context *ctx,
     if (out != NULL) {
         memset(out, 0, sizeof(*out));
     }
-    if (ctx == NULL || x == NULL || w == NULL || bias == NULL || out == NULL) {
+    if (ctx == NULL || x == NULL || w == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_linear_validate(ctx, x, w, bias);
@@ -67,13 +71,14 @@ gd_status gd_linear(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
+    memset(&bv, 0, sizeof(bv));
     if (!gd_op_matrix_view_from_tensor(x, &xv) ||
         !gd_op_matrix_view_from_tensor(w, &wv) ||
         !gd_op_matrix_view_from_tensor(&y, &yv) ||
-        !gd_op_vector_view_from_tensor(bias, &bv)) {
+        (bias != NULL && !gd_op_vector_view_from_tensor(bias, &bv))) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "linear invalid backend view");
     }
-    st = gd_backend_linear(gd_context_backend(ctx), &xv, &wv, &bv, &yv);
+    st = gd_backend_linear(gd_context_backend(ctx), &xv, &wv, bias != NULL ? &bv : NULL, &yv);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend linear failed");
     }

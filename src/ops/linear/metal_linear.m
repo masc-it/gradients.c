@@ -50,9 +50,9 @@ static bool gd_metal_gemm_reg_ok(const gd_backend_matrix_view *x,
                                  const gd_backend_vector_view *bias,
                                  const gd_backend_matrix_view *y)
 {
-    return x != NULL && w != NULL && bias != NULL && y != NULL &&
+    return x != NULL && w != NULL && y != NULL &&
            (x->offset % 16U) == 0U && (w->offset % 16U) == 0U &&
-           (bias->offset % 2U) == 0U && (y->offset % 16U) == 0U &&
+           (bias == NULL || (bias->offset % 2U) == 0U) && (y->offset % 16U) == 0U &&
            (x->row_bytes % 16U) == 0U && (w->row_bytes % 16U) == 0U &&
            (y->row_bytes % 16U) == 0U &&
            (y->rows % GD_METAL_GEMM_REG_TILE) == 0U &&
@@ -74,14 +74,15 @@ gd_status gd_backend_linear(gd_backend *backend,
     MTLSize threads;
     bool immediate;
     gd_status st;
-    if (backend == NULL || x == NULL || w == NULL || bias == NULL || y == NULL) {
+    if (backend == NULL || x == NULL || w == NULL || y == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (x->dtype != w->dtype || x->dtype != y->dtype || bias->dtype != y->dtype ||
+    if (x->dtype != w->dtype || x->dtype != y->dtype ||
+        (bias != NULL && bias->dtype != y->dtype) ||
         x->cols != w->rows || x->rows != y->rows || w->cols != y->cols ||
-        bias->length != y->cols || !gd_metal_matrix_bounds_ok(x) ||
+        (bias != NULL && bias->length != y->cols) || !gd_metal_matrix_bounds_ok(x) ||
         !gd_metal_matrix_bounds_ok(w) || !gd_metal_matrix_bounds_ok(y) ||
-        !gd_metal_vector_bounds_ok(bias)) {
+        (bias != NULL && !gd_metal_vector_bounds_ok(bias))) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (x->dtype != 1U) {
@@ -101,7 +102,7 @@ gd_status gd_backend_linear(gd_backend *backend,
     }
     args.x_offset = (uint64_t)x->offset;
     args.w_offset = (uint64_t)w->offset;
-    args.bias_offset = (uint64_t)bias->offset;
+    args.bias_offset = bias != NULL ? (uint64_t)bias->offset : 0U;
     args.y_offset = (uint64_t)y->offset;
     args.x_row_bytes = (uint64_t)x->row_bytes;
     args.w_row_bytes = (uint64_t)w->row_bytes;
@@ -109,7 +110,7 @@ gd_status gd_backend_linear(gd_backend *backend,
     args.rows = y->rows;
     args.cols = y->cols;
     args.inner = x->cols;
-    args.has_bias = 1U;
+    args.has_bias = bias != NULL ? 1U : 0U;
     encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
@@ -117,7 +118,9 @@ gd_status gd_backend_linear(gd_backend *backend,
     [encoder setComputePipelineState:pso];
     [encoder setBuffer:(__bridge id<MTLBuffer>)x->buffer->buffer offset:0U atIndex:0U];
     [encoder setBuffer:(__bridge id<MTLBuffer>)w->buffer->buffer offset:0U atIndex:1U];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)bias->buffer->buffer offset:0U atIndex:2U];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)(bias != NULL ? bias->buffer->buffer : x->buffer->buffer)
+                offset:0U
+               atIndex:2U];
     [encoder setBuffer:(__bridge id<MTLBuffer>)y->buffer->buffer offset:0U atIndex:3U];
     [encoder setBytes:&args length:sizeof(args) atIndex:4U];
     if (pso == (__bridge id<MTLComputePipelineState>)backend->linear_reg_pso) {
@@ -134,6 +137,54 @@ gd_status gd_backend_linear(gd_backend *backend,
                               GD_METAL_GEMM_BM / GD_METAL_GEMM_TM,
                               1U);
     }
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+gd_status gd_backend_reduce_rows(gd_backend *backend,
+                                 const gd_backend_matrix_view *x,
+                                 const gd_backend_vector_view *y)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    gd_metal_reduce_rows_args args;
+    MTLSize groups;
+    MTLSize threads;
+    bool immediate;
+    gd_status st;
+    if (backend == NULL || x == NULL || y == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (x->dtype != 1U || y->dtype != 1U) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    if (x->cols != y->length || !gd_metal_matrix_bounds_ok(x) || !gd_metal_vector_bounds_ok(y)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (backend->reduce_rows_pso == NULL) {
+        return GD_ERR_INTERNAL;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    args.x_offset = (uint64_t)x->offset;
+    args.y_offset = (uint64_t)y->offset;
+    args.x_row_bytes = (uint64_t)x->row_bytes;
+    args.rows = x->rows;
+    args.cols = x->cols;
+    args.pad0 = 0U;
+    [encoder setComputePipelineState:(__bridge id<MTLComputePipelineState>)backend->reduce_rows_pso];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)x->buffer->buffer offset:0U atIndex:0U];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)y->buffer->buffer offset:0U atIndex:1U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:2U];
+    groups = MTLSizeMake(gd_metal_div_up_u32(y->length, GD_METAL_REDUCE_ROWS_SIMDGROUPS), 1U, 1U);
+    threads = MTLSizeMake(32U * GD_METAL_REDUCE_ROWS_SIMDGROUPS, 1U, 1U);
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);

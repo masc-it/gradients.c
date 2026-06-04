@@ -9,6 +9,7 @@
 #define GD_METAL_GEMM_REG_NBLK 4U
 #define GD_METAL_GEMM_REG_TILE (GD_METAL_GEMM_REG_NBLK * 8U)
 #define GD_METAL_GEMM_REG_SIMDGROUPS 4U
+#define GD_METAL_REDUCE_ROWS_SIMDGROUPS 8U
 
 #ifdef __METAL_VERSION__
 
@@ -42,6 +43,15 @@ typedef struct gd_metal_gemm_args {
     uint inner;
     uint has_bias;
 } gd_metal_gemm_args;
+
+typedef struct gd_metal_reduce_rows_args {
+    ulong x_offset;
+    ulong y_offset;
+    ulong x_row_bytes;
+    uint rows;
+    uint cols;
+    uint pad0;
+} gd_metal_reduce_rows_args;
 
 #else
 
@@ -78,6 +88,15 @@ typedef struct gd_metal_gemm_args {
     uint32_t inner;
     uint32_t has_bias;
 } gd_metal_gemm_args;
+
+typedef struct gd_metal_reduce_rows_args {
+    uint64_t x_offset;
+    uint64_t y_offset;
+    uint64_t x_row_bytes;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t pad0;
+} gd_metal_reduce_rows_args;
 
 #endif /* __METAL_VERSION__ */
 

@@ -13,6 +13,7 @@ gd_status gd_matmul(gd_context *ctx,
                     const gd_tensor *w,
                     gd_tensor *out);
 
+/* Computes out = x @ w + bias. Pass bias=NULL for out = x @ w. */
 gd_status gd_linear(gd_context *ctx,
                     const gd_tensor *x,
                     const gd_tensor *w,

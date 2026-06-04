@@ -36,25 +36,27 @@ build/probes/v2_foundation_probe_asan
 
 ## v2_matmul_training_perf_probe
 
-Links against `libgradients.a` and measures the public `gd_matmul` and
-`gd_matmul_backward` paths on transformer-like workloads. This exercises the
-production Metal `gradients.metallib` F16 register-tiled simdgroup GEMM kernels
-through the scoped public API. It includes a small initialized correctness smoke
-test, then runs optimized profiles that mimic training-step GEMM pressure:
+Links against `libgradients.a` and measures the public `gd_linear`,
+`gd_linear_backward`, `gd_matmul`, and `gd_matmul_backward` paths on
+transformer-like workloads. This exercises the production Metal
+`gradients.metallib` F16 register-tiled simdgroup GEMM kernels and linear bias
+reductions through the scoped public API. It includes a small initialized
+correctness smoke test, then runs optimized profiles that mimic training-step
+GEMM pressure:
 
 - `h128x4h4`: `tokens=512 hidden=128 heads=4 intermediate=512`
 - `h256x4h4`: `tokens=512 hidden=256 heads=4 intermediate=1024`
 - `h512x4h4`: `tokens=512 hidden=512 heads=4 intermediate=2048`
 
-Each forward profile submits thirteen F16 matmuls in a scoped arena step: dense
-projection/MLP GEMMs (`qkv`, `proj`, `gate`, `up`, `down`) plus two attention
-GEMM shapes per head (`QK^T`, `AV`) for four heads. By default the probe also
-runs `gd_matmul_backward` after each forward matmul, adding the `grad_out @ W^T`
-and `X^T @ grad_out` GEMMs for 39 GEMM calls total. Wall time intentionally
-includes public API validation, scratch/data arena allocation, command-buffer
-submit, and wait. The resulting benchmark is still matmul-only: it does not
-include autograd graph traversal, optimizer, AMP scaler, softmax, losses,
-normalization, or activation kernels.
+Each forward profile submits thirteen F16 GEMM-like ops in a scoped arena step:
+fused-bias dense projection/MLP linears (`qkv`, `proj`, `gate`, `up`, `down`)
+plus two attention matmul shapes per head (`QK^T`, `AV`) for four heads. By
+default the probe also runs the corresponding backward op after each forward op,
+adding `grad_out @ W^T`, `X^T @ grad_out`, and five bias-gradient reductions.
+Wall time intentionally includes public API validation, scratch/data arena
+allocation, command-buffer submit, and wait. The resulting benchmark is still
+GEMM/linear-only: it does not include autograd graph traversal, optimizer, AMP
+scaler, softmax, losses, normalization, or activation kernels.
 
 Run directly with an optimized library/metallib build:
 

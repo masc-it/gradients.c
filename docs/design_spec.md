@@ -490,18 +490,30 @@ Containers organize the model tree. Typed C forward functions do computation.
 
 `nn.Module` is not a virtual class, not a tensor-memory owner, and not required to expose a generic `forward` callback. It stores names and traversal metadata only.
 
-Example module API shape:
+Low-level module registration API shape:
 
 ```c
 gd_module_init(ctx, &m->mod, "linear");
-gd_module_add_param(&m->mod, "weight", m->weight);
-gd_module_add_param(&m->mod, "bias", m->bias);
-gd_module_add_buffer(&m->mod, "running_mean", buf);
+gd_module_add_param(&m->mod, "weight", &m->weight);
+gd_module_add_param(&m->mod, "bias", &m->bias);
+gd_module_add_buffer(&m->mod, "running_mean", &buf);
 gd_module_add_child(&parent->mod, "proj", &m->mod);
 
 gd_module_set_training(&model->mod, true);
 gd_module_freeze(&model->mod, "backbone.*");
 gd_module_collect_params(ctx, &model->mod, groups, n_groups, &param_set);
+```
+
+Normal layer code should use create-and-register helpers instead of manually registering every tensor:
+
+```c
+gd_tensor_spec w = gd_tensor_spec_make(GD_DTYPE_F16, 2, w_shape, 256);
+gd_init_spec init = gd_init_rand_uniform(seed, -0.02f, 0.02f);
+gd_module_param(ctx, &m->mod, "weight", &w, &init, &m->weight);
+
+gd_linear_layer_config cfg = gd_linear_layer_config_make(in_features, out_features,
+                                                         GD_DTYPE_F16, seed);
+gd_linear_layer_init_child(ctx, &parent->mod, "proj", &m->proj, &cfg);
 ```
 
 `nn.ModuleList` stores ordered child registrations, but typed arrays hold concrete structs for fast C access:

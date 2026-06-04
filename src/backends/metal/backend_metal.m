@@ -139,7 +139,11 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
-    return gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_reg", &backend->matmul_tn_reg_pso);
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_reg", &backend->matmul_tn_reg_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_metal_make_pipeline(backend, library, "gd_reduce_rows_f16", &backend->reduce_rows_pso);
 }
 
 static bool gd_metal_byte_range_valid(const gd_backend_buffer *buffer, size_t offset, size_t nbytes)
@@ -238,6 +242,9 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->active_command_buffer != NULL) {
         CFRelease(backend->active_command_buffer);
+    }
+    if (backend->reduce_rows_pso != NULL) {
+        CFRelease(backend->reduce_rows_pso);
     }
     if (backend->matmul_tn_reg_pso != NULL) {
         CFRelease(backend->matmul_tn_reg_pso);

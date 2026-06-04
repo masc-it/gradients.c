@@ -22,6 +22,7 @@ struct gd_backend {
     void *matmul_tn_pso;
     void *matmul_nt_reg_pso;
     void *matmul_tn_reg_pso;
+    void *reduce_rows_pso;
     void *active_command_buffer;
     bool scope_active;
 };

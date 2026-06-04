@@ -5,6 +5,13 @@
 
 using namespace metal;
 
+static inline ulong gd_binary_row_bcast_offset(ulong row,
+                                               ulong col,
+                                               constant gd_metal_u64 *strides)
+{
+    return row * ulong(strides[0]) + col * ulong(strides[1]);
+}
+
 static inline ulong gd_binary_bcast_offset(ulong linear,
                                            constant gd_metal_binary_bcast_args &args,
                                            constant gd_metal_u64 *strides)

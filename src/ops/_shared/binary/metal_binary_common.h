@@ -155,7 +155,8 @@ static inline gd_status gd_metal_binary_dispatch(gd_backend *backend,
                                                  const gd_backend_tensor_view *y,
                                                  const gd_backend_tensor_view *out,
                                                  id<MTLComputePipelineState> direct_pso,
-                                                 id<MTLComputePipelineState> bcast_pso)
+                                                 id<MTLComputePipelineState> bcast_pso,
+                                                 id<MTLComputePipelineState> row_bcast_pso)
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
@@ -165,8 +166,9 @@ static inline gd_status gd_metal_binary_dispatch(gd_backend *backend,
     MTLSize threads;
     bool immediate;
     bool direct;
+    bool row_broadcast;
     gd_status st;
-    if (backend == NULL || direct_pso == nil || bcast_pso == nil) {
+    if (backend == NULL || direct_pso == nil || bcast_pso == nil || row_bcast_pso == nil) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_metal_binary_validate_broadcast_views(x, y, out);
@@ -174,6 +176,7 @@ static inline gd_status gd_metal_binary_dispatch(gd_backend *backend,
         return st;
     }
     direct = x->count == out->count && y->count == out->count;
+    row_broadcast = !direct && out->rank == 2U;
     if (direct) {
         st = gd_metal_binary_validate_direct_views(x, y, out);
         if (st != GD_OK) {
@@ -202,18 +205,27 @@ static inline gd_status gd_metal_binary_dispatch(gd_backend *backend,
         [encoder setBytes:&args length:sizeof(args) atIndex:3U];
     } else {
         gd_metal_binary_fill_bcast_args(&bcast_args, x, y, out);
-        [encoder setComputePipelineState:bcast_pso];
+        [encoder setComputePipelineState:row_broadcast ? row_bcast_pso : bcast_pso];
         [encoder setBuffer:gd_metal_binary_buffer(x->buffer) offset:0U atIndex:0U];
         [encoder setBuffer:gd_metal_binary_buffer(y->buffer) offset:0U atIndex:1U];
         [encoder setBuffer:gd_metal_binary_buffer(out->buffer) offset:0U atIndex:2U];
         [encoder setBytes:&bcast_args length:sizeof(bcast_args) atIndex:3U];
     }
-    grid = MTLSizeMake((NSUInteger)out->count, 1U, 1U);
-    threads = MTLSizeMake((NSUInteger)(out->count < GD_METAL_BINARY_MAX_THREADS_PER_GROUP ?
-                                       out->count : GD_METAL_BINARY_MAX_THREADS_PER_GROUP),
-                          1U,
-                          1U);
-    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    if (row_broadcast) {
+        grid = MTLSizeMake((NSUInteger)out->shape[1], (NSUInteger)out->shape[0], 1U);
+        threads = MTLSizeMake((NSUInteger)(out->shape[1] < GD_METAL_BINARY_MAX_THREADS_PER_GROUP ?
+                                           out->shape[1] : GD_METAL_BINARY_MAX_THREADS_PER_GROUP),
+                              1U,
+                              1U);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    } else {
+        grid = MTLSizeMake((NSUInteger)out->count, 1U, 1U);
+        threads = MTLSizeMake((NSUInteger)(out->count < GD_METAL_BINARY_MAX_THREADS_PER_GROUP ?
+                                           out->count : GD_METAL_BINARY_MAX_THREADS_PER_GROUP),
+                              1U,
+                              1U);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    }
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);
 }

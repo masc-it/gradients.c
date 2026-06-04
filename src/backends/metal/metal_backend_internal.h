@@ -30,8 +30,13 @@ struct gd_backend {
     void *unary_backward_pso[GD_OP_COUNT];
     void *binary_pso[GD_OP_COUNT];
     void *binary_bcast_pso[GD_OP_COUNT];
+    void *binary_row_bcast_pso[GD_OP_COUNT];
     void *binary_reduce_pso;
     void *binary_reduce_suffix_pso;
+    void *reduce_contiguous_pso;
+    void *reduce_axis_pso;
+    void *broadcast_axis_pso;
+    void *broadcast_to_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

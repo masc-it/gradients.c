@@ -735,7 +735,7 @@ static int gd_generate_metal_ops(const gd_gen_ops *ops)
             ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
         }
         if (ok && ops->items[i].backend_binary) {
-            char tmp[900];
+            char tmp[1400];
             int n = snprintf(tmp,
                              sizeof(tmp),
                              "    st = gd_metal_make_pipeline(backend, library, \"gd_%s_kernel\",\n"
@@ -747,7 +747,14 @@ static int gd_generate_metal_ops(const gd_gen_ops *ops)
                              "                                &backend->binary_bcast_pso[GD_OP_%s]);\n"
                              "    if (st != GD_OK) {\n"
                              "        return st;\n"
+                             "    }\n"
+                             "    st = gd_metal_make_pipeline(backend, library, \"gd_%s_row_bcast_kernel\",\n"
+                             "                                &backend->binary_row_bcast_pso[GD_OP_%s]);\n"
+                             "    if (st != GD_OK) {\n"
+                             "        return st;\n"
                              "    }\n",
+                             ops->items[i].name,
+                             ops->items[i].upper,
                              ops->items[i].name,
                              ops->items[i].upper,
                              ops->items[i].name,

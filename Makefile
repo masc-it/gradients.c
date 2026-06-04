@@ -81,11 +81,12 @@ TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 FOUNDATION_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_foundation_probe
 METAL_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_metal_arena_probe
 GEMM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_matmul_training_perf_probe
+ELEM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_elementwise_reduce_perf_probe
 GEN_OPS_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gen_ops
 NEW_OP_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gradients-new-op
 OPS_REGISTRY_STAMP := $(BUILD_DIR)/.ops-registry
 
-.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe tools ops-registry clean list FORCE
+.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe elementwise-reduce-perf-probe tools ops-registry clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c v2 commands:'
@@ -96,6 +97,7 @@ help:
 	@printf '%s\n' '  make probes            run standalone foundation probe'
 	@printf '%s\n' '  make metal-probe       build + run Metal probe on macOS'
 	@printf '%s\n' '  make gemm-perf-probe   optimized public API F16 GEMM performance probe'
+	@printf '%s\n' '  make elementwise-reduce-perf-probe optimized binary/reduce performance probe'
 	@printf '%s\n' '  make SAN=1 check       sanitizer build'
 	@printf '%s\n' '  make list              show discovered files'
 	@printf '%s\n' '  make clean             remove build dir'
@@ -157,12 +159,26 @@ gemm-perf-probe:
 	  -o '$(GEMM_PERF_PROBE)'
 	@printf '[probe] %s\n' '$(GEMM_PERF_PROBE)'
 	@GRADIENTS_METALLIB='$(PERF_BUILD_DIR)/gradients.metallib' '$(GEMM_PERF_PROBE)'
+
+elementwise-reduce-perf-probe:
+	$(MAKE) BUILD_DIR='$(PERF_BUILD_DIR)' CFLAGS='$(PERF_CFLAGS)' OBJCFLAGS='$(PERF_OBJCFLAGS)' build
+	@mkdir -p '$(PERF_BUILD_DIR)/$(PROBE_DIR)'
+	$(CC) -I$(INCLUDE_DIR) $(PERF_PROBE_CFLAGS) \
+	  $(PROBE_DIR)/v2_elementwise_reduce_perf_probe.c \
+	  '$(PERF_BUILD_DIR)/lib$(LIB_NAME).a' $(LDFLAGS) \
+	  -framework Foundation -framework Metal \
+	  -o '$(ELEM_PERF_PROBE)'
+	@printf '[probe] %s\n' '$(ELEM_PERF_PROBE)'
+	@GRADIENTS_METALLIB='$(PERF_BUILD_DIR)/gradients.metallib' '$(ELEM_PERF_PROBE)'
 else
 metal-probe:
 	@printf '[metal-probe] skipped: macOS required\n'
 
 gemm-perf-probe:
 	@printf '[gemm-perf-probe] skipped: macOS required\n'
+
+elementwise-reduce-perf-probe:
+	@printf '[elementwise-reduce-perf-probe] skipped: macOS required\n'
 endif
 
 list:

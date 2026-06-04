@@ -90,6 +90,37 @@ The stress script builds the performance library separately with `-O3 -DNDEBUG`
 `PERF_PROBE_CFLAGS`) so performance results are not accidentally taken from the
 Makefile's debug-oriented default build.
 
+## v2_elementwise_reduce_perf_probe
+
+Links against `libgradients.a` and measures the public binary elementwise,
+broadcasting, reduction, and scalar-loss autograd paths added for in-graph MSE:
+
+- direct F16/F32 `gd_add`, `gd_sub`, `gd_mul`
+- row/vector broadcast F16/F32 `gd_add` / `gd_mul` (`[tokens, hidden]` with `[hidden]`)
+- all-elements `gd_reduce_sum` and `gd_reduce_mean`
+- row-wise `gd_reduce_sum_axis(..., axis=1)` and `gd_reduce_mean_axis(..., axis=1)`
+- row-wise `reduce_mean_axis -> backward` for reduced-axis broadcast gradients
+- full `sub -> mul -> reduce_mean -> backward` MSE graph
+
+Profiles use activation-sized tensors such as `4096x1024` and `8192x2048`.
+Wall time includes public validation, scratch arena allocation, command-buffer
+submit, and synchronization.
+
+Run:
+
+```sh
+make elementwise-reduce-perf-probe
+```
+
+Knobs:
+
+```sh
+GD_QA_ELEM_PROFILE=all|h1024_f16|h2048_f16|h1024_f32
+GD_QA_ELEM_WARMUP=3
+GD_QA_ELEM_ITERS=10
+PERF_BUILD_DIR=build-perf
+```
+
 ## v2_metal_arena_probe
 
 Checks device-memory mapping for v2 arenas on Metal:

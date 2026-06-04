@@ -242,13 +242,13 @@ int main(void)
     gd_param_set params;
     xor_mlp model;
     gd_tensor x;
+    gd_tensor target;
     const int64_t x_shape[2] = {BATCH, IN};
     const int64_t y_shape[2] = {BATCH, OUT};
     uint16_t x_f16[BATCH * IN];
+    uint16_t y_f16[BATCH * OUT];
     uint16_t pred_f16[BATCH * OUT];
-    uint16_t grad_f16[BATCH * OUT];
     float pred[BATCH * OUT];
-    float grad[BATCH * OUT];
     float final_loss;
     int step;
     int correct;
@@ -266,9 +266,13 @@ int main(void)
     xor_mlp_init(ctx, &model);
 
     pack_f16(x_f32, x_f16, BATCH * IN);
+    pack_f16(y_f32, y_f16, BATCH * OUT);
     TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
+    TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, y_shape, 256U, &target));
     TRY(ctx, gd_tensor_write(ctx, &x, x_f16, sizeof(x_f16)));
+    TRY(ctx, gd_tensor_write(ctx, &target, y_f16, sizeof(y_f16)));
     x.requires_grad = false;
+    target.requires_grad = false;
 
     memset(groups, 0, sizeof(groups));
     groups[0].name = "hidden";
@@ -295,26 +299,31 @@ int main(void)
 
     for (step = 0; step < STEPS; ++step) {
         gd_tensor pred_tensor;
-        gd_tensor grad_tensor;
+        gd_tensor diff;
+        gd_tensor sq;
+        gd_tensor loss;
+        uint16_t loss_bits = 0U;
+        float loss_value = 0.0f;
         size_t i;
         TRY(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
         TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
+        TRY(ctx, gd_sub(ctx, &pred_tensor, &target, &diff));
+        TRY(ctx, gd_mul(ctx, &diff, &diff, &sq));
+        TRY(ctx, gd_reduce_mean(ctx, &sq, &loss));
         TRY(ctx, gd_tensor_read(ctx, &pred_tensor, pred_f16, sizeof(pred_f16)));
+        TRY(ctx, gd_tensor_read(ctx, &loss, &loss_bits, sizeof(loss_bits)));
+        loss_value = f16_bits_to_f32(loss_bits);
         for (i = 0U; i < BATCH * OUT; ++i) {
             pred[i] = f16_bits_to_f32(pred_f16[i]);
-            grad[i] = 2.0f * (pred[i] - y_f32[i]) / (float)(BATCH * OUT);
         }
-        pack_f16(grad, grad_f16, BATCH * OUT);
-        TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, 2U, y_shape, 256U, &grad_tensor));
-        TRY(ctx, gd_tensor_write(ctx, &grad_tensor, grad_f16, sizeof(grad_f16)));
-        TRY(ctx, gd_backward_scaled(ctx, &pred_tensor, &grad_tensor, gd_amp_scaler_scale(scaler)));
+        TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
         TRY(ctx, gd_end(ctx));
 
         if (step == 0 || (step + 1) % 40 == 0) {
             printf("step=%3d loss=%.6f scale=%.1f overflow=%s\n",
                    step + 1,
-                   (double)mean_squared_error(pred, y_f32, BATCH * OUT),
+                   (double)loss_value,
                    (double)gd_amp_scaler_scale(scaler),
                    gd_amp_scaler_last_found_inf(scaler) ? "yes" : "no");
         }

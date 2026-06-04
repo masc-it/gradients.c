@@ -37,6 +37,30 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
 
+/* Reduces a single axis. Negative axes are accepted Python-style. */
+gd_status gd_reduce_sum_axis(gd_context *ctx,
+                             const gd_tensor *x,
+                             int32_t axis,
+                             bool keepdims,
+                             gd_tensor *out);
+gd_status gd_reduce_sum_axis_backward(gd_context *ctx,
+                                      const gd_tensor *x,
+                                      const gd_tensor *grad_out,
+                                      int32_t axis,
+                                      bool keepdims,
+                                      gd_tensor *grad_x);
+gd_status gd_reduce_mean_axis(gd_context *ctx,
+                              const gd_tensor *x,
+                              int32_t axis,
+                              bool keepdims,
+                              gd_tensor *out);
+gd_status gd_reduce_mean_axis_backward(gd_context *ctx,
+                                       const gd_tensor *x,
+                                       const gd_tensor *grad_out,
+                                       int32_t axis,
+                                       bool keepdims,
+                                       gd_tensor *grad_x);
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,6 +17,9 @@ Stress workloads to validate v2 design before consolidation.
 - Ring depth/capacity affects OOM and wait frequency, not GEMM throughput directly.
 - Padding row strides or batched matrix gaps gives no reliable win and can hurt small H=256 shapes.
 - Generic MPS batched GEMM is acceptable for layout validation, but skinny attention-V shapes underutilize MPS; custom `sdpa_varlen` remains needed.
+- Binary elementwise direct kernels on real activation tensors reach memory-bandwidth-like throughput through public API; generic broadcast was initially too slow, so row/vector broadcast now has a 2D specialized Metal path.
+- All-elements reductions use multi-stage simdgroup contiguous kernels; current public API performance is acceptable for scalar losses and MSE graph stress.
+- Axis reductions now use dedicated simdgroup Metal kernels and optimized reduced-axis broadcast for backward; continue watching non-last-axis strided cases as normalization workloads expand.
 
 ## Device memory / MPS layout
 

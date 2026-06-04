@@ -164,6 +164,28 @@ gd_status gd_backend_scale(gd_backend *backend,
                            size_t count,
                            uint32_t dtype,
                            float scale);
+/* dst[j] = scale * sum(src chunk j) for contiguous all-reduce staging. */
+gd_status gd_backend_reduce_contiguous(gd_backend *backend,
+                                       const gd_backend_tensor_view *src,
+                                       const gd_backend_tensor_view *dst,
+                                       float scale);
+/* Reduce one axis of a contiguous tensor; dst is src with axis removed or kept as size 1. */
+gd_status gd_backend_reduce_axis(gd_backend *backend,
+                                 const gd_backend_tensor_view *src,
+                                 const gd_backend_tensor_view *dst,
+                                 uint32_t axis,
+                                 float scale);
+/* Broadcast a reduced-axis tensor back to dst = src expanded along axis, scaled. */
+gd_status gd_backend_broadcast_axis(gd_backend *backend,
+                                    const gd_backend_tensor_view *src,
+                                    const gd_backend_tensor_view *dst,
+                                    uint32_t axis,
+                                    float scale);
+/* dst = broadcast_to(src, dst.shape) * scale for contiguous tensors. */
+gd_status gd_backend_broadcast_to(gd_backend *backend,
+                                  const gd_backend_tensor_view *src,
+                                  const gd_backend_tensor_view *dst,
+                                  float scale);
 /* dst = sum_to_shape(src) * scale for contiguous broadcast-compatible tensors. */
 gd_status gd_backend_reduce_broadcast(gd_backend *backend,
                                       const gd_backend_tensor_view *src,

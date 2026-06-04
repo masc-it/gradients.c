@@ -143,6 +143,22 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_reduce_contiguous_kernel", &backend->reduce_contiguous_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_reduce_axis_kernel", &backend->reduce_axis_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_axis_kernel", &backend->broadcast_axis_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_to_kernel", &backend->broadcast_to_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
     if (st != GD_OK) {
         return st;
@@ -288,6 +304,18 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend->adamw_pso != NULL) {
         CFRelease(backend->adamw_pso);
     }
+    if (backend->broadcast_to_pso != NULL) {
+        CFRelease(backend->broadcast_to_pso);
+    }
+    if (backend->broadcast_axis_pso != NULL) {
+        CFRelease(backend->broadcast_axis_pso);
+    }
+    if (backend->reduce_axis_pso != NULL) {
+        CFRelease(backend->reduce_axis_pso);
+    }
+    if (backend->reduce_contiguous_pso != NULL) {
+        CFRelease(backend->reduce_contiguous_pso);
+    }
     if (backend->binary_reduce_suffix_pso != NULL) {
         CFRelease(backend->binary_reduce_suffix_pso);
     }
@@ -304,6 +332,9 @@ void gd_backend_destroy(gd_backend *backend)
         CFRelease(backend->accumulate_pso);
     }
     for (i = 0U; i < GD_OP_COUNT; ++i) {
+        if (backend->binary_row_bcast_pso[i] != NULL) {
+            CFRelease(backend->binary_row_bcast_pso[i]);
+        }
         if (backend->binary_bcast_pso[i] != NULL) {
             CFRelease(backend->binary_bcast_pso[i]);
         }

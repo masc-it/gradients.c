@@ -7,6 +7,8 @@ extern const gd_autograd_rule gd_bwd_rule_relu;
 extern const gd_autograd_rule gd_bwd_rule_add;
 extern const gd_autograd_rule gd_bwd_rule_mul;
 extern const gd_autograd_rule gd_bwd_rule_sub;
+extern const gd_autograd_rule gd_bwd_rule_reduce_mean;
+extern const gd_autograd_rule gd_bwd_rule_reduce_sum;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -15,6 +17,8 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_ADD] = &gd_bwd_rule_add,
     [GD_OP_MUL] = &gd_bwd_rule_mul,
     [GD_OP_SUB] = &gd_bwd_rule_sub,
+    [GD_OP_REDUCE_MEAN] = &gd_bwd_rule_reduce_mean,
+    [GD_OP_REDUCE_SUM] = &gd_bwd_rule_reduce_sum,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

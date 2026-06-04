@@ -10,7 +10,9 @@ typedef enum gd_op_kind {
     GD_OP_ADD = 4,
     GD_OP_MUL = 5,
     GD_OP_SUB = 6,
-    GD_OP_COUNT = 7,
+    GD_OP_REDUCE_MEAN = 7,
+    GD_OP_REDUCE_SUM = 8,
+    GD_OP_COUNT = 9,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

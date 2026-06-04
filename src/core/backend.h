@@ -34,6 +34,36 @@ typedef struct gd_backend_vector_view {
     uint32_t dtype;
 } gd_backend_vector_view;
 
+typedef struct gd_backend_adamw_desc {
+    gd_backend_buffer *param_buffer;
+    size_t param_offset;
+    gd_backend_buffer *grad_buffer;
+    size_t grad_offset;
+    gd_backend_buffer *m_buffer;
+    size_t m_offset;
+    gd_backend_buffer *v_buffer;
+    size_t v_offset;
+    size_t count;
+    uint32_t param_dtype;
+    uint32_t grad_dtype;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bias_correction1;
+    float bias_correction2;
+} gd_backend_adamw_desc;
+
+typedef struct gd_backend_tensor_view {
+    gd_backend_buffer *buffer;
+    size_t offset;
+    size_t count;
+    uint32_t dtype;
+} gd_backend_tensor_view;
+
+#include "backend_generated.h"
+
 gd_status gd_backend_create_default(gd_backend **out_backend);
 void gd_backend_destroy(gd_backend *backend);
 
@@ -108,6 +138,7 @@ gd_status gd_backend_accumulate(gd_backend *backend,
                                 size_t src_offset,
                                 size_t count,
                                 uint32_t dtype);
+gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

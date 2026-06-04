@@ -3,6 +3,7 @@
 
 #include <gradients/status.h>
 #include <gradients/tensor.h>
+#include <gradients/ops_generated.h>
 
 #ifdef __cplusplus
 extern "C" {

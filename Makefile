@@ -8,6 +8,7 @@ SRC_DIR := src
 TEST_DIR := tests
 PROBE_DIR := probes
 DOCS_DIR := docs
+TOOLS_DIR := tools
 
 LIB_NAME := gradients
 LIB := $(BUILD_DIR)/lib$(LIB_NAME).a
@@ -27,6 +28,7 @@ CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
 LDFLAGS ?=
 LDLIBS ?=
 PROBE_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Wpedantic
+TOOL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic
 PERF_BUILD_DIR ?= build-perf
 PERF_CFLAGS ?= -std=c11 -O3 -DNDEBUG -Wall -Wextra -Wpedantic -Werror \
                -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
@@ -69,6 +71,7 @@ endif
 
 OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC)) $(patsubst %.m,$(BUILD_DIR)/%.o,$(MSRC))
 DEP := $(OBJ:.o=.d)
+OPS_REGISTRY_OBJS := $(filter $(BUILD_DIR)/src/ops/%.o,$(OBJ)) $(filter $(BUILD_DIR)/src/autograd/%.o,$(OBJ))
 
 TEST_SRC := $(shell find $(TEST_DIR) -maxdepth 1 -type f -name '*.c' 2>/dev/null | sort)
 TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
@@ -76,12 +79,16 @@ TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/$(TEST_DIR)/%,$(TEST_SRC))
 FOUNDATION_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_foundation_probe
 METAL_PROBE := $(BUILD_DIR)/$(PROBE_DIR)/v2_metal_arena_probe
 GEMM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_matmul_training_perf_probe
+GEN_OPS_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gen_ops
+NEW_OP_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gradients-new-op
+OPS_REGISTRY_STAMP := $(BUILD_DIR)/.ops-registry
 
-.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe clean list FORCE
+.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe tools ops-registry clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c v2 commands:'
 	@printf '%s\n' '  make build             build static library'
+	@printf '%s\n' '  make tools             build op registry/scaffold tools'
 	@printf '%s\n' '  make test              build + run C tests'
 	@printf '%s\n' '  make check             docs-check + tests + foundation probe'
 	@printf '%s\n' '  make probes            run standalone foundation probe'
@@ -93,8 +100,18 @@ help:
 
 all: check
 
-build: $(LIB) $(METAL_BUILD_ARTIFACTS)
+build: ops-registry $(LIB) $(METAL_BUILD_ARTIFACTS)
 	@printf '[build] %s\n' '$(LIB)'
+
+tools: $(GEN_OPS_TOOL) $(NEW_OP_TOOL)
+	@printf '[tools] %s %s\n' '$(GEN_OPS_TOOL)' '$(NEW_OP_TOOL)'
+
+ops-registry: $(OPS_REGISTRY_STAMP)
+
+$(OPS_REGISTRY_STAMP): $(GEN_OPS_TOOL) FORCE
+	@$(GEN_OPS_TOOL) --stamp $@
+
+src/ops/op_kind.h src/ops/op_registry.c: $(OPS_REGISTRY_STAMP) ;
 
 check: docs-check test foundation-probe
 	@printf '[check] ok\n'
@@ -170,18 +187,28 @@ $(CONFIG_STAMP): FORCE
 		rm "$$tmp"; \
 	fi
 
-$(LIB): $(CONFIG_STAMP) $(OBJ)
+$(LIB): $(OPS_REGISTRY_STAMP) $(CONFIG_STAMP) $(OBJ)
 	@mkdir -p $(@D)
 	@$(RM) $@
 	$(AR) rcs $@ $(OBJ)
 
-$(BUILD_DIR)/%.o: %.c $(CONFIG_STAMP)
+$(GEN_OPS_TOOL): $(TOOLS_DIR)/gen_ops.c $(CONFIG_STAMP)
+	@mkdir -p $(@D)
+	$(CC) $(TOOL_CFLAGS) $< -o $@
+
+$(NEW_OP_TOOL): $(TOOLS_DIR)/gradients-new-op.c $(CONFIG_STAMP)
+	@mkdir -p $(@D)
+	$(CC) $(TOOL_CFLAGS) $< -o $@
+
+$(BUILD_DIR)/%.o: %.c $(CONFIG_STAMP) | ops-registry
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: %.m $(CONFIG_STAMP)
+$(BUILD_DIR)/%.o: %.m $(CONFIG_STAMP) | ops-registry
 	@mkdir -p $(@D)
 	$(OBJC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
+
+$(OPS_REGISTRY_OBJS): $(OPS_REGISTRY_STAMP)
 
 ifeq ($(UNAME_S),Darwin)
 $(METALLIB): $(METAL_AIR)

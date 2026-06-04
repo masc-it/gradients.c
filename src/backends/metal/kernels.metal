@@ -40,6 +40,22 @@ static inline void gd_write_float_dtype(device uchar *dst, ulong byte, uint dtyp
     }
 }
 
+static inline float gd_load_float_dtype(device const uchar *src, ulong byte, uint dtype)
+{
+    if (dtype == 1u) {
+        return float(*(reinterpret_cast<device const half *>(src + byte)));
+    }
+    if (dtype == 3u) {
+        return *(reinterpret_cast<device const float *>(src + byte));
+    }
+    return 0.0f;
+}
+
+static inline ulong gd_dtype_elem_size(uint dtype)
+{
+    return dtype == 3u ? 4ul : 2ul;
+}
+
 kernel void gd_fill_kernel(device uchar *dst [[buffer(0)]],
                            constant gd_metal_fill_args &args [[buffer(1)]],
                            uint gid [[thread_position_in_grid]])
@@ -84,6 +100,82 @@ kernel void gd_accumulate_kernel(device uchar *dst [[buffer(0)]],
         device float *d = reinterpret_cast<device float *>(dst + args.dst_offset);
         device const float *s = reinterpret_cast<device const float *>(src + args.src_offset);
         d[i] += s[i];
+    }
+}
+
+kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
+                            device const uchar *grad [[buffer(1)]],
+                            device uchar *m_buf [[buffer(2)]],
+                            device uchar *v_buf [[buffer(3)]],
+                            constant gd_metal_adamw_args &args [[buffer(4)]],
+                            uint gid [[thread_position_in_grid]])
+{
+    const ulong i = ulong(gid);
+    if (i >= args.count) {
+        return;
+    }
+
+    const ulong p_byte = args.param_offset + i * gd_dtype_elem_size(args.param_dtype);
+    const ulong g_byte = args.grad_offset + i * gd_dtype_elem_size(args.grad_dtype);
+    device float *m = reinterpret_cast<device float *>(m_buf + args.m_offset);
+    device float *v = reinterpret_cast<device float *>(v_buf + args.v_offset);
+
+    const float g = gd_load_float_dtype(grad, g_byte, args.grad_dtype);
+    const float p = gd_load_float_dtype(param, p_byte, args.param_dtype);
+    const float m_new = args.beta1 * m[i] + (1.0f - args.beta1) * g;
+    const float v_new = args.beta2 * v[i] + (1.0f - args.beta2) * g * g;
+    const float m_hat = m_new / args.bias_correction1;
+    const float v_hat = v_new / args.bias_correction2;
+    const float update = m_hat / (sqrt(v_hat) + args.eps);
+    const float p_new = p - args.lr * (update + args.weight_decay * p);
+
+    m[i] = m_new;
+    v[i] = v_new;
+    gd_write_float_dtype(param, p_byte, args.param_dtype, p_new);
+}
+
+kernel void gd_relu_kernel(device const uchar *xbuf [[buffer(0)]],
+                           device uchar *ybuf [[buffer(1)]],
+                           constant gd_metal_relu_args &args [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]])
+{
+    const ulong i = ulong(gid);
+    if (i >= args.count) {
+        return;
+    }
+    if (args.dtype == 1u) {
+        device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
+        device half *y = reinterpret_cast<device half *>(ybuf + args.y_offset);
+        const half v = x[i];
+        y[i] = v > half(0.0h) ? v : half(0.0h);
+    } else if (args.dtype == 3u) {
+        device const float *x = reinterpret_cast<device const float *>(xbuf + args.x_offset);
+        device float *y = reinterpret_cast<device float *>(ybuf + args.y_offset);
+        const float v = x[i];
+        y[i] = max(v, 0.0f);
+    }
+}
+
+kernel void gd_relu_backward_kernel(device const uchar *xbuf [[buffer(0)]],
+                                    device const uchar *gbuf [[buffer(1)]],
+                                    device uchar *dxbuf [[buffer(2)]],
+                                    constant gd_metal_relu_args &args [[buffer(3)]],
+                                    uint gid [[thread_position_in_grid]])
+{
+    const ulong i = ulong(gid);
+    if (i >= args.count) {
+        return;
+    }
+    if (args.dtype == 1u) {
+        device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
+        device const half *g = reinterpret_cast<device const half *>(gbuf + args.grad_offset);
+        device half *dx = reinterpret_cast<device half *>(dxbuf + args.y_offset);
+        dx[i] = x[i] > half(0.0h) ? g[i] : half(0.0h);
+    } else if (args.dtype == 3u) {
+        device const float *x = reinterpret_cast<device const float *>(xbuf + args.x_offset);
+        device const float *g = reinterpret_cast<device const float *>(gbuf + args.grad_offset);
+        device float *dx = reinterpret_cast<device float *>(dxbuf + args.y_offset);
+        dx[i] = x[i] > 0.0f ? g[i] : 0.0f;
     }
 }
 

@@ -224,6 +224,13 @@ gd_status gd_backend_accumulate(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
+{
+    (void)backend;
+    (void)desc;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)
 {
     (void)backend;

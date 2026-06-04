@@ -61,6 +61,43 @@ typedef struct gd_metal_accumulate_args {
     uint pad0;
 } gd_metal_accumulate_args;
 
+typedef struct gd_metal_unary_args {
+    ulong x_offset;
+    ulong y_offset;
+    ulong z_offset;
+    ulong count;
+    uint dtype;
+    uint pad0;
+} gd_metal_unary_args;
+
+typedef struct gd_metal_relu_args {
+    ulong x_offset;
+    ulong y_offset;
+    ulong grad_offset;
+    ulong count;
+    uint dtype;
+    uint pad0;
+} gd_metal_relu_args;
+
+typedef struct gd_metal_adamw_args {
+    ulong param_offset;
+    ulong grad_offset;
+    ulong m_offset;
+    ulong v_offset;
+    ulong count;
+    uint param_dtype;
+    uint grad_dtype;
+    uint pad0;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bias_correction1;
+    float bias_correction2;
+    float pad1;
+} gd_metal_adamw_args;
+
 #else
 
 #include <stddef.h>
@@ -114,6 +151,43 @@ typedef struct gd_metal_accumulate_args {
     uint32_t pad0;
 } gd_metal_accumulate_args;
 
+typedef struct gd_metal_unary_args {
+    uint64_t x_offset;
+    uint64_t y_offset;
+    uint64_t z_offset;
+    uint64_t count;
+    uint32_t dtype;
+    uint32_t pad0;
+} gd_metal_unary_args;
+
+typedef struct gd_metal_relu_args {
+    uint64_t x_offset;
+    uint64_t y_offset;
+    uint64_t grad_offset;
+    uint64_t count;
+    uint32_t dtype;
+    uint32_t pad0;
+} gd_metal_relu_args;
+
+typedef struct gd_metal_adamw_args {
+    uint64_t param_offset;
+    uint64_t grad_offset;
+    uint64_t m_offset;
+    uint64_t v_offset;
+    uint64_t count;
+    uint32_t param_dtype;
+    uint32_t grad_dtype;
+    uint32_t pad0;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bias_correction1;
+    float bias_correction2;
+    float pad1;
+} gd_metal_adamw_args;
+
 #endif /* __METAL_VERSION__ */
 
 #ifndef __METAL_VERSION__
@@ -121,6 +195,10 @@ _Static_assert(sizeof(gd_metal_fill_args) == 24U, "gd_metal_fill_args ABI mismat
 _Static_assert(sizeof(gd_metal_rand_uniform_args) == 40U, "gd_metal_rand_uniform_args ABI mismatch");
 _Static_assert(sizeof(gd_metal_gemm_args) == 72U, "gd_metal_gemm_args ABI mismatch");
 _Static_assert(sizeof(gd_metal_accumulate_args) == 32U, "gd_metal_accumulate_args ABI mismatch");
+_Static_assert(sizeof(gd_metal_unary_args) == 40U, "gd_metal_unary_args ABI mismatch");
+_Static_assert(sizeof(gd_metal_relu_args) == 40U, "gd_metal_relu_args ABI mismatch");
+_Static_assert(sizeof(gd_metal_adamw_args) == 88U, "gd_metal_adamw_args ABI mismatch");
+_Static_assert(offsetof(gd_metal_adamw_args, lr) == 52U, "gd_metal_adamw_args lr offset mismatch");
 _Static_assert(offsetof(gd_metal_gemm_args, rows) == 56U, "gd_metal_gemm_args rows offset mismatch");
 _Static_assert(offsetof(gd_metal_gemm_args, has_bias) == 68U, "gd_metal_gemm_args has_bias offset mismatch");
 #endif

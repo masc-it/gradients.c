@@ -79,6 +79,8 @@ typedef struct gd_param_ref {
     char path[GD_MODULE_PATH_MAX];
     gd_tensor *tensor;
     int32_t group_index;
+    float lr_mult;
+    float weight_decay;
     bool trainable;
 } gd_param_ref;
 

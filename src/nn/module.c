@@ -186,6 +186,8 @@ static gd_status gd_param_set_append(gd_param_set *set,
                                      const char path[GD_MODULE_PATH_MAX],
                                      gd_tensor *tensor,
                                      int32_t group_index,
+                                     float lr_mult,
+                                     float weight_decay,
                                      bool trainable)
 {
     gd_status st;
@@ -205,6 +207,8 @@ static gd_status gd_param_set_append(gd_param_set *set,
     (void)snprintf(item->path, sizeof(item->path), "%s", path);
     item->tensor = tensor;
     item->group_index = group_index;
+    item->lr_mult = lr_mult;
+    item->weight_decay = weight_decay;
     item->trainable = trainable;
     set->count += 1U;
     return GD_OK;
@@ -255,6 +259,8 @@ static gd_status gd_module_collect_params_impl(const gd_module *module,
     for (i = 0U; i < module->param_count; ++i) {
         char param_path[GD_MODULE_PATH_MAX];
         int32_t group_index;
+        float lr_mult = 1.0f;
+        float weight_decay = 0.0f;
         bool trainable;
         gd_module_param_entry *entry = &module->params[i];
         if (entry->tensor == NULL || gd_param_set_contains_tensor(out, entry->tensor)) {
@@ -266,10 +272,20 @@ static gd_status gd_module_collect_params_impl(const gd_module *module,
         }
         group_index = gd_module_select_group(param_path, groups, group_count);
         trainable = entry->trainable && entry->tensor->requires_grad;
-        if (group_index >= 0 && !groups[(uint32_t)group_index].trainable) {
-            trainable = false;
+        if (group_index >= 0) {
+            lr_mult = groups[(uint32_t)group_index].lr_mult;
+            weight_decay = groups[(uint32_t)group_index].weight_decay;
+            if (!groups[(uint32_t)group_index].trainable) {
+                trainable = false;
+            }
         }
-        st = gd_param_set_append(out, param_path, entry->tensor, group_index, trainable);
+        st = gd_param_set_append(out,
+                                 param_path,
+                                 entry->tensor,
+                                 group_index,
+                                 lr_mult,
+                                 weight_decay,
+                                 trainable);
         if (st != GD_OK) {
             return st;
         }

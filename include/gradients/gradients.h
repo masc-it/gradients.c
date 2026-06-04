@@ -8,5 +8,6 @@
 #include <gradients/ops.h>
 #include <gradients/autograd.h>
 #include <gradients/module.h>
+#include <gradients/optimizer.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

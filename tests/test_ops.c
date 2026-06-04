@@ -215,6 +215,8 @@ static void test_matmul_linear(gd_context *ctx)
     gd_tensor y;
     gd_tensor lin;
     gd_tensor lin_no_bias;
+    gd_tensor relu_y;
+    gd_tensor relu_dx;
     gd_tensor dx;
     gd_tensor dw;
     gd_tensor db;
@@ -262,6 +264,25 @@ static void test_matmul_linear(gd_context *ctx)
     CHECK_OK(gd_tensor_read(ctx, &lin_no_bias, got, sizeof(got)));
     for (i = 0U; i < M * N; ++i) {
         CHECK(got[i] == y_got[i], "linear optional null bias equals matmul");
+    }
+
+    CHECK_OK(gd_relu(ctx, &x, &relu_y));
+    memset(dx_got, 0, sizeof(dx_got));
+    CHECK_OK(gd_tensor_read(ctx, &relu_y, dx_got, sizeof(dx_got)));
+    for (i = 0U; i < M * K; ++i) {
+        float xv = f16_bits_to_f32(x_data[i]);
+        float want = xv > 0.0f ? xv : 0.0f;
+        float have = f16_bits_to_f32(dx_got[i]);
+        CHECK(abs_f32(want - have) <= 0.0f, "relu output exact");
+    }
+    CHECK_OK(gd_relu_backward(ctx, &x, &x, &relu_dx));
+    memset(dx_got, 0, sizeof(dx_got));
+    CHECK_OK(gd_tensor_read(ctx, &relu_dx, dx_got, sizeof(dx_got)));
+    for (i = 0U; i < M * K; ++i) {
+        float xv = f16_bits_to_f32(x_data[i]);
+        float want = xv > 0.0f ? xv : 0.0f;
+        float have = f16_bits_to_f32(dx_got[i]);
+        CHECK(abs_f32(want - have) <= 0.0f, "relu backward exact");
     }
 
     CHECK_OK(gd_matmul_backward(ctx, &x, &w, &y, &dx, &dw));

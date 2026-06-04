@@ -56,6 +56,36 @@ static inline bool gd_op_matrix_view_from_tensor(const gd_tensor *tensor,
     return out->buffer != NULL;
 }
 
+static inline bool gd_op_tensor_view_from_tensor(const gd_tensor *tensor,
+                                                 gd_backend_tensor_view *out)
+{
+    int64_t numel;
+    size_t elem_size;
+    size_t offset;
+    uint32_t i;
+    if (tensor == NULL || out == NULL || tensor->rank > GD_MAX_DIMS) {
+        return false;
+    }
+    elem_size = gd_dtype_size(tensor->dtype);
+    if (elem_size == 0U || !gd_tensor_is_contiguous(tensor) ||
+        tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return false;
+    }
+    numel = 1;
+    for (i = 0U; i < tensor->rank; ++i) {
+        if (tensor->shape[i] <= 0 || numel > INT64_MAX / tensor->shape[i]) {
+            return false;
+        }
+        numel *= tensor->shape[i];
+    }
+    offset = tensor->storage.offset + tensor->view_offset;
+    out->buffer = (gd_backend_buffer *)tensor->storage.buffer;
+    out->offset = offset;
+    out->count = (size_t)numel;
+    out->dtype = (uint32_t)tensor->dtype;
+    return out->buffer != NULL;
+}
+
 static inline bool gd_op_vector_view_from_tensor(const gd_tensor *tensor,
                                                  gd_backend_vector_view *out)
 {

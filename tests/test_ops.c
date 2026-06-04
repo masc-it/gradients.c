@@ -164,6 +164,36 @@ static float ref_matmul_value(const uint16_t *x,
     return f16_bits_to_f32(f32_to_f16_bits(sum));
 }
 
+static float ref_matmul_backward_x_value(const uint16_t *grad_out,
+                                         const uint16_t *w,
+                                         uint32_t row,
+                                         uint32_t col,
+                                         uint32_t n)
+{
+    uint32_t p;
+    float sum = 0.0f;
+    for (p = 0U; p < n; ++p) {
+        sum += f16_bits_to_f32(grad_out[row * n + p]) * f16_bits_to_f32(w[col * n + p]);
+    }
+    return f16_bits_to_f32(f32_to_f16_bits(sum));
+}
+
+static float ref_matmul_backward_w_value(const uint16_t *x,
+                                         const uint16_t *grad_out,
+                                         uint32_t row,
+                                         uint32_t col,
+                                         uint32_t m,
+                                         uint32_t k,
+                                         uint32_t n)
+{
+    uint32_t p;
+    float sum = 0.0f;
+    for (p = 0U; p < m; ++p) {
+        sum += f16_bits_to_f32(x[p * k + row]) * f16_bits_to_f32(grad_out[p * n + col]);
+    }
+    return f16_bits_to_f32(f32_to_f16_bits(sum));
+}
+
 static void test_matmul_linear(gd_context *ctx)
 {
     enum { M = 4, K = 7, N = 6 };
@@ -174,6 +204,9 @@ static void test_matmul_linear(gd_context *ctx)
     uint16_t w_data[K * N];
     uint16_t b_data[N];
     uint16_t got[M * N];
+    uint16_t y_got[M * N];
+    uint16_t dx_got[M * K];
+    uint16_t dw_got[K * N];
     gd_tensor x;
     gd_tensor w;
     gd_tensor b;
@@ -200,6 +233,7 @@ static void test_matmul_linear(gd_context *ctx)
     CHECK_OK(gd_matmul(ctx, &x, &w, &y));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &y, got, sizeof(got)));
+    memcpy(y_got, got, sizeof(y_got));
     for (i = 0U; i < M; ++i) {
         for (j = 0U; j < N; ++j) {
             float want = ref_matmul_value(x_data, w_data, i, j, K, N);
@@ -219,9 +253,27 @@ static void test_matmul_linear(gd_context *ctx)
         }
     }
 
-    CHECK_STATUS(gd_matmul_backward(ctx, &x, &w, &y, &dx, &dw), GD_ERR_NOT_IMPLEMENTED);
-    CHECK(dx.storage.nbytes == 0U && dw.storage.nbytes == 0U, "matmul bwd does not publish grads");
-    gd_context_clear_error(ctx);
+    CHECK_OK(gd_matmul_backward(ctx, &x, &w, &y, &dx, &dw));
+    CHECK(dx.shape[0] == M && dx.shape[1] == K && dw.shape[0] == K && dw.shape[1] == N,
+          "matmul bwd gradient shapes");
+    memset(dx_got, 0, sizeof(dx_got));
+    memset(dw_got, 0, sizeof(dw_got));
+    CHECK_OK(gd_tensor_read(ctx, &dx, dx_got, sizeof(dx_got)));
+    CHECK_OK(gd_tensor_read(ctx, &dw, dw_got, sizeof(dw_got)));
+    for (i = 0U; i < M; ++i) {
+        for (j = 0U; j < K; ++j) {
+            float want = ref_matmul_backward_x_value(y_got, w_data, i, j, N);
+            float have = f16_bits_to_f32(dx_got[i * K + j]);
+            CHECK(abs_f32(want - have) <= 0.03f, "matmul backward dx close");
+        }
+    }
+    for (i = 0U; i < K; ++i) {
+        for (j = 0U; j < N; ++j) {
+            float want = ref_matmul_backward_w_value(x_data, y_got, i, j, M, K, N);
+            float have = f16_bits_to_f32(dw_got[i * N + j]);
+            CHECK(abs_f32(want - have) <= 0.03f, "matmul backward dw close");
+        }
+    }
     CHECK_STATUS(gd_linear_backward(ctx, &x, &w, &b, &lin, &dx, &dw, &db), GD_ERR_NOT_IMPLEMENTED);
     CHECK(dx.storage.nbytes == 0U && dw.storage.nbytes == 0U && db.storage.nbytes == 0U,
           "linear bwd does not publish grads");

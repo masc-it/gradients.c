@@ -8,23 +8,6 @@
 
 #define GD_METAL_MAX_THREADS_PER_GROUP 256U
 
-typedef struct gd_metal_fill_args {
-    uint64_t byte_offset;
-    uint64_t count;
-    uint32_t elem_size;
-    uint32_t pattern;
-} gd_metal_fill_args;
-
-typedef struct gd_metal_rand_uniform_args {
-    uint64_t byte_offset;
-    uint64_t count;
-    uint32_t dtype;
-    uint32_t pad0;
-    uint64_t seed;
-    float low;
-    float high;
-} gd_metal_rand_uniform_args;
-
 static id<MTLDevice> gd_metal_device(gd_backend *backend)
 {
     return (__bridge id<MTLDevice>)backend->device;
@@ -60,79 +43,103 @@ static id<MTLCommandBuffer> gd_metal_command_buffer(gd_backend_fence *fence)
     return (__bridge id<MTLCommandBuffer>)fence->handle;
 }
 
-static const char *gd_metal_kernel_source(void)
+static NSURL *gd_metal_metallib_url(void)
 {
-    return "#include <metal_stdlib>\n"
-           "using namespace metal;\n"
-           "struct gd_fill_args { ulong byte_offset; ulong count; uint elem_size; uint pattern; };\n"
-           "struct gd_rand_uniform_args { ulong byte_offset; ulong count; uint dtype; uint pad0; ulong seed; float low; float high; };\n"
-           "static inline void gd_write_pattern(device uchar *dst, ulong byte, uint elem_size, uint pattern) {\n"
-           "  for (uint i = 0; i < elem_size; ++i) { dst[byte + i] = uchar((pattern >> (8u * i)) & 255u); }\n"
-           "}\n"
-           "static inline ulong gd_splitmix64(ulong x) {\n"
-           "  x += 0x9E3779B97F4A7C15ul;\n"
-           "  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ul;\n"
-           "  x = (x ^ (x >> 27)) * 0x94D049BB133111EBul;\n"
-           "  return x ^ (x >> 31);\n"
-           "}\n"
-           "static inline ushort gd_bf16_bits(float v) {\n"
-           "  uint bits = as_type<uint>(v);\n"
-           "  uint lsb = (bits >> 16) & 1u;\n"
-           "  bits += 0x7fffu + lsb;\n"
-           "  return ushort(bits >> 16);\n"
-           "}\n"
-           "static inline void gd_write_float_dtype(device uchar *dst, ulong byte, uint dtype, float v) {\n"
-           "  if (dtype == 1u) { ushort bits = as_type<ushort>(half(v)); gd_write_pattern(dst, byte, 2u, uint(bits)); }\n"
-           "  else if (dtype == 2u) { gd_write_pattern(dst, byte, 2u, uint(gd_bf16_bits(v))); }\n"
-           "  else { gd_write_pattern(dst, byte, 4u, as_type<uint>(v)); }\n"
-           "}\n"
-           "kernel void gd_fill_kernel(device uchar *dst [[buffer(0)]], constant gd_fill_args &args [[buffer(1)]], uint gid [[thread_position_in_grid]]) {\n"
-           "  ulong i = ulong(gid);\n"
-           "  if (i >= args.count) { return; }\n"
-           "  gd_write_pattern(dst, args.byte_offset + i * ulong(args.elem_size), args.elem_size, args.pattern);\n"
-           "}\n"
-           "kernel void gd_rand_uniform_kernel(device uchar *dst [[buffer(0)]], constant gd_rand_uniform_args &args [[buffer(1)]], uint gid [[thread_position_in_grid]]) {\n"
-           "  ulong i = ulong(gid);\n"
-           "  if (i >= args.count) { return; }\n"
-           "  ulong r = gd_splitmix64(args.seed + i);\n"
-           "  uint mant = uint((r >> 40) & 0xfffffful);\n"
-           "  float u = float(mant) * (1.0f / 16777216.0f);\n"
-           "  float v = args.low + (args.high - args.low) * u;\n"
-           "  ulong elem_size = args.dtype == 3u ? 4ul : 2ul;\n"
-           "  gd_write_float_dtype(dst, args.byte_offset + i * elem_size, args.dtype, v);\n"
-           "}\n";
+    const char *env = getenv("GRADIENTS_METALLIB");
+    NSURL *url;
+    if (env != NULL && env[0] != '\0') {
+        NSString *path = [NSString stringWithUTF8String:env];
+        return path != nil ? [NSURL fileURLWithPath:path] : nil;
+    }
+    url = [[NSBundle mainBundle] URLForResource:@"gradients" withExtension:@"metallib"];
+    if (url != nil) {
+        return url;
+    }
+    return [NSURL fileURLWithPath:@"build/gradients.metallib"];
+}
+
+static gd_status gd_metal_make_pipeline(gd_backend *backend,
+                                        id<MTLLibrary> library,
+                                        const char *kernel_name,
+                                        void **out_pso)
+{
+    NSError *error = nil;
+    NSString *name;
+    id<MTLFunction> function;
+    id<MTLComputePipelineState> pso;
+    if (backend == NULL || library == nil || kernel_name == NULL || out_pso == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    name = [NSString stringWithUTF8String:kernel_name];
+    if (name == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    function = [library newFunctionWithName:name];
+    if (function == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    pso = [gd_metal_device(backend) newComputePipelineStateWithFunction:function error:&error];
+    if (pso == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    *out_pso = (void *)CFBridgingRetain(pso);
+    return GD_OK;
 }
 
 static gd_status gd_metal_make_pipelines(gd_backend *backend)
 {
     NSError *error = nil;
-    NSString *source;
+    NSURL *url;
     id<MTLLibrary> library;
-    id<MTLFunction> fill_function;
-    id<MTLFunction> rand_uniform_function;
-    id<MTLComputePipelineState> fill_pso;
-    id<MTLComputePipelineState> rand_uniform_pso;
-    source = [NSString stringWithUTF8String:gd_metal_kernel_source()];
-    if (source == nil) {
+    gd_status st;
+    if (backend == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    url = gd_metal_metallib_url();
+    if (url == nil) {
         return GD_ERR_INTERNAL;
     }
-    library = [gd_metal_device(backend) newLibraryWithSource:source options:nil error:&error];
+    library = [gd_metal_device(backend) newLibraryWithURL:url error:&error];
     if (library == nil) {
-        return GD_ERR_INTERNAL;
+        return GD_ERR_UNSUPPORTED;
     }
-    fill_function = [library newFunctionWithName:@"gd_fill_kernel"];
-    rand_uniform_function = [library newFunctionWithName:@"gd_rand_uniform_kernel"];
-    if (fill_function == nil || rand_uniform_function == nil) {
-        return GD_ERR_INTERNAL;
+    st = gd_metal_make_pipeline(backend, library, "gd_fill_kernel", &backend->fill_pso);
+    if (st != GD_OK) {
+        return st;
     }
-    fill_pso = [gd_metal_device(backend) newComputePipelineStateWithFunction:fill_function error:&error];
-    rand_uniform_pso = [gd_metal_device(backend) newComputePipelineStateWithFunction:rand_uniform_function error:&error];
-    if (fill_pso == nil || rand_uniform_pso == nil) {
-        return GD_ERR_INTERNAL;
+    st = gd_metal_make_pipeline(backend, library, "gd_rand_uniform_kernel", &backend->rand_uniform_pso);
+    if (st != GD_OK) {
+        return st;
     }
-    backend->fill_pso = (void *)CFBridgingRetain(fill_pso);
-    backend->rand_uniform_pso = (void *)CFBridgingRetain(rand_uniform_pso);
-    return GD_OK;
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tiled", &backend->matmul_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_linear_f16_tiled", &backend->linear_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_reg", &backend->matmul_reg_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_linear_f16_reg", &backend->linear_reg_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_nt_tiled", &backend->matmul_nt_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_tiled", &backend->matmul_tn_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_nt_reg", &backend->matmul_nt_reg_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_reg", &backend->matmul_tn_reg_pso);
 }
 
 static bool gd_metal_byte_range_valid(const gd_backend_buffer *buffer, size_t offset, size_t nbytes)
@@ -232,8 +239,29 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend->active_command_buffer != NULL) {
         CFRelease(backend->active_command_buffer);
     }
-    if (backend->linear_bias_pso != NULL) {
-        CFRelease(backend->linear_bias_pso);
+    if (backend->matmul_tn_reg_pso != NULL) {
+        CFRelease(backend->matmul_tn_reg_pso);
+    }
+    if (backend->matmul_nt_reg_pso != NULL) {
+        CFRelease(backend->matmul_nt_reg_pso);
+    }
+    if (backend->matmul_tn_pso != NULL) {
+        CFRelease(backend->matmul_tn_pso);
+    }
+    if (backend->matmul_nt_pso != NULL) {
+        CFRelease(backend->matmul_nt_pso);
+    }
+    if (backend->linear_reg_pso != NULL) {
+        CFRelease(backend->linear_reg_pso);
+    }
+    if (backend->matmul_reg_pso != NULL) {
+        CFRelease(backend->matmul_reg_pso);
+    }
+    if (backend->linear_pso != NULL) {
+        CFRelease(backend->linear_pso);
+    }
+    if (backend->matmul_pso != NULL) {
+        CFRelease(backend->matmul_pso);
     }
     if (backend->rand_uniform_pso != NULL) {
         CFRelease(backend->rand_uniform_pso);
@@ -429,8 +457,8 @@ gd_status gd_backend_fill(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    args.byte_offset = offset;
-    args.count = count;
+    args.byte_offset = (uint64_t)offset;
+    args.count = (uint64_t)count;
     args.elem_size = (uint32_t)elem_size;
     args.pattern = pattern;
     [encoder setComputePipelineState:gd_metal_fill_pso(backend)];
@@ -483,8 +511,8 @@ gd_status gd_backend_rand_uniform(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    args.byte_offset = offset;
-    args.count = count;
+    args.byte_offset = (uint64_t)offset;
+    args.count = (uint64_t)count;
     args.dtype = dtype;
     args.pad0 = 0U;
     args.seed = seed;

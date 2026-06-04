@@ -102,14 +102,12 @@ Optimizer state dtype and placement are explicit. Adam-family moments use FP32 s
 
 `state_arena` is for caller-visible runtime state, not temporary activations.
 
-State objects are handles containing name, offset, size, dtype/layout metadata as needed, generation, and last-use backend fence.
+State objects are opaque handles containing allocation metadata and a last-use backend fence.
+Callers acquire a scoped span/tensor view before enqueueing work; the acquire records the exact allocation epoch touched by the scope.
 
-When async work reads or mutates a state object, runtime records the command fence on that object.
+When async work reads or mutates a state object, `gd_end(ctx)` records the command fence on that object.
 
-Reset/reuse of an in-flight state object must either:
-
-- wait for the object's last-use fence, then reuse the same block, or
-- allocate a fresh state block and update the object handle without waiting.
+Reset/reuse of an in-flight state object waits for the object's last-use fence, then reuses the same block when it fits or allocates a larger/fresh block when required. Reset is rejected while the object has already been acquired in the active scope.
 
 Whole `state_arena` reset is only valid for explicit session/model/cache teardown after all object fences are complete. Runtime state is not saved in training checkpoints unless caller opts into a separate application-level state save.
 
@@ -121,7 +119,7 @@ Whole `state_arena` reset is only valid for explicit session/model/cache teardow
 
 If no slot is complete, `gd_begin` waits for the oldest in-flight slot only. It must not call global synchronize as normal lifecycle.
 
-`gd_end(ctx)` closes tape, submits queued backend work as needed, and records the resulting fence on every ring slot and state object touched by the scope.
+`gd_end(ctx)` closes tape, submits queued backend work as needed, and records the resulting fence on every ring slot and state object acquired by the scope.
 
 A tensor descriptor or view that references a ring slot is valid only until that slot is reset. Debug descriptors store arena kind, slot index, and generation so stale use can be caught when the descriptor is still reachable.
 
@@ -396,7 +394,7 @@ gd_end(ctx);
 
 `gd_begin(ctx, mode)` advances `scratch`/`data` ring slots to completed generations, prepares tape when training, and opens a backend command batch/stream scope. If the ring is exhausted, it waits for the oldest slot only.
 
-`gd_end(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects used by the scope. It does not reset `params` or `state`.
+`gd_end(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects acquired by the scope. It does not reset `params` or `state`.
 
 `gd_optimizer_zero_grad(ctx, opt)` is explicit so callers can choose gradient accumulation by omitting it.
 
@@ -672,7 +670,7 @@ Arena watermark tests report peak `params`, `state`, `scratch`, and `data` usage
 
 Ring-buffer tests verify `scratch` and `data` are not reused before backend fences complete and slot generations bump before reuse.
 
-State reset tests verify KV cache/state objects wait or allocate fresh blocks before reuse.
+State reset tests verify KV cache/state objects wait on prior fences before reuse and allocate fresh blocks only when size/alignment requires it.
 
 Backend portability tests verify:
 

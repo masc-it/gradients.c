@@ -89,7 +89,7 @@ def collect_rows() -> list[Row]:
         "gd_debug_current_ring_slot", "gd_debug_ring_slot_generation", "gd_debug_ring_slot_fence",
     ])
     add_symbol(rows, "memory", "state object fence reset/reuse", [
-        "gd_state_object_create", "gd_state_touch", "gd_state_object_reset",
+        "gd_state_object_create", "gd_state_object_acquire_span", "gd_state_object_reset",
     ])
     add_symbol(rows, "tensor", "concrete tensor descriptors + views", [
         "gd_tensor_empty", "gd_tensor_slice", "gd_tensor_contiguous", "gd_tensor_validate",

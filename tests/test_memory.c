@@ -75,7 +75,8 @@ static void test_arena_contract(gd_context *ctx)
 
 static void test_scope_rings_and_state(gd_context *ctx)
 {
-    gd_state_object state;
+    gd_state_object *state = NULL;
+    gd_span state_span;
     gd_memory_stats stats;
     gd_span scratch;
     gd_span data;
@@ -88,7 +89,7 @@ static void test_scope_rings_and_state(gd_context *ctx)
     uint64_t waits_before_reset;
 
     CHECK_OK(gd_state_object_create(ctx, 1024U, 256U, &state));
-    CHECK(state.span.offset % 256U == 0U, "state object aligned");
+    CHECK(state != NULL, "state object created");
 
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
@@ -107,9 +108,11 @@ static void test_scope_rings_and_state(gd_context *ctx)
     CHECK(scratch.buffer != NULL && data.buffer != NULL, "ring spans carry backend buffers");
     CHECK(scratch.offset % 256U == 0U, "scratch offset aligned");
     CHECK(data.offset % 128U == 0U, "data offset aligned");
-    CHECK_OK(gd_state_touch(ctx, &state));
+    CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
+    CHECK(state_span.offset % 256U == 0U, "state object aligned");
     CHECK_OK(gd_end(ctx));
-    CHECK(state.last_use_fence != 0U, "state touch records fence at end");
+    CHECK(gd_debug_state_object_last_use_fence(state) != 0U,
+          "state acquire records fence at end");
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != scratch_slot0,
@@ -138,28 +141,30 @@ static void test_scope_rings_and_state(gd_context *ctx)
     CHECK(stats.backend_waits <= 1U, "ring exhaustion waits only if oldest fence still in flight");
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
-    CHECK_OK(gd_state_touch(ctx, &state));
+    CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
+    CHECK_STATUS(gd_state_object_reset(ctx, state, 0U, 0U, &relocated), GD_ERR_BUSY);
+    gd_context_clear_error(ctx);
     CHECK_OK(gd_end(ctx));
-    CHECK_OK(gd_memory_stats_query(ctx, &stats));
-    waits_before_reset = stats.backend_waits;
-    CHECK_OK(gd_state_object_reset(ctx, &state, 0U, 0U, true, &relocated));
-    CHECK_OK(gd_memory_stats_query(ctx, &stats));
-    CHECK(stats.backend_waits == waits_before_reset,
-          "state allow-realloc path avoids backend wait when possible");
+    CHECK(gd_debug_state_object_last_use_fence(state) != 0U,
+          "state acquire records fence after reset rejection");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
-    CHECK_OK(gd_state_touch(ctx, &state));
-    CHECK_OK(gd_end(ctx));
     CHECK_OK(gd_memory_stats_query(ctx, &stats));
     waits_before_reset = stats.backend_waits;
-    CHECK_OK(gd_state_object_reset(ctx, &state, 0U, 0U, false, &relocated));
+    CHECK_OK(gd_state_object_reset(ctx, state, 0U, 0U, &relocated));
     CHECK(!relocated, "state reset can reuse after wait");
     CHECK_OK(gd_memory_stats_query(ctx, &stats));
     CHECK(stats.backend_waits == waits_before_reset || stats.backend_waits == waits_before_reset + 1U,
           "state reset waits only if fence still in flight");
 
-    gd_debug_set_heap_guard(false);
+    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK_OK(gd_state_object_reset(ctx, state, 0U, 0U, &relocated));
+    CHECK(!relocated, "state reset before acquire in active scope can reuse");
+    CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
+    CHECK_OK(gd_end(ctx));
+
     CHECK(gd_debug_heap_alloc_count() == heap_before, "no heap allocation in scoped hot path");
+    gd_debug_set_heap_guard(false);
+    CHECK_OK(gd_state_object_destroy(ctx, state));
 }
 
 int main(void)

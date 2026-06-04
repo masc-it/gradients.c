@@ -7,13 +7,21 @@
 #include <stddef.h>
 
 #include "../../core/backend.h"
+#include "metal_kernel_types.h"
 
 struct gd_backend {
     void *device;
     void *queue;
     void *fill_pso;
     void *rand_uniform_pso;
-    void *linear_bias_pso;
+    void *matmul_pso;
+    void *linear_pso;
+    void *matmul_reg_pso;
+    void *linear_reg_pso;
+    void *matmul_nt_pso;
+    void *matmul_tn_pso;
+    void *matmul_nt_reg_pso;
+    void *matmul_tn_reg_pso;
     void *active_command_buffer;
     bool scope_active;
 };

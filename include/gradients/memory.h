@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct gd_context gd_context;
+typedef struct gd_state_object gd_state_object;
 
 typedef enum gd_arena_kind {
     GD_ARENA_PARAMS = 0,
@@ -74,10 +75,11 @@ typedef struct gd_memory_stats {
     uint64_t last_scope_fence;
 } gd_memory_stats;
 
-typedef struct gd_state_object {
-    gd_span span;
-    uint64_t last_use_fence;
-} gd_state_object;
+typedef enum gd_state_access {
+    GD_STATE_READ = 1,
+    GD_STATE_WRITE = 2,
+    GD_STATE_READ_WRITE = 3,
+} gd_state_access;
 
 gd_memory_config gd_memory_config_default(void);
 
@@ -98,16 +100,22 @@ gd_status gd_alloc_state(gd_context *ctx, size_t nbytes, size_t alignment, gd_sp
 gd_status gd_alloc_scratch(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out);
 gd_status gd_alloc_data(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out);
 
+/* Opaque persistent runtime state. Acquire a scoped span before enqueueing work. */
 gd_status gd_state_object_create(gd_context *ctx,
                                  size_t nbytes,
                                  size_t alignment,
-                                 gd_state_object *out);
-gd_status gd_state_touch(gd_context *ctx, gd_state_object *object);
+                                 gd_state_object **out);
+gd_status gd_state_object_destroy(gd_context *ctx, gd_state_object *object);
+gd_status gd_state_object_acquire_span(gd_context *ctx,
+                                       gd_state_object *object,
+                                       gd_state_access access,
+                                       gd_span *out);
+/* Logical reset: waits for prior use, reallocates only when required, and rejects
+   objects already acquired in the active scope. */
 gd_status gd_state_object_reset(gd_context *ctx,
                                 gd_state_object *object,
                                 size_t nbytes,
                                 size_t alignment,
-                                bool allow_realloc,
                                 bool *out_relocated);
 
 gd_status gd_memory_stats_query(const gd_context *ctx, gd_memory_stats *out);
@@ -122,6 +130,7 @@ uint64_t gd_debug_ring_slot_generation(const gd_context *ctx,
 uint64_t gd_debug_ring_slot_fence(const gd_context *ctx,
                                   gd_arena_kind arena,
                                   uint32_t slot);
+uint64_t gd_debug_state_object_last_use_fence(const gd_state_object *object);
 
 #ifdef __cplusplus
 }

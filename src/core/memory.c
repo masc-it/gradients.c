@@ -48,6 +48,22 @@ typedef struct gd_backend_runtime {
     gd_pending_fence pending[GD_MAX_PENDING_FENCES];
 } gd_backend_runtime;
 
+struct gd_state_object {
+    gd_context *owner;
+    gd_span span;
+    uint64_t last_use_fence;
+    uint64_t epoch;
+    gd_state_object *prev;
+    gd_state_object *next;
+};
+
+typedef struct gd_touched_state {
+    gd_state_object *object;
+    gd_span span;
+    uint64_t epoch;
+    gd_state_access access;
+} gd_touched_state;
+
 struct gd_context {
     gd_arena params;
     gd_arena state;
@@ -57,7 +73,8 @@ struct gd_context {
     gd_scope_mode mode;
     bool in_scope;
     uint64_t last_scope_fence;
-    gd_state_object *touched_state[GD_MAX_TOUCHED_STATE];
+    gd_state_object *state_objects;
+    gd_touched_state touched_state[GD_MAX_TOUCHED_STATE];
     uint32_t touched_state_count;
     gd_status status;
     char error[160];
@@ -534,14 +551,91 @@ gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span)
     return gd_backend_wait_until(ctx, fence);
 }
 
+static bool gd_state_access_valid(gd_state_access access)
+{
+    return access == GD_STATE_READ || access == GD_STATE_WRITE ||
+           access == GD_STATE_READ_WRITE;
+}
+
+static bool gd_state_object_registered(const gd_context *ctx,
+                                       const gd_state_object *object)
+{
+    const gd_state_object *cursor;
+    if (ctx == NULL || object == NULL) {
+        return false;
+    }
+    for (cursor = ctx->state_objects; cursor != NULL; cursor = cursor->next) {
+        if (cursor == object) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool gd_state_object_live(const gd_context *ctx, const gd_state_object *object)
 {
-    if (ctx == NULL || object == NULL || object->span.arena != GD_ARENA_STATE ||
+    if (ctx == NULL || object == NULL || object->owner != ctx ||
+        !gd_state_object_registered(ctx, object) || object->span.arena != GD_ARENA_STATE ||
         object->span.generation != ctx->state.generation || object->span.buffer != ctx->state.buffer) {
         return false;
     }
     return object->span.offset <= ctx->state.capacity &&
            object->span.nbytes <= ctx->state.capacity - object->span.offset;
+}
+
+static int32_t gd_state_touched_find(const gd_context *ctx,
+                                     const gd_state_object *object)
+{
+    uint32_t i;
+    if (ctx == NULL || object == NULL) {
+        return -1;
+    }
+    for (i = 0; i < ctx->touched_state_count; ++i) {
+        if (ctx->touched_state[i].object == object) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static bool gd_state_object_touched(const gd_context *ctx,
+                                    const gd_state_object *object)
+{
+    return gd_state_touched_find(ctx, object) >= 0;
+}
+
+static void gd_state_object_bump_epoch(gd_state_object *object)
+{
+    object->epoch += 1U;
+    if (object->epoch == 0U) {
+        object->epoch = 1U;
+    }
+}
+
+static void gd_state_object_link(gd_context *ctx, gd_state_object *object)
+{
+    object->owner = ctx;
+    object->prev = NULL;
+    object->next = ctx->state_objects;
+    if (ctx->state_objects != NULL) {
+        ctx->state_objects->prev = object;
+    }
+    ctx->state_objects = object;
+}
+
+static void gd_state_object_unlink(gd_context *ctx, gd_state_object *object)
+{
+    if (object->prev != NULL) {
+        object->prev->next = object->next;
+    } else if (ctx->state_objects == object) {
+        ctx->state_objects = object->next;
+    }
+    if (object->next != NULL) {
+        object->next->prev = object->prev;
+    }
+    object->owner = NULL;
+    object->prev = NULL;
+    object->next = NULL;
 }
 
 static gd_status gd_alloc_from_ring(gd_context *ctx,
@@ -649,6 +743,11 @@ void gd_context_destroy(gd_context *ctx)
     for (i = 0; i < GD_MAX_PENDING_FENCES; ++i) {
         gd_backend_fence_destroy(&ctx->backend.pending[i].fence);
     }
+    while (ctx->state_objects != NULL) {
+        gd_state_object *object = ctx->state_objects;
+        ctx->state_objects = object->next;
+        free(object);
+    }
     gd_ring_destroy(&ctx->scratch);
     gd_ring_destroy(&ctx->data);
     gd_arena_destroy(&ctx->params);
@@ -728,6 +827,13 @@ gd_status gd_end(gd_context *ctx)
     if (!ctx->in_scope || ctx->scratch.current < 0 || ctx->data.current < 0) {
         return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid gd_end state");
     }
+    for (i = 0; i < ctx->touched_state_count; ++i) {
+        if (!gd_state_object_live(ctx, ctx->touched_state[i].object) ||
+            ctx->touched_state[i].object->epoch != ctx->touched_state[i].epoch) {
+            return gd_set_error(ctx, GD_ERR_BAD_STATE,
+                                "touched state object changed during scope");
+        }
+    }
     st = gd_backend_record(ctx, &fence);
     if (st != GD_OK) {
         return st;
@@ -735,7 +841,7 @@ gd_status gd_end(gd_context *ctx)
     ctx->scratch.slot_fences[ctx->scratch.current] = fence;
     ctx->data.slot_fences[ctx->data.current] = fence;
     for (i = 0; i < ctx->touched_state_count; ++i) {
-        ctx->touched_state[i]->last_use_fence = fence;
+        ctx->touched_state[i].object->last_use_fence = fence;
     }
     ctx->touched_state_count = 0U;
     ctx->last_scope_fence = fence;
@@ -806,45 +912,99 @@ gd_status gd_context_alloc_span(gd_context *ctx,
 gd_status gd_state_object_create(gd_context *ctx,
                                  size_t nbytes,
                                  size_t alignment,
-                                 gd_state_object *out)
+                                 gd_state_object **out)
 {
     gd_status st;
+    gd_state_object *object;
+    gd_span span;
     if (out != NULL) {
-        memset(out, 0, sizeof(*out));
+        *out = NULL;
     }
     if (ctx == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_alloc_state(ctx, nbytes, alignment, &out->span);
+    object = (gd_state_object *)gd_heap_alloc(sizeof(*object));
+    if (object == NULL) {
+        return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "state object allocation failed");
+    }
+    st = gd_alloc_state(ctx, nbytes, alignment, &span);
     if (st != GD_OK) {
+        free(object);
         return st;
     }
-    out->last_use_fence = 0U;
+    memset(object, 0, sizeof(*object));
+    object->span = span;
+    object->epoch = 1U;
+    gd_state_object_link(ctx, object);
+    *out = object;
     return GD_OK;
 }
 
-gd_status gd_state_touch(gd_context *ctx, gd_state_object *object)
+gd_status gd_state_object_destroy(gd_context *ctx, gd_state_object *object)
 {
-    uint32_t i;
+    gd_status st;
     if (ctx == NULL || object == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
-    }
-    if (!ctx->in_scope) {
-        return gd_set_error(ctx, GD_ERR_BAD_STATE, "state touch requires active scope");
     }
     if (!gd_state_object_live(ctx, object)) {
         return gd_set_error(ctx, GD_ERR_BAD_STATE, "state object is stale");
     }
-    for (i = 0; i < ctx->touched_state_count; ++i) {
-        if (ctx->touched_state[i] == object) {
-            return GD_OK;
+    if (ctx->in_scope && gd_state_object_touched(ctx, object)) {
+        return gd_set_error(ctx, GD_ERR_BUSY,
+                            "cannot destroy state object touched in active scope");
+    }
+    if (object->last_use_fence != 0U &&
+        !gd_fence_sequence_is_complete(ctx, object->last_use_fence)) {
+        st = gd_backend_wait_until(ctx, object->last_use_fence);
+        if (st != GD_OK) {
+            return st;
         }
+    }
+    gd_state_object_unlink(ctx, object);
+    memset(object, 0, sizeof(*object));
+    free(object);
+    return GD_OK;
+}
+
+gd_status gd_state_object_acquire_span(gd_context *ctx,
+                                       gd_state_object *object,
+                                       gd_state_access access,
+                                       gd_span *out)
+{
+    int32_t touched;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+        out->slot = -1;
+    }
+    if (ctx == NULL || object == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!ctx->in_scope) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE,
+                            "state object acquire requires active scope");
+    }
+    if (!gd_state_access_valid(access)) {
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid state access mode");
+    }
+    if (!gd_state_object_live(ctx, object)) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "state object is stale");
+    }
+    touched = gd_state_touched_find(ctx, object);
+    if (touched >= 0) {
+        gd_touched_state *entry = &ctx->touched_state[(uint32_t)touched];
+        entry->access = (gd_state_access)((uint32_t)entry->access | (uint32_t)access);
+        *out = entry->span;
+        return GD_OK;
     }
     if (ctx->touched_state_count >= GD_MAX_TOUCHED_STATE) {
         return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "too many touched state objects");
     }
-    ctx->touched_state[ctx->touched_state_count] = object;
+    ctx->touched_state[ctx->touched_state_count].object = object;
+    ctx->touched_state[ctx->touched_state_count].span = object->span;
+    ctx->touched_state[ctx->touched_state_count].epoch = object->epoch;
+    ctx->touched_state[ctx->touched_state_count].access = access;
     ctx->touched_state_count += 1U;
+    *out = object->span;
     return GD_OK;
 }
 
@@ -852,7 +1012,6 @@ gd_status gd_state_object_reset(gd_context *ctx,
                                 gd_state_object *object,
                                 size_t nbytes,
                                 size_t alignment,
-                                bool allow_realloc,
                                 bool *out_relocated)
 {
     gd_status st;
@@ -867,28 +1026,22 @@ gd_status gd_state_object_reset(gd_context *ctx,
     if (!gd_state_object_live(ctx, object)) {
         return gd_set_error(ctx, GD_ERR_BAD_STATE, "state object is stale");
     }
+    if (ctx->in_scope && gd_state_object_touched(ctx, object)) {
+        return gd_set_error(ctx, GD_ERR_BUSY,
+                            "cannot reset state object touched in active scope");
+    }
     if (nbytes == 0U) {
         nbytes = object->span.nbytes;
     }
     if (alignment == 0U) {
         alignment = object->span.alignment;
+    } else if (!gd_is_power_of_two(alignment) || alignment > GD_MAX_SUBALLOC_ALIGNMENT) {
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "state object reset invalid alignment");
     }
     need_fresh = nbytes > object->span.nbytes ||
                  (alignment > object->span.alignment && (object->span.offset % alignment) != 0U);
     if (object->last_use_fence != 0U &&
         !gd_fence_sequence_is_complete(ctx, object->last_use_fence)) {
-        if (allow_realloc) {
-            st = gd_alloc_state(ctx, nbytes, alignment, &fresh);
-            if (st != GD_OK) {
-                return st;
-            }
-            object->span = fresh;
-            object->last_use_fence = 0U;
-            if (out_relocated != NULL) {
-                *out_relocated = true;
-            }
-            return GD_OK;
-        }
         st = gd_backend_wait_until(ctx, object->last_use_fence);
         if (st != GD_OK) {
             return st;
@@ -905,6 +1058,7 @@ gd_status gd_state_object_reset(gd_context *ctx,
         }
     }
     object->last_use_fence = 0U;
+    gd_state_object_bump_epoch(object);
     return GD_OK;
 }
 
@@ -1015,4 +1169,9 @@ uint64_t gd_debug_ring_slot_fence(const gd_context *ctx, gd_arena_kind arena, ui
         return 0U;
     }
     return ring->slot_fences[slot];
+}
+
+uint64_t gd_debug_state_object_last_use_fence(const gd_state_object *object)
+{
+    return object != NULL ? object->last_use_fence : 0U;
 }

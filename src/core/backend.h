@@ -81,6 +81,16 @@ gd_status gd_backend_matmul(gd_backend *backend,
                             const gd_backend_matrix_view *x,
                             const gd_backend_matrix_view *w,
                             const gd_backend_matrix_view *y);
+/* y = x * w^T, where w is stored row-major as (y.cols, x.cols). */
+gd_status gd_backend_matmul_nt(gd_backend *backend,
+                               const gd_backend_matrix_view *x,
+                               const gd_backend_matrix_view *w,
+                               const gd_backend_matrix_view *y);
+/* y = x^T * w, where x is stored row-major as (inner, y.rows). */
+gd_status gd_backend_matmul_tn(gd_backend *backend,
+                               const gd_backend_matrix_view *x,
+                               const gd_backend_matrix_view *w,
+                               const gd_backend_matrix_view *y);
 gd_status gd_backend_linear(gd_backend *backend,
                             const gd_backend_matrix_view *x,
                             const gd_backend_matrix_view *w,

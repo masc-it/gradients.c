@@ -34,6 +34,60 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic \
 build/probes/v2_foundation_probe_asan
 ```
 
+## v2_matmul_training_perf_probe
+
+Links against `libgradients.a` and measures the public `gd_matmul` and
+`gd_matmul_backward` paths on transformer-like workloads. This exercises the
+production Metal `gradients.metallib` F16 register-tiled simdgroup GEMM kernels
+through the scoped public API. It includes a small initialized correctness smoke
+test, then runs optimized profiles that mimic training-step GEMM pressure:
+
+- `h128x4h4`: `tokens=512 hidden=128 heads=4 intermediate=512`
+- `h256x4h4`: `tokens=512 hidden=256 heads=4 intermediate=1024`
+- `h512x4h4`: `tokens=512 hidden=512 heads=4 intermediate=2048`
+
+Each forward profile submits thirteen F16 matmuls in a scoped arena step: dense
+projection/MLP GEMMs (`qkv`, `proj`, `gate`, `up`, `down`) plus two attention
+GEMM shapes per head (`QK^T`, `AV`) for four heads. By default the probe also
+runs `gd_matmul_backward` after each forward matmul, adding the `grad_out @ W^T`
+and `X^T @ grad_out` GEMMs for 39 GEMM calls total. Wall time intentionally
+includes public API validation, scratch/data arena allocation, command-buffer
+submit, and wait. The resulting benchmark is still matmul-only: it does not
+include autograd graph traversal, optimizer, AMP scaler, softmax, losses,
+normalization, or activation kernels.
+
+Run directly with an optimized library/metallib build:
+
+```sh
+make gemm-perf-probe
+```
+
+Or run via the stress script:
+
+```sh
+sh probes/run_v2_qa_stress.sh
+```
+
+Knobs:
+
+```sh
+GD_QA_PERF_PROFILE=all|h128x4h4|h256x4h4|h512x4h4
+GD_QA_PERF_WARMUP=5
+GD_QA_PERF_ITERS=20
+GD_QA_PERF_PIPELINE=1
+GD_QA_PERF_PIPELINE_ITERS=20
+GD_QA_PERF_BACKWARD=1       # include gd_matmul_backward after each forward matmul
+GD_QA_PERF_RING_SLOTS=3
+RUN_PERF=0                  # skip public API perf probe
+RUN_METAL_BASELINE=0        # skip standalone raw MPS baseline
+PERF_BUILD_DIR=build-qa-probes-perf
+```
+
+The stress script builds the performance library separately with `-O3 -DNDEBUG`
+(default overrideable via `PERF_CFLAGS`, `PERF_OBJCFLAGS`, and
+`PERF_PROBE_CFLAGS`) so performance results are not accidentally taken from the
+Makefile's debug-oriented default build.
+
 ## v2_metal_arena_probe
 
 Checks device-memory mapping for v2 arenas on Metal:

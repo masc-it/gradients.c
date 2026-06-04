@@ -102,10 +102,10 @@ Stress workloads to validate v2 design before consolidation.
 
 ## Training control / persistent state
 
-- [ ] Toy AdamW optimizer kernel
-  - param, grad, m, v in params arena
-  - FP32 optimizer slots, low-precision param/grad
-  - validate persistent in-place writes
+- [x] AdamW optimizer + AMP step path
+  - FP32 moments in state arena
+  - FP32 master weights for F16 params
+  - loss-scale-aware grad unscale, finite check, overflow skip, dynamic scale update
 
 - [ ] Multi-head loss sum
   - two scalar losses in scratch

@@ -49,6 +49,7 @@ UNAME_S := $(shell uname -s)
 
 METAL_BUILD_ARTIFACTS :=
 METAL_SRC :=
+METAL_HEADERS :=
 METAL_AIR :=
 TEST_ENV :=
 
@@ -56,7 +57,8 @@ ifeq ($(UNAME_S),Darwin)
 CPPFLAGS += -DGD_ENABLE_METAL=1
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/null/*' 2>/dev/null | sort)
 MSRC := $(shell find $(SRC_DIR) -type f -name '*.m' 2>/dev/null | sort)
-METAL_SRC := $(shell find $(SRC_DIR)/backends/metal -type f -name '*.metal' 2>/dev/null | sort)
+METAL_SRC := $(shell find $(SRC_DIR)/backends/metal $(SRC_DIR)/ops $(SRC_DIR)/optim -type f -name '*.metal' 2>/dev/null | sort)
+METAL_HEADERS := $(shell find $(SRC_DIR)/backends/metal $(SRC_DIR)/ops $(SRC_DIR)/optim -type f \( -name '*.h' -o -name '*.inc' \) 2>/dev/null | sort)
 METAL_AIR := $(patsubst %.metal,$(BUILD_DIR)/%.air,$(METAL_SRC))
 METALLIB := $(BUILD_DIR)/gradients.metallib
 METAL_BUILD_ARTIFACTS := $(METALLIB)
@@ -168,6 +170,7 @@ list:
 	@printf 'TEST_SRC:\n%s\n' '$(TEST_SRC)'
 	@printf 'MSRC:\n%s\n' '$(MSRC)'
 	@printf 'METAL_SRC:\n%s\n' '$(METAL_SRC)'
+	@printf 'METAL_HEADERS:\n%s\n' '$(METAL_HEADERS)'
 	@printf 'OBJ:\n%s\n' '$(OBJ)'
 	@printf 'TEST_BINS:\n%s\n' '$(TEST_BINS)'
 
@@ -215,9 +218,9 @@ $(METALLIB): $(METAL_AIR)
 	@mkdir -p $(@D)
 	$(METALLIB_TOOL) $^ -o $@
 
-$(BUILD_DIR)/%.air: %.metal $(CONFIG_STAMP) $(SRC_DIR)/backends/metal/metal_kernel_types.h
+$(BUILD_DIR)/%.air: %.metal $(CONFIG_STAMP) $(METAL_HEADERS)
 	@mkdir -p $(@D)
-	$(METALC) -I$(SRC_DIR)/backends/metal -c $< -o $@
+	$(METALC) -I$(SRC_DIR) -I$(SRC_DIR)/backends/metal -c $< -o $@
 endif
 
 $(BUILD_DIR)/$(TEST_DIR)/%: $(TEST_DIR)/%.c $(LIB) $(METAL_BUILD_ARTIFACTS)

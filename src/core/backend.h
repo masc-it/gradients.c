@@ -37,6 +37,8 @@ typedef struct gd_backend_vector_view {
 typedef struct gd_backend_adamw_desc {
     gd_backend_buffer *param_buffer;
     size_t param_offset;
+    gd_backend_buffer *master_buffer; /* Optional FP32 master weights. */
+    size_t master_offset;
     gd_backend_buffer *grad_buffer;
     size_t grad_offset;
     gd_backend_buffer *m_buffer;
@@ -46,6 +48,8 @@ typedef struct gd_backend_adamw_desc {
     size_t count;
     uint32_t param_dtype;
     uint32_t grad_dtype;
+    uint32_t has_master;
+    uint32_t pad0;
     float lr;
     float beta1;
     float beta2;
@@ -54,6 +58,16 @@ typedef struct gd_backend_adamw_desc {
     float bias_correction1;
     float bias_correction2;
 } gd_backend_adamw_desc;
+
+typedef struct gd_backend_amp_unscale_desc {
+    gd_backend_buffer *grad_buffer;
+    size_t grad_offset;
+    size_t count;
+    uint32_t grad_dtype;
+    float inv_scale;
+    gd_backend_buffer *found_inf_buffer;
+    size_t found_inf_offset;
+} gd_backend_amp_unscale_desc;
 
 typedef struct gd_backend_tensor_view {
     gd_backend_buffer *buffer;
@@ -138,7 +152,17 @@ gd_status gd_backend_accumulate(gd_backend *backend,
                                 size_t src_offset,
                                 size_t count,
                                 uint32_t dtype);
+/* dst[i] = src[i] * scale for contiguous tensors, dtype values from gd_dtype. */
+gd_status gd_backend_scale(gd_backend *backend,
+                           gd_backend_buffer *dst_buffer,
+                           size_t dst_offset,
+                           gd_backend_buffer *src_buffer,
+                           size_t src_offset,
+                           size_t count,
+                           uint32_t dtype,
+                           float scale);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
+gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

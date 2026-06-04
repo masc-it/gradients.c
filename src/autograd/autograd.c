@@ -380,6 +380,62 @@ static gd_status gd_backend_accumulate_tensor(gd_context *ctx,
     return GD_OK;
 }
 
+static gd_status gd_backend_scale_tensor(gd_context *ctx,
+                                         gd_tensor *dst,
+                                         const gd_tensor *src,
+                                         float scale)
+{
+    gd_backend *backend;
+    gd_status st;
+    int64_t numel;
+    size_t count;
+    if (ctx == NULL || dst == NULL || src == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_validate(ctx, dst);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_validate(ctx, src);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (!gd_tensors_same_shape(dst, src)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "gradient scale shape mismatch");
+    }
+    if (!gd_tensor_is_contiguous(dst) || !gd_tensor_is_contiguous(src)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "gradient scale requires contiguous tensors");
+    }
+    st = gd_tensor_numel(src, &numel);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "gradient scale invalid shape");
+    }
+    if ((uint64_t)numel > (uint64_t)SIZE_MAX) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "gradient scale count overflow");
+    }
+    count = (size_t)numel;
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || dst->storage.buffer == NULL || src->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "gradient scale missing backend buffer");
+    }
+    st = gd_backend_scale(backend,
+                          (gd_backend_buffer *)dst->storage.buffer,
+                          gd_tensor_storage_offset(dst),
+                          (gd_backend_buffer *)src->storage.buffer,
+                          gd_tensor_storage_offset(src),
+                          count,
+                          (uint32_t)dst->dtype,
+                          scale);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend gradient scale failed");
+    }
+    dst->version += 1U;
+    if (dst->version == 0U) {
+        dst->version = 1U;
+    }
+    return GD_OK;
+}
+
 static bool gd_node_has_output_grad(gd_autograd_state *state, const gd_tape_node *node)
 {
     uint16_t i;
@@ -436,18 +492,41 @@ gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
 
 static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
                                      const gd_tensor *output,
-                                     const gd_tensor *grad_output)
+                                     const gd_tensor *grad_output,
+                                     float scale)
 {
     gd_tensor seed;
     gd_status st;
     if (output == NULL || output->id == 0U) {
         return gd_context_set_error(bwd->ctx, GD_ERR_INVALID_ARGUMENT, "invalid backward output tensor");
     }
+    if (!(scale == scale)) {
+        return gd_context_set_error(bwd->ctx, GD_ERR_INVALID_ARGUMENT, "invalid backward scale");
+    }
     if (grad_output != NULL) {
         if (!gd_tensors_same_shape(output, grad_output)) {
             return gd_context_set_error(bwd->ctx, GD_ERR_INVALID_ARGUMENT, "backward seed shape mismatch");
         }
-        return gd_autograd_accumulate(bwd, output->id, grad_output);
+        if (scale == 1.0f) {
+            return gd_autograd_accumulate(bwd, output->id, grad_output);
+        }
+        st = gd_tensor_empty(bwd->ctx,
+                             GD_ARENA_SCRATCH,
+                             grad_output->dtype,
+                             grad_output->rank,
+                             grad_output->shape,
+                             GD_AUTOGRAD_GRAD_ALIGNMENT,
+                             &seed);
+        if (st != GD_OK) {
+            return st;
+        }
+        seed.requires_grad = false;
+        seed.is_leaf = false;
+        st = gd_backend_scale_tensor(bwd->ctx, &seed, grad_output, scale);
+        if (st != GD_OK) {
+            return st;
+        }
+        return gd_autograd_accumulate(bwd, output->id, &seed);
     }
     st = gd_tensor_ones(bwd->ctx,
                         GD_ARENA_SCRATCH,
@@ -461,13 +540,20 @@ static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
     }
     seed.requires_grad = false;
     seed.is_leaf = false;
+    if (scale != 1.0f) {
+        st = gd_backend_scale_tensor(bwd->ctx, &seed, &seed, scale);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
     return gd_autograd_accumulate(bwd, output->id, &seed);
 }
 
-gd_status gd_backward_many(gd_context *ctx,
-                           uint32_t n_outputs,
-                           const gd_tensor *const *outputs,
-                           const gd_tensor *const *grad_outputs)
+static gd_status gd_backward_many_impl(gd_context *ctx,
+                                       uint32_t n_outputs,
+                                       const gd_tensor *const *outputs,
+                                       const gd_tensor *const *grad_outputs,
+                                       float scale)
 {
     gd_autograd_state *state;
     gd_bwd_ctx bwd;
@@ -491,7 +577,7 @@ gd_status gd_backward_many(gd_context *ctx,
 
     for (i = 0U; i < n_outputs; ++i) {
         const gd_tensor *grad = grad_outputs != NULL ? grad_outputs[i] : NULL;
-        st = gd_seed_output_grad(&bwd, outputs[i], grad);
+        st = gd_seed_output_grad(&bwd, outputs[i], grad, scale);
         if (st != GD_OK) {
             goto done;
         }
@@ -519,6 +605,14 @@ done:
     return st;
 }
 
+gd_status gd_backward_many(gd_context *ctx,
+                           uint32_t n_outputs,
+                           const gd_tensor *const *outputs,
+                           const gd_tensor *const *grad_outputs)
+{
+    return gd_backward_many_impl(ctx, n_outputs, outputs, grad_outputs, 1.0f);
+}
+
 gd_status gd_backward(gd_context *ctx,
                       const gd_tensor *output,
                       const gd_tensor *grad_output)
@@ -528,6 +622,18 @@ gd_status gd_backward(gd_context *ctx,
     outputs[0] = output;
     grad_outputs[0] = grad_output;
     return gd_backward_many(ctx, 1U, outputs, grad_outputs);
+}
+
+gd_status gd_backward_scaled(gd_context *ctx,
+                             const gd_tensor *output,
+                             const gd_tensor *grad_output,
+                             float scale)
+{
+    const gd_tensor *outputs[1];
+    const gd_tensor *grad_outputs[1];
+    outputs[0] = output;
+    grad_outputs[0] = grad_output;
+    return gd_backward_many_impl(ctx, 1U, outputs, grad_outputs, scale);
 }
 
 gd_status gd_tensor_grad(gd_context *ctx,

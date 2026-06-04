@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct gd_optimizer gd_optimizer;
+typedef struct gd_amp_scaler gd_amp_scaler;
 
 typedef struct gd_adamw_config {
     float lr;
@@ -22,7 +23,25 @@ typedef struct gd_adamw_config {
     bool bias_correction;
 } gd_adamw_config;
 
+typedef struct gd_amp_config {
+    bool enabled;
+    float init_scale;
+    float growth_factor;
+    float backoff_factor;
+    float min_scale;
+    float max_scale;
+    uint32_t growth_interval;
+} gd_amp_config;
+
 gd_adamw_config gd_adamw_config_default(void);
+gd_amp_config gd_amp_config_default(void);
+
+gd_status gd_amp_scaler_create(const gd_amp_config *config, gd_amp_scaler **out);
+void gd_amp_scaler_destroy(gd_amp_scaler *scaler);
+float gd_amp_scaler_scale(const gd_amp_scaler *scaler);
+bool gd_amp_scaler_enabled(const gd_amp_scaler *scaler);
+bool gd_amp_scaler_last_found_inf(const gd_amp_scaler *scaler);
+uint32_t gd_amp_scaler_growth_tracker(const gd_amp_scaler *scaler);
 
 gd_status gd_adamw_create(gd_context *ctx,
                           const gd_param_set *params,
@@ -32,6 +51,7 @@ void gd_optimizer_destroy(gd_optimizer *optimizer);
 
 gd_status gd_optimizer_zero_grad(gd_context *ctx, gd_optimizer *optimizer);
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer);
+gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp_scaler *scaler);
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer);
 
 #ifdef __cplusplus

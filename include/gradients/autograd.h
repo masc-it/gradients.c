@@ -18,6 +18,13 @@ gd_status gd_backward(gd_context *ctx,
                       const gd_tensor *output,
                       const gd_tensor *grad_output);
 
+/* Like gd_backward, but seeds the reverse pass with grad_output * scale (or
+   ones * scale when grad_output is NULL). Useful for AMP loss scaling. */
+gd_status gd_backward_scaled(gd_context *ctx,
+                             const gd_tensor *output,
+                             const gd_tensor *grad_output,
+                             float scale);
+
 gd_status gd_backward_many(gd_context *ctx,
                            uint32_t n_outputs,
                            const gd_tensor *const *outputs,

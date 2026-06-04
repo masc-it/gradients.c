@@ -1,4 +1,5 @@
 #include "../../backends/metal/metal_backend_internal.h"
+#include "metal_matmul_types.h"
 
 #include <stdint.h>
 

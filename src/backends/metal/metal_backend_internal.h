@@ -7,7 +7,6 @@
 #include <stddef.h>
 
 #include "../../core/backend.h"
-#include "metal_kernel_types.h"
 #include "../../ops/op_kind.h"
 
 struct gd_backend {
@@ -25,6 +24,8 @@ struct gd_backend {
     void *matmul_tn_reg_pso;
     void *reduce_rows_pso;
     void *accumulate_pso;
+    void *scale_pso;
+    void *amp_unscale_pso;
     void *unary_pso[GD_OP_COUNT];
     void *unary_backward_pso[GD_OP_COUNT];
     void *adamw_pso;

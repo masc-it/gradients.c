@@ -145,7 +145,7 @@ static bool gd_make_core_content(char *out, size_t out_size, const char *op, con
                      "/* Scaffold for the '%s' op.\n"
                      "\n"
                      "   Next steps:\n"
-                     "   1. Add the public declaration to include/gradients/ops.h.\n"
+                     "   1. Confirm generated public declaration in include/gradients/ops_generated.h.\n"
                      "   2. Replace this anchor with gd_%s(...) validation/allocation/backend dispatch.\n"
                      "   3. Record the op with gd_autograd_record(ctx, GD_OP_%s, ...).\n"
                      "   4. Add backend implementations/tests/probes as needed.\n"
@@ -190,13 +190,101 @@ static bool gd_make_metal_content(char *out, size_t out_size, const char *op)
     int n = snprintf(out,
                      out_size,
                      "#include \"../../backends/metal/metal_backend_internal.h\"\n"
+                     "#include \"metal_%s_types.h\"\n"
                      "\n"
                      "/* Scaffold for the '%s' Metal backend capsule.\n"
                      "\n"
-                     "   Add backend entry points declared in src/core/backend.h here,\n"
-                     "   bind any metallib kernels, and keep hot paths allocation-free.\n"
+                     "   Add backend entry points declared in src/core/backend_generated.h here,\n"
+                     "   bind kernels from metal_%s.metal, and keep hot paths allocation-free.\n"
                      "*/\n"
                      "typedef int gd_%s_metal_scaffold_anchor;\n",
+                     op,
+                     op,
+                     op,
+                     op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_types_content(char *out, size_t out_size, const char *op, const char *upper)
+{
+    int n = snprintf(out,
+                     out_size,
+                     "#ifndef GD_OP_%s_METAL_TYPES_H\n"
+                     "#define GD_OP_%s_METAL_TYPES_H\n"
+                     "\n"
+                     "/* Op-local Metal ABI types for %s. Keep host/Metal layouts in sync. */\n"
+                     "\n"
+                     "#include \"../../backends/metal/metal_abi.h\"\n"
+                     "\n"
+                     "typedef struct gd_metal_%s_args {\n"
+                     "    gd_metal_u64 x_offset;\n"
+                     "    gd_metal_u64 y_offset;\n"
+                     "    gd_metal_u64 grad_offset;\n"
+                     "    gd_metal_u64 count;\n"
+                     "    gd_metal_u32 dtype;\n"
+                     "    gd_metal_u32 pad0;\n"
+                     "} gd_metal_%s_args;\n"
+                     "\n"
+                     "#ifndef __METAL_VERSION__\n"
+                     "_Static_assert(sizeof(gd_metal_%s_args) == 40U, \"gd_metal_%s_args ABI mismatch\");\n"
+                     "#endif\n"
+                     "\n"
+                     "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
+                     upper,
+                     upper,
+                     op,
+                     op,
+                     op,
+                     op,
+                     op,
+                     upper);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_kernel_content(char *out, size_t out_size, const char *op)
+{
+    int n = snprintf(out,
+                     out_size,
+                     "#include <metal_stdlib>\n"
+                     "#include \"metal_%s_types.h\"\n"
+                     "\n"
+                     "using namespace metal;\n"
+                     "\n"
+                     "/* Scaffold for the '%s' op-local Metal kernels.\n"
+                     "\n"
+                     "   The generated Metal PSO glue expects unary ops to export:\n"
+                     "     gd_%s_kernel\n"
+                     "     gd_%s_backward_kernel\n"
+                     "*/\n"
+                     "kernel void gd_%s_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                         device uchar *y [[buffer(1)]],\n"
+                     "                         constant gd_metal_%s_args &args [[buffer(2)]],\n"
+                     "                         uint gid [[thread_position_in_grid]])\n"
+                     "{\n"
+                     "    (void)x;\n"
+                     "    (void)y;\n"
+                     "    (void)args;\n"
+                     "    (void)gid;\n"
+                     "}\n"
+                     "\n"
+                     "kernel void gd_%s_backward_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                                  device const uchar *grad_out [[buffer(1)]],\n"
+                     "                                  device uchar *grad_x [[buffer(2)]],\n"
+                     "                                  constant gd_metal_%s_args &args [[buffer(3)]],\n"
+                     "                                  uint gid [[thread_position_in_grid]])\n"
+                     "{\n"
+                     "    (void)x;\n"
+                     "    (void)grad_out;\n"
+                     "    (void)grad_x;\n"
+                     "    (void)args;\n"
+                     "    (void)gid;\n"
+                     "}\n",
+                     op,
+                     op,
+                     op,
+                     op,
+                     op,
+                     op,
                      op,
                      op);
     return n >= 0 && (size_t)n < out_size;
@@ -313,13 +401,16 @@ static bool gd_make_readme_content(char *out, size_t out_size, const char *op)
                      "\n"
                      "Checklist:\n"
                      "\n"
-                     "- [ ] Public API declaration in `include/gradients/ops.h`\n"
+                     "- [ ] Public API generated in `include/gradients/ops_generated.h`\n"
                      "- [ ] Forward validation/allocation/recording in `core_%s.c`\n"
-                     "- [ ] Backend dispatch in `metal_%s.m` + kernels if needed\n"
+                     "- [ ] Backend dispatch in `metal_%s.m`\n"
+                     "- [ ] Op-local Metal ABI/kernel implementation in `metal_%s_types.h` / `metal_%s.metal`\n"
                      "- [ ] Backward rule in `autograd_%s.c`\n"
                      "- [ ] Forward PyTorch harness in `fwd.py`\n"
                      "- [ ] Backward PyTorch harness in `bwd.py`\n"
                      "- [ ] C tests under `tests/`\n",
+                     op,
+                     op,
                      op,
                      op,
                      op,
@@ -420,6 +511,8 @@ int main(int argc, char **argv)
     char core_path[GD_NEW_OP_PATH_MAX];
     char autograd_path[GD_NEW_OP_PATH_MAX];
     char metal_path[GD_NEW_OP_PATH_MAX];
+    char metal_types_path[GD_NEW_OP_PATH_MAX];
+    char metal_kernel_path[GD_NEW_OP_PATH_MAX];
     char fwd_path[GD_NEW_OP_PATH_MAX];
     char bwd_path[GD_NEW_OP_PATH_MAX];
     char readme_path[GD_NEW_OP_PATH_MAX];
@@ -442,6 +535,8 @@ int main(int argc, char **argv)
         !gd_make_op_file_path(core_path, sizeof(core_path), op, "core_", ".c") ||
         !gd_make_op_file_path(autograd_path, sizeof(autograd_path), op, "autograd_", ".c") ||
         !gd_make_op_file_path(metal_path, sizeof(metal_path), op, "metal_", ".m") ||
+        !gd_make_op_file_path(metal_types_path, sizeof(metal_types_path), op, "metal_", "_types.h") ||
+        !gd_make_op_file_path(metal_kernel_path, sizeof(metal_kernel_path), op, "metal_", ".metal") ||
         !gd_make_op_named_path(fwd_path, sizeof(fwd_path), op, "fwd.py") ||
         !gd_make_op_named_path(bwd_path, sizeof(bwd_path), op, "bwd.py") ||
         !gd_make_op_named_path(readme_path, sizeof(readme_path), op, "README.md")) {
@@ -465,6 +560,14 @@ int main(int argc, char **argv)
     }
     if (!gd_make_metal_content(content, sizeof(content), op) ||
         gd_write_new_file(metal_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_metal_types_content(content, sizeof(content), op, upper) ||
+        gd_write_new_file(metal_types_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_metal_kernel_content(content, sizeof(content), op) ||
+        gd_write_new_file(metal_kernel_path, content) != 0) {
         return 1;
     }
     if (!gd_make_fwd_py_content(content, sizeof(content), op) ||

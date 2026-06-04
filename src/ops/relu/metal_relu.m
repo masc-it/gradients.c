@@ -1,4 +1,5 @@
 #include "../../backends/metal/metal_backend_internal.h"
+#include "metal_relu_types.h"
 
 #include <gradients/tensor.h>
 

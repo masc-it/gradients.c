@@ -19,6 +19,8 @@ The scaffold tool creates the capsule directory and starter files, then regenera
 [create] src/ops/my_op/core_my_op.c
 [create] src/ops/my_op/autograd_my_op.c
 [create] src/ops/my_op/metal_my_op.m
+[create] src/ops/my_op/metal_my_op_types.h
+[create] src/ops/my_op/metal_my_op.metal
 [create] src/ops/my_op/fwd.py
 [create] src/ops/my_op/bwd.py
 [create] src/ops/my_op/README.md
@@ -33,13 +35,15 @@ If a file already exists, the tool prints `[exists]` and leaves it untouched.
 
 ## What gets generated
 
-The registry generator scans direct children of `src/ops/` and recognizes these files:
+The scaffold creates these op-capsule files under `src/ops/<op>/`:
 
 ```text
 src/ops/<op>/op_<op>.def      # op metadata for generated stubs
 src/ops/<op>/core_<op>.c       # forward/public op implementation
 src/ops/<op>/autograd_<op>.c   # backward rule capsule
-src/ops/<op>/metal_<op>.m      # accelerated backend capsule scaffold
+src/ops/<op>/metal_<op>.m      # accelerated backend host/dispatch capsule scaffold
+src/ops/<op>/metal_<op>_types.h # op-local Metal kernel ABI structs
+src/ops/<op>/metal_<op>.metal  # op-local Metal kernels compiled into the metallib
 src/ops/<op>/fwd.py            # PEP 723 PyTorch forward comparison template
 src/ops/<op>/bwd.py            # PEP 723 PyTorch backward comparison template
 ```
@@ -66,6 +70,8 @@ backend=unary
 
 For custom signatures, adjust the generated prototypes or extend `tools/gen_ops.c` with a new metadata shape before implementing the op.
 
+Metal kernels should stay in the op capsule. `make build` compiles `.metal` files found under `src/backends/metal/`, `src/ops/`, and `src/optim/` into the offline `gradients.metallib`; the generated Metal PSO glue only cares about exported kernel names. See [Metal kernel capsule layout](metal_capsules.md) for ownership rules.
+
 ## Implement the forward op
 
 Edit `src/ops/my_op/core_my_op.c`.
@@ -78,7 +84,7 @@ Typical forward implementation shape:
 #include "../autograd_impl.h"
 #include "../op_common.h"
 
-/* Add public declaration to include/gradients/ops.h. */
+/* Public declaration is generated in include/gradients/ops_generated.h. */
 gd_status gd_my_op(gd_context *ctx,
                    const gd_tensor *x,
                    gd_tensor *out)
@@ -214,7 +220,8 @@ Run Python harnesses with `uv run ...`.
 - [ ] `build/tools/gradients-new-op my_op`
 - [ ] Confirm generated public declarations in `include/gradients/ops_generated.h`
 - [ ] Forward implementation in `src/ops/my_op/core_my_op.c`
-- [ ] Backend dispatch in `src/ops/my_op/metal_my_op.m` and kernels if needed
+- [ ] Backend dispatch in `src/ops/my_op/metal_my_op.m`
+- [ ] Op-local Metal types/kernels in `src/ops/my_op/metal_my_op_types.h` and `src/ops/my_op/metal_my_op.metal`
 - [ ] Backward rule in `src/ops/my_op/autograd_my_op.c`
 - [ ] Forward/backward PyTorch harnesses in `src/ops/my_op/fwd.py` / `src/ops/my_op/bwd.py`
 - [ ] C tests and PyTorch comparison

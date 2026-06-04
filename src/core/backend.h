@@ -100,6 +100,14 @@ gd_status gd_backend_linear(gd_backend *backend,
 gd_status gd_backend_reduce_rows(gd_backend *backend,
                                  const gd_backend_matrix_view *x,
                                  const gd_backend_vector_view *y);
+/* dst[i] += src[i] for contiguous tensors, dtype values from gd_dtype. */
+gd_status gd_backend_accumulate(gd_backend *backend,
+                                gd_backend_buffer *dst_buffer,
+                                size_t dst_offset,
+                                gd_backend_buffer *src_buffer,
+                                size_t src_offset,
+                                size_t count,
+                                uint32_t dtype);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

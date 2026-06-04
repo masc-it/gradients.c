@@ -338,6 +338,10 @@ static gd_status gd_tensor_fill_pattern(gd_context *ctx, gd_tensor *tensor, uint
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend tensor fill failed");
     }
+    tensor->version += 1U;
+    if (tensor->version == 0U) {
+        tensor->version = 1U;
+    }
     return GD_OK;
 }
 
@@ -392,6 +396,11 @@ gd_status gd_tensor_empty(gd_context *ctx,
         return gd_context_set_error(ctx, st, "invalid tensor allocation shape");
     }
     memset(&tensor, 0, sizeof(tensor));
+    st = gd_context_next_tensor_id(ctx, &tensor.id);
+    if (st != GD_OK) {
+        return st;
+    }
+    tensor.version = 0U;
     tensor.dtype = dtype;
     tensor.device = GD_DEVICE_GPU;
     tensor.layout = GD_LAYOUT_STRIDED;
@@ -407,6 +416,7 @@ gd_status gd_tensor_empty(gd_context *ctx,
     tensor.view_offset = 0U;
     tensor.is_view = false;
     tensor.requires_grad = false;
+    tensor.is_leaf = true;
     st = gd_tensor_validate(ctx, &tensor);
     if (st != GD_OK) {
         return st;
@@ -529,9 +539,15 @@ gd_status gd_tensor_slice(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "tensor slice offset overflow");
     }
     view = *base;
+    st = gd_context_next_tensor_id(ctx, &view.id);
+    if (st != GD_OK) {
+        return st;
+    }
+    view.version = 0U;
     view.shape[dim] = length;
     view.view_offset = base->view_offset + byte_delta;
     view.is_view = true;
+    view.is_leaf = false;
     st = gd_tensor_validate(ctx, &view);
     if (st != GD_OK) {
         return st;
@@ -562,6 +578,7 @@ gd_status gd_tensor_contiguous(gd_context *ctx,
         return st;
     }
     out->requires_grad = src->requires_grad;
+    out->is_leaf = false;
     return GD_OK;
 }
 
@@ -641,6 +658,10 @@ gd_status gd_tensor_rand_uniform_(gd_context *ctx,
                                  high);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend tensor rand failed");
+    }
+    tensor->version += 1U;
+    if (tensor->version == 0U) {
+        tensor->version = 1U;
     }
     return GD_OK;
 }

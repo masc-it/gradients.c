@@ -34,6 +34,8 @@ typedef enum gd_layout {
 
 /* Tensor descriptors are caller-owned metadata. Tensor bytes live in arena storage. */
 typedef struct gd_tensor {
+    uint64_t id;
+    uint32_t version;
     gd_dtype dtype;
     gd_device device;
     gd_layout layout;
@@ -44,6 +46,7 @@ typedef struct gd_tensor {
     size_t view_offset;
     bool is_view;
     bool requires_grad;
+    bool is_leaf;
 } gd_tensor;
 
 size_t gd_dtype_size(gd_dtype dtype);

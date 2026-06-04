@@ -206,6 +206,24 @@ gd_status gd_backend_reduce_rows(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_accumulate(gd_backend *backend,
+                                gd_backend_buffer *dst_buffer,
+                                size_t dst_offset,
+                                gd_backend_buffer *src_buffer,
+                                size_t src_offset,
+                                size_t count,
+                                uint32_t dtype)
+{
+    (void)backend;
+    (void)dst_buffer;
+    (void)dst_offset;
+    (void)src_buffer;
+    (void)src_offset;
+    (void)count;
+    (void)dtype;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)
 {
     (void)backend;

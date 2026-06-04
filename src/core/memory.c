@@ -76,6 +76,8 @@ struct gd_context {
     gd_state_object *state_objects;
     gd_touched_state touched_state[GD_MAX_TOUCHED_STATE];
     uint32_t touched_state_count;
+    gd_autograd_state *autograd;
+    uint64_t next_tensor_id;
     gd_status status;
     char error[160];
 };
@@ -106,6 +108,39 @@ gd_status gd_context_set_error(gd_context *ctx, gd_status status, const char *me
 gd_backend *gd_context_backend(gd_context *ctx)
 {
     return ctx != NULL ? ctx->backend.backend : NULL;
+}
+
+gd_autograd_state *gd_context_autograd(gd_context *ctx)
+{
+    return ctx != NULL ? ctx->autograd : NULL;
+}
+
+const gd_autograd_state *gd_context_autograd_const(const gd_context *ctx)
+{
+    return ctx != NULL ? ctx->autograd : NULL;
+}
+
+gd_scope_mode gd_context_scope_mode(const gd_context *ctx)
+{
+    return ctx != NULL ? ctx->mode : GD_SCOPE_NONE;
+}
+
+bool gd_context_in_scope(const gd_context *ctx)
+{
+    return ctx != NULL && ctx->in_scope;
+}
+
+gd_status gd_context_next_tensor_id(gd_context *ctx, uint64_t *out_id)
+{
+    if (ctx == NULL || out_id == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->next_tensor_id == 0U || ctx->next_tensor_id == UINT64_MAX) {
+        return gd_set_error(ctx, GD_ERR_INTERNAL, "tensor id counter overflow");
+    }
+    *out_id = ctx->next_tensor_id;
+    ctx->next_tensor_id += 1U;
+    return GD_OK;
 }
 
 static void *gd_heap_alloc(size_t nbytes)
@@ -705,6 +740,7 @@ gd_status gd_context_create(const gd_memory_config *config, gd_context **out_ctx
     ctx->scratch.current = -1;
     ctx->data.current = -1;
     ctx->mode = GD_SCOPE_NONE;
+    ctx->next_tensor_id = 1U;
     st = gd_arena_init(backend, &ctx->params, GD_ARENA_PARAMS, -1,
                        cfg.params_bytes, default_alignment);
     if (st != GD_OK) {
@@ -729,6 +765,11 @@ gd_status gd_context_create(const gd_memory_config *config, gd_context **out_ctx
         gd_context_destroy(ctx);
         return st;
     }
+    st = gd_autograd_state_create(ctx, &ctx->autograd);
+    if (st != GD_OK) {
+        gd_context_destroy(ctx);
+        return st;
+    }
     *out_ctx = ctx;
     return GD_OK;
 }
@@ -748,6 +789,8 @@ void gd_context_destroy(gd_context *ctx)
         ctx->state_objects = object->next;
         free(object);
     }
+    gd_autograd_state_destroy(ctx->autograd);
+    ctx->autograd = NULL;
     gd_ring_destroy(&ctx->scratch);
     gd_ring_destroy(&ctx->data);
     gd_arena_destroy(&ctx->params);
@@ -813,6 +856,12 @@ gd_status gd_begin(gd_context *ctx, gd_scope_mode mode)
     ctx->mode = mode;
     ctx->in_scope = true;
     ctx->touched_state_count = 0U;
+    st = gd_autograd_on_begin(ctx);
+    if (st != GD_OK) {
+        ctx->mode = GD_SCOPE_NONE;
+        ctx->in_scope = false;
+        return st;
+    }
     return GD_OK;
 }
 
@@ -845,6 +894,7 @@ gd_status gd_end(gd_context *ctx)
     }
     ctx->touched_state_count = 0U;
     ctx->last_scope_fence = fence;
+    gd_autograd_on_end(ctx);
     ctx->mode = GD_SCOPE_NONE;
     ctx->in_scope = false;
     return GD_OK;

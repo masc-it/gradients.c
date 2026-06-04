@@ -67,6 +67,26 @@ kernel void gd_rand_uniform_kernel(device uchar *dst [[buffer(0)]],
     gd_write_float_dtype(dst, args.byte_offset + i * elem_size, args.dtype, v);
 }
 
+kernel void gd_accumulate_kernel(device uchar *dst [[buffer(0)]],
+                                 device const uchar *src [[buffer(1)]],
+                                 constant gd_metal_accumulate_args &args [[buffer(2)]],
+                                 uint gid [[thread_position_in_grid]])
+{
+    ulong i = ulong(gid);
+    if (i >= args.count) {
+        return;
+    }
+    if (args.dtype == 1u) {
+        device half *d = reinterpret_cast<device half *>(dst + args.dst_offset);
+        device const half *s = reinterpret_cast<device const half *>(src + args.src_offset);
+        d[i] = half(d[i] + s[i]);
+    } else if (args.dtype == 3u) {
+        device float *d = reinterpret_cast<device float *>(dst + args.dst_offset);
+        device const float *s = reinterpret_cast<device const float *>(src + args.src_offset);
+        d[i] += s[i];
+    }
+}
+
 static inline half gd_load_f16(device const uchar *buf, ulong byte)
 {
     return *(reinterpret_cast<device const half *>(buf + byte));

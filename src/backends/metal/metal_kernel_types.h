@@ -53,6 +53,14 @@ typedef struct gd_metal_reduce_rows_args {
     uint pad0;
 } gd_metal_reduce_rows_args;
 
+typedef struct gd_metal_accumulate_args {
+    ulong dst_offset;
+    ulong src_offset;
+    ulong count;
+    uint dtype;
+    uint pad0;
+} gd_metal_accumulate_args;
+
 #else
 
 #include <stddef.h>
@@ -98,12 +106,21 @@ typedef struct gd_metal_reduce_rows_args {
     uint32_t pad0;
 } gd_metal_reduce_rows_args;
 
+typedef struct gd_metal_accumulate_args {
+    uint64_t dst_offset;
+    uint64_t src_offset;
+    uint64_t count;
+    uint32_t dtype;
+    uint32_t pad0;
+} gd_metal_accumulate_args;
+
 #endif /* __METAL_VERSION__ */
 
 #ifndef __METAL_VERSION__
 _Static_assert(sizeof(gd_metal_fill_args) == 24U, "gd_metal_fill_args ABI mismatch");
 _Static_assert(sizeof(gd_metal_rand_uniform_args) == 40U, "gd_metal_rand_uniform_args ABI mismatch");
 _Static_assert(sizeof(gd_metal_gemm_args) == 72U, "gd_metal_gemm_args ABI mismatch");
+_Static_assert(sizeof(gd_metal_accumulate_args) == 32U, "gd_metal_accumulate_args ABI mismatch");
 _Static_assert(offsetof(gd_metal_gemm_args, rows) == 56U, "gd_metal_gemm_args rows offset mismatch");
 _Static_assert(offsetof(gd_metal_gemm_args, has_bias) == 68U, "gd_metal_gemm_args has_bias offset mismatch");
 #endif

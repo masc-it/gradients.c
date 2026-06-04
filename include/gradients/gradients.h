@@ -6,6 +6,7 @@
 #include <gradients/tensor.h>
 #include <gradients/transfer.h>
 #include <gradients/ops.h>
+#include <gradients/autograd.h>
 #include <gradients/module.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

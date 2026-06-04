@@ -28,6 +28,11 @@ static id<MTLComputePipelineState> gd_metal_rand_uniform_pso(gd_backend *backend
     return (__bridge id<MTLComputePipelineState>)backend->rand_uniform_pso;
 }
 
+static id<MTLComputePipelineState> gd_metal_accumulate_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->accumulate_pso;
+}
+
 static id<MTLCommandBuffer> gd_metal_active_command_buffer(gd_backend *backend)
 {
     return (__bridge id<MTLCommandBuffer>)backend->active_command_buffer;
@@ -108,6 +113,10 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
         return st;
     }
     st = gd_metal_make_pipeline(backend, library, "gd_rand_uniform_kernel", &backend->rand_uniform_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_accumulate_kernel", &backend->accumulate_pso);
     if (st != GD_OK) {
         return st;
     }
@@ -242,6 +251,9 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->active_command_buffer != NULL) {
         CFRelease(backend->active_command_buffer);
+    }
+    if (backend->accumulate_pso != NULL) {
+        CFRelease(backend->accumulate_pso);
     }
     if (backend->reduce_rows_pso != NULL) {
         CFRelease(backend->reduce_rows_pso);
@@ -528,6 +540,62 @@ gd_status gd_backend_rand_uniform(gd_backend *backend,
     [encoder setComputePipelineState:gd_metal_rand_uniform_pso(backend)];
     [encoder setBuffer:gd_metal_buffer(buffer) offset:0U atIndex:0U];
     [encoder setBytes:&args length:sizeof(args) atIndex:1U];
+    grid = MTLSizeMake((NSUInteger)count, 1U, 1U);
+    threads = MTLSizeMake((NSUInteger)(count < GD_METAL_MAX_THREADS_PER_GROUP ? count : GD_METAL_MAX_THREADS_PER_GROUP),
+                          1U,
+                          1U);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+gd_status gd_backend_accumulate(gd_backend *backend,
+                                gd_backend_buffer *dst_buffer,
+                                size_t dst_offset,
+                                gd_backend_buffer *src_buffer,
+                                size_t src_offset,
+                                size_t count,
+                                uint32_t dtype)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    gd_metal_accumulate_args args;
+    MTLSize grid;
+    MTLSize threads;
+    bool immediate;
+    size_t elem_size;
+    size_t nbytes;
+    gd_status st;
+    if (dtype == 1U) {
+        elem_size = 2U;
+    } else if (dtype == 3U) {
+        elem_size = 4U;
+    } else {
+        return GD_ERR_UNSUPPORTED;
+    }
+    if (backend == NULL || dst_buffer == NULL || src_buffer == NULL || count == 0U ||
+        count > UINT32_MAX || !gd_metal_count_bytes(count, elem_size, &nbytes) ||
+        !gd_metal_byte_range_valid(dst_buffer, dst_offset, nbytes) ||
+        !gd_metal_byte_range_valid(src_buffer, src_offset, nbytes)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    args.dst_offset = (uint64_t)dst_offset;
+    args.src_offset = (uint64_t)src_offset;
+    args.count = (uint64_t)count;
+    args.dtype = dtype;
+    args.pad0 = 0U;
+    [encoder setComputePipelineState:gd_metal_accumulate_pso(backend)];
+    [encoder setBuffer:gd_metal_buffer(dst_buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_metal_buffer(src_buffer) offset:0U atIndex:1U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:2U];
     grid = MTLSizeMake((NSUInteger)count, 1U, 1U);
     threads = MTLSizeMake((NSUInteger)(count < GD_METAL_MAX_THREADS_PER_GROUP ? count : GD_METAL_MAX_THREADS_PER_GROUP),
                           1U,

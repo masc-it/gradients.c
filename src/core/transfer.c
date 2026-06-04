@@ -115,7 +115,15 @@ gd_status gd_upload(gd_context *ctx, const void *src, size_t nbytes, gd_tensor *
     if (nbytes != logical_nbytes) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor upload size mismatch");
     }
-    return gd_span_upload(ctx, &dst->storage, dst->view_offset, src, nbytes);
+    st = gd_span_upload(ctx, &dst->storage, dst->view_offset, src, nbytes);
+    if (st != GD_OK) {
+        return st;
+    }
+    dst->version += 1U;
+    if (dst->version == 0U) {
+        dst->version = 1U;
+    }
+    return GD_OK;
 }
 
 gd_status gd_download(gd_context *ctx, const gd_tensor *src, void *dst, size_t nbytes)

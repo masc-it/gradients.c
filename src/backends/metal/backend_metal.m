@@ -135,6 +135,14 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_binary_reduce_broadcast_kernel", &backend->binary_reduce_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_binary_reduce_broadcast_suffix_kernel", &backend->binary_reduce_suffix_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
     if (st != GD_OK) {
         return st;
@@ -280,6 +288,12 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend->adamw_pso != NULL) {
         CFRelease(backend->adamw_pso);
     }
+    if (backend->binary_reduce_suffix_pso != NULL) {
+        CFRelease(backend->binary_reduce_suffix_pso);
+    }
+    if (backend->binary_reduce_pso != NULL) {
+        CFRelease(backend->binary_reduce_pso);
+    }
     if (backend->amp_unscale_pso != NULL) {
         CFRelease(backend->amp_unscale_pso);
     }
@@ -290,6 +304,12 @@ void gd_backend_destroy(gd_backend *backend)
         CFRelease(backend->accumulate_pso);
     }
     for (i = 0U; i < GD_OP_COUNT; ++i) {
+        if (backend->binary_bcast_pso[i] != NULL) {
+            CFRelease(backend->binary_bcast_pso[i]);
+        }
+        if (backend->binary_pso[i] != NULL) {
+            CFRelease(backend->binary_pso[i]);
+        }
         if (backend->unary_backward_pso[i] != NULL) {
             CFRelease(backend->unary_backward_pso[i]);
         }

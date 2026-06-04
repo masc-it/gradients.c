@@ -74,6 +74,9 @@ typedef struct gd_backend_tensor_view {
     size_t offset;
     size_t count;
     uint32_t dtype;
+    uint32_t rank;
+    int64_t shape[8];
+    int64_t strides[8];
 } gd_backend_tensor_view;
 
 #include "backend_generated.h"
@@ -161,6 +164,11 @@ gd_status gd_backend_scale(gd_backend *backend,
                            size_t count,
                            uint32_t dtype,
                            float scale);
+/* dst = sum_to_shape(src) * scale for contiguous broadcast-compatible tensors. */
+gd_status gd_backend_reduce_broadcast(gd_backend *backend,
+                                      const gd_backend_tensor_view *src,
+                                      const gd_backend_tensor_view *dst,
+                                      float scale);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
 

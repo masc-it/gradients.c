@@ -10,3 +10,33 @@
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_add_kernel",
+                                &backend->binary_pso[GD_OP_ADD]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_add_bcast_kernel",
+                                &backend->binary_bcast_pso[GD_OP_ADD]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_mul_kernel",
+                                &backend->binary_pso[GD_OP_MUL]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_mul_bcast_kernel",
+                                &backend->binary_bcast_pso[GD_OP_MUL]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sub_kernel",
+                                &backend->binary_pso[GD_OP_SUB]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sub_bcast_kernel",
+                                &backend->binary_bcast_pso[GD_OP_SUB]);
+    if (st != GD_OK) {
+        return st;
+    }

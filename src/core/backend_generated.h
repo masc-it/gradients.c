@@ -11,4 +11,19 @@ gd_status gd_backend_relu_backward(gd_backend *backend,
                                    const gd_backend_tensor_view *grad_out,
                                    const gd_backend_tensor_view *grad_x);
 
+gd_status gd_backend_add(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out);
+
+gd_status gd_backend_mul(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out);
+
+gd_status gd_backend_sub(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out);
+
 #endif /* GD_CORE_BACKEND_GENERATED_H */

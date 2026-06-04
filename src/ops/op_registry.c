@@ -4,11 +4,17 @@
 extern const gd_autograd_rule gd_bwd_rule_matmul;
 extern const gd_autograd_rule gd_bwd_rule_linear;
 extern const gd_autograd_rule gd_bwd_rule_relu;
+extern const gd_autograd_rule gd_bwd_rule_add;
+extern const gd_autograd_rule gd_bwd_rule_mul;
+extern const gd_autograd_rule gd_bwd_rule_sub;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
     [GD_OP_LINEAR] = &gd_bwd_rule_linear,
     [GD_OP_RELU] = &gd_bwd_rule_relu,
+    [GD_OP_ADD] = &gd_bwd_rule_add,
+    [GD_OP_MUL] = &gd_bwd_rule_mul,
+    [GD_OP_SUB] = &gd_bwd_rule_sub,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

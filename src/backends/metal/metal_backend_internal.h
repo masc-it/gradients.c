@@ -28,6 +28,10 @@ struct gd_backend {
     void *amp_unscale_pso;
     void *unary_pso[GD_OP_COUNT];
     void *unary_backward_pso[GD_OP_COUNT];
+    void *binary_pso[GD_OP_COUNT];
+    void *binary_bcast_pso[GD_OP_COUNT];
+    void *binary_reduce_pso;
+    void *binary_reduce_suffix_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

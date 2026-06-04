@@ -24,3 +24,39 @@ gd_status gd_backend_relu_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_add(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)out;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_mul(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)out;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_sub(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y,
+                          const gd_backend_tensor_view *out)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)out;
+    return GD_ERR_UNSUPPORTED;
+}
+

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <gradients/tensor.h>
 
@@ -66,6 +67,7 @@ static inline bool gd_op_tensor_view_from_tensor(const gd_tensor *tensor,
     if (tensor == NULL || out == NULL || tensor->rank > GD_MAX_DIMS) {
         return false;
     }
+    memset(out, 0, sizeof(*out));
     elem_size = gd_dtype_size(tensor->dtype);
     if (elem_size == 0U || !gd_tensor_is_contiguous(tensor) ||
         tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
@@ -83,6 +85,11 @@ static inline bool gd_op_tensor_view_from_tensor(const gd_tensor *tensor,
     out->offset = offset;
     out->count = (size_t)numel;
     out->dtype = (uint32_t)tensor->dtype;
+    out->rank = tensor->rank;
+    for (i = 0U; i < tensor->rank; ++i) {
+        out->shape[i] = tensor->shape[i];
+        out->strides[i] = tensor->strides[i];
+    }
     return out->buffer != NULL;
 }
 

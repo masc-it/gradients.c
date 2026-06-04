@@ -122,15 +122,18 @@ static bool gd_make_op_named_path(char *out, size_t out_size, const char *op, co
     return n >= 0 && (size_t)n < out_size;
 }
 
-static bool gd_make_def_content(char *out, size_t out_size, const char *op)
+static bool gd_make_def_content(char *out, size_t out_size, const char *op, bool binary)
 {
+    const char *shape = binary ? "binary" : "unary";
     int n = snprintf(out,
                      out_size,
                      "# Generated op metadata for %s.\n"
                      "# api/backend shape controls generated public/backend stubs.\n"
-                     "api=unary\n"
-                     "backend=unary\n",
-                     op);
+                     "api=%s\n"
+                     "backend=%s\n",
+                     op,
+                     shape,
+                     shape);
     return n >= 0 && (size_t)n < out_size;
 }
 
@@ -205,77 +208,101 @@ static bool gd_make_metal_content(char *out, size_t out_size, const char *op)
     return n >= 0 && (size_t)n < out_size;
 }
 
-static bool gd_make_metal_types_content(char *out, size_t out_size, const char *op, const char *upper)
+static bool gd_make_metal_types_content(char *out,
+                                        size_t out_size,
+                                        const char *op,
+                                        const char *upper,
+                                        bool binary)
 {
-    int n = snprintf(out,
+    int n;
+    if (binary) {
+        n = snprintf(out,
                      out_size,
                      "#ifndef GD_OP_%s_METAL_TYPES_H\n"
                      "#define GD_OP_%s_METAL_TYPES_H\n"
                      "\n"
-                     "/* Op-local Metal ABI types for %s. Keep host/Metal layouts in sync. */\n"
-                     "\n"
-                     "#include \"../../backends/metal/metal_abi.h\"\n"
-                     "\n"
-                     "typedef struct gd_metal_%s_args {\n"
-                     "    gd_metal_u64 x_offset;\n"
-                     "    gd_metal_u64 y_offset;\n"
-                     "    gd_metal_u64 grad_offset;\n"
-                     "    gd_metal_u64 count;\n"
-                     "    gd_metal_u32 dtype;\n"
-                     "    gd_metal_u32 pad0;\n"
-                     "} gd_metal_%s_args;\n"
-                     "\n"
-                     "#ifndef __METAL_VERSION__\n"
-                     "_Static_assert(sizeof(gd_metal_%s_args) == 40U, \"gd_metal_%s_args ABI mismatch\");\n"
-                     "#endif\n"
+                     "/* Binary elementwise ops use the shared binary Metal ABI. */\n"
+                     "#include \"../_shared/binary/metal_binary_types.h\"\n"
                      "\n"
                      "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
                      upper,
                      upper,
-                     op,
-                     op,
-                     op,
-                     op,
-                     op,
                      upper);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#ifndef GD_OP_%s_METAL_TYPES_H\n"
+                 "#define GD_OP_%s_METAL_TYPES_H\n"
+                 "\n"
+                 "/* Op-local Metal ABI types for %s. Keep host/Metal layouts in sync. */\n"
+                 "\n"
+                 "#include \"../../backends/metal/metal_abi.h\"\n"
+                 "\n"
+                 "typedef struct gd_metal_%s_args {\n"
+                 "    gd_metal_u64 x_offset;\n"
+                 "    gd_metal_u64 y_offset;\n"
+                 "    gd_metal_u64 grad_offset;\n"
+                 "    gd_metal_u64 count;\n"
+                 "    gd_metal_u32 dtype;\n"
+                 "    gd_metal_u32 pad0;\n"
+                 "} gd_metal_%s_args;\n"
+                 "\n"
+                 "#ifndef __METAL_VERSION__\n"
+                 "_Static_assert(sizeof(gd_metal_%s_args) == 40U, \"gd_metal_%s_args ABI mismatch\");\n"
+                 "#endif\n"
+                 "\n"
+                 "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
+                 upper,
+                 upper,
+                 op,
+                 op,
+                 op,
+                 op,
+                 op,
+                 upper);
     return n >= 0 && (size_t)n < out_size;
 }
 
-static bool gd_make_metal_kernel_content(char *out, size_t out_size, const char *op)
+static bool gd_make_metal_kernel_content(char *out, size_t out_size, const char *op, bool binary)
 {
-    int n = snprintf(out,
+    int n;
+    if (binary) {
+        n = snprintf(out,
                      out_size,
                      "#include <metal_stdlib>\n"
                      "#include \"metal_%s_types.h\"\n"
                      "\n"
                      "using namespace metal;\n"
                      "\n"
-                     "/* Scaffold for the '%s' op-local Metal kernels.\n"
+                     "/* Scaffold for the '%s' binary op-local Metal kernels.\n"
                      "\n"
-                     "   The generated Metal PSO glue expects unary ops to export:\n"
+                     "   The generated Metal PSO glue expects binary ops to export:\n"
                      "     gd_%s_kernel\n"
-                     "     gd_%s_backward_kernel\n"
+                     "     gd_%s_bcast_kernel\n"
                      "*/\n"
                      "kernel void gd_%s_kernel(device const uchar *x [[buffer(0)]],\n"
-                     "                         device uchar *y [[buffer(1)]],\n"
-                     "                         constant gd_metal_%s_args &args [[buffer(2)]],\n"
+                     "                         device const uchar *y [[buffer(1)]],\n"
+                     "                         device uchar *out [[buffer(2)]],\n"
+                     "                         constant gd_metal_binary_args &args [[buffer(3)]],\n"
                      "                         uint gid [[thread_position_in_grid]])\n"
                      "{\n"
                      "    (void)x;\n"
                      "    (void)y;\n"
+                     "    (void)out;\n"
                      "    (void)args;\n"
                      "    (void)gid;\n"
                      "}\n"
                      "\n"
-                     "kernel void gd_%s_backward_kernel(device const uchar *x [[buffer(0)]],\n"
-                     "                                  device const uchar *grad_out [[buffer(1)]],\n"
-                     "                                  device uchar *grad_x [[buffer(2)]],\n"
-                     "                                  constant gd_metal_%s_args &args [[buffer(3)]],\n"
-                     "                                  uint gid [[thread_position_in_grid]])\n"
+                     "kernel void gd_%s_bcast_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                               device const uchar *y [[buffer(1)]],\n"
+                     "                               device uchar *out [[buffer(2)]],\n"
+                     "                               constant gd_metal_binary_bcast_args &args [[buffer(3)]],\n"
+                     "                               uint gid [[thread_position_in_grid]])\n"
                      "{\n"
                      "    (void)x;\n"
-                     "    (void)grad_out;\n"
-                     "    (void)grad_x;\n"
+                     "    (void)y;\n"
+                     "    (void)out;\n"
                      "    (void)args;\n"
                      "    (void)gid;\n"
                      "}\n",
@@ -284,9 +311,53 @@ static bool gd_make_metal_kernel_content(char *out, size_t out_size, const char 
                      op,
                      op,
                      op,
-                     op,
-                     op,
                      op);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include <metal_stdlib>\n"
+                 "#include \"metal_%s_types.h\"\n"
+                 "\n"
+                 "using namespace metal;\n"
+                 "\n"
+                 "/* Scaffold for the '%s' op-local Metal kernels.\n"
+                 "\n"
+                 "   The generated Metal PSO glue expects unary ops to export:\n"
+                 "     gd_%s_kernel\n"
+                 "     gd_%s_backward_kernel\n"
+                 "*/\n"
+                 "kernel void gd_%s_kernel(device const uchar *x [[buffer(0)]],\n"
+                 "                         device uchar *y [[buffer(1)]],\n"
+                 "                         constant gd_metal_%s_args &args [[buffer(2)]],\n"
+                 "                         uint gid [[thread_position_in_grid]])\n"
+                 "{\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)args;\n"
+                 "    (void)gid;\n"
+                 "}\n"
+                 "\n"
+                 "kernel void gd_%s_backward_kernel(device const uchar *x [[buffer(0)]],\n"
+                 "                                  device const uchar *grad_out [[buffer(1)]],\n"
+                 "                                  device uchar *grad_x [[buffer(2)]],\n"
+                 "                                  constant gd_metal_%s_args &args [[buffer(3)]],\n"
+                 "                                  uint gid [[thread_position_in_grid]])\n"
+                 "{\n"
+                 "    (void)x;\n"
+                 "    (void)grad_out;\n"
+                 "    (void)grad_x;\n"
+                 "    (void)args;\n"
+                 "    (void)gid;\n"
+                 "}\n",
+                 op,
+                 op,
+                 op,
+                 op,
+                 op,
+                 op,
+                 op,
+                 op);
     return n >= 0 && (size_t)n < out_size;
 }
 
@@ -504,7 +575,8 @@ static int gd_run_gen_ops(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    const char *op;
+    const char *op = NULL;
+    bool binary = false;
     char upper[GD_NEW_OP_NAME_MAX];
     char op_dir[GD_NEW_OP_PATH_MAX];
     char def_path[GD_NEW_OP_PATH_MAX];
@@ -518,11 +590,18 @@ int main(int argc, char **argv)
     char readme_path[GD_NEW_OP_PATH_MAX];
     char content[GD_NEW_OP_CONTENT_MAX];
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <snake_case_op_name>\n", argv[0]);
+    if (argc == 2) {
+        op = argv[1];
+    } else if (argc == 3 && strcmp(argv[1], "--binary") == 0) {
+        binary = true;
+        op = argv[2];
+    } else if (argc == 3 && strcmp(argv[2], "--binary") == 0) {
+        binary = true;
+        op = argv[1];
+    } else {
+        fprintf(stderr, "usage: %s [--binary] <snake_case_op_name>\n", argv[0]);
         return 2;
     }
-    op = argv[1];
     if (!gd_valid_op_name(op)) {
         fprintf(stderr,
                 "gradients-new-op: invalid op name '%s' (use snake_case: [a-z][a-z0-9_]*, no trailing/double underscores)\n",
@@ -546,7 +625,7 @@ int main(int argc, char **argv)
     if (gd_mkdir_if_missing("src/ops") != 0 || gd_mkdir_if_missing(op_dir) != 0) {
         return 1;
     }
-    if (!gd_make_def_content(content, sizeof(content), op) ||
+    if (!gd_make_def_content(content, sizeof(content), op, binary) ||
         gd_write_new_file(def_path, content) != 0) {
         return 1;
     }
@@ -562,11 +641,11 @@ int main(int argc, char **argv)
         gd_write_new_file(metal_path, content) != 0) {
         return 1;
     }
-    if (!gd_make_metal_types_content(content, sizeof(content), op, upper) ||
+    if (!gd_make_metal_types_content(content, sizeof(content), op, upper, binary) ||
         gd_write_new_file(metal_types_path, content) != 0) {
         return 1;
     }
-    if (!gd_make_metal_kernel_content(content, sizeof(content), op) ||
+    if (!gd_make_metal_kernel_content(content, sizeof(content), op, binary) ||
         gd_write_new_file(metal_kernel_path, content) != 0) {
         return 1;
     }

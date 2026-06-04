@@ -7,6 +7,8 @@
 ```sh
 make tools
 build/tools/gradients-new-op my_op
+# or, for a same-shape binary elementwise op scaffold:
+build/tools/gradients-new-op --binary my_op
 ```
 
 The op name must be snake case: `[a-z][a-z0-9_]*` with no double or trailing underscores.
@@ -61,14 +63,23 @@ src/backends/metal/metal_ops_generated.inc # Metal PSO registration snippets
 
 Existing enum IDs are preserved when possible; new ops are appended. `make build` also runs the registry generator before compiling.
 
-The scaffolded `op_<op>.def` currently supports unary public/backend stubs:
+The `op_<op>.def` metadata controls generated public/backend stubs. Supported shapes are:
 
 ```text
 api=unary
 backend=unary
 ```
 
-For custom signatures, adjust the generated prototypes or extend `tools/gen_ops.c` with a new metadata shape before implementing the op.
+and:
+
+```text
+api=binary
+backend=binary
+```
+
+Unary ops export `gd_<op>(ctx, x, out)` and `gd_<op>_backward(ctx, x, grad_out, grad_x)`. Binary ops export `gd_<op>(ctx, x, y, out)` and `gd_<op>_backward(ctx, x, y, grad_out, grad_x, grad_y)`; the generated backend stub is the forward elementwise entry point.
+
+For custom signatures, extend `tools/gen_ops.c` with a new metadata shape before implementing the op.
 
 Metal kernels should stay in the op capsule. `make build` compiles `.metal` files found under `src/backends/metal/`, `src/ops/`, and `src/optim/` into the offline `gradients.metallib`; the generated Metal PSO glue only cares about exported kernel names. See [Metal kernel capsule layout](metal_capsules.md) for ownership rules.
 

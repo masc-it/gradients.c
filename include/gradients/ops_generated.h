@@ -19,6 +19,42 @@ gd_status gd_relu_backward(gd_context *ctx,
                            const gd_tensor *grad_out,
                            gd_tensor *grad_x);
 
+gd_status gd_add(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *y,
+                  gd_tensor *out);
+
+gd_status gd_add_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *y,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x,
+                           gd_tensor *grad_y);
+
+gd_status gd_mul(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *y,
+                  gd_tensor *out);
+
+gd_status gd_mul_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *y,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x,
+                           gd_tensor *grad_y);
+
+gd_status gd_sub(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *y,
+                  gd_tensor *out);
+
+gd_status gd_sub_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *y,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x,
+                           gd_tensor *grad_y);
+
 #ifdef __cplusplus
 }
 #endif

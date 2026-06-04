@@ -18,6 +18,22 @@ typedef enum gd_backend_kind {
     GD_BACKEND_METAL = 1,
 } gd_backend_kind;
 
+typedef struct gd_backend_matrix_view {
+    gd_backend_buffer *buffer;
+    size_t offset;
+    uint32_t rows;
+    uint32_t cols;
+    size_t row_bytes;
+    uint32_t dtype;
+} gd_backend_matrix_view;
+
+typedef struct gd_backend_vector_view {
+    gd_backend_buffer *buffer;
+    size_t offset;
+    uint32_t length;
+    uint32_t dtype;
+} gd_backend_vector_view;
+
 gd_status gd_backend_create_default(gd_backend **out_backend);
 void gd_backend_destroy(gd_backend *backend);
 
@@ -32,6 +48,9 @@ size_t gd_backend_buffer_nbytes(const gd_backend_buffer *buffer);
 void *gd_backend_buffer_host_ptr(gd_backend_buffer *buffer);
 bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer);
 
+gd_status gd_backend_scope_begin(gd_backend *backend);
+gd_status gd_backend_flush(gd_backend *backend);
+
 gd_status gd_backend_upload(gd_backend *backend,
                             gd_backend_buffer *buffer,
                             size_t offset,
@@ -42,6 +61,31 @@ gd_status gd_backend_download(gd_backend *backend,
                               size_t offset,
                               void *dst,
                               size_t nbytes);
+
+gd_status gd_backend_fill(gd_backend *backend,
+                          gd_backend_buffer *buffer,
+                          size_t offset,
+                          size_t count,
+                          size_t elem_size,
+                          uint32_t pattern);
+gd_status gd_backend_rand_uniform(gd_backend *backend,
+                                  gd_backend_buffer *buffer,
+                                  size_t offset,
+                                  size_t count,
+                                  uint32_t dtype,
+                                  uint64_t seed,
+                                  float low,
+                                  float high);
+
+gd_status gd_backend_matmul(gd_backend *backend,
+                            const gd_backend_matrix_view *x,
+                            const gd_backend_matrix_view *w,
+                            const gd_backend_matrix_view *y);
+gd_status gd_backend_linear(gd_backend *backend,
+                            const gd_backend_matrix_view *x,
+                            const gd_backend_matrix_view *w,
+                            const gd_backend_vector_view *bias,
+                            const gd_backend_matrix_view *y);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

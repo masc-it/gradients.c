@@ -36,6 +36,10 @@ gd_status gd_span_upload(gd_context *ctx,
         dst->offset > SIZE_MAX - dst_offset) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "span upload range out of bounds");
     }
+    st = gd_context_flush_backend(ctx);
+    if (st != GD_OK) {
+        return st;
+    }
     backend = gd_context_backend(ctx);
     if (backend == NULL || dst->buffer == NULL) {
         return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "span upload missing backend buffer");
@@ -69,6 +73,10 @@ gd_status gd_span_download(gd_context *ctx,
     if (!gd_range_inside(src->nbytes, src_offset, nbytes) ||
         src->offset > SIZE_MAX - src_offset) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "span download range out of bounds");
+    }
+    st = gd_context_flush_backend(ctx);
+    if (st != GD_OK) {
+        return st;
     }
     backend = gd_context_backend(ctx);
     if (backend == NULL || src->buffer == NULL) {

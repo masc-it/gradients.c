@@ -65,6 +65,7 @@ static void test_scope_transfer(gd_context *ctx)
 {
     const int64_t token_shape[2] = {2, 4};
     const int64_t hidden_shape[3] = {2, 6, 4};
+    const int64_t ordered_shape[1] = {4};
     int32_t tokens_src[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     int32_t tokens_dst[8];
     uint16_t hidden_src[48];
@@ -72,10 +73,13 @@ static void test_scope_transfer(gd_context *ctx)
     gd_tensor tokens;
     gd_tensor hidden;
     gd_tensor suffix;
+    gd_tensor ordered;
     uint64_t heap_before;
     int32_t scratch_slot;
     uint64_t scratch_generation;
     uint32_t i;
+    float ordered_src[4] = {2.0f, 3.0f, 4.0f, 5.0f};
+    float ordered_dst[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (i = 0U; i < 48U; ++i) {
         hidden_src[i] = (uint16_t)(0x3000U + i);
@@ -101,6 +105,8 @@ static void test_scope_transfer(gd_context *ctx)
     CHECK(!gd_tensor_is_contiguous(&suffix), "middle-dim suffix is non-contiguous");
     CHECK_STATUS(gd_tensor_read(ctx, &suffix, hidden_dst, 24U * sizeof(hidden_dst[0])), GD_ERR_UNSUPPORTED);
     gd_context_clear_error(ctx);
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, ordered_shape, 64U, &ordered));
+    CHECK_OK(gd_tensor_write(ctx, &ordered, ordered_src, sizeof(ordered_src)));
     gd_debug_set_heap_guard(false);
     CHECK(gd_debug_heap_alloc_count() == heap_before, "transfer hot path does not heap allocate");
     CHECK_OK(gd_end(ctx));
@@ -108,6 +114,9 @@ static void test_scope_transfer(gd_context *ctx)
     memset(hidden_dst, 0, sizeof(hidden_dst));
     CHECK_OK(gd_tensor_read(ctx, &hidden, hidden_dst, sizeof(hidden_dst)));
     CHECK(memcmp(hidden_src, hidden_dst, sizeof(hidden_src)) == 0, "post-scope scratch read waits relevant fence");
+    CHECK_OK(gd_tensor_read(ctx, &ordered, ordered_dst, sizeof(ordered_dst)));
+    CHECK(memcmp(ordered_src, ordered_dst, sizeof(ordered_src)) == 0,
+          "blocking write after queued fill preserves program order");
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != scratch_slot,

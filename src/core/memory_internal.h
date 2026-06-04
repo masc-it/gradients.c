@@ -10,6 +10,7 @@ typedef struct gd_backend gd_backend;
 gd_backend *gd_context_backend(gd_context *ctx);
 
 gd_status gd_context_set_error(gd_context *ctx, gd_status status, const char *message);
+gd_status gd_context_flush_backend(gd_context *ctx);
 gd_status gd_context_synchronize(gd_context *ctx);
 gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span);
 

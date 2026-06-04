@@ -38,7 +38,16 @@ static void test_arena_contract(gd_context *ctx)
     gd_memory_stats before;
     gd_memory_stats after;
 
+    fail.arena = GD_ARENA_PARAMS;
+    fail.slot = 123;
+    fail.offset = 456U;
+    fail.nbytes = 789U;
+    fail.generation = 99U;
+    fail.buffer = (void *)(uintptr_t)0x1U;
+    fail.host_ptr = (void *)(uintptr_t)0x2U;
     CHECK_STATUS(gd_alloc_scratch(ctx, 8U, 8U, &fail), GD_ERR_BAD_STATE);
+    CHECK(fail.nbytes == 0U && fail.buffer == NULL && fail.host_ptr == NULL && fail.slot == -1,
+          "failed scratch alloc clears output span");
     gd_context_clear_error(ctx);
 
     CHECK_OK(gd_alloc_params(ctx, 1U, 256U, &a));

@@ -291,10 +291,28 @@ static gd_status gd_backend_wait_until(gd_context *ctx, uint64_t sequence)
     return GD_OK;
 }
 
-gd_status gd_context_synchronize(gd_context *ctx)
+gd_status gd_context_flush_backend(gd_context *ctx)
 {
+    gd_status st;
     if (ctx == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_backend_flush(ctx->backend.backend);
+    if (st != GD_OK) {
+        return gd_set_error(ctx, st, "backend flush failed");
+    }
+    return GD_OK;
+}
+
+gd_status gd_context_synchronize(gd_context *ctx)
+{
+    gd_status st;
+    if (ctx == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_context_flush_backend(ctx);
+    if (st != GD_OK) {
+        return st;
     }
     if (ctx->backend.next_fence == 0U ||
         gd_fence_sequence_is_complete(ctx, ctx->backend.next_fence)) {
@@ -534,6 +552,10 @@ static gd_status gd_alloc_from_ring(gd_context *ctx,
                                     const char *message)
 {
     gd_arena *arena;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+        out->slot = -1;
+    }
     if (ctx == NULL || !ctx->in_scope) {
         return gd_set_error(ctx, GD_ERR_BAD_STATE, message);
     }
@@ -685,6 +707,10 @@ gd_status gd_begin(gd_context *ctx, gd_scope_mode mode)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_backend_scope_begin(ctx->backend.backend);
+    if (st != GD_OK) {
+        return gd_set_error(ctx, st, "backend scope begin failed");
+    }
     ctx->mode = mode;
     ctx->in_scope = true;
     ctx->touched_state_count = 0U;
@@ -720,6 +746,10 @@ gd_status gd_end(gd_context *ctx)
 
 gd_status gd_alloc_params(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out)
 {
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+        out->slot = -1;
+    }
     if (ctx == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -728,6 +758,10 @@ gd_status gd_alloc_params(gd_context *ctx, size_t nbytes, size_t alignment, gd_s
 
 gd_status gd_alloc_state(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out)
 {
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+        out->slot = -1;
+    }
     if (ctx == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }

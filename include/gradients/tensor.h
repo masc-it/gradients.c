@@ -56,6 +56,38 @@ gd_status gd_tensor_empty(gd_context *ctx,
                           const int64_t *shape,
                           size_t alignment,
                           gd_tensor *out);
+gd_status gd_tensor_zeros(gd_context *ctx,
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          uint32_t rank,
+                          const int64_t *shape,
+                          size_t alignment,
+                          gd_tensor *out);
+gd_status gd_tensor_ones(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         uint32_t rank,
+                         const int64_t *shape,
+                         size_t alignment,
+                         gd_tensor *out);
+gd_status gd_tensor_rand(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         uint32_t rank,
+                         const int64_t *shape,
+                         size_t alignment,
+                         uint64_t seed,
+                         gd_tensor *out);
+gd_status gd_tensor_rand_uniform(gd_context *ctx,
+                                 gd_arena_kind arena,
+                                 gd_dtype dtype,
+                                 uint32_t rank,
+                                 const int64_t *shape,
+                                 size_t alignment,
+                                 uint64_t seed,
+                                 float low,
+                                 float high,
+                                 gd_tensor *out);
 
 gd_status gd_tensor_slice(gd_context *ctx,
                           const gd_tensor *base,
@@ -70,6 +102,15 @@ gd_status gd_tensor_contiguous(gd_context *ctx,
                                const gd_tensor *src,
                                size_t alignment,
                                gd_tensor *out);
+
+gd_status gd_tensor_zero_(gd_context *ctx, gd_tensor *tensor);
+gd_status gd_tensor_one_(gd_context *ctx, gd_tensor *tensor);
+gd_status gd_tensor_rand_(gd_context *ctx, gd_tensor *tensor, uint64_t seed);
+gd_status gd_tensor_rand_uniform_(gd_context *ctx,
+                                  gd_tensor *tensor,
+                                  uint64_t seed,
+                                  float low,
+                                  float high);
 
 bool gd_tensor_is_contiguous(const gd_tensor *tensor);
 size_t gd_tensor_storage_offset(const gd_tensor *tensor);

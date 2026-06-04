@@ -70,6 +70,18 @@ bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer)
     return false;
 }
 
+gd_status gd_backend_scope_begin(gd_backend *backend)
+{
+    (void)backend;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_flush(gd_backend *backend)
+{
+    (void)backend;
+    return GD_OK;
+}
+
 gd_status gd_backend_upload(gd_backend *backend,
                             gd_backend_buffer *buffer,
                             size_t offset,
@@ -95,6 +107,68 @@ gd_status gd_backend_download(gd_backend *backend,
     (void)offset;
     (void)dst;
     (void)nbytes;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_fill(gd_backend *backend,
+                          gd_backend_buffer *buffer,
+                          size_t offset,
+                          size_t count,
+                          size_t elem_size,
+                          uint32_t pattern)
+{
+    (void)backend;
+    (void)buffer;
+    (void)offset;
+    (void)count;
+    (void)elem_size;
+    (void)pattern;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rand_uniform(gd_backend *backend,
+                                  gd_backend_buffer *buffer,
+                                  size_t offset,
+                                  size_t count,
+                                  uint32_t dtype,
+                                  uint64_t seed,
+                                  float low,
+                                  float high)
+{
+    (void)backend;
+    (void)buffer;
+    (void)offset;
+    (void)count;
+    (void)dtype;
+    (void)seed;
+    (void)low;
+    (void)high;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_matmul(gd_backend *backend,
+                            const gd_backend_matrix_view *x,
+                            const gd_backend_matrix_view *w,
+                            const gd_backend_matrix_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)w;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_linear(gd_backend *backend,
+                            const gd_backend_matrix_view *x,
+                            const gd_backend_matrix_view *w,
+                            const gd_backend_vector_view *bias,
+                            const gd_backend_matrix_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)w;
+    (void)bias;
+    (void)y;
     return GD_ERR_UNSUPPORTED;
 }
 

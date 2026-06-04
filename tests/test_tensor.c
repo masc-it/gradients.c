@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CHECK(cond, msg)                                                        \
     do {                                                                       \
@@ -34,13 +35,22 @@ static void test_params_tensor(gd_context *ctx)
 {
     const int64_t shape[2] = {4, 8};
     const int64_t bad_shape[1] = {-1};
+    const int64_t fill_shape[1] = {4};
     gd_tensor param;
     gd_tensor view;
+    gd_tensor zeros;
+    gd_tensor ones;
+    gd_tensor rand_a;
+    gd_tensor rand_b;
     gd_tensor bad;
     gd_memory_stats before;
     gd_memory_stats after;
     int64_t numel;
     size_t nbytes;
+    uint16_t zero_bits[4] = {1U, 1U, 1U, 1U};
+    float one_values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rand_values_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rand_values_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     CHECK(gd_dtype_size(GD_DTYPE_F16) == 2U, "f16 dtype size");
     CHECK(gd_dtype_size(GD_DTYPE_F32) == 4U, "f32 dtype size");
@@ -65,6 +75,47 @@ static void test_params_tensor(gd_context *ctx)
     CHECK(gd_tensor_storage_offset(&param) == param.storage.offset, "param view offset zero");
     CHECK_OK(gd_tensor_validate(ctx, &param));
 
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, fill_shape, 64U, &zeros));
+    CHECK_OK(gd_tensor_read(ctx, &zeros, zero_bits, sizeof(zero_bits)));
+    CHECK(zero_bits[0] == 0U && zero_bits[1] == 0U && zero_bits[2] == 0U && zero_bits[3] == 0U,
+          "zeros initializes f16 storage");
+
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape, 64U, &ones));
+    CHECK_OK(gd_tensor_read(ctx, &ones, one_values, sizeof(one_values)));
+    CHECK(one_values[0] == 1.0f && one_values[1] == 1.0f &&
+          one_values[2] == 1.0f && one_values[3] == 1.0f,
+          "ones initializes f32 storage");
+
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
+                                    64U, 1234U, -1.0f, 1.0f, &rand_a));
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
+                                    64U, 1234U, -1.0f, 1.0f, &rand_b));
+    CHECK_OK(gd_tensor_read(ctx, &rand_a, rand_values_a, sizeof(rand_values_a)));
+    CHECK_OK(gd_tensor_read(ctx, &rand_b, rand_values_b, sizeof(rand_values_b)));
+    CHECK(memcmp(rand_values_a, rand_values_b, sizeof(rand_values_a)) == 0,
+          "rand_uniform deterministic for same seed");
+    CHECK(rand_values_a[0] >= -1.0f && rand_values_a[0] <= 1.0f &&
+          rand_values_a[1] >= -1.0f && rand_values_a[1] <= 1.0f &&
+          rand_values_a[2] >= -1.0f && rand_values_a[2] <= 1.0f &&
+          rand_values_a[3] >= -1.0f && rand_values_a[3] <= 1.0f,
+          "rand_uniform stays in requested range");
+
+    CHECK_OK(gd_memory_stats_query(ctx, &before));
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, fill_shape,
+                                        64U, 1U, 0.0f, 1.0f, &bad),
+                 GD_ERR_UNSUPPORTED);
+    CHECK_OK(gd_memory_stats_query(ctx, &after));
+    CHECK(before.params.offset == after.params.offset,
+          "unsupported rand dtype does not allocate");
+    gd_context_clear_error(ctx);
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
+                                        64U, 1U, 2.0f, 1.0f, &bad),
+                 GD_ERR_INVALID_ARGUMENT);
+    CHECK_OK(gd_memory_stats_query(ctx, &after));
+    CHECK(before.params.offset == after.params.offset,
+          "invalid rand range does not allocate");
+    gd_context_clear_error(ctx);
+
     CHECK_OK(gd_tensor_slice(ctx, &param, 0U, 1, 2, &view));
     CHECK(view.is_view, "slice is view");
     CHECK(view.storage.buffer == param.storage.buffer, "slice shares storage buffer");
@@ -88,14 +139,17 @@ static void test_scope_tensor_views(gd_context *ctx)
 {
     const int64_t token_shape[2] = {2, 16};
     const int64_t hidden_shape[3] = {2, 14, 32};
+    const int64_t scratch_fill_shape[1] = {4};
     gd_tensor tokens;
     gd_tensor hidden;
     gd_tensor suffix;
     gd_tensor compact;
+    gd_tensor scratch_ones;
     gd_memory_stats stats;
     uint64_t heap_before;
     int32_t hidden_slot;
     uint64_t hidden_generation;
+    float scratch_fill[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, hidden_shape, 64U, &hidden),
                  GD_ERR_BAD_STATE);
@@ -107,6 +161,8 @@ static void test_scope_tensor_views(gd_context *ctx)
 
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, 2U, token_shape, 64U, &tokens));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, hidden_shape, 64U, &hidden));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, scratch_fill_shape,
+                            64U, &scratch_ones));
     hidden_slot = hidden.storage.slot;
     hidden_generation = hidden.storage.generation;
     CHECK(tokens.storage.arena == GD_ARENA_DATA, "tokens live in data arena");
@@ -126,10 +182,18 @@ static void test_scope_tensor_views(gd_context *ctx)
     CHECK(compact.strides[0] == 256 && compact.strides[1] == 32 && compact.strides[2] == 1,
           "contiguous output strides");
     CHECK_OK(gd_tensor_validate(ctx, &compact));
+    CHECK_OK(gd_tensor_read(ctx, &scratch_ones, scratch_fill, sizeof(scratch_fill)));
+    CHECK(scratch_fill[0] == 1.0f && scratch_fill[1] == 1.0f &&
+          scratch_fill[2] == 1.0f && scratch_fill[3] == 1.0f,
+          "active-scope read flushes queued ones fill");
 
     gd_debug_set_heap_guard(false);
     CHECK(gd_debug_heap_alloc_count() == heap_before, "tensor hot path does not heap allocate");
     CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_tensor_read(ctx, &scratch_ones, scratch_fill, sizeof(scratch_fill)));
+    CHECK(scratch_fill[0] == 1.0f && scratch_fill[1] == 1.0f &&
+          scratch_fill[2] == 1.0f && scratch_fill[3] == 1.0f,
+          "scoped ones fill commits at gd_end");
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != hidden_slot,

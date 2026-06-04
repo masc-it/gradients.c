@@ -11,6 +11,7 @@ const char *gd_status_string(gd_status status)
     case GD_ERR_BAD_STATE: return "bad state";
     case GD_ERR_UNSUPPORTED: return "unsupported";
     case GD_ERR_INTERNAL: return "internal error";
+    case GD_ERR_NOT_IMPLEMENTED: return "not implemented";
     default: return "unknown error";
     }
 }

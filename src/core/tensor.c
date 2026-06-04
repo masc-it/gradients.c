@@ -1,5 +1,6 @@
 #include <gradients/tensor.h>
 
+#include "backend.h"
 #include "memory_internal.h"
 
 #include <stdint.h>
@@ -245,6 +246,130 @@ gd_status gd_tensor_validate(gd_context *ctx, const gd_tensor *tensor)
     return GD_OK;
 }
 
+static gd_status gd_tensor_count(const gd_tensor *tensor, size_t *out_count)
+{
+    int64_t numel;
+    gd_status st;
+    if (tensor == NULL || out_count == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_numel(tensor, &numel);
+    if (st != GD_OK) {
+        return st;
+    }
+    if ((uint64_t)numel > (uint64_t)SIZE_MAX) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *out_count = (size_t)numel;
+    return GD_OK;
+}
+
+static bool gd_dtype_one_pattern(gd_dtype dtype, uint32_t *out_pattern)
+{
+    if (out_pattern == NULL) {
+        return false;
+    }
+    switch (dtype) {
+    case GD_DTYPE_F16:
+        *out_pattern = 0x00003c00U;
+        return true;
+    case GD_DTYPE_BF16:
+        *out_pattern = 0x00003f80U;
+        return true;
+    case GD_DTYPE_F32:
+        *out_pattern = 0x3f800000U;
+        return true;
+    case GD_DTYPE_I32:
+    case GD_DTYPE_U8:
+        *out_pattern = 1U;
+        return true;
+    case GD_DTYPE_INVALID:
+    default:
+        return false;
+    }
+}
+
+static bool gd_dtype_rand_supported(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F16 || dtype == GD_DTYPE_BF16 || dtype == GD_DTYPE_F32;
+}
+
+static gd_status gd_tensor_fill_pattern(gd_context *ctx, gd_tensor *tensor, uint32_t pattern)
+{
+    gd_backend *backend;
+    gd_status st;
+    size_t count;
+    size_t elem_size;
+    size_t offset;
+    if (ctx == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_validate(ctx, tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (!gd_tensor_is_contiguous(tensor)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor fill requires contiguous tensor");
+    }
+    st = gd_context_wait_for_span(ctx, &tensor->storage);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_count(tensor, &count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor fill invalid shape");
+    }
+    elem_size = gd_dtype_size(tensor->dtype);
+    if (elem_size == 0U || tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor fill invalid descriptor");
+    }
+    offset = tensor->storage.offset + tensor->view_offset;
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || tensor->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor fill missing backend buffer");
+    }
+    st = gd_backend_fill(backend,
+                         (gd_backend_buffer *)tensor->storage.buffer,
+                         offset,
+                         count,
+                         elem_size,
+                         pattern);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend tensor fill failed");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_tensor_alloc_then_zero_or_one(gd_context *ctx,
+                                                  gd_arena_kind arena,
+                                                  gd_dtype dtype,
+                                                  uint32_t rank,
+                                                  const int64_t *shape,
+                                                  size_t alignment,
+                                                  bool one,
+                                                  gd_tensor *out)
+{
+    gd_tensor tensor;
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_empty(ctx, arena, dtype, rank, shape, alignment, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = one ? gd_tensor_one_(ctx, &tensor) : gd_tensor_zero_(ctx, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = tensor;
+    return GD_OK;
+}
+
 gd_status gd_tensor_empty(gd_context *ctx,
                           gd_arena_kind arena,
                           gd_dtype dtype,
@@ -283,6 +408,84 @@ gd_status gd_tensor_empty(gd_context *ctx,
     tensor.is_view = false;
     tensor.requires_grad = false;
     st = gd_tensor_validate(ctx, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = tensor;
+    return GD_OK;
+}
+
+gd_status gd_tensor_zeros(gd_context *ctx,
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          uint32_t rank,
+                          const int64_t *shape,
+                          size_t alignment,
+                          gd_tensor *out)
+{
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, rank, shape, alignment, false, out);
+}
+
+gd_status gd_tensor_ones(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         uint32_t rank,
+                         const int64_t *shape,
+                         size_t alignment,
+                         gd_tensor *out)
+{
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, rank, shape, alignment, true, out);
+}
+
+gd_status gd_tensor_rand(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         uint32_t rank,
+                         const int64_t *shape,
+                         size_t alignment,
+                         uint64_t seed,
+                         gd_tensor *out)
+{
+    return gd_tensor_rand_uniform(ctx, arena, dtype, rank, shape, alignment,
+                                  seed, 0.0f, 1.0f, out);
+}
+
+gd_status gd_tensor_rand_uniform(gd_context *ctx,
+                                 gd_arena_kind arena,
+                                 gd_dtype dtype,
+                                 uint32_t rank,
+                                 const int64_t *shape,
+                                 size_t alignment,
+                                 uint64_t seed,
+                                 float low,
+                                 float high,
+                                 gd_tensor *out)
+{
+    gd_tensor tensor;
+    gd_status st;
+    size_t unused_nbytes;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_dtype_rand_supported(dtype)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires floating dtype");
+    }
+    if (!(low <= high)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid range");
+    }
+    st = gd_shape_storage_nbytes(dtype, rank, shape, &unused_nbytes);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "invalid tensor rand shape");
+    }
+    st = gd_tensor_empty(ctx, arena, dtype, rank, shape, alignment, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_rand_uniform_(ctx, &tensor, seed, low, high);
     if (st != GD_OK) {
         return st;
     }
@@ -359,5 +562,85 @@ gd_status gd_tensor_contiguous(gd_context *ctx,
         return st;
     }
     out->requires_grad = src->requires_grad;
+    return GD_OK;
+}
+
+gd_status gd_tensor_zero_(gd_context *ctx, gd_tensor *tensor)
+{
+    return gd_tensor_fill_pattern(ctx, tensor, 0U);
+}
+
+gd_status gd_tensor_one_(gd_context *ctx, gd_tensor *tensor)
+{
+    uint32_t pattern;
+    if (tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_dtype_one_pattern(tensor->dtype, &pattern)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor one invalid dtype");
+    }
+    return gd_tensor_fill_pattern(ctx, tensor, pattern);
+}
+
+gd_status gd_tensor_rand_(gd_context *ctx, gd_tensor *tensor, uint64_t seed)
+{
+    return gd_tensor_rand_uniform_(ctx, tensor, seed, 0.0f, 1.0f);
+}
+
+gd_status gd_tensor_rand_uniform_(gd_context *ctx,
+                                  gd_tensor *tensor,
+                                  uint64_t seed,
+                                  float low,
+                                  float high)
+{
+    gd_backend *backend;
+    gd_status st;
+    size_t count;
+    size_t offset;
+    if (ctx == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_dtype_rand_supported(tensor->dtype)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires floating dtype");
+    }
+    if (!(low <= high)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid range");
+    }
+    st = gd_tensor_validate(ctx, tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (!gd_tensor_is_contiguous(tensor)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires contiguous tensor");
+    }
+    st = gd_context_wait_for_span(ctx, &tensor->storage);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_count(tensor, &count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor rand invalid shape");
+    }
+    if (tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid descriptor");
+    }
+    offset = tensor->storage.offset + tensor->view_offset;
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || tensor->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor rand missing backend buffer");
+    }
+    st = gd_backend_rand_uniform(backend,
+                                 (gd_backend_buffer *)tensor->storage.buffer,
+                                 offset,
+                                 count,
+                                 (uint32_t)tensor->dtype,
+                                 seed,
+                                 low,
+                                 high);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend tensor rand failed");
+    }
     return GD_OK;
 }

@@ -213,7 +213,21 @@ Each op capsule owns:
 - PyTorch reference script for forward/backward correctness
 - tests
 
-Op wrappers allocate outputs from `scratch` by default.
+Capsule layout:
+
+```text
+src/ops/<op>/
+  core_<op>.c          public forward wrapper, validation, output allocation, backend dispatch
+  core_<op>_bwd.c      public backward wrapper or explicit `GD_ERR_NOT_IMPLEMENTED` stub
+  metal_<op>.m         Metal/MPS encoder implementation
+  metal_<op>.metal     custom kernels when needed
+  fwd.py               PyTorch/numeric forward oracle
+  bwd.py               PyTorch/numeric backward oracle
+```
+
+`fwd.py` and `bwd.py` use PEP 723 script metadata with dependencies and are run through `uv run path/to/script.py`. They are reference/oracle programs for numerical correctness, not runtime dependencies.
+
+Forward wrappers allocate outputs from `scratch` by default and publish the output descriptor only after backend enqueue succeeds. Backward wrappers may be present before implementation and must return `GD_ERR_NOT_IMPLEMENTED` without publishing grad descriptors.
 
 Ops with persistent outputs use explicit destination APIs.
 
@@ -345,7 +359,7 @@ Required abstractions:
 - `gd_arena` / `gd_ring_arena`: bump allocation over `gd_buffer`, aligned span returns, capacity/offset/watermark tracking, freeze/seal state, generations, ring-slot selection, and slot-fence retention.
 - `gd_transfer`: upload/download/read/write path that hides Metal direct shared access versus CUDA staged copies.
 - `gd_kernel`: backend kernel/module/pipeline handle plus argument packing, by-value uniforms, grid/block or threadgroup launch dimensions, and optional dynamic shared/threadgroup memory.
-- `gd_matmul`: backend matmul descriptor for dtype, accumulation dtype, transpose/layout, row strides, batch strides, pointer offsets/origins, and epilogue support. Metal maps to MPS or custom kernels. CUDA maps to cuBLAS/cuBLASLt or custom kernels.
+- `gd_matmul`: backend matmul descriptor for dtype, accumulation dtype, transpose/layout, row strides, batch strides, pointer offsets/origins, and epilogue support. Metal maps first to MPS matrix multiplication. Linear-style epilogues are encoded as a custom Metal epilogue kernel in the same command buffer after MPS GEMM, not as a naive single-kernel matmul for transformer-sized shapes. CUDA maps to cuBLAS/cuBLASLt or custom kernels.
 
 No generic runtime code may dereference compute tensor storage directly. Only backend implementations and transfer helpers may turn a `gd_buffer` plus offset into an address.
 

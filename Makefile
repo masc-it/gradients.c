@@ -41,7 +41,7 @@ CPPFLAGS += -DGD_ENABLE_METAL=1
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/null/*' 2>/dev/null | sort)
 MSRC := $(shell find $(SRC_DIR) -type f -name '*.m' 2>/dev/null | sort)
 OBJCFLAGS ?= $(CPPFLAGS) -O0 -g3 -Wall -Wextra -Werror -fobjc-arc $(SAN_FLAGS)
-LDLIBS += -framework Foundation -framework Metal
+LDLIBS += -framework Foundation -framework Metal -framework MetalPerformanceShaders
 else
 CPPFLAGS += -DGD_ENABLE_METAL=0
 SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/metal/*' 2>/dev/null | sort)

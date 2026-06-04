@@ -14,6 +14,7 @@ typedef enum gd_status {
     GD_ERR_BAD_STATE = -5,
     GD_ERR_UNSUPPORTED = -6,
     GD_ERR_INTERNAL = -7,
+    GD_ERR_NOT_IMPLEMENTED = -8,
 } gd_status;
 
 const char *gd_status_string(gd_status status);

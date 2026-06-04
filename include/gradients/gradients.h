@@ -5,5 +5,6 @@
 #include <gradients/memory.h>
 #include <gradients/tensor.h>
 #include <gradients/transfer.h>
+#include <gradients/ops.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

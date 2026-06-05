@@ -7,7 +7,7 @@ A tiny full-batch XOR training run that exercises the current v2 API:
 - module tree + child `gd_linear_layer`s
 - parameter collection and param groups
 - F16 `linear -> relu -> linear`
-- in-graph MSE loss with `sub -> mul -> reduce_mean`
+- fused in-graph MSE loss with `gd_mse`
 - reverse-mode autograd from scalar loss
 - `gd_backward_scaled` + AdamW AMP step
 - FP32 AdamW master weights for F16 params

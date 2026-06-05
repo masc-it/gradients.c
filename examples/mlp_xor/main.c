@@ -211,8 +211,6 @@ int main(void)
         gd_tensor *x;
         gd_tensor *target;
         gd_tensor pred_tensor;
-        gd_tensor diff;
-        gd_tensor sq;
         gd_tensor loss;
         const int report = step == 0 || (step + 1) % 40 == 0;
         TRY(ctx, gd_dataloader_next(loader, &batch));
@@ -220,9 +218,7 @@ int main(void)
         x = gd_batch_tensor(batch, "x");
         target = gd_batch_tensor(batch, "target");
         TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
-        TRY(ctx, gd_sub(ctx, &pred_tensor, target, &diff));
-        TRY(ctx, gd_mul(ctx, &diff, &diff, &sq));
-        TRY(ctx, gd_reduce_mean(ctx, &sq, &loss));
+        TRY(ctx, gd_mse(ctx, &pred_tensor, target, &loss));
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
         TRY(ctx, gd_end_step(ctx));

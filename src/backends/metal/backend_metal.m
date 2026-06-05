@@ -239,6 +239,22 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_mse_forward_f16_kernel", &backend->mse_forward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_mse_forward_f32_kernel", &backend->mse_forward_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_mse_backward_f16_kernel", &backend->mse_backward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_mse_backward_f32_kernel", &backend->mse_backward_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
     if (st != GD_OK) {
         return st;
@@ -423,6 +439,18 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->cross_entropy_loss_f16_pso != NULL) {
         CFRelease(backend->cross_entropy_loss_f16_pso);
+    }
+    if (backend->mse_backward_f32_pso != NULL) {
+        CFRelease(backend->mse_backward_f32_pso);
+    }
+    if (backend->mse_backward_f16_pso != NULL) {
+        CFRelease(backend->mse_backward_f16_pso);
+    }
+    if (backend->mse_forward_f32_pso != NULL) {
+        CFRelease(backend->mse_forward_f32_pso);
+    }
+    if (backend->mse_forward_f16_pso != NULL) {
+        CFRelease(backend->mse_forward_f16_pso);
     }
     if (backend->broadcast_scalar_f32_to_f16_pso != NULL) {
         CFRelease(backend->broadcast_scalar_f32_to_f16_pso);

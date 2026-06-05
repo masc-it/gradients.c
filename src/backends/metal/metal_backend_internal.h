@@ -61,6 +61,10 @@ struct gd_backend {
     void *cross_entropy_loss_stats_f16_pso;
     void *cross_entropy_backward_f16_pso;
     void *cross_entropy_backward_stats_f16_pso;
+    void *mse_forward_f16_pso;
+    void *mse_forward_f32_pso;
+    void *mse_backward_f16_pso;
+    void *mse_backward_f32_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

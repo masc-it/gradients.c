@@ -94,6 +94,18 @@ gd_status gd_sigmoid_backward(gd_context *ctx,
                            const gd_tensor *grad_out,
                            gd_tensor *grad_x);
 
+gd_status gd_mse(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *y,
+                  gd_tensor *out);
+
+gd_status gd_mse_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *y,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x,
+                           gd_tensor *grad_y);
+
 #ifdef __cplusplus
 }
 #endif

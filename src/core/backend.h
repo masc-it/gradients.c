@@ -241,6 +241,21 @@ gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
                                                   const gd_backend_tensor_view *grad_loss,
                                                   const gd_backend_tensor_view *grad_logits,
                                                   float scale);
+/* MSE loss: out chunks contain scale * sum((x - y)^2) over each contiguous chunk. */
+gd_status gd_backend_mse_forward(gd_backend *backend,
+                                 const gd_backend_tensor_view *x,
+                                 const gd_backend_tensor_view *y,
+                                 const gd_backend_tensor_view *out,
+                                 uint64_t chunk_size,
+                                 float scale);
+/* MSE backward: optional grad_x/grad_y receive +/- grad_out[0] * scale * (x - y). */
+gd_status gd_backend_mse_backward(gd_backend *backend,
+                                  const gd_backend_tensor_view *x,
+                                  const gd_backend_tensor_view *y,
+                                  const gd_backend_tensor_view *grad_out,
+                                  const gd_backend_tensor_view *grad_x,
+                                  const gd_backend_tensor_view *grad_y,
+                                  float scale);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
 

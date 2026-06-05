@@ -106,6 +106,18 @@ gd_status gd_mse_backward(gd_context *ctx,
                            gd_tensor *grad_x,
                            gd_tensor *grad_y);
 
+gd_status gd_huber(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *y,
+                  gd_tensor *out);
+
+gd_status gd_huber_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *y,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x,
+                           gd_tensor *grad_y);
+
 #ifdef __cplusplus
 }
 #endif

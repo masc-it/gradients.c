@@ -458,6 +458,44 @@ gd_status gd_backend_mse_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_huber_forward(gd_backend *backend,
+                                   const gd_backend_tensor_view *x,
+                                   const gd_backend_tensor_view *y,
+                                   const gd_backend_tensor_view *out,
+                                   uint64_t chunk_size,
+                                   float scale,
+                                   float delta)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)out;
+    (void)chunk_size;
+    (void)scale;
+    (void)delta;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_huber_backward(gd_backend *backend,
+                                    const gd_backend_tensor_view *x,
+                                    const gd_backend_tensor_view *y,
+                                    const gd_backend_tensor_view *grad_out,
+                                    const gd_backend_tensor_view *grad_x,
+                                    const gd_backend_tensor_view *grad_y,
+                                    float scale,
+                                    float delta)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)grad_out;
+    (void)grad_x;
+    (void)grad_y;
+    (void)scale;
+    (void)delta;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
 {
     (void)backend;

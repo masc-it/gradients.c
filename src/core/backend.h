@@ -256,6 +256,23 @@ gd_status gd_backend_mse_backward(gd_backend *backend,
                                   const gd_backend_tensor_view *grad_x,
                                   const gd_backend_tensor_view *grad_y,
                                   float scale);
+/* Huber loss: out chunks contain scale * sum(huber_delta(x - y)) over each contiguous chunk. */
+gd_status gd_backend_huber_forward(gd_backend *backend,
+                                   const gd_backend_tensor_view *x,
+                                   const gd_backend_tensor_view *y,
+                                   const gd_backend_tensor_view *out,
+                                   uint64_t chunk_size,
+                                   float scale,
+                                   float delta);
+/* Huber backward: optional grad_x/grad_y receive +/- grad_out[0] * scale * clamp(x - y, -delta, delta). */
+gd_status gd_backend_huber_backward(gd_backend *backend,
+                                    const gd_backend_tensor_view *x,
+                                    const gd_backend_tensor_view *y,
+                                    const gd_backend_tensor_view *grad_out,
+                                    const gd_backend_tensor_view *grad_x,
+                                    const gd_backend_tensor_view *grad_y,
+                                    float scale,
+                                    float delta);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
 

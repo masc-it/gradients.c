@@ -65,6 +65,10 @@ struct gd_backend {
     void *mse_forward_f32_pso;
     void *mse_backward_f16_pso;
     void *mse_backward_f32_pso;
+    void *huber_forward_f16_pso;
+    void *huber_forward_f32_pso;
+    void *huber_backward_f16_pso;
+    void *huber_backward_f32_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

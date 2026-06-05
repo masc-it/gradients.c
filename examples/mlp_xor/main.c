@@ -218,7 +218,7 @@ int main(void)
         x = gd_batch_tensor(batch, "x");
         target = gd_batch_tensor(batch, "target");
         TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
-        TRY(ctx, gd_mse(ctx, &pred_tensor, target, &loss));
+        TRY(ctx, gd_huber(ctx, &pred_tensor, target, &loss));
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
         TRY(ctx, gd_end_step(ctx));

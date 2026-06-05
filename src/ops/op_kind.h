@@ -15,7 +15,8 @@ typedef enum gd_op_kind {
     GD_OP_CROSS_ENTROPY = 9,
     GD_OP_SIGMOID = 10,
     GD_OP_MSE = 11,
-    GD_OP_COUNT = 12,
+    GD_OP_HUBER = 12,
+    GD_OP_COUNT = 13,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

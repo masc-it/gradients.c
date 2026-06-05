@@ -7,9 +7,20 @@
 ```sh
 make tools
 build/tools/gradients-new-op my_op
-# or, for a same-shape binary elementwise op scaffold:
+# same-shape/broadcast binary elementwise scaffold:
 build/tools/gradients-new-op --binary my_op
+# custom backend entry points instead of generated backend= stubs:
+build/tools/gradients-new-op --binary --custom my_loss
 ```
+
+Useful scaffold flags:
+
+- `--binary` / `--unary`: choose generated public API shape.
+- `--custom` or `--no-backend`: omit generated `backend=` metadata so the op can define custom backend entry points manually.
+- `--f16-only`: annotate/scaffold for dtype-specialized F16 kernels.
+- `--f16-f32-accum`: annotate/scaffold for F16 inputs with FP32 accumulation.
+- `--save-stats`: annotate/scaffold for compact forward stats consumed by backward.
+- `--reduction`: annotate/scaffold for shape-adaptive reduction kernels.
 
 The op name must be snake case: `[a-z][a-z0-9_]*` with no double or trailing underscores.
 
@@ -79,9 +90,9 @@ backend=binary
 
 Unary ops export `gd_<op>(ctx, x, out)` and `gd_<op>_backward(ctx, x, grad_out, grad_x)`. Binary ops export `gd_<op>(ctx, x, y, out)` and `gd_<op>_backward(ctx, x, y, grad_out, grad_x, grad_y)`; the generated backend stub is the forward elementwise entry point.
 
-For custom signatures, extend `tools/gen_ops.c` with a new metadata shape before implementing the op.
+For custom public signatures, extend `tools/gen_ops.c` with a new metadata shape before implementing the op. For standard unary/binary public APIs with non-elementwise backend work, use `--custom` / `--no-backend` and add custom backend declarations manually.
 
-Metal kernels should stay in the op capsule. `make build` compiles `.metal` files found under `src/backends/metal/`, `src/ops/`, and `src/optim/` into the offline `gradients.metallib`; the generated Metal PSO glue only cares about exported kernel names. See [Metal kernel capsule layout](metal_capsules.md) for ownership rules.
+Metal kernels should stay in the op capsule. `make build` compiles `.metal` files found under `src/backends/metal/`, `src/ops/`, and `src/optim/` into the offline `gradients.metallib`; the generated Metal PSO glue only cares about exported kernel names. See [Metal kernel capsule layout](metal_capsules.md) for ownership rules and [Metal performance tips](metal_tips.md) for high-performance fwd/bwd kernel guidance.
 
 ## Implement the forward op
 

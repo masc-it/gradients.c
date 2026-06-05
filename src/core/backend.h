@@ -191,6 +191,18 @@ gd_status gd_backend_reduce_broadcast(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,
                                       float scale);
+/* F16-only mul fast path: grad_x = grad_out * y and grad_y = grad_out * x for direct shapes. */
+gd_status gd_backend_mul_backward_direct(gd_backend *backend,
+                                         const gd_backend_tensor_view *x,
+                                         const gd_backend_tensor_view *y,
+                                         const gd_backend_tensor_view *grad_out,
+                                         const gd_backend_tensor_view *grad_x,
+                                         const gd_backend_tensor_view *grad_y);
+/* F16-only mul fast path: dst[j] = sum_r grad_out[r, j] * other[r, j] for suffix reductions. */
+gd_status gd_backend_mul_reduce_suffix(gd_backend *backend,
+                                       const gd_backend_tensor_view *grad_out,
+                                       const gd_backend_tensor_view *other,
+                                       const gd_backend_tensor_view *dst);
 /* F16-only: row_loss[n] = logsumexp(logits[n, :]) - logits[n, target[n]]. */
 gd_status gd_backend_cross_entropy_loss(gd_backend *backend,
                                         const gd_backend_tensor_view *logits,

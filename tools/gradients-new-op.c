@@ -849,6 +849,178 @@ static bool gd_make_bwd_py_content(char *out, size_t out_size, const char *op)
     return n >= 0 && (size_t)n < out_size;
 }
 
+static bool gd_make_perf_test_content(char *out,
+                                      size_t out_size,
+                                      const gd_new_op_options *opts,
+                                      const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (out == NULL || opts == NULL || upper == NULL) {
+        return false;
+    }
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "/*\n"
+                 " * Performance probe scaffold for gd_%s.\n"
+                 " *\n"
+                 " * Run from the repository root with:\n"
+                 " *   make op-perf OP=%s\n"
+                 " *\n"
+                 " * Define realistic cases, allocate one reusable model/context per case,\n"
+                 " * warm up, then report avg_ms plus FLOP/s or logical bandwidth.\n"
+                 " * Keep public API overhead in the timed path.\n"
+                 " *\n"
+                 "%s"
+                 " */\n"
+                 "\n"
+                 "#ifndef _POSIX_C_SOURCE\n"
+                 "#define _POSIX_C_SOURCE 200809L\n"
+                 "#endif\n"
+                 "\n"
+                 "#include <gradients/gradients.h>\n"
+                 "\n"
+                 "#include <stdbool.h>\n"
+                 "#include <stdint.h>\n"
+                 "#include <stdio.h>\n"
+                 "#include <stdlib.h>\n"
+                 "#include <string.h>\n"
+                 "#if defined(__APPLE__)\n"
+                 "#include <mach/mach_time.h>\n"
+                 "#else\n"
+                 "#include <time.h>\n"
+                 "#endif\n"
+                 "\n"
+                 "#define GD_%s_PERF_GIB (1024.0 * 1024.0 * 1024.0)\n"
+                 "\n"
+                 "#if defined(__APPLE__)\n"
+                 "static double perf_now_seconds(void)\n"
+                 "{\n"
+                 "    static mach_timebase_info_data_t info;\n"
+                 "    static double scale = 0.0;\n"
+                 "    if (scale == 0.0) {\n"
+                 "        if (mach_timebase_info(&info) != 0 || info.denom == 0U) {\n"
+                 "            return 0.0;\n"
+                 "        }\n"
+                 "        scale = ((double)info.numer / (double)info.denom) * 1.0e-9;\n"
+                 "    }\n"
+                 "    return (double)mach_absolute_time() * scale;\n"
+                 "}\n"
+                 "#else\n"
+                 "static double perf_now_seconds(void)\n"
+                 "{\n"
+                 "    struct timespec ts;\n"
+                 "    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {\n"
+                 "        return 0.0;\n"
+                 "    }\n"
+                 "    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;\n"
+                 "}\n"
+                 "#endif\n"
+                 "\n"
+                 "static int perf_env_int(const char *name, int fallback, int min_value, int max_value)\n"
+                 "{\n"
+                 "    const char *value = getenv(name);\n"
+                 "    char *end = NULL;\n"
+                 "    long parsed;\n"
+                 "    if (value == NULL || value[0] == '\\0') {\n"
+                 "        return fallback;\n"
+                 "    }\n"
+                 "    parsed = strtol(value, &end, 10);\n"
+                 "    if (end == value || *end != '\\0') {\n"
+                 "        return fallback;\n"
+                 "    }\n"
+                 "    if (parsed < (long)min_value) {\n"
+                 "        return min_value;\n"
+                 "    }\n"
+                 "    if (parsed > (long)max_value) {\n"
+                 "        return max_value;\n"
+                 "    }\n"
+                 "    return (int)parsed;\n"
+                 "}\n"
+                 "\n"
+                 "typedef struct perf_case {\n"
+                 "    const char *name;\n"
+                 "    int64_t rows;\n"
+                 "    int64_t cols;\n"
+                 "} perf_case;\n"
+                 "\n"
+                 "static bool perf_case_selected(const perf_case *pcase, const char *profile)\n"
+                 "{\n"
+                 "    if (profile == NULL || profile[0] == '\\0' || strcmp(profile, \"all\") == 0) {\n"
+                 "        return true;\n"
+                 "    }\n"
+                 "    if (strcmp(profile, \"smoke\") == 0) {\n"
+                 "        return strcmp(pcase->name, \"small_tail\") == 0 ||\n"
+                 "               strcmp(pcase->name, \"activation_mid\") == 0;\n"
+                 "    }\n"
+                 "    return strcmp(profile, pcase->name) == 0;\n"
+                 "}\n"
+                 "\n"
+                 "int main(void)\n"
+                 "{\n"
+                 "    static const perf_case cases[] = {\n"
+                 "        {\"small_tail\", 1, 513},\n"
+                 "        {\"activation_mid\", 4096, 768},\n"
+                 "        {\"activation_large\", 4096, 4096},\n"
+                 "    };\n"
+                 "    const char *profile = getenv(\"GD_%s_PERF_PROFILE\");\n"
+                 "    int warmup = perf_env_int(\"GD_%s_PERF_WARMUP\", 10, 0, 10000);\n"
+                 "    int iters = perf_env_int(\"GD_%s_PERF_ITERS\", 100, 1, 1000000);\n"
+                 "    double timer_start = perf_now_seconds();\n"
+                 "    double timer_elapsed;\n"
+                 "    bool ran = false;\n"
+                 "    size_t i;\n"
+                 "    timer_elapsed = perf_now_seconds() - timer_start;\n"
+                 "    printf(\"[%s] perf scaffold for gd_%s: warmup=%%d iters=%%d profile=%%s timer_overhead_ms=%%.6f\\n\",\n"
+                 "           warmup,\n"
+                 "           iters,\n"
+                 "           profile != NULL && profile[0] != '\\0' ? profile : \"all\",\n"
+                 "           timer_elapsed * 1.0e3);\n"
+                 "    printf(\"[%s] TODO: replace scaffold loop with real model allocation and timed gd_%s calls.\\n\");\n"
+                 "    printf(\"[%s] Report avg_ms plus FLOP/s for compute-bound ops or logical_GiB/s for memory-bound ops.\\n\");\n"
+                 "    (void)GD_%s_PERF_GIB;\n"
+                 "    for (i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {\n"
+                 "        size_t elems;\n"
+                 "        if (!perf_case_selected(&cases[i], profile)) {\n"
+                 "            continue;\n"
+                 "        }\n"
+                 "        ran = true;\n"
+                 "        elems = (size_t)cases[i].rows * (size_t)cases[i].cols;\n"
+                 "        printf(\"[%s][TODO] case=%%s shape=%%lldx%%lld elems=%%zu\\n\",\n"
+                 "               cases[i].name,\n"
+                 "               (long long)cases[i].rows,\n"
+                 "               (long long)cases[i].cols,\n"
+                 "               elems);\n"
+                 "    }\n"
+                 "    if (!ran) {\n"
+                 "        fprintf(stderr, \"[%s][FAIL] no cases selected for GD_%s_PERF_PROFILE=%%s\\n\",\n"
+                 "                profile != NULL ? profile : \"(null)\");\n"
+                 "        return 2;\n"
+                 "    }\n"
+                 "    return 0;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 upper);
+    return n >= 0 && (size_t)n < out_size;
+}
+
 static bool gd_make_readme_content(char *out,
                                    size_t out_size,
                                    const gd_new_op_options *opts)
@@ -879,9 +1051,10 @@ static bool gd_make_readme_content(char *out,
                  "- [ ] Forward PyTorch harness in `fwd.py`\n"
                  "- [ ] Backward PyTorch harness in `bwd.py`\n"
                  "- [ ] C tests under `tests/`\n"
-                 "- [ ] Perf probe or benchmark for hot shapes\n",
+                 "- [ ] Op-local perf probe in `perf_test.c` (`make op-perf OP=%s`)\n",
                  opts->op,
                  notes,
+                 opts->op,
                  opts->op,
                  opts->op,
                  opts->op,
@@ -1069,6 +1242,7 @@ int main(int argc, char **argv)
     char metal_kernel_path[GD_NEW_OP_PATH_MAX];
     char fwd_path[GD_NEW_OP_PATH_MAX];
     char bwd_path[GD_NEW_OP_PATH_MAX];
+    char perf_path[GD_NEW_OP_PATH_MAX];
     char readme_path[GD_NEW_OP_PATH_MAX];
     char content[GD_NEW_OP_CONTENT_MAX];
 
@@ -1091,6 +1265,7 @@ int main(int argc, char **argv)
         !gd_make_op_file_path(metal_kernel_path, sizeof(metal_kernel_path), opts.op, "metal_", ".metal") ||
         !gd_make_op_named_path(fwd_path, sizeof(fwd_path), opts.op, "fwd.py") ||
         !gd_make_op_named_path(bwd_path, sizeof(bwd_path), opts.op, "bwd.py") ||
+        !gd_make_op_named_path(perf_path, sizeof(perf_path), opts.op, "perf_test.c") ||
         !gd_make_op_named_path(readme_path, sizeof(readme_path), opts.op, "README.md")) {
         fprintf(stderr, "gradients-new-op: generated path too long\n");
         return 1;
@@ -1128,6 +1303,10 @@ int main(int argc, char **argv)
     }
     if (!gd_make_bwd_py_content(content, sizeof(content), opts.op) ||
         gd_write_new_file(bwd_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_perf_test_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(perf_path, content) != 0) {
         return 1;
     }
     if (!gd_make_readme_content(content, sizeof(content), &opts) ||

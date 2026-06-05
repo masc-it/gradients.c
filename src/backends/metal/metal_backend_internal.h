@@ -33,6 +33,9 @@ struct gd_backend {
     void *binary_row_bcast_pso[GD_OP_COUNT];
     void *binary_reduce_pso;
     void *binary_reduce_suffix_pso;
+    void *mul_backward_direct_pso;
+    void *mul_reduce_suffix_pso;
+    void *mul_reduce_suffix_small_pso;
     void *reduce_contiguous_pso;
     void *reduce_axis_pso;
     void *broadcast_axis_pso;

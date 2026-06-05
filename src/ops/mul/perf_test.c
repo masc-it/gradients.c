@@ -428,6 +428,7 @@ int main(void)
         {"row_4096x1024_fwd", 2U, {4096, 1024}, 1U, {1024}, MUL_PERF_FWD},
         {"row_8192x2048_fwd", 2U, {8192, 2048}, 1U, {2048}, MUL_PERF_FWD},
         {"generic_8x512x1024_fwd", 3U, {8, 512, 1024}, 3U, {8, 1, 1024}, MUL_PERF_FWD},
+        {"suffix8_8x512x1024_bwd_y", 3U, {8, 512, 1024}, 2U, {512, 1024}, MUL_PERF_BWD_Y},
         {"direct_4096x1024_bwd_xy", 2U, {4096, 1024}, 2U, {4096, 1024}, MUL_PERF_BWD_XY},
         {"direct_8192x2048_bwd_xy", 2U, {8192, 2048}, 2U, {8192, 2048}, MUL_PERF_BWD_XY},
         {"row_4096x1024_bwd_x", 2U, {4096, 1024}, 1U, {1024}, MUL_PERF_BWD_X},

@@ -142,6 +142,22 @@ static void expect_f32_tensor(gd_context *ctx,
     }
 }
 
+static void expect_f16_tensor(gd_context *ctx,
+                              const gd_tensor *tensor,
+                              const float *want,
+                              uint32_t count,
+                              float tol,
+                              const char *what)
+{
+    uint16_t got[32];
+    uint32_t i;
+    CHECK(count <= 32U, "helper count");
+    CHECK_OK(gd_tensor_read(ctx, tensor, got, (size_t)count * sizeof(got[0])));
+    for (i = 0U; i < count; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - want[i]) <= tol, what);
+    }
+}
+
 static void create_context_or_skip(const gd_memory_config *cfg, gd_context **out_ctx)
 {
     gd_status st = gd_context_create(cfg, out_ctx);
@@ -282,6 +298,8 @@ static void test_mse_graph(void)
     const int64_t shape[2] = {2, 3};
     const float pred_data[COUNT] = {0.0f, 0.25f, 0.75f, 1.0f, -0.5f, 1.5f};
     const float target_data[COUNT] = {0.0f, 1.0f, 1.0f, 0.0f, -1.0f, 1.0f};
+    uint16_t pred_h[COUNT];
+    uint16_t target_h[COUNT];
     float want_grad[COUNT];
     gd_context *ctx = NULL;
     gd_memory_config cfg = reduce_config();
@@ -291,14 +309,16 @@ static void test_mse_graph(void)
     gd_tensor sq;
     gd_tensor loss;
     gd_tensor dpred;
-    float got_loss = 0.0f;
+    uint16_t got_loss_h = 0U;
     float want_loss = 0.0f;
     uint32_t i;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &pred));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &target));
-    CHECK_OK(gd_tensor_write(ctx, &pred, pred_data, sizeof(pred_data)));
-    CHECK_OK(gd_tensor_write(ctx, &target, target_data, sizeof(target_data)));
+    pack_f16(pred_data, pred_h, COUNT);
+    pack_f16(target_data, target_h, COUNT);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &pred));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &target));
+    CHECK_OK(gd_tensor_write(ctx, &pred, pred_h, sizeof(pred_h)));
+    CHECK_OK(gd_tensor_write(ctx, &target, target_h, sizeof(target_h)));
     pred.requires_grad = true;
     target.requires_grad = false;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -307,16 +327,16 @@ static void test_mse_graph(void)
     CHECK_OK(gd_sub(ctx, &pred, &target, &diff));
     CHECK_OK(gd_mul(ctx, &diff, &diff, &sq));
     CHECK_OK(gd_reduce_mean(ctx, &sq, &loss));
-    CHECK_OK(gd_tensor_read(ctx, &loss, &got_loss, sizeof(got_loss)));
+    CHECK_OK(gd_tensor_read(ctx, &loss, &got_loss_h, sizeof(got_loss_h)));
     for (i = 0U; i < COUNT; ++i) {
         float d = pred_data[i] - target_data[i];
         want_loss += d * d / (float)COUNT;
         want_grad[i] = 2.0f * d / (float)COUNT;
     }
-    CHECK(abs_f32(got_loss - want_loss) <= 1.0e-6f, "mse graph loss");
+    CHECK(abs_f32(f16_bits_to_f32(got_loss_h) - want_loss) <= 1.0e-3f, "mse graph loss");
     CHECK_OK(gd_backward(ctx, &loss, NULL));
     CHECK_OK(gd_tensor_grad(ctx, &pred, &dpred));
-    expect_f32_tensor(ctx, &dpred, want_grad, COUNT, 1.0e-6f, "mse graph autograd grad");
+    expect_f16_tensor(ctx, &dpred, want_grad, COUNT, 1.0e-3f, "mse graph autograd grad");
     CHECK_OK(gd_end(ctx));
 
     gd_context_destroy(ctx);

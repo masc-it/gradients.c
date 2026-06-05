@@ -308,6 +308,34 @@ gd_status gd_backend_reduce_broadcast(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_mul_backward_direct(gd_backend *backend,
+                                         const gd_backend_tensor_view *x,
+                                         const gd_backend_tensor_view *y,
+                                         const gd_backend_tensor_view *grad_out,
+                                         const gd_backend_tensor_view *grad_x,
+                                         const gd_backend_tensor_view *grad_y)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)grad_out;
+    (void)grad_x;
+    (void)grad_y;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_mul_reduce_suffix(gd_backend *backend,
+                                       const gd_backend_tensor_view *grad_out,
+                                       const gd_backend_tensor_view *other,
+                                       const gd_backend_tensor_view *dst)
+{
+    (void)backend;
+    (void)grad_out;
+    (void)other;
+    (void)dst;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_cross_entropy_loss(gd_backend *backend,
                                         const gd_backend_tensor_view *logits,
                                         const gd_backend_tensor_view *targets,

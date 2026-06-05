@@ -36,6 +36,7 @@ The scaffold tool creates the capsule directory and starter files, then regenera
 [create] src/ops/my_op/metal_my_op.metal
 [create] src/ops/my_op/fwd.py
 [create] src/ops/my_op/bwd.py
+[create] src/ops/my_op/perf_test.c
 [create] src/ops/my_op/README.md
 [ops-registry] generated src/ops/op_kind.h
 [ops-registry] generated src/ops/op_registry.c
@@ -59,6 +60,7 @@ src/ops/<op>/metal_<op>_types.h # op-local Metal kernel ABI structs
 src/ops/<op>/metal_<op>.metal  # op-local Metal kernels compiled into the metallib
 src/ops/<op>/fwd.py            # PEP 723 PyTorch forward comparison template
 src/ops/<op>/bwd.py            # PEP 723 PyTorch backward comparison template
+src/ops/<op>/perf_test.c       # optimized op-local performance probe scaffold
 ```
 
 It writes:
@@ -212,6 +214,37 @@ const gd_autograd_rule gd_bwd_rule_my_op = {
     .backward = gd_my_op_autograd_backward,
 };
 ```
+
+## Implement the performance probe
+
+Edit `src/ops/my_op/perf_test.c`. Keep performance probes op-local and run them with:
+
+```sh
+make op-perf OP=my_op
+```
+
+The scaffold is compile-valid and intentionally prints TODO rows until the op is implemented. Replace the scaffold loop with real timed cases using this structure:
+
+1. Define realistic shape/dtype cases, including tails and production-sized activations.
+2. Create one reusable context/model per case outside the timed loop.
+3. Warm up before measuring.
+4. Measure separate entry points:
+   - forward only,
+   - direct public backward helper when available,
+   - autograd forward+backward for the training-path baseline.
+5. Include public API overhead, Metal command submission, and synchronization in wall time.
+6. Report `avg_ms` plus one of:
+   - `logical_GiB/s` for memory-bound elementwise/reduction ops,
+   - `TFLOP/s` or `GFLOP/s` for compute-bound ops.
+7. Print shape, dtype contract, warmup, and iteration count in the output.
+
+Use environment variables for reproducibility and selective runs:
+
+```sh
+GD_MY_OP_PERF_PROFILE=all GD_MY_OP_PERF_WARMUP=10 GD_MY_OP_PERF_ITERS=100 make op-perf OP=my_op
+```
+
+The generic `op-perf` target builds the library with `O3`/`NDEBUG`, compiles `src/ops/<op>/perf_test.c`, and sets `GRADIENTS_METALLIB` for the probe. `perf_test.c` files are excluded from the library source list so they can contain standalone `main()` functions.
 
 ## Regenerate manually
 

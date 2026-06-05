@@ -172,15 +172,16 @@ static void run_binary_ops_test(void)
     uint16_t x_h[COUNT];
     uint16_t y_h[COUNT];
     uint16_t g_h[COUNT];
+    uint16_t b_h[3];
     gd_context *ctx = NULL;
     gd_memory_config cfg = binary_config();
     gd_tensor x;
     gd_tensor y;
     gd_tensor g;
+    gd_tensor b;
     gd_tensor x32;
     gd_tensor y32;
     gd_tensor b32;
-    gd_tensor g32;
     gd_tensor out;
     gd_tensor dx;
     gd_tensor dy;
@@ -197,22 +198,24 @@ static void run_binary_ops_test(void)
     pack_f16(x_f32, x_h, COUNT);
     pack_f16(y_f32, y_h, COUNT);
     pack_f16(g_f32, g_h, COUNT);
+    pack_f16(b_f32, b_h, 3U);
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &x));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &y));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &g));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, bias_shape, 256U, &b));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &x32));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &y32));
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, bias_shape, 256U, &b32));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &g32));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     CHECK_OK(gd_tensor_write(ctx, &y, y_h, sizeof(y_h)));
     CHECK_OK(gd_tensor_write(ctx, &g, g_h, sizeof(g_h)));
+    CHECK_OK(gd_tensor_write(ctx, &b, b_h, sizeof(b_h)));
     CHECK_OK(gd_tensor_write(ctx, &x32, x_f32, sizeof(x_f32)));
     CHECK_OK(gd_tensor_write(ctx, &y32, y_f32, sizeof(y_f32)));
     CHECK_OK(gd_tensor_write(ctx, &b32, b_f32, sizeof(b_f32)));
-    CHECK_OK(gd_tensor_write(ctx, &g32, g_f32, sizeof(g_f32)));
     x.requires_grad = true;
     y.requires_grad = true;
+    b.requires_grad = true;
     x32.requires_grad = true;
     b32.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -249,11 +252,15 @@ static void run_binary_ops_test(void)
     }
     expect_tensor_f32(ctx, &out, want, COUNT, "add f32 broadcast forward");
 
-    CHECK_OK(gd_mul(ctx, &x32, &b32, &out));
+    st = gd_mul(ctx, &x32, &b32, &out);
+    CHECK(st == GD_ERR_UNSUPPORTED, "mul f32 unsupported");
+    gd_context_clear_error(ctx);
+
+    CHECK_OK(gd_mul(ctx, &x, &b, &out));
     for (i = 0U; i < COUNT; ++i) {
         want[i] = x_f32[i] * b_f32[i % 3U];
     }
-    expect_tensor_f32(ctx, &out, want, COUNT, "mul f32 broadcast forward");
+    expect_tensor_f16(ctx, &out, want, COUNT, "mul f16 broadcast forward");
 
     CHECK_OK(gd_sub_backward(ctx, &x, &y, &g, &dx, &dy));
     expect_tensor_f16(ctx, &dx, g_f32, COUNT, "sub backward dx");
@@ -272,15 +279,15 @@ static void run_binary_ops_test(void)
     }
     expect_tensor_f16(ctx, &dy, want, COUNT, "mul backward dy");
 
-    CHECK_OK(gd_mul_backward(ctx, &x32, &b32, &g32, &dx, &dy));
+    CHECK_OK(gd_mul_backward(ctx, &x, &b, &g, &dx, &dy));
     for (i = 0U; i < COUNT; ++i) {
         want[i] = g_f32[i] * b_f32[i % 3U];
     }
-    expect_tensor_f32(ctx, &dx, want, COUNT, "mul broadcast backward dx");
+    expect_tensor_f16(ctx, &dx, want, COUNT, "mul broadcast backward dx");
     for (i = 0U; i < 3U; ++i) {
         want[i] = g_f32[i] * x_f32[i] + g_f32[i + 3U] * x_f32[i + 3U];
     }
-    expect_tensor_f32(ctx, &dy, want, 3U, "mul broadcast backward dy");
+    expect_tensor_f16(ctx, &dy, want, 3U, "mul broadcast backward dy");
     CHECK_OK(gd_end(ctx));
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
@@ -294,13 +301,13 @@ static void run_binary_ops_test(void)
     CHECK_OK(gd_end(ctx));
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
-    CHECK_OK(gd_mul(ctx, &x32, &b32, &out));
-    CHECK_OK(gd_backward(ctx, &out, &g32));
-    CHECK_OK(gd_tensor_grad(ctx, &b32, &dy));
+    CHECK_OK(gd_mul(ctx, &x, &b, &out));
+    CHECK_OK(gd_backward(ctx, &out, &g));
+    CHECK_OK(gd_tensor_grad(ctx, &b, &dy));
     for (i = 0U; i < 3U; ++i) {
         want[i] = g_f32[i] * x_f32[i] + g_f32[i + 3U] * x_f32[i + 3U];
     }
-    expect_tensor_f32(ctx, &dy, want, 3U, "mul broadcast autograd dy");
+    expect_tensor_f16(ctx, &dy, want, 3U, "mul broadcast autograd dy");
     CHECK_OK(gd_end(ctx));
 
     gd_context_destroy(ctx);

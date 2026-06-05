@@ -75,6 +75,7 @@ For end-to-end op scaffolding and registration, see [Register a new op](register
   - C tests for edge cases and dtype contract.
   - PyTorch harnesses for forward and backward parity.
 - Performance:
+  - Put op-local probes at `src/ops/<op>/perf_test.c` and run them with `make op-perf OP=<op>`.
   - Measure forward and forward+backward separately.
   - Use optimized builds (`O3`, `NDEBUG`) for numbers.
   - Report shape, dtype, warmup/iters, wall time, and effective bandwidth.

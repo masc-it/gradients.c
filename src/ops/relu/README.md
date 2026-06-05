@@ -2,6 +2,8 @@
 
 ReLU op capsule.
 
+Contract: FP16 tensors only. Metal kernels are dtype-specialized and branch-free for the hot path.
+
 Checklist:
 
 - [x] Public API generated in `include/gradients/ops_generated.h`
@@ -12,3 +14,4 @@ Checklist:
 - [x] Forward PyTorch harness in `fwd.py`
 - [x] Backward PyTorch harness in `bwd.py`
 - [x] C tests under `tests/`
+- [x] Perf probe in `perf_test.c` (`make op-perf OP=relu`)

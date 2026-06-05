@@ -15,9 +15,9 @@ static gd_status gd_relu_validate(gd_context *ctx, const gd_tensor *x)
     if (st != GD_OK) {
         return st;
     }
-    if (x->dtype != GD_DTYPE_F16 && x->dtype != GD_DTYPE_F32) {
+    if (x->dtype != GD_DTYPE_F16) {
         return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
-                                    "relu currently supports f16/f32 tensors only");
+                                    "relu supports f16 tensors only");
     }
     if (!gd_tensor_is_contiguous(x)) {
         return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,

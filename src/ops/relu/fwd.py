@@ -3,7 +3,7 @@
 # dependencies = ["torch", "numpy"]
 # ///
 
-"""Live gradients.c ReLU forward correctness check against PyTorch."""
+"""Live gradients.c FP16 ReLU forward correctness check against PyTorch."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class Case:
     name: str
     rows: int
     cols: int
-    dtype: str
+    edge: bool = False
 
 
 RUNNER_SOURCE = r'''
@@ -73,10 +73,10 @@ static size_t align_up(size_t v, size_t a) { return (v + a - 1U) & ~(a - 1U); }
 
 int main(int argc, char **argv)
 {
-    uint32_t rows, cols, dtype;
-    size_t elems, elem_size, bytes;
-    void *x_data = NULL;
-    void *y_data = NULL;
+    uint32_t rows, cols;
+    size_t elems, bytes;
+    uint16_t *x_data = NULL;
+    uint16_t *y_data = NULL;
     gd_context *ctx = NULL;
     gd_memory_config cfg;
     gd_tensor x, y;
@@ -84,16 +84,14 @@ int main(int argc, char **argv)
     gd_status st;
     int rc = 1;
 
-    if (argc != 6 || parse_u32(argv[3], &rows) != 0 || parse_u32(argv[4], &cols) != 0 ||
-        parse_u32(argv[5], &dtype) != 0) {
-        fprintf(stderr, "usage: %s X.bin Y.bin ROWS COLS DTYPE\n", argv[0]);
+    if (argc != 5 || parse_u32(argv[3], &rows) != 0 || parse_u32(argv[4], &cols) != 0) {
+        fprintf(stderr, "usage: %s X.bin Y.bin ROWS COLS\n", argv[0]);
         return 2;
     }
-    elem_size = dtype == (uint32_t)GD_DTYPE_F32 ? 4U : 2U;
     elems = (size_t)rows * (size_t)cols;
-    bytes = elems * elem_size;
-    x_data = malloc(bytes);
-    y_data = calloc(elems, elem_size);
+    bytes = elems * sizeof(uint16_t);
+    x_data = (uint16_t *)malloc(bytes);
+    y_data = (uint16_t *)calloc(elems, sizeof(uint16_t));
     if (x_data == NULL || y_data == NULL || read_file(argv[1], x_data, bytes) != 0) { goto fail; }
 
     memset(&cfg, 0, sizeof(cfg));
@@ -106,7 +104,7 @@ int main(int argc, char **argv)
     if (st == GD_ERR_UNSUPPORTED) { printf("SKIP unsupported backend\n"); rc = 77; goto done; }
     if (check_status(ctx, st, "gd_context_create") != 0 || ctx == NULL) { goto fail; }
     shape[0] = (int64_t)rows; shape[1] = (int64_t)cols;
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, (gd_dtype)dtype, 2U, shape, 256U, &x));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &x));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
     CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
@@ -149,8 +147,8 @@ def compile_runner(root: Path, tmp: Path) -> Path:
 
 
 def make_cases() -> list[Case]:
-    smoke = [Case("small_f16", 4, 17, "f16"), Case("small_f32", 3, 19, "f32")]
-    classic = [Case("large_f16", 1024, 1024, "f16"), Case("large_f32", 512, 512, "f32")]
+    smoke = [Case("edge_f16", 1, 8, True), Case("small_tail_f16", 4, 17)]
+    classic = [Case("large_square_f16", 1024, 1024), Case("large_tail_f16", 2048, 513)]
     profile = os.environ.get("GD_RELU_FWD_PROFILE", "smoke")
     if profile == "smoke":
         return smoke
@@ -164,25 +162,33 @@ def make_cases() -> list[Case]:
     return selected
 
 
-def dtype_info(name: str) -> tuple[torch.dtype, np.dtype, int]:
-    if name == "f16":
-        return torch.float16, np.float16, 1
-    if name == "f32":
-        return torch.float32, np.float32, 3
-    raise ValueError(name)
+def edge_input(rows: int, cols: int) -> torch.Tensor:
+    bits = np.array([0x7E00, 0x8000, 0x0000, 0xBC00, 0x3C00, 0x7C00, 0xFC00, 0x0001], dtype=np.uint16)
+    if rows * cols != bits.size:
+        raise ValueError("edge case shape must match edge vector")
+    return torch.from_numpy(bits.view(np.float16).reshape(rows, cols).copy())
+
+
+def case_input(case: Case) -> torch.Tensor:
+    if case.edge:
+        return edge_input(case.rows, case.cols)
+    gen = torch.Generator(device="cpu").manual_seed(1000 + case.rows * 3 + case.cols)
+    return (torch.randn(case.rows, case.cols, generator=gen, dtype=torch.float32) * 2.0 - 0.2).to(torch.float16)
+
+
+def f16_bits(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().contiguous().numpy().astype(np.float16, copy=False).view(np.uint16)
 
 
 def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
-    torch_dtype, np_dtype, gd_dtype = dtype_info(case.dtype)
-    gen = torch.Generator(device="cpu").manual_seed(1000 + case.rows * 3 + case.cols)
-    x = (torch.randn(case.rows, case.cols, generator=gen, dtype=torch.float32) * 2.0 - 0.2).to(torch_dtype)
-    ref = torch.relu(x).to(torch.float32)
+    x = case_input(case)
+    ref = torch.relu(x)
     x_path = tmp / f"{case.name}.x.bin"
     y_path = tmp / f"{case.name}.y.bin"
-    x.detach().cpu().contiguous().numpy().astype(np_dtype, copy=False).tofile(x_path)
+    f16_bits(x).tofile(x_path)
     env = os.environ.copy()
     env["GRADIENTS_METALLIB"] = str(root / "build" / "gradients.metallib")
-    proc = subprocess.run([str(runner), str(x_path), str(y_path), str(case.rows), str(case.cols), str(gd_dtype)],
+    proc = subprocess.run([str(runner), str(x_path), str(y_path), str(case.rows), str(case.cols)],
                           cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode == 77:
         print(f"relu fwd skipped case={case.name}: {proc.stdout.strip()}")
@@ -190,12 +196,11 @@ def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
     if proc.returncode != 0:
         print(proc.stdout, end=""); print(proc.stderr, end="")
         raise RuntimeError(f"runner failed case={case.name} rc={proc.returncode}")
-    actual_np = np.fromfile(y_path, dtype=np_dtype).reshape(case.rows, case.cols)
-    actual = torch.from_numpy(actual_np.copy()).to(torch.float32)
-    diff = (actual - ref).abs()
-    max_abs = float(diff.max().item())
-    ok = bool(torch.all(diff <= (1e-6 if case.dtype == "f32" else 0.0)).item())
-    print(f"relu fwd actual {'ok' if ok else 'FAIL'} case={case.name} dtype={case.dtype} max_abs={max_abs:.3e}")
+    actual_bits = np.fromfile(y_path, dtype=np.uint16).reshape(case.rows, case.cols)
+    ref_bits = f16_bits(ref).reshape(case.rows, case.cols)
+    ok = bool(np.array_equal(actual_bits, ref_bits))
+    mismatches = int(np.count_nonzero(actual_bits != ref_bits))
+    print(f"relu fwd actual {'ok' if ok else 'FAIL'} case={case.name} dtype=f16 mismatches={mismatches}")
     return ok
 
 

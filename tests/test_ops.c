@@ -194,6 +194,15 @@ static float ref_matmul_backward_w_value(const uint16_t *x,
     return f16_bits_to_f32(f32_to_f16_bits(sum));
 }
 
+static void test_relu_f32_unsupported(gd_context *ctx)
+{
+    const int64_t shape[1] = {1};
+    gd_tensor x;
+    gd_tensor y;
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape, 256U, &x));
+    CHECK_STATUS(gd_relu(ctx, &x, &y), GD_ERR_UNSUPPORTED);
+}
+
 static void test_matmul_linear(gd_context *ctx)
 {
     enum { M = 4, K = 7, N = 6 };
@@ -354,6 +363,7 @@ int main(void)
         }
         CHECK_OK(st);
     }
+    test_relu_f32_unsupported(ctx);
     test_matmul_linear(ctx);
     gd_context_destroy(ctx);
     printf("test_ops: ok\n");

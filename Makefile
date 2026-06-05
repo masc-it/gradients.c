@@ -55,7 +55,7 @@ TEST_ENV :=
 
 ifeq ($(UNAME_S),Darwin)
 CPPFLAGS += -DGD_ENABLE_METAL=1
-SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/null/*' 2>/dev/null | sort)
+SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -name 'perf_test.c' ! -path '$(SRC_DIR)/backends/null/*' 2>/dev/null | sort)
 MSRC := $(shell find $(SRC_DIR) -type f -name '*.m' 2>/dev/null | sort)
 METAL_SRC := $(shell find $(SRC_DIR)/backends/metal $(SRC_DIR)/ops $(SRC_DIR)/optim -type f -name '*.metal' 2>/dev/null | sort)
 METAL_HEADERS := $(shell find $(SRC_DIR)/backends/metal $(SRC_DIR)/ops $(SRC_DIR)/optim -type f \( -name '*.h' -o -name '*.inc' \) 2>/dev/null | sort)
@@ -67,7 +67,7 @@ OBJCFLAGS ?= $(CPPFLAGS) -O0 -g3 -Wall -Wextra -Werror -fobjc-arc $(SAN_FLAGS)
 LDLIBS += -framework Foundation -framework Metal
 else
 CPPFLAGS += -DGD_ENABLE_METAL=0
-SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -path '$(SRC_DIR)/backends/metal/*' 2>/dev/null | sort)
+SRC := $(shell find $(SRC_DIR) -type f -name '*.c' ! -name 'perf_test.c' ! -path '$(SRC_DIR)/backends/metal/*' 2>/dev/null | sort)
 MSRC :=
 endif
 
@@ -85,8 +85,9 @@ ELEM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_elementwise_reduce_perf_pro
 GEN_OPS_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gen_ops
 NEW_OP_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gradients-new-op
 OPS_REGISTRY_STAMP := $(BUILD_DIR)/.ops-registry
+OP_UPPER = $(shell printf '%s' '$(OP)' | tr '[:lower:]' '[:upper:]')
 
-.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe elementwise-reduce-perf-probe tools ops-registry clean list FORCE
+.PHONY: help all build check test tests docs-check probes foundation-probe metal-probe gemm-perf-probe elementwise-reduce-perf-probe op-perf tools ops-registry clean list FORCE
 
 help:
 	@printf '%s\n' 'gradients.c v2 commands:'
@@ -98,6 +99,7 @@ help:
 	@printf '%s\n' '  make metal-probe       build + run Metal probe on macOS'
 	@printf '%s\n' '  make gemm-perf-probe   optimized public API F16 GEMM performance probe'
 	@printf '%s\n' '  make elementwise-reduce-perf-probe optimized binary/reduce performance probe'
+	@printf '%s\n' '  make op-perf OP=relu   optimized src/ops/<op>/perf_test.c probe'
 	@printf '%s\n' '  make SAN=1 check       sanitizer build'
 	@printf '%s\n' '  make list              show discovered files'
 	@printf '%s\n' '  make clean             remove build dir'
@@ -170,6 +172,25 @@ elementwise-reduce-perf-probe:
 	  -o '$(ELEM_PERF_PROBE)'
 	@printf '[probe] %s\n' '$(ELEM_PERF_PROBE)'
 	@GRADIENTS_METALLIB='$(PERF_BUILD_DIR)/gradients.metallib' '$(ELEM_PERF_PROBE)'
+
+op-perf:
+	@if [ -z '$(OP)' ]; then \
+	  printf '%s\n' 'usage: make op-perf OP=<op-name>'; \
+	  exit 2; \
+	fi
+	@if [ ! -f '$(SRC_DIR)/ops/$(OP)/perf_test.c' ]; then \
+	  printf 'missing %s\n' '$(SRC_DIR)/ops/$(OP)/perf_test.c'; \
+	  exit 2; \
+	fi
+	$(MAKE) BUILD_DIR='$(PERF_BUILD_DIR)' CFLAGS='$(PERF_CFLAGS)' OBJCFLAGS='$(PERF_OBJCFLAGS)' build
+	@mkdir -p '$(PERF_BUILD_DIR)/$(SRC_DIR)/ops/$(OP)'
+	$(CC) -I$(INCLUDE_DIR) $(PERF_PROBE_CFLAGS) -DGD_PERF_TEST_MAIN -DGD_$(OP_UPPER)_PERF_TEST_MAIN \
+	  '$(SRC_DIR)/ops/$(OP)/perf_test.c' \
+	  '$(PERF_BUILD_DIR)/lib$(LIB_NAME).a' $(LDFLAGS) \
+	  -framework Foundation -framework Metal \
+	  -o '$(PERF_BUILD_DIR)/$(SRC_DIR)/ops/$(OP)/perf_test'
+	@printf '[probe] %s\n' '$(PERF_BUILD_DIR)/$(SRC_DIR)/ops/$(OP)/perf_test'
+	@GRADIENTS_METALLIB='$(PERF_BUILD_DIR)/gradients.metallib' '$(PERF_BUILD_DIR)/$(SRC_DIR)/ops/$(OP)/perf_test'
 else
 metal-probe:
 	@printf '[metal-probe] skipped: macOS required\n'
@@ -179,6 +200,9 @@ gemm-perf-probe:
 
 elementwise-reduce-perf-probe:
 	@printf '[elementwise-reduce-perf-probe] skipped: macOS required\n'
+
+op-perf:
+	@printf '[op-perf] skipped: macOS required\n'
 endif
 
 list:

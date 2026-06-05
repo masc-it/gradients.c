@@ -234,8 +234,13 @@ For differentiable ops, also add:
 
 - a C test under `tests/`
 - completed Python/PyTorch comparison harnesses in `src/ops/my_op/fwd.py` and `src/ops/my_op/bwd.py`
+- an optimized op-local performance probe at `src/ops/my_op/perf_test.c`
 
-Run Python harnesses with `uv run ...`.
+Run Python harnesses with `uv run ...`. Run the op-local performance probe with:
+
+```sh
+make op-perf OP=my_op
+```
 
 ## Checklist
 
@@ -247,4 +252,5 @@ Run Python harnesses with `uv run ...`.
 - [ ] Backward rule in `src/ops/my_op/autograd_my_op.c`
 - [ ] Forward/backward PyTorch harnesses in `src/ops/my_op/fwd.py` / `src/ops/my_op/bwd.py`
 - [ ] C tests and PyTorch comparison
+- [ ] Op-local perf probe in `src/ops/my_op/perf_test.c` (`make op-perf OP=my_op`)
 - [ ] `make check`

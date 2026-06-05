@@ -85,6 +85,34 @@ static gd_status gd_shape_numel(uint32_t rank, const int64_t *shape, int64_t *ou
     return GD_OK;
 }
 
+static float gd_f16_bits_to_f32(uint16_t bits)
+{
+    uint32_t sign = ((uint32_t)bits & 0x8000U) << 16;
+    int32_t exp = (int32_t)(((uint32_t)bits >> 10) & 0x1fU);
+    uint32_t mant = (uint32_t)bits & 0x3ffU;
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    if (exp == 0) {
+        if (mant == 0U) {
+            v.u = sign;
+            return v.f;
+        }
+        while ((mant & 0x400U) == 0U) {
+            mant <<= 1U;
+            exp -= 1;
+        }
+        mant &= 0x3ffU;
+        exp += 1;
+    } else if (exp == 31) {
+        v.u = sign | 0x7f800000U | (mant << 13);
+        return v.f;
+    }
+    v.u = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (mant << 13);
+    return v.f;
+}
+
 static gd_status gd_shape_storage_nbytes(gd_dtype dtype,
                                          uint32_t rank,
                                          const int64_t *shape,
@@ -217,6 +245,76 @@ gd_status gd_tensor_logical_nbytes(const gd_tensor *tensor, size_t *out_nbytes)
         return GD_ERR_OUT_OF_MEMORY;
     }
     *out_nbytes = (size_t)numel * elem_size;
+    return GD_OK;
+}
+
+gd_status gd_tensor_item(gd_context *ctx, const gd_tensor *src, float *out)
+{
+    gd_backend *backend;
+    gd_status st;
+    int64_t numel;
+    size_t offset;
+    if (out != NULL) {
+        *out = 0.0f;
+    }
+    if (ctx == NULL || src == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_validate(ctx, src);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_numel(src, &numel);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor item invalid shape");
+    }
+    if (numel != 1) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor item requires exactly one element");
+    }
+    if (src->dtype != GD_DTYPE_F16 && src->dtype != GD_DTYPE_F32) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "tensor item supports f16 and f32 tensors");
+    }
+    if (src->storage.offset > SIZE_MAX - src->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor item invalid descriptor");
+    }
+    st = gd_context_wait_for_span(ctx, &src->storage);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_context_flush_backend(ctx);
+    if (st != GD_OK) {
+        return st;
+    }
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || src->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor item missing backend buffer");
+    }
+    offset = src->storage.offset + src->view_offset;
+    if (src->dtype == GD_DTYPE_F16) {
+        uint16_t bits = 0U;
+        st = gd_backend_download(backend,
+                                 (gd_backend_buffer *)src->storage.buffer,
+                                 offset,
+                                 &bits,
+                                 sizeof(bits));
+        if (st != GD_OK) {
+            return gd_context_set_error(ctx, st, "backend tensor item download failed");
+        }
+        *out = gd_f16_bits_to_f32(bits);
+        return GD_OK;
+    }
+    {
+        float value = 0.0f;
+        st = gd_backend_download(backend,
+                                 (gd_backend_buffer *)src->storage.buffer,
+                                 offset,
+                                 &value,
+                                 sizeof(value));
+        if (st != GD_OK) {
+            return gd_context_set_error(ctx, st, "backend tensor item download failed");
+        }
+        *out = value;
+    }
     return GD_OK;
 }
 

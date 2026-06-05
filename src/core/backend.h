@@ -186,6 +186,11 @@ gd_status gd_backend_broadcast_to(gd_backend *backend,
                                   const gd_backend_tensor_view *src,
                                   const gd_backend_tensor_view *dst,
                                   float scale);
+/* dst[i] = src[0] * scale for contiguous tensors. */
+gd_status gd_backend_broadcast_scalar(gd_backend *backend,
+                                      const gd_backend_tensor_view *src,
+                                      const gd_backend_tensor_view *dst,
+                                      float scale);
 /* dst = sum_to_shape(src) * scale for contiguous broadcast-compatible tensors. */
 gd_status gd_backend_reduce_broadcast(gd_backend *backend,
                                       const gd_backend_tensor_view *src,

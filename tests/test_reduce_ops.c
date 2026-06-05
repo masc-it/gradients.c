@@ -371,12 +371,125 @@ static void test_reduce_f16(void)
     gd_context_destroy(ctx);
 }
 
+static void test_reduce_f16_large_multistage(void)
+{
+    enum { COUNT = 5000 };
+    const int64_t shape[1] = {COUNT};
+    uint16_t *x_h = NULL;
+    uint16_t *dx_h = NULL;
+    uint16_t got_h = 0U;
+    float want = 0.0f;
+    gd_context *ctx = NULL;
+    gd_memory_config cfg = reduce_config();
+    gd_tensor x;
+    gd_tensor sum;
+    gd_tensor dx;
+    uint32_t i;
+    cfg.params_bytes = 32768U;
+    cfg.scratch_slot_bytes = 262144U;
+    x_h = (uint16_t *)malloc((size_t)COUNT * sizeof(*x_h));
+    dx_h = (uint16_t *)malloc((size_t)COUNT * sizeof(*dx_h));
+    CHECK(x_h != NULL && dx_h != NULL, "malloc large f16 reduce buffers");
+    for (i = 0U; i < COUNT; ++i) {
+        float value;
+        switch (i & 3U) {
+        case 0U:
+            value = 0.25f;
+            break;
+        case 1U:
+            value = -0.125f;
+            break;
+        case 2U:
+            value = 0.5f;
+            break;
+        default:
+            value = -0.25f;
+            break;
+        }
+        x_h[i] = f32_to_f16_bits(value);
+        want += value;
+    }
+    create_context_or_skip(&cfg, &ctx);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_write(ctx, &x, x_h, (size_t)COUNT * sizeof(*x_h)));
+    x.requires_grad = true;
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_reduce_sum(ctx, &x, &sum));
+    CHECK_OK(gd_tensor_read(ctx, &sum, &got_h, sizeof(got_h)));
+    CHECK(abs_f32(f16_bits_to_f32(got_h) - want) <= 5.0e-1f, "large reduce_sum f16 forward");
+    CHECK_OK(gd_backward(ctx, &sum, NULL));
+    CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
+    CHECK_OK(gd_tensor_read(ctx, &dx, dx_h, (size_t)COUNT * sizeof(*dx_h)));
+    for (i = 0U; i < COUNT; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(dx_h[i]) - 1.0f) <= 0.0f, "large reduce_sum f16 autograd fill");
+    }
+    CHECK_OK(gd_end(ctx));
+    gd_context_destroy(ctx);
+    free(x_h);
+    free(dx_h);
+}
+
+static void test_reduce_f16_axis_rank3(void)
+{
+    enum { COUNT = 24 };
+    const int64_t shape[3] = {2, 3, 4};
+    const float x_f32[COUNT] = {
+        1.0f,  2.0f,  3.0f,  4.0f,
+        0.5f, -1.0f,  1.5f, -2.0f,
+        2.0f,  0.0f, -0.5f,  1.0f,
+       -1.0f,  0.25f, 0.5f,  1.5f,
+        1.0f,  1.25f, 1.5f, -0.5f,
+        0.0f, -0.25f, 2.0f,  0.5f,
+    };
+    const float want_axis[8] = {3.5f, 1.0f, 4.0f, 3.0f, 0.0f, 1.25f, 4.0f, 1.5f};
+    float want_grad_direct[COUNT];
+    float want_grad_auto[COUNT];
+    uint16_t x_h[COUNT];
+    gd_context *ctx = NULL;
+    gd_memory_config cfg = reduce_config();
+    gd_tensor x;
+    gd_tensor out;
+    gd_tensor dx;
+    uint32_t outer;
+    uint32_t reduce;
+    uint32_t inner;
+    create_context_or_skip(&cfg, &ctx);
+    pack_f16(x_f32, x_h, COUNT);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 3U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
+    x.requires_grad = true;
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_reduce_sum_axis(ctx, &x, 1, false, &out));
+    CHECK(out.rank == 2U && out.shape[0] == 2 && out.shape[1] == 4, "f16 axis rank3 output shape");
+    expect_f16_tensor(ctx, &out, want_axis, 8U, 1.0e-3f, "f16 axis rank3 forward");
+    CHECK_OK(gd_reduce_sum_axis_backward(ctx, &x, &out, 1, false, &dx));
+    for (outer = 0U; outer < 2U; ++outer) {
+        for (reduce = 0U; reduce < 3U; ++reduce) {
+            for (inner = 0U; inner < 4U; ++inner) {
+                uint32_t dst_i = (outer * 3U + reduce) * 4U + inner;
+                want_grad_direct[dst_i] = want_axis[outer * 4U + inner];
+                want_grad_auto[dst_i] = 1.0f;
+            }
+        }
+    }
+    expect_f16_tensor(ctx, &dx, want_grad_direct, COUNT, 1.0e-3f, "f16 axis rank3 direct backward");
+    CHECK_OK(gd_backward(ctx, &out, NULL));
+    CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
+    expect_f16_tensor(ctx, &dx, want_grad_auto, COUNT, 0.0f, "f16 axis rank3 autograd backward");
+    CHECK_OK(gd_end(ctx));
+    gd_context_destroy(ctx);
+}
+
 int main(void)
 {
     test_reduce_forward_backward();
     test_reduce_axis_forward_backward();
     test_mse_graph();
     test_reduce_f16();
+    test_reduce_f16_large_multistage();
+    test_reduce_f16_axis_rank3();
     printf("test_reduce_ops: ok\n");
     return 0;
 }

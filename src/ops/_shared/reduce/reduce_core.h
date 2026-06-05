@@ -259,12 +259,13 @@ static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
             current_count = 1U;
         } else {
             gd_tensor partial;
+            gd_dtype partial_dtype = x->dtype == GD_DTYPE_F16 ? GD_DTYPE_F32 : x->dtype;
             int64_t partial_shape[1];
             if (next_count > (size_t)INT64_MAX) {
                 return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "reduce partial count overflow");
             }
             partial_shape[0] = (int64_t)next_count;
-            st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, 1U, partial_shape, 256U, &partial);
+            st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, partial_dtype, 1U, partial_shape, 256U, &partial);
             if (st != GD_OK) {
                 return st;
             }
@@ -469,9 +470,9 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "reduce backward invalid tensor view");
     }
-    st = gd_backend_broadcast_to(gd_context_backend(ctx), &gv, &dxv, scale);
+    st = gd_backend_broadcast_scalar(gd_context_backend(ctx), &gv, &dxv, scale);
     if (st != GD_OK) {
-        return gd_context_set_error(ctx, st, "backend reduce backward broadcast failed");
+        return gd_context_set_error(ctx, st, "backend reduce backward scalar broadcast failed");
     }
     *grad_x = dx;
     return GD_OK;

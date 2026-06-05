@@ -56,17 +56,10 @@ static void test_linear_child_module(gd_context *ctx)
     CHECK_OK(gd_linear_layer_init_child(ctx, &root, "fc1", &fc1, &fc1_cfg));
     CHECK_OK(gd_linear_layer_init_child(ctx, &root, "fc2", &fc2, &fc2_cfg));
 
-    memset(groups, 0, sizeof(groups));
-    groups[0].name = "hidden";
-    groups[0].match = "xor.fc1.*";
-    groups[0].lr_mult = 1.0f;
-    groups[0].trainable = true;
-    groups[1].name = "head";
-    groups[1].match = "xor.fc2.*";
-    groups[1].lr_mult = 1.0f;
-    groups[1].trainable = true;
+    groups[0] = gd_param_group_build("hidden", "xor.fc1.*", 1.0f, 0.0f, true);
+    groups[1] = gd_param_group_build("head", "xor.fc2.*", 1.0f, 0.0f, true);
 
-    CHECK_OK(gd_module_collect_params(ctx, &root, groups, 2U, &params));
+    CHECK_OK(gd_module_collect_params(ctx, &root, groups, GD_ARRAY_LEN(groups), &params));
     CHECK(params.count == 4U, "xor model exposes four params");
     CHECK(path_is(&params, 0U, "xor.fc1.weight"), "fc1 weight path");
     CHECK(path_is(&params, 1U, "xor.fc1.bias"), "fc1 bias path");
@@ -77,7 +70,7 @@ static void test_linear_child_module(gd_context *ctx)
     gd_param_set_free(&params);
 
     CHECK_OK(gd_module_freeze(&root, "xor.fc1.*"));
-    CHECK_OK(gd_module_collect_params(ctx, &root, NULL, 0U, &params));
+    CHECK_OK(gd_module_parameters(ctx, &root, &params));
     CHECK(!params.items[0].trainable && !params.items[1].trainable,
           "freeze marks hidden layer params non-trainable");
     CHECK(params.items[2].trainable && params.items[3].trainable,
@@ -117,7 +110,7 @@ static void test_module_list_paths(gd_context *ctx)
 
     CHECK_STATUS(gd_module_list_set(&layers, 2U, &layer1.mod), GD_ERR_INVALID_ARGUMENT);
 
-    CHECK_OK(gd_module_collect_params(ctx, &root, NULL, 0U, &params));
+    CHECK_OK(gd_module_parameters(ctx, &root, &params));
     CHECK(params.count == 4U, "module list exposes params recursively");
     CHECK(path_is(&params, 0U, "toy.layers.0.weight"), "module list index 0 weight path");
     CHECK(path_is(&params, 2U, "toy.layers.1.weight"), "module list index 1 weight path");
@@ -149,7 +142,7 @@ static void test_module_dict_paths(gd_context *ctx)
     CHECK_OK(gd_module_dict_set(&heads, "lm", &lm.mod));
     CHECK_OK(gd_module_dict_set(&heads, "repr", &repr.mod));
 
-    CHECK_OK(gd_module_collect_params(ctx, &root, NULL, 0U, &params));
+    CHECK_OK(gd_module_parameters(ctx, &root, &params));
     CHECK(params.count == 4U, "module dict exposes params recursively");
     CHECK(path_is(&params, 0U, "vlm.heads.lm.weight"), "module dict lm path");
     CHECK(path_is(&params, 2U, "vlm.heads.repr.weight"), "module dict repr path");

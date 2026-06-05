@@ -14,6 +14,9 @@ extern "C" {
 
 #define GD_MODULE_NAME_MAX 64U
 #define GD_MODULE_PATH_MAX 256U
+#ifndef GD_ARRAY_LEN
+#define GD_ARRAY_LEN(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
+#endif
 
 typedef enum gd_module_init_kind {
     GD_INIT_EMPTY = 0,
@@ -192,8 +195,16 @@ void gd_module_set_training(gd_module *module, bool training);
 gd_status gd_module_freeze(gd_module *module, const char *pattern);
 gd_status gd_module_unfreeze(gd_module *module, const char *pattern);
 
+gd_param_group gd_param_group_build(const char *name,
+                                    const char *match,
+                                    float lr_mult,
+                                    float weight_decay,
+                                    bool trainable);
 void gd_param_set_init(gd_param_set *set);
 void gd_param_set_free(gd_param_set *set);
+gd_status gd_module_parameters(gd_context *ctx,
+                               const gd_module *module,
+                               gd_param_set *out);
 gd_status gd_module_collect_params(gd_context *ctx,
                                    const gd_module *module,
                                    const gd_param_group *groups,

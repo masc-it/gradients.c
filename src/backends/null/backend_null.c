@@ -296,6 +296,18 @@ gd_status gd_backend_broadcast_to(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_broadcast_scalar(gd_backend *backend,
+                                      const gd_backend_tensor_view *src,
+                                      const gd_backend_tensor_view *dst,
+                                      float scale)
+{
+    (void)backend;
+    (void)src;
+    (void)dst;
+    (void)scale;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_reduce_broadcast(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,

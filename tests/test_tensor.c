@@ -36,10 +36,14 @@ static void test_params_tensor(gd_context *ctx)
     const int64_t shape[2] = {4, 8};
     const int64_t bad_shape[1] = {-1};
     const int64_t fill_shape[1] = {4};
+    const int64_t scalar_shape[1] = {1};
     gd_tensor param;
     gd_tensor view;
     gd_tensor zeros;
     gd_tensor ones;
+    gd_tensor scalar_f16;
+    gd_tensor scalar_f32;
+    gd_tensor scalar_i32;
     gd_tensor rand_a;
     gd_tensor rand_b;
     gd_tensor bad;
@@ -48,7 +52,11 @@ static void test_params_tensor(gd_context *ctx)
     int64_t numel;
     size_t nbytes;
     uint16_t zero_bits[4] = {1U, 1U, 1U, 1U};
+    uint16_t scalar_f16_bits = 0xc000U;
+    int32_t scalar_i32_value = 42;
     float one_values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float scalar_f32_value = 3.25f;
+    float scalar_item = 0.0f;
     float rand_values_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float rand_values_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -85,6 +93,23 @@ static void test_params_tensor(gd_context *ctx)
     CHECK(one_values[0] == 1.0f && one_values[1] == 1.0f &&
           one_values[2] == 1.0f && one_values[3] == 1.0f,
           "ones initializes f32 storage");
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, scalar_shape, 64U, &scalar_f16));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_f16, &scalar_f16_bits, sizeof(scalar_f16_bits)));
+    CHECK_OK(gd_tensor_item(ctx, &scalar_f16, &scalar_item));
+    CHECK(scalar_item == -2.0f, "tensor item converts f16 scalar to f32");
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, scalar_shape, 64U, &scalar_f32));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_f32, &scalar_f32_value, sizeof(scalar_f32_value)));
+    CHECK_OK(gd_tensor_item(ctx, &scalar_f32, &scalar_item));
+    CHECK(scalar_item == 3.25f, "tensor item reads f32 scalar");
+
+    CHECK_STATUS(gd_tensor_item(ctx, &ones, &scalar_item), GD_ERR_INVALID_ARGUMENT);
+    gd_context_clear_error(ctx);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, scalar_shape, 64U, &scalar_i32));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_i32, &scalar_i32_value, sizeof(scalar_i32_value)));
+    CHECK_STATUS(gd_tensor_item(ctx, &scalar_i32, &scalar_item), GD_ERR_UNSUPPORTED);
+    gd_context_clear_error(ctx);
 
     CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
                                     64U, 1234U, -1.0f, 1.0f, &rand_a));

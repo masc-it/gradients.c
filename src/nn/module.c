@@ -655,6 +655,21 @@ gd_status gd_module_unfreeze(gd_module *module, const char *pattern)
     return gd_module_apply_trainable(module, module->name, pattern, true);
 }
 
+gd_param_group gd_param_group_build(const char *name,
+                                    const char *match,
+                                    float lr_mult,
+                                    float weight_decay,
+                                    bool trainable)
+{
+    gd_param_group group;
+    group.name = name;
+    group.match = match;
+    group.lr_mult = lr_mult;
+    group.weight_decay = weight_decay;
+    group.trainable = trainable;
+    return group;
+}
+
 void gd_param_set_init(gd_param_set *set)
 {
     if (set != NULL) {
@@ -669,6 +684,13 @@ void gd_param_set_free(gd_param_set *set)
     }
     free(set->items);
     memset(set, 0, sizeof(*set));
+}
+
+gd_status gd_module_parameters(gd_context *ctx,
+                               const gd_module *module,
+                               gd_param_set *out)
+{
+    return gd_module_collect_params(ctx, module, NULL, 0U, out);
 }
 
 gd_status gd_module_collect_params(gd_context *ctx,

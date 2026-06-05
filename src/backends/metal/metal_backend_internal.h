@@ -37,6 +37,10 @@ struct gd_backend {
     void *reduce_axis_pso;
     void *broadcast_axis_pso;
     void *broadcast_to_pso;
+    void *cross_entropy_loss_f16_pso;
+    void *cross_entropy_loss_stats_f16_pso;
+    void *cross_entropy_backward_f16_pso;
+    void *cross_entropy_backward_stats_f16_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

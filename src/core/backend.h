@@ -191,6 +191,34 @@ gd_status gd_backend_reduce_broadcast(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,
                                       float scale);
+/* F16-only: row_loss[n] = logsumexp(logits[n, :]) - logits[n, target[n]]. */
+gd_status gd_backend_cross_entropy_loss(gd_backend *backend,
+                                        const gd_backend_tensor_view *logits,
+                                        const gd_backend_tensor_view *targets,
+                                        const gd_backend_tensor_view *row_loss);
+/* F16-only training fast path: also saves row max and reciprocal exp-sum. */
+gd_status gd_backend_cross_entropy_loss_stats(gd_backend *backend,
+                                              const gd_backend_tensor_view *logits,
+                                              const gd_backend_tensor_view *targets,
+                                              const gd_backend_tensor_view *row_loss,
+                                              const gd_backend_tensor_view *row_max,
+                                              const gd_backend_tensor_view *row_inv_sum);
+/* F16-only direct backward: recomputes row stats. */
+gd_status gd_backend_cross_entropy_backward(gd_backend *backend,
+                                            const gd_backend_tensor_view *logits,
+                                            const gd_backend_tensor_view *targets,
+                                            const gd_backend_tensor_view *grad_loss,
+                                            const gd_backend_tensor_view *grad_logits,
+                                            float scale);
+/* F16-only autograd fast path: consumes forward-saved row stats. */
+gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
+                                                  const gd_backend_tensor_view *logits,
+                                                  const gd_backend_tensor_view *targets,
+                                                  const gd_backend_tensor_view *row_max,
+                                                  const gd_backend_tensor_view *row_inv_sum,
+                                                  const gd_backend_tensor_view *grad_loss,
+                                                  const gd_backend_tensor_view *grad_logits,
+                                                  float scale);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
 

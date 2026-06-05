@@ -100,6 +100,7 @@ broadcasting, reduction, and scalar-loss autograd paths added for in-graph MSE:
 - all-elements `gd_reduce_sum` and `gd_reduce_mean`
 - row-wise `gd_reduce_sum_axis(..., axis=1)` and `gd_reduce_mean_axis(..., axis=1)`
 - row-wise `reduce_mean_axis -> backward` for reduced-axis broadcast gradients
+- sparse `gd_cross_entropy` and `cross_entropy -> backward` over `[tokens, classes]`
 - full `sub -> mul -> reduce_mean -> backward` MSE graph
 
 Profiles use activation-sized tensors such as `4096x1024` and `8192x2048`.

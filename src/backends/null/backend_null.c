@@ -308,6 +308,70 @@ gd_status gd_backend_reduce_broadcast(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_cross_entropy_loss(gd_backend *backend,
+                                        const gd_backend_tensor_view *logits,
+                                        const gd_backend_tensor_view *targets,
+                                        const gd_backend_tensor_view *row_loss)
+{
+    (void)backend;
+    (void)logits;
+    (void)targets;
+    (void)row_loss;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_cross_entropy_loss_stats(gd_backend *backend,
+                                              const gd_backend_tensor_view *logits,
+                                              const gd_backend_tensor_view *targets,
+                                              const gd_backend_tensor_view *row_loss,
+                                              const gd_backend_tensor_view *row_max,
+                                              const gd_backend_tensor_view *row_inv_sum)
+{
+    (void)backend;
+    (void)logits;
+    (void)targets;
+    (void)row_loss;
+    (void)row_max;
+    (void)row_inv_sum;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_cross_entropy_backward(gd_backend *backend,
+                                            const gd_backend_tensor_view *logits,
+                                            const gd_backend_tensor_view *targets,
+                                            const gd_backend_tensor_view *grad_loss,
+                                            const gd_backend_tensor_view *grad_logits,
+                                            float scale)
+{
+    (void)backend;
+    (void)logits;
+    (void)targets;
+    (void)grad_loss;
+    (void)grad_logits;
+    (void)scale;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
+                                                  const gd_backend_tensor_view *logits,
+                                                  const gd_backend_tensor_view *targets,
+                                                  const gd_backend_tensor_view *row_max,
+                                                  const gd_backend_tensor_view *row_inv_sum,
+                                                  const gd_backend_tensor_view *grad_loss,
+                                                  const gd_backend_tensor_view *grad_logits,
+                                                  float scale)
+{
+    (void)backend;
+    (void)logits;
+    (void)targets;
+    (void)row_max;
+    (void)row_inv_sum;
+    (void)grad_loss;
+    (void)grad_logits;
+    (void)scale;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
 {
     (void)backend;

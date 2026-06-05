@@ -159,6 +159,22 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_loss_f16_kernel", &backend->cross_entropy_loss_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_loss_stats_f16_kernel", &backend->cross_entropy_loss_stats_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_backward_f16_kernel", &backend->cross_entropy_backward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_backward_stats_f16_kernel", &backend->cross_entropy_backward_stats_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
     if (st != GD_OK) {
         return st;
@@ -303,6 +319,18 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->adamw_pso != NULL) {
         CFRelease(backend->adamw_pso);
+    }
+    if (backend->cross_entropy_backward_stats_f16_pso != NULL) {
+        CFRelease(backend->cross_entropy_backward_stats_f16_pso);
+    }
+    if (backend->cross_entropy_backward_f16_pso != NULL) {
+        CFRelease(backend->cross_entropy_backward_f16_pso);
+    }
+    if (backend->cross_entropy_loss_stats_f16_pso != NULL) {
+        CFRelease(backend->cross_entropy_loss_stats_f16_pso);
+    }
+    if (backend->cross_entropy_loss_f16_pso != NULL) {
+        CFRelease(backend->cross_entropy_loss_f16_pso);
     }
     if (backend->broadcast_to_pso != NULL) {
         CFRelease(backend->broadcast_to_pso);

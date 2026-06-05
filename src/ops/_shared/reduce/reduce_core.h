@@ -255,6 +255,7 @@ static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
             if (st != GD_OK) {
                 return st;
             }
+            current = &result;
             current_count = 1U;
         } else {
             gd_tensor partial;

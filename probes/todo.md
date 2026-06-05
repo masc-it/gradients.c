@@ -20,6 +20,7 @@ Stress workloads to validate v2 design before consolidation.
 - Binary elementwise direct kernels on real activation tensors reach memory-bandwidth-like throughput through public API; generic broadcast was initially too slow, so row/vector broadcast now has a 2D specialized Metal path.
 - All-elements reductions use multi-stage simdgroup contiguous kernels; current public API performance is acceptable for scalar losses and MSE graph stress.
 - Axis reductions now use dedicated simdgroup Metal kernels and optimized reduced-axis broadcast for backward; continue watching non-last-axis strided cases as normalization workloads expand.
+- Sparse cross entropy uses stable per-row logsumexp and fused backward without softmax materialization; current QA covers 1K/2K class rows through the public API.
 
 ## Device memory / MPS layout
 

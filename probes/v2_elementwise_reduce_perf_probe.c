@@ -2,8 +2,8 @@
  * v2 public elementwise/reduction performance probe.
  *
  * Measures the public gd_add/gd_sub/gd_mul broadcast paths plus all-elements and
- * axis gd_reduce_sum/gd_reduce_mean, and a scalar-loss MSE graph on real
- * activation-sized tensors.
+ * axis gd_reduce_sum/gd_reduce_mean, sparse cross entropy, and scalar-loss MSE
+ * graph on real activation-sized tensors.
  * Wall time includes public validation, scoped arena allocation, Metal command
  * buffer submit, and synchronization.
  */
@@ -106,7 +106,9 @@ typedef enum perf_op_kind {
     PERF_OP_REDUCE_SUM_AXIS1 = 8,
     PERF_OP_REDUCE_MEAN_AXIS1 = 9,
     PERF_OP_REDUCE_MEAN_AXIS1_BWD = 10,
-    PERF_OP_MSE_GRAPH = 11,
+    PERF_OP_CROSS_ENTROPY = 11,
+    PERF_OP_CROSS_ENTROPY_BWD = 12,
+    PERF_OP_MSE_GRAPH = 13,
 } perf_op_kind;
 
 typedef struct perf_case {
@@ -123,6 +125,7 @@ typedef struct perf_model {
     gd_tensor y;
     gd_tensor bias;
     gd_tensor target;
+    gd_tensor labels;
     int64_t tokens;
     int64_t hidden;
     size_t count;
@@ -145,6 +148,8 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
     gd_memory_config cfg;
     int64_t x_shape[2];
     int64_t bias_shape[1];
+    int64_t label_shape[1];
+    int32_t *labels;
     size_t tensor_bytes;
     size_t scratch_bytes;
     gd_status st;
@@ -168,6 +173,7 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
     scratch_bytes = perf_align_up(tensor_bytes * 12U + 128U * 1024U * 1024U, 4096U);
     memset(&cfg, 0, sizeof(cfg));
     cfg.params_bytes = perf_align_up(tensor_bytes * 3U + (size_t)pcase->hidden * model->elem_size +
+                                         (size_t)pcase->tokens * sizeof(int32_t) +
                                          64U * 1024U * 1024U,
                                      4096U);
     cfg.state_bytes = 4U * 1024U * 1024U;
@@ -187,6 +193,7 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
     x_shape[0] = pcase->tokens;
     x_shape[1] = pcase->hidden;
     bias_shape[0] = pcase->hidden;
+    label_shape[0] = pcase->tokens;
     PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
                                                        GD_ARENA_PARAMS,
                                                        pcase->dtype,
@@ -227,10 +234,37 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
                                                        -0.25f,
                                                        0.25f,
                                                        &model->bias));
+    labels = (int32_t *)malloc((size_t)pcase->tokens * sizeof(*labels));
+    if (labels == NULL) {
+        return false;
+    }
+    for (int64_t i = 0; i < pcase->tokens; ++i) {
+        labels[i] = (int32_t)(i % pcase->hidden);
+    }
+    st = gd_tensor_empty(model->ctx,
+                         GD_ARENA_PARAMS,
+                         GD_DTYPE_I32,
+                         1U,
+                         label_shape,
+                         256U,
+                         &model->labels);
+    if (!perf_status_ok(model->ctx, st, "gd_tensor_empty labels")) {
+        free(labels);
+        return false;
+    }
+    st = gd_tensor_write(model->ctx,
+                         &model->labels,
+                         labels,
+                         (size_t)pcase->tokens * sizeof(*labels));
+    free(labels);
+    if (!perf_status_ok(model->ctx, st, "gd_tensor_write labels")) {
+        return false;
+    }
     model->x.requires_grad = true;
     model->y.requires_grad = false;
     model->target.requires_grad = false;
     model->bias.requires_grad = false;
+    model->labels.requires_grad = false;
     PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     printf("[ELEM] case=%s dtype=%s shape=%lldx%lld elems=%zu tensor=%.1f MiB scratch_slot=%.1f MiB\n",
@@ -259,7 +293,8 @@ static bool perf_run_once(perf_model *model, perf_op_kind kind)
     gd_tensor loss;
     gd_tensor sq;
     gd_tensor diff;
-    gd_scope_mode mode = (kind == PERF_OP_MSE_GRAPH || kind == PERF_OP_REDUCE_MEAN_AXIS1_BWD) ?
+    gd_scope_mode mode = (kind == PERF_OP_MSE_GRAPH || kind == PERF_OP_REDUCE_MEAN_AXIS1_BWD ||
+                          kind == PERF_OP_CROSS_ENTROPY_BWD) ?
                              GD_SCOPE_TRAIN : GD_SCOPE_INFER;
     PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, mode));
     switch (kind) {
@@ -293,6 +328,14 @@ static bool perf_run_once(perf_model *model, perf_op_kind kind)
     case PERF_OP_REDUCE_MEAN_AXIS1_BWD:
         PERF_REQUIRE_OK(model->ctx, gd_reduce_mean_axis(model->ctx, &model->x, 1, false, &out));
         PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &out, NULL));
+        PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->x, &tmp));
+        break;
+    case PERF_OP_CROSS_ENTROPY:
+        PERF_REQUIRE_OK(model->ctx, gd_cross_entropy(model->ctx, &model->x, &model->labels, &loss));
+        break;
+    case PERF_OP_CROSS_ENTROPY_BWD:
+        PERF_REQUIRE_OK(model->ctx, gd_cross_entropy(model->ctx, &model->x, &model->labels, &loss));
+        PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &loss, NULL));
         PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->x, &tmp));
         break;
     case PERF_OP_MSE_GRAPH:
@@ -333,6 +376,10 @@ static const char *perf_op_name(perf_op_kind kind)
         return "reduce_mean_axis1";
     case PERF_OP_REDUCE_MEAN_AXIS1_BWD:
         return "reduce_mean_axis1_bwd";
+    case PERF_OP_CROSS_ENTROPY:
+        return "cross_entropy";
+    case PERF_OP_CROSS_ENTROPY_BWD:
+        return "cross_entropy_bwd";
     case PERF_OP_MSE_GRAPH:
         return "mse_fwd_bwd";
     default:
@@ -360,6 +407,10 @@ static double perf_effective_bytes(const perf_model *model, perf_op_kind kind)
         return tensor + (double)model->tokens * (double)model->elem_size;
     case PERF_OP_REDUCE_MEAN_AXIS1_BWD:
         return tensor * 4.0 + (double)model->tokens * (double)model->elem_size * 2.0;
+    case PERF_OP_CROSS_ENTROPY:
+        return tensor * 2.0 + (double)model->tokens * (double)(sizeof(int32_t) + sizeof(float));
+    case PERF_OP_CROSS_ENTROPY_BWD:
+        return tensor * 6.0 + (double)model->tokens * (double)(sizeof(int32_t) + sizeof(float));
     case PERF_OP_MSE_GRAPH:
         /* sub fwd + mul fwd + reduce read + reduce bwd broadcast + two mul bwd + two accumulates + sub bwd */
         return tensor * 16.0;
@@ -413,6 +464,8 @@ static bool perf_run_case(const perf_case *pcase, int warmup, int iters)
         PERF_OP_REDUCE_SUM_AXIS1,
         PERF_OP_REDUCE_MEAN_AXIS1,
         PERF_OP_REDUCE_MEAN_AXIS1_BWD,
+        PERF_OP_CROSS_ENTROPY,
+        PERF_OP_CROSS_ENTROPY_BWD,
         PERF_OP_MSE_GRAPH,
     };
     perf_model model;
@@ -421,6 +474,14 @@ static bool perf_run_case(const perf_case *pcase, int warmup, int iters)
         return false;
     }
     for (i = 0U; i < sizeof(ops) / sizeof(ops[0]); ++i) {
+        if (pcase->dtype != GD_DTYPE_F16 &&
+            (ops[i] == PERF_OP_CROSS_ENTROPY || ops[i] == PERF_OP_CROSS_ENTROPY_BWD)) {
+            printf("[ELEM][PERF] case=%s dtype=%s op=%-22s skipped=f16_only\n",
+                   pcase->name,
+                   perf_dtype_name(pcase->dtype),
+                   perf_op_name(ops[i]));
+            continue;
+        }
         if (!perf_bench_op(&model, ops[i], warmup, iters)) {
             perf_destroy_model(&model);
             return false;

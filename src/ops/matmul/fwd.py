@@ -214,9 +214,9 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, x_bytes));
     CHECK(ctx, gd_tensor_write(ctx, &w, w_data, w_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(ctx, gd_matmul(ctx, &x, &w, &y));
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &y, y_data, y_bytes));
 

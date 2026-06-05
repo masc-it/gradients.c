@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct gd_context gd_context;
+typedef struct gd_batch gd_batch;
 typedef struct gd_state_object gd_state_object;
 
 typedef enum gd_arena_kind {
@@ -92,8 +93,8 @@ void gd_context_clear_error(gd_context *ctx);
 
 gd_status gd_context_seal_params(gd_context *ctx);
 
-gd_status gd_begin(gd_context *ctx, gd_scope_mode mode);
-gd_status gd_end(gd_context *ctx);
+gd_status gd_begin_step(gd_context *ctx, gd_scope_mode mode, gd_batch *batch);
+gd_status gd_end_step(gd_context *ctx);
 
 gd_status gd_alloc_params(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out);
 gd_status gd_alloc_state(gd_context *ctx, size_t nbytes, size_t alignment, gd_span *out);

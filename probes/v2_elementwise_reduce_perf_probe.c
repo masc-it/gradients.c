@@ -254,7 +254,7 @@ static bool perf_run_once(perf_model *model, perf_op_kind kind)
     gd_scope_mode mode = (kind == PERF_OP_MSE_GRAPH || kind == PERF_OP_REDUCE_MEAN_AXIS1_BWD ||
                           kind == PERF_OP_CROSS_ENTROPY_BWD) ?
                              GD_SCOPE_TRAIN : GD_SCOPE_INFER;
-    PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, mode));
+    PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, mode, gd_batch_empty()));
     switch (kind) {
     case PERF_OP_ADD:
         PERF_REQUIRE_OK(model->ctx, gd_add(model->ctx, &model->x, &model->y, &out));
@@ -306,7 +306,7 @@ static bool perf_run_once(perf_model *model, perf_op_kind kind)
     default:
         return false;
     }
-    PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

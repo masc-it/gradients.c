@@ -167,9 +167,9 @@ static void test_sigmoid_f32_forward_backward(void)
     CHECK_OK(gd_tensor_write(ctx, &g, g_data, sizeof(g_data)));
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid(ctx, &x, &y));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &y, got, sizeof(got)));
@@ -177,9 +177,9 @@ static void test_sigmoid_f32_forward_backward(void)
         check_close(got[i], sigmoid_ref(x_data[i]), 6.0e-6f, "f32 sigmoid forward");
     }
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid_backward(ctx, &x, &g, &dx));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &dx, got, sizeof(got)));
@@ -189,11 +189,11 @@ static void test_sigmoid_f32_forward_backward(void)
     }
 
     x.requires_grad = true;
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid(ctx, &x, &y_auto));
     CHECK_OK(gd_backward(ctx, &y_auto, &g));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx_auto));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &dx_auto, got, sizeof(got)));
@@ -240,9 +240,9 @@ static void test_sigmoid_f16_forward_backward(void)
     CHECK_OK(gd_tensor_write(ctx, &g, g_data, sizeof(g_data)));
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid(ctx, &x, &y));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &y, got, sizeof(got)));
@@ -251,9 +251,9 @@ static void test_sigmoid_f16_forward_backward(void)
         check_close(f16_bits_to_f32(got[i]), want, 1.2e-3f, "f16 sigmoid forward");
     }
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid_backward(ctx, &x, &g, &dx));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &dx, got, sizeof(got)));
@@ -266,11 +266,11 @@ static void test_sigmoid_f16_forward_backward(void)
     }
 
     x.requires_grad = true;
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sigmoid(ctx, &x, &y_auto));
     CHECK_OK(gd_backward(ctx, &y_auto, &g));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx_auto));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &dx_auto, got, sizeof(got)));

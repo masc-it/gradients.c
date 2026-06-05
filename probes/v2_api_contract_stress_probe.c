@@ -244,16 +244,16 @@ static void test_active_scope_blocking_read(qa_counts *qa)
         return;
     }
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, &t));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &t, got_before_end, sizeof(got_before_end)));
     qa_check_f32x4(qa,
                    "blocking tensor_read inside active scope observes queued fill",
                    got_before_end,
                    want);
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &t, got_after_end, sizeof(got_after_end)));
-    qa_check_f32x4(qa, "post-gd_end tensor_read observes queued fill", got_after_end, want);
+    qa_check_f32x4(qa, "post-gd_end_step tensor_read observes queued fill", got_after_end, want);
 
     gd_context_destroy(ctx);
 }
@@ -270,10 +270,10 @@ static void test_active_scope_write_order(qa_counts *qa)
         return;
     }
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, &t));
     QA_EXPECT_OK(qa, gd_tensor_write(ctx, &t, src, sizeof(src)));
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &t, got, sizeof(got)));
     qa_check_f32x4(qa,
                    "blocking tensor_write after queued op preserves program order",
@@ -296,7 +296,7 @@ static void test_ring_generation_and_stale_views(qa_counts *qa)
         return;
     }
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, shape), 64U, &hidden));
     QA_EXPECT_OK(qa, gd_tensor_slice(ctx, &hidden, 1U, 2, 3, &suffix));
     first_slot = hidden.storage.slot;
@@ -304,15 +304,15 @@ static void test_ring_generation_and_stale_views(qa_counts *qa)
     qa_check(qa, !gd_tensor_is_contiguous(&suffix),
              "middle-dim suffix slice is non-contiguous view",
              "suffix slice was reported contiguous");
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     qa_check(qa, gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != first_slot,
              "second scope advances scratch ring slot",
              "scratch ring reused first slot too early");
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     qa_check(qa, gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) == first_slot,
              "third scope selects oldest scratch ring slot",
              "scratch ring did not cycle back to oldest slot");
@@ -325,7 +325,7 @@ static void test_ring_generation_and_stale_views(qa_counts *qa)
     gd_context_clear_error(ctx);
     QA_EXPECT_STATUS(qa, gd_tensor_validate(ctx, &suffix), GD_ERR_BAD_STATE);
     gd_context_clear_error(ctx);
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
 
     gd_context_destroy(ctx);
 }
@@ -348,7 +348,7 @@ static void test_hot_path_heap_guard_and_transfers(qa_counts *qa)
         return;
     }
 
-    QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
+    QA_EXPECT_OK(qa, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
 
@@ -370,7 +370,7 @@ static void test_hot_path_heap_guard_and_transfers(qa_counts *qa)
     qa_check(qa, gd_debug_heap_alloc_count() == heap_before,
              "debug heap guard sees no core heap allocation in tensor hot path",
              "core heap allocation count changed during guarded hot path");
-    QA_EXPECT_OK(qa, gd_end(ctx));
+    QA_EXPECT_OK(qa, gd_end_step(ctx));
     QA_EXPECT_OK(qa, gd_memory_stats_query(ctx, &stats));
     qa_check(qa, stats.scratch.max_slot_watermark >= compact.storage.offset + compact.storage.nbytes,
              "scratch watermark includes explicit contiguous output",

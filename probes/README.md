@@ -10,7 +10,7 @@ Checks foundation invariants without v1 headers or real kernels:
 - aligned arena spans, OOM status, reset generations, sealed params
 - no heap allocation in scoped hot path
 - scratch/data ring slots + fake async fences
-- `gd_begin` / `gd_end` lifecycle
+- step lifecycle (`gd_begin_step` / `gd_end_step` in the public API)
 - concrete tensors, storage allocation vs view offsets, non-contiguous `slice`, explicit `contiguous`
 - `Module`, `ModuleList`, `ModuleDict`
 - named parameter traversal, tied-weight dedup, param groups

@@ -113,11 +113,11 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_write(ctx, &g, g_data, bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
     x.requires_grad = true;
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(ctx, gd_relu(ctx, &x, &y));
     CHECK(ctx, gd_backward(ctx, &y, &g));
     CHECK(ctx, gd_tensor_grad(ctx, &x, &dx));
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &dx, dx_data, bytes));
     if (write_file(argv[3], dx_data, bytes) != 0) { goto fail; }

@@ -198,7 +198,7 @@ static void test_reduce_forward_backward(void)
         ref_sum += x_data[i];
     }
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_sum(ctx, &x, &sum));
     CHECK(sum.rank == 0U, "reduce_sum output is scalar");
     CHECK_OK(gd_tensor_read(ctx, &sum, &got_sum, sizeof(got_sum)));
@@ -212,9 +212,9 @@ static void test_reduce_forward_backward(void)
         want_grad[i] = ref_sum / (float)COUNT;
     }
     expect_f32_tensor(ctx, &dx, want_grad, COUNT, 1.0e-6f, "reduce_mean backward broadcast scale");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean(ctx, &x, &mean));
     CHECK_OK(gd_backward(ctx, &mean, NULL));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
@@ -222,7 +222,7 @@ static void test_reduce_forward_backward(void)
         want_grad[i] = 1.0f / (float)COUNT;
     }
     expect_f32_tensor(ctx, &dx, want_grad, COUNT, 1.0e-6f, "reduce_mean autograd gradient");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     gd_context_destroy(ctx);
 }
@@ -247,7 +247,7 @@ static void test_reduce_axis_forward_backward(void)
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_sum_axis(ctx, &x, 1, false, &out));
     CHECK(out.rank == 1U && out.shape[0] == 2, "reduce_sum_axis output shape");
     expect_f32_tensor(ctx, &out, want_row_sum, 2U, 1.0e-6f, "reduce_sum_axis rows");
@@ -263,9 +263,9 @@ static void test_reduce_axis_forward_backward(void)
         want_grad[i] = 1.0f;
     }
     expect_f32_tensor(ctx, &dx, want_grad, COUNT, 1.0e-6f, "reduce_sum_axis autograd grad");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean_axis(ctx, &x, 0, true, &out));
     CHECK(out.rank == 2U && out.shape[0] == 1 && out.shape[1] == 3,
           "reduce_mean_axis keepdims output shape");
@@ -276,9 +276,9 @@ static void test_reduce_axis_forward_backward(void)
         want_grad[i] = 0.5f;
     }
     expect_f32_tensor(ctx, &dx, want_grad, COUNT, 1.0e-6f, "reduce_mean_axis keepdims autograd grad");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean_axis(ctx, &x, -1, false, &out));
     CHECK(out.rank == 1U && out.shape[0] == 2, "reduce_mean_axis negative axis shape");
     CHECK_OK(gd_backward(ctx, &out, NULL));
@@ -287,7 +287,7 @@ static void test_reduce_axis_forward_backward(void)
         want_grad[i] = 1.0f / 3.0f;
     }
     expect_f32_tensor(ctx, &dx, want_grad, COUNT, 1.0e-6f, "reduce_mean_axis negative autograd grad");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     gd_context_destroy(ctx);
 }
@@ -323,7 +323,7 @@ static void test_mse_graph(void)
     target.requires_grad = false;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_sub(ctx, &pred, &target, &diff));
     CHECK_OK(gd_mul(ctx, &diff, &diff, &sq));
     CHECK_OK(gd_reduce_mean(ctx, &sq, &loss));
@@ -338,7 +338,7 @@ static void test_mse_graph(void)
     CHECK_OK(gd_backward(ctx, &loss, NULL));
     CHECK_OK(gd_tensor_grad(ctx, &pred, &dpred));
     expect_f16_tensor(ctx, &dpred, want_grad, COUNT, 1.0e-3f, "mse graph autograd grad");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     gd_context_destroy(ctx);
 }
@@ -364,11 +364,11 @@ static void test_reduce_f16(void)
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     CHECK_OK(gd_context_seal_params(ctx));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_sum(ctx, &x, &sum));
     CHECK_OK(gd_tensor_read(ctx, &sum, &got_h, sizeof(got_h)));
     CHECK(abs_f32(f16_bits_to_f32(got_h) - want) <= 1.0e-3f, "reduce_sum f16 forward");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 
@@ -415,7 +415,7 @@ static void test_reduce_f16_large_multistage(void)
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, (size_t)COUNT * sizeof(*x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_sum(ctx, &x, &sum));
     CHECK_OK(gd_tensor_read(ctx, &sum, &got_h, sizeof(got_h)));
     CHECK(abs_f32(f16_bits_to_f32(got_h) - want) <= 5.0e-1f, "large reduce_sum f16 forward");
@@ -425,7 +425,7 @@ static void test_reduce_f16_large_multistage(void)
     for (i = 0U; i < COUNT; ++i) {
         CHECK(abs_f32(f16_bits_to_f32(dx_h[i]) - 1.0f) <= 0.0f, "large reduce_sum f16 autograd fill");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
     free(x_h);
     free(dx_h);
@@ -477,7 +477,7 @@ static void test_reduce_mean_f16_large_multistage(void)
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean(ctx, &x, &mean));
     CHECK(mean.dtype == GD_DTYPE_F32 && mean.rank == 0U, "large f16 reduce_mean scalar is f32");
     CHECK_OK(gd_tensor_read(ctx, &mean, &got_mean, sizeof(got_mean)));
@@ -490,9 +490,9 @@ static void test_reduce_mean_f16_large_multistage(void)
         CHECK(abs_f32(f16_bits_to_f32(dx_h[i]) - want_direct) <= 1.0e-6f,
               "large f16 reduce_mean direct backward f32 grad scalar");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean(ctx, &x, &mean));
     CHECK_OK(gd_backward(ctx, &mean, NULL));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
@@ -502,7 +502,7 @@ static void test_reduce_mean_f16_large_multistage(void)
         CHECK(abs_f32(f16_bits_to_f32(dx_h[i]) - want_auto) <= 1.0e-6f,
               "large f16 reduce_mean autograd f32 seed");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     gd_context_destroy(ctx);
     free(x_h);
@@ -539,7 +539,7 @@ static void test_reduce_f16_axis_rank3(void)
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_sum_axis(ctx, &x, 1, false, &out));
     CHECK(out.rank == 2U && out.shape[0] == 2 && out.shape[1] == 4, "f16 axis rank3 output shape");
     expect_f16_tensor(ctx, &out, want_axis, 8U, 1.0e-3f, "f16 axis rank3 forward");
@@ -557,7 +557,7 @@ static void test_reduce_f16_axis_rank3(void)
     CHECK_OK(gd_backward(ctx, &out, NULL));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
     expect_f16_tensor(ctx, &dx, want_grad_auto, COUNT, 0.0f, "f16 axis rank3 autograd backward");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 
@@ -595,7 +595,7 @@ static void test_reduce_mean_f16_axis_rank3(void)
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_reduce_mean_axis(ctx, &x, 1, false, &out));
     CHECK(out.dtype == GD_DTYPE_F16 && out.rank == 2U && out.shape[0] == 2 && out.shape[1] == 4,
           "f16 mean axis rank3 output shape");
@@ -616,7 +616,7 @@ static void test_reduce_mean_f16_axis_rank3(void)
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
     expect_f16_tensor(ctx, &dx, want_grad_auto, COUNT, 1.0e-3f,
                       "f16 mean axis rank3 autograd backward");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 

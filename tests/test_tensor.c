@@ -176,7 +176,7 @@ static void test_scope_tensor_views(gd_context *ctx)
                  GD_ERR_BAD_STATE);
     gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
 
@@ -209,25 +209,25 @@ static void test_scope_tensor_views(gd_context *ctx)
 
     gd_debug_set_heap_guard(false);
     CHECK(gd_debug_heap_alloc_count() == heap_before, "tensor hot path does not heap allocate");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_tensor_read(ctx, &scratch_ones, scratch_fill, sizeof(scratch_fill)));
     CHECK(scratch_fill[0] == 1.0f && scratch_fill[1] == 1.0f &&
           scratch_fill[2] == 1.0f && scratch_fill[3] == 1.0f,
-          "scoped ones fill commits at gd_end");
+          "scoped ones fill commits at gd_end_step");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != hidden_slot,
           "second scope uses next scratch slot");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) == hidden_slot,
           "third scope reuses original scratch slot");
     CHECK(gd_debug_ring_slot_generation(ctx, GD_ARENA_SCRATCH, (uint32_t)hidden_slot) > hidden_generation,
           "scratch generation bumped on reuse");
     CHECK_STATUS(gd_tensor_validate(ctx, &hidden), GD_ERR_BAD_STATE);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     CHECK_OK(gd_memory_stats_query(ctx, &stats));
     CHECK(stats.scratch.max_slot_watermark >= compact.storage.offset + compact.storage.nbytes,

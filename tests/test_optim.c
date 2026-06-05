@@ -162,11 +162,11 @@ static void run_amp_adamw_test(void)
     CHECK_OK(gd_amp_scaler_create(&amp, &scaler));
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_relu(ctx, &param, &y));
     CHECK_OK(gd_backward_scaled(ctx, &y, &grad_seed, gd_amp_scaler_scale(scaler)));
     CHECK_OK(gd_optimizer_step_amp(ctx, opt, scaler));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     CHECK_OK(gd_tensor_read(ctx, &param, got, sizeof(got)));
     expect_adamw_first_step(want, p0_f32, g0_f32, 3U, &adam);
@@ -182,11 +182,11 @@ static void run_amp_adamw_test(void)
     grad_bits[1] = f32_to_f16_bits(1.0f);
     grad_bits[2] = f32_to_f16_bits(-1.0f);
     CHECK_OK(gd_tensor_write(ctx, &grad_seed, grad_bits, sizeof(grad_bits)));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_relu(ctx, &param, &y));
     CHECK_OK(gd_backward_scaled(ctx, &y, &grad_seed, gd_amp_scaler_scale(scaler)));
     CHECK_OK(gd_optimizer_step_amp(ctx, opt, scaler));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK_OK(gd_synchronize(ctx));
     CHECK_OK(gd_tensor_read(ctx, &param, got, sizeof(got)));
     for (i = 0U; i < 3U; ++i) {

@@ -141,13 +141,13 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, gd_shape_make(rank, shape), 256U, &x));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, x_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
     if (axis == AXIS_ALL) {
         CHECK(ctx, gd_reduce_mean(ctx, &x, &out));
     } else {
         CHECK(ctx, gd_reduce_mean_axis(ctx, &x, axis, false, &out));
     }
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     if (tensor_count(out.rank, out.shape, &out_count) != 0) { goto fail; }
     out_elem_size = out.dtype == GD_DTYPE_F32 ? 4U : 2U;

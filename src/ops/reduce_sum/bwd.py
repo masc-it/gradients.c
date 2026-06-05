@@ -176,7 +176,7 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_write(ctx, &grad_out, grad_data, grad_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
     x.requires_grad = true;
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     if (axis == AXIS_ALL) {
         CHECK(ctx, gd_reduce_sum(ctx, &x, &out));
     } else {
@@ -184,7 +184,7 @@ int main(int argc, char **argv)
     }
     CHECK(ctx, gd_backward(ctx, &out, &grad_out));
     CHECK(ctx, gd_tensor_grad(ctx, &x, &dx));
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &dx, dx_data, x_bytes));
     if (write_file(argv[3], dx_data, x_bytes) != 0) { goto fail; }

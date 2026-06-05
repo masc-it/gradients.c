@@ -145,13 +145,13 @@ int main(int argc, char **argv)
         CHECK(ctx, gd_tensor_write(ctx, &b, b_data, b_bytes));
     }
     CHECK(ctx, gd_context_seal_params(ctx));
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     if (has_bias != 0U) {
         CHECK(ctx, gd_linear_backward(ctx, &x, &w, &b, &g, &dx, &dw, &db));
     } else {
         CHECK(ctx, gd_linear_backward(ctx, &x, &w, NULL, &g, &dx, &dw, NULL));
     }
-    CHECK(ctx, gd_end(ctx)); CHECK(ctx, gd_synchronize(ctx));
+    CHECK(ctx, gd_end_step(ctx)); CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &dx, dx_data, dx_bytes));
     CHECK(ctx, gd_tensor_read(ctx, &dw, dw_data, dw_bytes));
     if (has_bias != 0U) { CHECK(ctx, gd_tensor_read(ctx, &db, db_data, b_bytes)); }

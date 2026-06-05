@@ -326,7 +326,7 @@ static bool mul_perf_run_once(mul_perf_model *model, mul_perf_op op)
     gd_tensor dx;
     gd_tensor dy;
     gd_scope_mode mode = op == MUL_PERF_FWD ? GD_SCOPE_INFER : GD_SCOPE_TRAIN;
-    MUL_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, mode));
+    MUL_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, mode, gd_batch_empty()));
     if (op == MUL_PERF_FWD) {
         MUL_PERF_REQUIRE_OK(model->ctx, gd_mul(model->ctx, &model->x, &model->y, &out));
     } else if (op == MUL_PERF_BWD_X) {
@@ -341,7 +341,7 @@ static bool mul_perf_run_once(mul_perf_model *model, mul_perf_op op)
     } else {
         return false;
     }
-    MUL_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    MUL_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     MUL_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

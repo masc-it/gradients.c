@@ -282,9 +282,9 @@ static bool reduce_perf_run_all_forward(reduce_perf_model *model, int32_t axis)
     gd_tensor out;
     (void)axis;
     model->x.requires_grad = false;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_reduce_sum(model->ctx, &model->x, &out));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -294,10 +294,10 @@ static bool reduce_perf_run_all_backward(reduce_perf_model *model, int32_t axis)
     gd_tensor dx;
     (void)axis;
     model->x.requires_grad = false;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx,
                            gd_reduce_sum_backward(model->ctx, &model->x, &model->scalar_grad, &dx));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -308,11 +308,11 @@ static bool reduce_perf_run_all_autograd(reduce_perf_model *model, int32_t axis)
     gd_tensor dx;
     (void)axis;
     model->x.requires_grad = true;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_reduce_sum(model->ctx, &model->x, &out));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &out, &model->scalar_grad));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->x, &dx));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -321,9 +321,9 @@ static bool reduce_perf_run_axis_forward(reduce_perf_model *model, int32_t axis)
 {
     gd_tensor out;
     model->x.requires_grad = false;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_reduce_sum_axis(model->ctx, &model->x, axis, false, &out));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -332,7 +332,7 @@ static bool reduce_perf_run_axis_backward(reduce_perf_model *model, int32_t axis
 {
     gd_tensor dx;
     model->x.requires_grad = false;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx,
                            gd_reduce_sum_axis_backward(model->ctx,
                                                        &model->x,
@@ -340,7 +340,7 @@ static bool reduce_perf_run_axis_backward(reduce_perf_model *model, int32_t axis
                                                        axis,
                                                        false,
                                                        &dx));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -350,11 +350,11 @@ static bool reduce_perf_run_axis_autograd(reduce_perf_model *model, int32_t axis
     gd_tensor out;
     gd_tensor dx;
     model->x.requires_grad = true;
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_reduce_sum_axis(model->ctx, &model->x, axis, false, &out));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &out, &model->axis_grad));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->x, &dx));
-    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    REDUCE_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

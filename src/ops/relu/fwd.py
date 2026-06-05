@@ -107,9 +107,9 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &x));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(ctx, gd_relu(ctx, &x, &y));
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &y, y_data, bytes));
     if (write_file(argv[2], y_data, bytes) != 0) { goto fail; }

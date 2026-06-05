@@ -73,8 +73,8 @@ Use four logical arenas per context.
 | --- | --- | --- | --- |
 | `params` | model / optimizer lifetime | model structs, parameter descriptors/storage, persistent buffers, leaf grads, optimizer slots, scaler/scheduler state | never resets during training; sealed after init |
 | `state` / `state_arena` | explicit runtime-state lifetime | KV caches, recurrent state, generation buffers, long-lived non-checkpoint workspaces | object-level reset/reuse only |
-| `scratch` | one train/eval/infer scope | activations, temporary outputs, tape entries, saved tensors, workspaces, temporary grads | ring slot reset at `gd_begin` |
-| `data` | one batch / input scope | decoded samples, token/image buffers, input tensor descriptors/storage | ring slot reset at `gd_begin` |
+| `scratch` | one train/eval/infer step | activations, temporary outputs, tape entries, saved tensors, workspaces, temporary grads | ring slot reset at `gd_begin_step` |
+| `data` | one loaded batch / input step | decoded samples, token/image buffers, input tensor descriptors/storage | producer/consumer slot lifecycle; reset before worker fill |
 
 No tensor owns memory with `malloc`.
 
@@ -105,21 +105,23 @@ Optimizer state dtype and placement are explicit. Adam-family moments use FP32 s
 State objects are opaque handles containing allocation metadata and a last-use backend fence.
 Callers acquire a scoped span/tensor view before enqueueing work; the acquire records the exact allocation epoch touched by the scope.
 
-When async work reads or mutates a state object, `gd_end(ctx)` records the command fence on that object.
+When async work reads or mutates a state object, `gd_end_step(ctx)` records the command fence on that object.
 
 Reset/reuse of an in-flight state object waits for the object's last-use fence, then reuses the same block when it fits or allocates a larger/fresh block when required. Reset is rejected while the object has already been acquired in the active scope.
 
 Whole `state_arena` reset is only valid for explicit session/model/cache teardown after all object fences are complete. Runtime state is not saved in training checkpoints unless caller opts into a separate application-level state save.
 
-### Scratch/data rings and scope lifecycle
+### Scratch/data rings and step lifecycle
 
-`scratch` and `data` are ring-buffered on async GPU backends.
+`scratch` is ring-buffered on async GPU backends. `data` is a ring-backed producer/consumer pool.
 
-`gd_begin(ctx, mode)` selects completed `scratch` and `data` slots, resets their bump offsets, bumps slot generations, prepares tape when training, and opens an ordered backend scope.
+Dataloader workers acquire free `data` slots, reset their bump offsets/generations, collate host fields, write batch tensor bytes, and publish the slot as ready.
 
-If no slot is complete, `gd_begin` waits for the oldest in-flight slot only. It must not call global synchronize as normal lifecycle.
+`gd_begin_step(ctx, mode, batch)` binds a ready batch/data slot, selects a completed `scratch` slot, prepares tape when training, and opens an ordered backend scope.
 
-`gd_end(ctx)` closes tape, submits queued backend work as needed, and records the resulting fence on every ring slot and state object acquired by the scope.
+If no scratch slot is complete, `gd_begin_step` waits for the oldest in-flight scratch slot only. If no data slot is free, dataloader workers wait for a retired data slot fence before refilling it.
+
+`gd_end_step(ctx)` closes tape, submits queued backend work as needed, and records the resulting fence on the scratch slot, bound data slot, and state objects acquired by the step.
 
 A tensor descriptor or view that references a ring slot is valid only until that slot is reset. Debug descriptors store arena kind, slot index, and generation so stale use can be caught when the descriptor is still reachable.
 
@@ -369,32 +371,35 @@ Model/optimizer/scaler/scheduler constructors allocate persistent metadata/stora
 
 Forward ops take context and tensors.
 
-Use scopes for train/eval/infer lifecycle.
+Use explicit steps for train/eval/infer lifecycle. Every step binds a batch.
 
 Training loop shape:
 
 ```c
-gd_begin(ctx, GD_SCOPE_TRAIN);
-load_batch(ctx, &batch);
+gd_dataloader_next(loader, &batch);
+gd_begin_step(ctx, GD_SCOPE_TRAIN, batch);
 gd_optimizer_zero_grad(ctx, opt);
-model_forward(ctx, model, batch.x, &loss);
+model_forward(ctx, model, gd_batch_tensor(batch, "x"), &loss);
 gd_amp_backward(ctx, scaler, loss);
 gd_optimizer_step_amp(ctx, opt, scaler);
-gd_end(ctx);
+gd_end_step(ctx);
+gd_dataloader_release(loader, batch);
 ```
 
 Eval/inference loop shape:
 
 ```c
-gd_begin(ctx, GD_SCOPE_INFER);
-model_prefill_or_decode(ctx, model, state, input_tokens, &logits);
+gd_dataloader_next(loader, &batch);
+gd_begin_step(ctx, GD_SCOPE_INFER, batch);
+model_prefill_or_decode(ctx, model, state, gd_batch_tensor(batch, "tokens"), &logits);
 gd_topk_sample(ctx, logits, rng_state, next_tokens);
-gd_end(ctx);
+gd_end_step(ctx);
+gd_dataloader_release(loader, batch);
 ```
 
-`gd_begin(ctx, mode)` advances `scratch`/`data` ring slots to completed generations, prepares tape when training, and opens a backend command batch/stream scope. If the ring is exhausted, it waits for the oldest slot only.
+`gd_begin_step(ctx, mode, batch)` binds a ready data slot, advances `scratch` to a completed generation, prepares tape when training, and opens a backend command batch/stream scope. If the scratch ring is exhausted, it waits for the oldest scratch slot only.
 
-`gd_end(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects acquired by the scope. It does not reset `params` or `state`.
+`gd_end_step(ctx)` closes the tape when training, submits queued backend work as needed, and records backend completion fences for arena slots and state objects acquired by the step. It does not reset `params` or `state`.
 
 `gd_optimizer_zero_grad(ctx, opt)` is explicit so callers can choose gradient accumulation by omitting it.
 
@@ -620,15 +625,17 @@ Early-fusion VLM remains decoder-only:
 
 ## Data path
 
-Dataloader writes batch tensors into `data`.
+Dataloader writes batch tensors into `data` slots before execution.
+
+Every execution is an explicit step: `gd_begin_step(ctx, mode, batch)` binds a ready batch/data slot, and `gd_end_step(ctx)` records the fence that protects that batch's data until reuse.
 
 Data tensors survive through forward and backward for that batch.
 
-On async GPUs, `data` is ring-buffered like `scratch`; next batch writes into a completed slot, never memory still referenced by in-flight work.
+On async GPUs, `data` is a producer/consumer pool: loader workers fill free slots, ready batches bind to steps, and retired slots are reused only after their recorded fence completes.
 
 Variable-length batches use explicit packed tensors and metadata tensors.
 
-Padding policy is model or dataloader choice, not core runtime magic.
+Padding policy is model or datataloader choice, not core runtime magic.
 
 Generation token ping-pong buffers may live in `state_arena` or `data` ring slots. Production generation should write next tokens device-side to avoid per-token CPU synchronization.
 

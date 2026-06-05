@@ -124,7 +124,7 @@ static void test_scope_transfer(gd_context *ctx)
     }
     memset(tokens_dst, 0, sizeof(tokens_dst));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, gd_shape_make(2U, token_shape), 64U, &tokens));
@@ -146,7 +146,7 @@ static void test_scope_transfer(gd_context *ctx)
     CHECK_OK(gd_tensor_write(ctx, &ordered, ordered_src, sizeof(ordered_src)));
     gd_debug_set_heap_guard(false);
     CHECK(gd_debug_heap_alloc_count() == heap_before, "transfer hot path does not heap allocate");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     memset(hidden_dst, 0, sizeof(hidden_dst));
     CHECK_OK(gd_tensor_read(ctx, &hidden, hidden_dst, sizeof(hidden_dst)));
@@ -155,18 +155,18 @@ static void test_scope_transfer(gd_context *ctx)
     CHECK(memcmp(ordered_src, ordered_dst, sizeof(ordered_src)) == 0,
           "blocking write after queued fill preserves program order");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != scratch_slot,
           "second scope advances scratch slot");
-    CHECK_OK(gd_end(ctx));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) == scratch_slot,
           "third scope reuses original scratch slot");
     CHECK(gd_debug_ring_slot_generation(ctx, GD_ARENA_SCRATCH, (uint32_t)scratch_slot) > scratch_generation,
           "scratch generation bumped before stale transfer check");
     CHECK_STATUS(gd_tensor_read(ctx, &hidden, hidden_dst, sizeof(hidden_dst)), GD_ERR_BAD_STATE);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 }
 
 int main(void)

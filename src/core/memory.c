@@ -3,10 +3,12 @@
 #include "backend.h"
 #include "memory_internal.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define GD_MAX_RING_SLOTS 64U
 #define GD_MAX_TOUCHED_STATE 128U
@@ -27,9 +29,18 @@ typedef struct gd_arena {
     bool sealed;
 } gd_arena;
 
+typedef enum gd_data_slot_state_internal {
+    GD_DATA_SLOT_FREE_INTERNAL = 0,
+    GD_DATA_SLOT_FILLING_INTERNAL = 1,
+    GD_DATA_SLOT_READY_INTERNAL = 2,
+    GD_DATA_SLOT_IN_STEP_INTERNAL = 3,
+    GD_DATA_SLOT_RETIRED_INTERNAL = 4,
+} gd_data_slot_state_internal;
+
 typedef struct gd_ring_arena {
     gd_arena *slots;
     uint64_t *slot_fences;
+    uint8_t *slot_states; /* Only used by the data ring. */
     uint32_t n_slots;
     int32_t current;
     uint64_t waits;
@@ -80,6 +91,14 @@ struct gd_context {
     uint64_t next_tensor_id;
     gd_status status;
     char error[160];
+    pthread_mutex_t tensor_id_mutex;
+    pthread_mutex_t backend_mutex;
+    pthread_mutex_t data_mutex;
+    pthread_cond_t data_cv;
+    bool sync_ready;
+    gd_batch *active_batch;
+    int32_t active_data_slot;
+    uint64_t active_data_generation;
 };
 
 static uint64_t gd_global_heap_allocs;
@@ -132,15 +151,28 @@ bool gd_context_in_scope(const gd_context *ctx)
 
 gd_status gd_context_next_tensor_id(gd_context *ctx, uint64_t *out_id)
 {
+    gd_status st = GD_OK;
     if (ctx == NULL || out_id == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    pthread_mutex_lock(&ctx->tensor_id_mutex);
     if (ctx->next_tensor_id == 0U || ctx->next_tensor_id == UINT64_MAX) {
-        return gd_set_error(ctx, GD_ERR_INTERNAL, "tensor id counter overflow");
+        st = gd_set_error(ctx, GD_ERR_INTERNAL, "tensor id counter overflow");
+    } else {
+        *out_id = ctx->next_tensor_id;
+        ctx->next_tensor_id += 1U;
     }
-    *out_id = ctx->next_tensor_id;
-    ctx->next_tensor_id += 1U;
-    return GD_OK;
+    pthread_mutex_unlock(&ctx->tensor_id_mutex);
+    return st;
+}
+
+uint64_t gd_context_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0U;
+    }
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
 static void *gd_heap_alloc(size_t nbytes)
@@ -304,7 +336,7 @@ static gd_status gd_pending_add(gd_context *ctx, uint64_t sequence, gd_backend_f
     return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "pending fence table full");
 }
 
-static bool gd_fence_sequence_is_complete(gd_context *ctx, uint64_t sequence)
+static bool gd_fence_sequence_is_complete_locked(gd_context *ctx, uint64_t sequence)
 {
     gd_backend_fence *fence;
     if (sequence == 0U || sequence <= ctx->backend.completed_fence) {
@@ -322,24 +354,40 @@ static bool gd_fence_sequence_is_complete(gd_context *ctx, uint64_t sequence)
     return false;
 }
 
+static bool gd_fence_sequence_is_complete(gd_context *ctx, uint64_t sequence)
+{
+    bool complete;
+    pthread_mutex_lock(&ctx->backend_mutex);
+    complete = gd_fence_sequence_is_complete_locked(ctx, sequence);
+    pthread_mutex_unlock(&ctx->backend_mutex);
+    return complete;
+}
+
 static gd_status gd_backend_wait_until(gd_context *ctx, uint64_t sequence)
 {
     gd_backend_fence *fence;
-    gd_status st;
+    gd_status st = GD_OK;
+    pthread_mutex_lock(&ctx->backend_mutex);
     if (sequence == 0U || sequence <= ctx->backend.completed_fence) {
+        pthread_mutex_unlock(&ctx->backend_mutex);
         return GD_OK;
     }
     fence = gd_pending_find(ctx, sequence);
     if (fence == NULL) {
-        return gd_set_error(ctx, GD_ERR_INTERNAL, "missing backend fence");
+        st = gd_set_error(ctx, GD_ERR_INTERNAL, "missing backend fence");
+        pthread_mutex_unlock(&ctx->backend_mutex);
+        return st;
     }
     st = gd_backend_fence_wait(fence);
     if (st != GD_OK) {
-        return gd_set_error(ctx, st, "backend fence wait failed");
+        st = gd_set_error(ctx, st, "backend fence wait failed");
+        pthread_mutex_unlock(&ctx->backend_mutex);
+        return st;
     }
     ctx->backend.completed_fence = sequence;
     ctx->backend.waits += 1U;
     gd_pending_release_completed(ctx);
+    pthread_mutex_unlock(&ctx->backend_mutex);
     return GD_OK;
 }
 
@@ -382,22 +430,27 @@ static gd_status gd_backend_record(gd_context *ctx, uint64_t *out_sequence)
     if (ctx == NULL || out_sequence == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    pthread_mutex_lock(&ctx->backend_mutex);
     st = gd_backend_record_fence(ctx->backend.backend, &fence);
     if (st != GD_OK) {
+        pthread_mutex_unlock(&ctx->backend_mutex);
         return gd_set_error(ctx, st, "backend fence record failed");
     }
     sequence = ctx->backend.next_fence + 1U;
     if (sequence == 0U) {
         gd_backend_fence_destroy(&fence);
+        pthread_mutex_unlock(&ctx->backend_mutex);
         return gd_set_error(ctx, GD_ERR_INTERNAL, "backend fence sequence overflow");
     }
     st = gd_pending_add(ctx, sequence, &fence);
     if (st != GD_OK) {
         gd_backend_fence_destroy(&fence);
+        pthread_mutex_unlock(&ctx->backend_mutex);
         return st;
     }
     ctx->backend.next_fence = sequence;
     *out_sequence = sequence;
+    pthread_mutex_unlock(&ctx->backend_mutex);
     return GD_OK;
 }
 
@@ -412,6 +465,7 @@ static void gd_ring_destroy(gd_ring_arena *ring)
     }
     free(ring->slots);
     free(ring->slot_fences);
+    free(ring->slot_states);
     memset(ring, 0, sizeof(*ring));
     ring->current = -1;
 }
@@ -432,7 +486,11 @@ static gd_status gd_ring_init(gd_backend *backend,
     }
     ring->slots = (gd_arena *)gd_heap_alloc((size_t)n_slots * sizeof(*ring->slots));
     ring->slot_fences = (uint64_t *)gd_heap_alloc((size_t)n_slots * sizeof(*ring->slot_fences));
-    if (ring->slots == NULL || ring->slot_fences == NULL) {
+    if (kind == GD_ARENA_DATA) {
+        ring->slot_states = (uint8_t *)gd_heap_alloc((size_t)n_slots * sizeof(*ring->slot_states));
+    }
+    if (ring->slots == NULL || ring->slot_fences == NULL ||
+        (kind == GD_ARENA_DATA && ring->slot_states == NULL)) {
         gd_ring_destroy(ring);
         return GD_ERR_OUT_OF_MEMORY;
     }
@@ -740,7 +798,17 @@ gd_status gd_context_create(const gd_memory_config *config, gd_context **out_ctx
     ctx->scratch.current = -1;
     ctx->data.current = -1;
     ctx->mode = GD_SCOPE_NONE;
+    ctx->active_data_slot = -1;
     ctx->next_tensor_id = 1U;
+    if (pthread_mutex_init(&ctx->tensor_id_mutex, NULL) != 0 ||
+        pthread_mutex_init(&ctx->backend_mutex, NULL) != 0 ||
+        pthread_mutex_init(&ctx->data_mutex, NULL) != 0 ||
+        pthread_cond_init(&ctx->data_cv, NULL) != 0) {
+        gd_backend_destroy(backend);
+        free(ctx);
+        return GD_ERR_INTERNAL;
+    }
+    ctx->sync_ready = true;
     st = gd_arena_init(backend, &ctx->params, GD_ARENA_PARAMS, -1,
                        cfg.params_bytes, default_alignment);
     if (st != GD_OK) {
@@ -796,6 +864,12 @@ void gd_context_destroy(gd_context *ctx)
     gd_arena_destroy(&ctx->params);
     gd_arena_destroy(&ctx->state);
     gd_backend_destroy(ctx->backend.backend);
+    if (ctx->sync_ready) {
+        pthread_cond_destroy(&ctx->data_cv);
+        pthread_mutex_destroy(&ctx->data_mutex);
+        pthread_mutex_destroy(&ctx->backend_mutex);
+        pthread_mutex_destroy(&ctx->tensor_id_mutex);
+    }
     free(ctx);
 }
 
@@ -832,55 +906,341 @@ gd_status gd_context_seal_params(gd_context *ctx)
     return GD_OK;
 }
 
-gd_status gd_begin(gd_context *ctx, gd_scope_mode mode)
+static bool gd_scope_mode_is_valid(gd_scope_mode mode)
 {
-    gd_status st;
-    if (ctx == NULL) {
+    return mode == GD_SCOPE_TRAIN || mode == GD_SCOPE_EVAL || mode == GD_SCOPE_INFER;
+}
+
+static gd_status gd_data_shape_nbytes(gd_dtype dtype, gd_shape shape, size_t *out)
+{
+    size_t elem_size;
+    size_t n = 1U;
+    uint32_t i;
+    if (out == NULL || shape.rank > GD_MAX_DIMS) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (ctx->in_scope || (mode != GD_SCOPE_TRAIN && mode != GD_SCOPE_EVAL && mode != GD_SCOPE_INFER)) {
-        return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid gd_begin state");
+    elem_size = gd_dtype_size(dtype);
+    if (elem_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_ring_select(ctx, &ctx->scratch);
+    for (i = 0U; i < shape.rank; ++i) {
+        if (shape.dims[i] <= 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        if ((uint64_t)shape.dims[i] > (uint64_t)(SIZE_MAX / n)) {
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        n *= (size_t)shape.dims[i];
+    }
+    if (n > SIZE_MAX / elem_size) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *out = n * elem_size;
+    return GD_OK;
+}
+
+static void gd_data_tensor_set_strides(gd_tensor *tensor)
+{
+    uint32_t i;
+    int64_t stride = 1;
+    for (i = tensor->rank; i > 0U; --i) {
+        uint32_t dim = i - 1U;
+        tensor->strides[dim] = stride;
+        stride *= tensor->shape[dim];
+    }
+}
+
+gd_status gd_context_data_slot_acquire(gd_context *ctx,
+                                       int32_t *out_slot,
+                                       uint64_t *out_generation)
+{
+    if (out_slot != NULL) {
+        *out_slot = -1;
+    }
+    if (out_generation != NULL) {
+        *out_generation = 0U;
+    }
+    if (ctx == NULL || out_slot == NULL || out_generation == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (;;) {
+        int32_t retired = -1;
+        uint64_t retired_fence = 0U;
+        uint32_t i;
+        pthread_mutex_lock(&ctx->data_mutex);
+        for (i = 0U; i < ctx->data.n_slots; ++i) {
+            if (ctx->data.slot_states[i] == (uint8_t)GD_DATA_SLOT_FREE_INTERNAL) {
+                gd_arena_reset(&ctx->data.slots[i]);
+                ctx->data.slot_fences[i] = 0U;
+                ctx->data.slot_states[i] = (uint8_t)GD_DATA_SLOT_FILLING_INTERNAL;
+                *out_slot = (int32_t)i;
+                *out_generation = ctx->data.slots[i].generation;
+                pthread_mutex_unlock(&ctx->data_mutex);
+                return GD_OK;
+            }
+        }
+        for (i = 0U; i < ctx->data.n_slots; ++i) {
+            if (ctx->data.slot_states[i] == (uint8_t)GD_DATA_SLOT_RETIRED_INTERNAL) {
+                retired = (int32_t)i;
+                retired_fence = ctx->data.slot_fences[i];
+                break;
+            }
+        }
+        if (retired < 0) {
+            pthread_cond_wait(&ctx->data_cv, &ctx->data_mutex);
+            pthread_mutex_unlock(&ctx->data_mutex);
+            continue;
+        }
+        pthread_mutex_unlock(&ctx->data_mutex);
+        {
+            gd_status st = gd_backend_wait_until(ctx, retired_fence);
+            if (st != GD_OK) {
+                return st;
+            }
+        }
+        pthread_mutex_lock(&ctx->data_mutex);
+        if (ctx->data.slot_states[(uint32_t)retired] ==
+                (uint8_t)GD_DATA_SLOT_RETIRED_INTERNAL &&
+            ctx->data.slot_fences[(uint32_t)retired] == retired_fence) {
+            ctx->data.slot_states[(uint32_t)retired] =
+                (uint8_t)GD_DATA_SLOT_FREE_INTERNAL;
+            ctx->data.slot_fences[(uint32_t)retired] = 0U;
+            pthread_cond_broadcast(&ctx->data_cv);
+        }
+        pthread_mutex_unlock(&ctx->data_mutex);
+    }
+}
+
+gd_status gd_context_data_slot_tensor(gd_context *ctx,
+                                      int32_t slot,
+                                      uint64_t generation,
+                                      gd_dtype dtype,
+                                      gd_shape shape,
+                                      size_t alignment,
+                                      gd_tensor *out)
+{
+    gd_tensor tensor;
+    size_t nbytes = 0U;
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || out == NULL || slot < 0 || (uint32_t)slot >= ctx->data.n_slots) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_data_shape_nbytes(dtype, shape, &nbytes);
+    if (st != GD_OK) {
+        return gd_set_error(ctx, st, "invalid data tensor shape");
+    }
+    memset(&tensor, 0, sizeof(tensor));
+    st = gd_context_next_tensor_id(ctx, &tensor.id);
     if (st != GD_OK) {
         return st;
     }
-    st = gd_ring_select(ctx, &ctx->data);
+    tensor.version = 0U;
+    tensor.dtype = dtype;
+    tensor.device = GD_DEVICE_GPU;
+    tensor.layout = GD_LAYOUT_STRIDED;
+    tensor.rank = shape.rank;
+    if (shape.rank > 0U) {
+        memcpy(tensor.shape, shape.dims, (size_t)shape.rank * sizeof(tensor.shape[0]));
+    }
+    gd_data_tensor_set_strides(&tensor);
+    pthread_mutex_lock(&ctx->data_mutex);
+    if (ctx->data.slot_states[(uint32_t)slot] !=
+            (uint8_t)GD_DATA_SLOT_FILLING_INTERNAL ||
+        ctx->data.slots[(uint32_t)slot].generation != generation) {
+        pthread_mutex_unlock(&ctx->data_mutex);
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "data slot is not fillable");
+    }
+    st = gd_arena_alloc(ctx, &ctx->data.slots[(uint32_t)slot], nbytes,
+                        alignment, &tensor.storage);
+    pthread_mutex_unlock(&ctx->data_mutex);
     if (st != GD_OK) {
+        return st;
+    }
+    tensor.view_offset = 0U;
+    tensor.is_view = false;
+    tensor.requires_grad = false;
+    tensor.is_leaf = true;
+    *out = tensor;
+    return GD_OK;
+}
+
+gd_status gd_context_data_slot_publish(gd_context *ctx,
+                                       int32_t slot,
+                                       uint64_t generation)
+{
+    if (ctx == NULL || slot < 0 || (uint32_t)slot >= ctx->data.n_slots) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    pthread_mutex_lock(&ctx->data_mutex);
+    if (ctx->data.slot_states[(uint32_t)slot] !=
+            (uint8_t)GD_DATA_SLOT_FILLING_INTERNAL ||
+        ctx->data.slots[(uint32_t)slot].generation != generation) {
+        pthread_mutex_unlock(&ctx->data_mutex);
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "data slot publish state mismatch");
+    }
+    ctx->data.slot_states[(uint32_t)slot] = (uint8_t)GD_DATA_SLOT_READY_INTERNAL;
+    pthread_cond_broadcast(&ctx->data_cv);
+    pthread_mutex_unlock(&ctx->data_mutex);
+    return GD_OK;
+}
+
+gd_status gd_context_data_slot_abort(gd_context *ctx,
+                                     int32_t slot,
+                                     uint64_t generation)
+{
+    if (ctx == NULL || slot < 0 || (uint32_t)slot >= ctx->data.n_slots) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    pthread_mutex_lock(&ctx->data_mutex);
+    if (ctx->data.slots[(uint32_t)slot].generation == generation &&
+        (ctx->data.slot_states[(uint32_t)slot] ==
+             (uint8_t)GD_DATA_SLOT_FILLING_INTERNAL ||
+         ctx->data.slot_states[(uint32_t)slot] ==
+             (uint8_t)GD_DATA_SLOT_READY_INTERNAL)) {
+        ctx->data.slot_states[(uint32_t)slot] = (uint8_t)GD_DATA_SLOT_FREE_INTERNAL;
+        ctx->data.slot_fences[(uint32_t)slot] = 0U;
+        pthread_cond_broadcast(&ctx->data_cv);
+    }
+    pthread_mutex_unlock(&ctx->data_mutex);
+    return GD_OK;
+}
+
+static gd_status gd_context_begin_on_data_slot(gd_context *ctx,
+                                               int32_t slot,
+                                               uint64_t generation)
+{
+    if (slot < 0 || (uint32_t)slot >= ctx->data.n_slots) {
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid step data slot");
+    }
+    pthread_mutex_lock(&ctx->data_mutex);
+    if (ctx->data.slot_states[(uint32_t)slot] != (uint8_t)GD_DATA_SLOT_READY_INTERNAL ||
+        ctx->data.slots[(uint32_t)slot].generation != generation) {
+        pthread_mutex_unlock(&ctx->data_mutex);
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "step batch is not ready");
+    }
+    ctx->data.slot_states[(uint32_t)slot] = (uint8_t)GD_DATA_SLOT_IN_STEP_INTERNAL;
+    ctx->data.current = slot;
+    ctx->active_data_slot = slot;
+    ctx->active_data_generation = generation;
+    pthread_mutex_unlock(&ctx->data_mutex);
+    return GD_OK;
+}
+
+static void gd_context_rollback_data_begin(gd_context *ctx, bool empty_batch)
+{
+    if (ctx == NULL || ctx->active_data_slot < 0) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->data_mutex);
+    if ((uint32_t)ctx->active_data_slot < ctx->data.n_slots &&
+        ctx->data.slot_states[(uint32_t)ctx->active_data_slot] ==
+            (uint8_t)GD_DATA_SLOT_IN_STEP_INTERNAL &&
+        ctx->data.slots[(uint32_t)ctx->active_data_slot].generation ==
+            ctx->active_data_generation) {
+        ctx->data.slot_states[(uint32_t)ctx->active_data_slot] =
+            empty_batch ? (uint8_t)GD_DATA_SLOT_FREE_INTERNAL
+                        : (uint8_t)GD_DATA_SLOT_READY_INTERNAL;
+        pthread_cond_broadcast(&ctx->data_cv);
+    }
+    ctx->data.current = -1;
+    ctx->active_data_slot = -1;
+    ctx->active_data_generation = 0U;
+    pthread_mutex_unlock(&ctx->data_mutex);
+}
+
+gd_status gd_begin_step(gd_context *ctx, gd_scope_mode mode, gd_batch *batch)
+{
+    gd_status st;
+    int32_t slot = -1;
+    uint64_t generation = 0U;
+    bool empty_batch;
+    if (ctx == NULL || batch == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    empty_batch = _gd_batch_is_empty(batch) != 0;
+    if (ctx->in_scope || !gd_scope_mode_is_valid(mode)) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid gd_begin_step state");
+    }
+    if (empty_batch) {
+        st = gd_context_data_slot_acquire(ctx, &slot, &generation);
+        if (st == GD_OK) {
+            st = gd_context_data_slot_publish(ctx, slot, generation);
+        }
+        if (st != GD_OK) {
+            if (slot >= 0) {
+                (void)gd_context_data_slot_abort(ctx, slot, generation);
+            }
+            return st;
+        }
+    } else {
+        st = _gd_batch_begin_step(batch, ctx, &slot, &generation);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    st = gd_context_begin_on_data_slot(ctx, slot, generation);
+    if (st != GD_OK) {
+        if (empty_batch) {
+            (void)gd_context_data_slot_abort(ctx, slot, generation);
+        } else {
+            _gd_batch_abort_begin_step(batch);
+        }
+        return st;
+    }
+    st = gd_ring_select(ctx, &ctx->scratch);
+    if (st != GD_OK) {
+        gd_context_rollback_data_begin(ctx, empty_batch);
+        if (!empty_batch) {
+            _gd_batch_abort_begin_step(batch);
+        }
         return st;
     }
     st = gd_backend_scope_begin(ctx->backend.backend);
     if (st != GD_OK) {
+        gd_context_rollback_data_begin(ctx, empty_batch);
+        if (!empty_batch) {
+            _gd_batch_abort_begin_step(batch);
+        }
         return gd_set_error(ctx, st, "backend scope begin failed");
     }
     ctx->mode = mode;
     ctx->in_scope = true;
     ctx->touched_state_count = 0U;
+    ctx->active_batch = empty_batch ? NULL : batch;
     st = gd_autograd_on_begin(ctx);
     if (st != GD_OK) {
+        ctx->active_batch = NULL;
         ctx->mode = GD_SCOPE_NONE;
         ctx->in_scope = false;
+        gd_context_rollback_data_begin(ctx, empty_batch);
+        if (!empty_batch) {
+            _gd_batch_abort_begin_step(batch);
+        }
         return st;
     }
     return GD_OK;
 }
 
-gd_status gd_end(gd_context *ctx)
+gd_status gd_end_step(gd_context *ctx)
 {
     uint32_t i;
     uint64_t fence;
     gd_status st;
+    int32_t data_slot;
     if (ctx == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (!ctx->in_scope || ctx->scratch.current < 0 || ctx->data.current < 0) {
-        return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid gd_end state");
+    if (!ctx->in_scope || ctx->scratch.current < 0 || ctx->active_data_slot < 0) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid gd_end_step state");
     }
     for (i = 0; i < ctx->touched_state_count; ++i) {
         if (!gd_state_object_live(ctx, ctx->touched_state[i].object) ||
             ctx->touched_state[i].object->epoch != ctx->touched_state[i].epoch) {
             return gd_set_error(ctx, GD_ERR_BAD_STATE,
-                                "touched state object changed during scope");
+                                "touched state object changed during step");
         }
     }
     st = gd_backend_record(ctx, &fence);
@@ -888,7 +1248,18 @@ gd_status gd_end(gd_context *ctx)
         return st;
     }
     ctx->scratch.slot_fences[ctx->scratch.current] = fence;
-    ctx->data.slot_fences[ctx->data.current] = fence;
+    data_slot = ctx->active_data_slot;
+    pthread_mutex_lock(&ctx->data_mutex);
+    if ((uint32_t)data_slot < ctx->data.n_slots &&
+        ctx->data.slot_states[(uint32_t)data_slot] ==
+            (uint8_t)GD_DATA_SLOT_IN_STEP_INTERNAL) {
+        ctx->data.slot_fences[(uint32_t)data_slot] = fence;
+        ctx->data.slot_states[(uint32_t)data_slot] =
+            (uint8_t)GD_DATA_SLOT_RETIRED_INTERNAL;
+        pthread_cond_broadcast(&ctx->data_cv);
+    }
+    ctx->data.current = -1;
+    pthread_mutex_unlock(&ctx->data_mutex);
     for (i = 0; i < ctx->touched_state_count; ++i) {
         ctx->touched_state[i].object->last_use_fence = fence;
     }
@@ -897,6 +1268,12 @@ gd_status gd_end(gd_context *ctx)
     gd_autograd_on_end(ctx);
     ctx->mode = GD_SCOPE_NONE;
     ctx->in_scope = false;
+    if (ctx->active_batch != NULL) {
+        _gd_batch_end_step(ctx->active_batch, fence);
+    }
+    ctx->active_batch = NULL;
+    ctx->active_data_slot = -1;
+    ctx->active_data_generation = 0U;
     return GD_OK;
 }
 

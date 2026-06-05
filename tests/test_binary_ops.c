@@ -204,7 +204,7 @@ static void run_binary_ops_test(void)
     b32.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_add(ctx, &x, &y, &out));
     for (i = 0U; i < COUNT; ++i) {
         want[i] = x_f32[i] + y_f32[i];
@@ -281,9 +281,9 @@ static void run_binary_ops_test(void)
         want[i] = g_f32[i] * x_f32[i] + g_f32[i + 3U] * x_f32[i + 3U];
     }
     expect_tensor_f16(ctx, &dy, want, 3U, "mul broadcast backward dy");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_mul(ctx, &x, &x, &out));
     CHECK_OK(gd_backward(ctx, &out, &g));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
@@ -291,9 +291,9 @@ static void run_binary_ops_test(void)
         want[i] = 2.0f * x_f32[i] * g_f32[i];
     }
     expect_tensor_f16(ctx, &dx, want, COUNT, "mul autograd fanin accumulates twice");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_mul(ctx, &x, &b, &out));
     CHECK_OK(gd_backward(ctx, &out, &g));
     CHECK_OK(gd_tensor_grad(ctx, &b, &dy));
@@ -301,9 +301,9 @@ static void run_binary_ops_test(void)
         want[i] = g_f32[i] * x_f32[i] + g_f32[i + 3U] * x_f32[i + 3U];
     }
     expect_tensor_f16(ctx, &dy, want, 3U, "mul broadcast autograd dy");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_add(ctx, &x, &b, &out));
     CHECK_OK(gd_backward(ctx, &out, &g));
     CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
@@ -314,7 +314,7 @@ static void run_binary_ops_test(void)
         want[i] = g_f32[i] + g_f32[i + 3U];
     }
     expect_tensor_f16(ctx, &dy, want, 3U, "add broadcast autograd dy");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     gd_context_destroy(ctx);
 }

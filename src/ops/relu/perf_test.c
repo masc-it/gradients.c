@@ -195,9 +195,9 @@ static bool relu_perf_run_forward(relu_perf_model *model)
 {
     gd_tensor y;
     model->x.requires_grad = false;
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_relu(model->ctx, &model->x, &y));
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -206,9 +206,9 @@ static bool relu_perf_run_backward_direct(relu_perf_model *model)
 {
     gd_tensor dx;
     model->x.requires_grad = false;
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_relu_backward(model->ctx, &model->x, &model->grad, &dx));
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -217,10 +217,10 @@ static bool relu_perf_run_forward_backward_autograd(relu_perf_model *model)
 {
     gd_tensor y;
     model->x.requires_grad = true;
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_relu(model->ctx, &model->x, &y));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &y, &model->grad));
-    RELU_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    RELU_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

@@ -265,9 +265,9 @@ static bool add_perf_run_forward(add_perf_model *model)
     gd_tensor out;
     model->x.requires_grad = false;
     model->y.requires_grad = false;
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_add(model->ctx, &model->x, &model->y, &out));
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -278,9 +278,9 @@ static bool add_perf_run_backward_direct(add_perf_model *model)
     gd_tensor dy;
     model->x.requires_grad = false;
     model->y.requires_grad = false;
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_EVAL));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_EVAL, gd_batch_empty()));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_add_backward(model->ctx, &model->x, &model->y, &model->grad, &dx, &dy));
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -292,12 +292,12 @@ static bool add_perf_run_forward_backward_autograd(add_perf_model *model)
     gd_tensor dy;
     model->x.requires_grad = true;
     model->y.requires_grad = true;
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_add(model->ctx, &model->x, &model->y, &out));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &out, &model->grad));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->x, &dx));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_tensor_grad(model->ctx, &model->y, &dy));
-    ADD_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    ADD_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

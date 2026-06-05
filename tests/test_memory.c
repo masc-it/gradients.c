@@ -94,7 +94,7 @@ static void test_scope_rings_and_state(gd_context *ctx)
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     scratch_slot0 = gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH);
     data_slot0 = gd_debug_current_ring_slot(ctx, GD_ARENA_DATA);
     scratch_gen0 = gd_debug_ring_slot_generation(ctx, GD_ARENA_SCRATCH, (uint32_t)scratch_slot0);
@@ -110,23 +110,23 @@ static void test_scope_rings_and_state(gd_context *ctx)
     CHECK(data.offset % 128U == 0U, "data offset aligned");
     CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
     CHECK(state_span.offset % 256U == 0U, "state object aligned");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK(gd_debug_state_object_last_use_fence(state) != 0U,
           "state acquire records fence at end");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != scratch_slot0,
           "scratch second scope uses next slot");
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_DATA) != data_slot0,
           "data second scope uses next slot");
     CHECK_OK(gd_alloc_scratch(ctx, 256U, 256U, &scratch));
     CHECK_OK(gd_alloc_data(ctx, 64U, 64U, &data));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     CHECK_OK(gd_memory_stats_query(ctx, &stats));
     CHECK(stats.backend_waits == 0U, "two ring slots avoid wait initially");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) == scratch_slot0,
           "scratch third scope reuses oldest slot");
     CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_DATA) == data_slot0,
@@ -135,16 +135,16 @@ static void test_scope_rings_and_state(gd_context *ctx)
           "scratch generation bumps before reuse");
     CHECK(gd_debug_ring_slot_generation(ctx, GD_ARENA_DATA, (uint32_t)data_slot0) > data_gen0,
           "data generation bumps before reuse");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     CHECK_OK(gd_memory_stats_query(ctx, &stats));
     CHECK(stats.backend_waits <= 1U, "ring exhaustion waits only if oldest fence still in flight");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
     CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
     CHECK_STATUS(gd_state_object_reset(ctx, state, 0U, 0U, &relocated), GD_ERR_BUSY);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     CHECK(gd_debug_state_object_last_use_fence(state) != 0U,
           "state acquire records fence after reset rejection");
 
@@ -156,11 +156,11 @@ static void test_scope_rings_and_state(gd_context *ctx)
     CHECK(stats.backend_waits == waits_before_reset || stats.backend_waits == waits_before_reset + 1U,
           "state reset waits only if fence still in flight");
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
     CHECK_OK(gd_state_object_reset(ctx, state, 0U, 0U, &relocated));
     CHECK(!relocated, "state reset before acquire in active scope can reuse");
     CHECK_OK(gd_state_object_acquire_span(ctx, state, GD_STATE_READ_WRITE, &state_span));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     CHECK(gd_debug_heap_alloc_count() == heap_before, "no heap allocation in scoped hot path");
     gd_debug_set_heap_guard(false);

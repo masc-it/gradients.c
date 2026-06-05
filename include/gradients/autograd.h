@@ -13,7 +13,7 @@ extern "C" {
 
 /* Reverse-mode vector-Jacobian product. If grad_output is NULL, a tensor of
    ones with output's shape/dtype is used. Gradients are scope-local scratch
-   tensors and remain valid until the next gd_begin() reuses their arena slot. */
+   tensors and remain valid until the next gd_begin_step() reuses their arena slot. */
 gd_status gd_backward(gd_context *ctx,
                       const gd_tensor *output,
                       const gd_tensor *grad_output);
@@ -31,7 +31,7 @@ gd_status gd_backward_many(gd_context *ctx,
                            const gd_tensor *const *grad_outputs);
 
 /* Returns the accumulated gradient descriptor for tensor. The returned tensor
-   aliases internal scratch storage; copy/read it before the next gd_begin(). */
+   aliases internal scratch storage; copy/read it before the next gd_begin_step(). */
 gd_status gd_tensor_grad(gd_context *ctx,
                          const gd_tensor *tensor,
                          gd_tensor *out_grad);

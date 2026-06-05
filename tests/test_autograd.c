@@ -296,7 +296,7 @@ static void test_fanout_many_loss(gd_context *ctx)
     v.requires_grad = true;
     b.requires_grad = true;
     u.requires_grad = true;
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_matmul(ctx, &x, &w, &y));
     CHECK_OK(gd_linear(ctx, &y, &v, &b, &z1));
     CHECK_OK(gd_matmul(ctx, &y, &u, &z2));
@@ -310,7 +310,7 @@ static void test_fanout_many_loss(gd_context *ctx)
     CHECK_OK(gd_tensor_grad(ctx, &v, &dv));
     CHECK_OK(gd_tensor_grad(ctx, &b, &db));
     CHECK_OK(gd_tensor_grad(ctx, &u, &du));
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &dx, got, sizeof(dx_ref)));

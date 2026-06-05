@@ -94,9 +94,9 @@ static void test_cross_entropy_rejects_f32_logits(void)
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     CHECK_OK(gd_context_seal_params(ctx));
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
     CHECK_STATUS(gd_cross_entropy(ctx, &logits, &targets, &loss), GD_ERR_UNSUPPORTED);
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 
@@ -125,7 +125,7 @@ static void test_cross_entropy_f16_zero_logits_small(void)
     logits.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_cross_entropy(ctx, &logits, &targets, &loss));
     CHECK(loss.rank == 0U && loss.dtype == GD_DTYPE_F32, "cross_entropy scalar f32 output");
     CHECK_OK(gd_tensor_read(ctx, &loss, &got_loss, sizeof(got_loss)));
@@ -141,7 +141,7 @@ static void test_cross_entropy_f16_zero_logits_small(void)
         }
         expect_f32(f16_bits_to_f32(got_grad[i]), want, 1.0e-4f, "cross_entropy f16 grad");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 
@@ -167,7 +167,7 @@ static void test_cross_entropy_f16_direct_backward(void)
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
     CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(0U, NULL), 256U, &grad_seed));
     CHECK_OK(gd_cross_entropy_backward(ctx, &logits, &targets, &grad_seed, &dlogits, NULL));
     CHECK_OK(gd_tensor_read(ctx, &dlogits, got_grad, sizeof(got_grad)));
@@ -178,7 +178,7 @@ static void test_cross_entropy_f16_direct_backward(void)
         }
         expect_f32(f16_bits_to_f32(got_grad[i]), want, 1.0e-4f, "cross_entropy direct backward f16 grad");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
     gd_context_destroy(ctx);
 }
 
@@ -208,7 +208,7 @@ static void test_cross_entropy_f16_thousands_classes(void)
     logits.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_cross_entropy(ctx, &logits, &targets, &loss));
     CHECK_OK(gd_tensor_read(ctx, &loss, &got_loss, sizeof(got_loss)));
     expect_f32(got_loss, want_loss, 1.0e-5f, "cross_entropy f16 thousands classes loss");
@@ -220,7 +220,7 @@ static void test_cross_entropy_f16_thousands_classes(void)
     expect_f32(f16_bits_to_f32(got_grad[C + 1023]), target, 5.0e-4f, "cross_entropy thousands grad target row1");
     expect_f32(f16_bits_to_f32(got_grad[(2U * C) + 2047U]), target, 5.0e-4f, "cross_entropy thousands grad target row2");
     expect_f32(f16_bits_to_f32(got_grad[(2U * C) + 17U]), non_target, 2.0e-6f, "cross_entropy thousands grad non-target row2");
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 
     free(got_grad);
     gd_context_destroy(ctx);

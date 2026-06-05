@@ -193,7 +193,7 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_context_seal_params(ctx));
 
     x.requires_grad = true; w.requires_grad = true; v.requires_grad = true; b.requires_grad = true; u.requires_grad = true;
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(ctx, gd_matmul(ctx, &x, &w, &y));
     CHECK(ctx, gd_linear(ctx, &y, &v, &b, &z1));
     CHECK(ctx, gd_matmul(ctx, &y, &u, &z2));
@@ -207,7 +207,7 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_grad(ctx, &u, &du));
     CHECK(ctx, gd_tensor_grad(ctx, &y, &dummy));
     (void)dummy;
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &dx, dx_data, x_b));
     CHECK(ctx, gd_tensor_read(ctx, &dw, dw_data, w_b));

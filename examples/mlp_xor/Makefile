@@ -8,7 +8,7 @@ CC ?= cc
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
-LDLIBS :=
+LDLIBS := -pthread
 
 ifeq ($(UNAME_S),Darwin)
 LDLIBS += -framework Foundation -framework Metal

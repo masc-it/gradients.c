@@ -239,9 +239,9 @@ static bool sigmoid_perf_run_forward(sigmoid_perf_model *model)
 {
     gd_tensor y;
     model->x.requires_grad = false;
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_sigmoid(model->ctx, &model->x, &y));
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -250,9 +250,9 @@ static bool sigmoid_perf_run_backward_direct(sigmoid_perf_model *model)
 {
     gd_tensor dx;
     model->x.requires_grad = false;
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_sigmoid_backward(model->ctx, &model->x, &model->grad, &dx));
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }
@@ -261,10 +261,10 @@ static bool sigmoid_perf_run_forward_backward_autograd(sigmoid_perf_model *model
 {
     gd_tensor y;
     model->x.requires_grad = true;
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin(model->ctx, GD_SCOPE_TRAIN));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_begin_step(model->ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_sigmoid(model->ctx, &model->x, &y));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_backward(model->ctx, &y, &model->grad));
-    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end(model->ctx));
+    SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_end_step(model->ctx));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     return true;
 }

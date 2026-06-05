@@ -595,7 +595,7 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
     head_kt_shape[1] = model->tokens;
     head_v_shape[0] = model->tokens;
     head_v_shape[1] = model->head_dim;
-    PERF_REQUIRE_OK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    PERF_REQUIRE_OK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
     if (!perf_linear_step(ctx, &x, &model->w_qkv, &model->b_qkv, include_backward, &qkv)) {
         return false;
@@ -629,7 +629,7 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
     if (!perf_linear_step(ctx, &up, &model->w_down, &model->b_down, include_backward, &down)) {
         return false;
     }
-    PERF_REQUIRE_OK(ctx, gd_end(ctx));
+    PERF_REQUIRE_OK(ctx, gd_end_step(ctx));
     (void)qkv;
     (void)proj;
     (void)gate;
@@ -754,7 +754,7 @@ static bool perf_smoke_correctness(perf_totals *totals)
     PERF_REQUIRE_OK(ctx, gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     PERF_REQUIRE_OK(ctx, gd_tensor_write(ctx, &w, w_data, sizeof(w_data)));
     PERF_REQUIRE_OK(ctx, gd_context_seal_params(ctx));
-    PERF_REQUIRE_OK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    PERF_REQUIRE_OK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     PERF_REQUIRE_OK(ctx, gd_matmul(ctx, &x, &w, &y));
     memset(&dx, 0, sizeof(dx));
     memset(&dw, 0, sizeof(dw));
@@ -773,7 +773,7 @@ static bool perf_smoke_correctness(perf_totals *totals)
     } else {
         printf("[PERF] matmul_backward_status=%s training_ready=partial\n", gd_status_string(st));
     }
-    PERF_REQUIRE_OK(ctx, gd_end(ctx));
+    PERF_REQUIRE_OK(ctx, gd_end_step(ctx));
     PERF_REQUIRE_OK(ctx, gd_synchronize(ctx));
     memset(got, 0, sizeof(got));
     PERF_REQUIRE_OK(ctx, gd_tensor_read(ctx, &y, got, sizeof(got)));

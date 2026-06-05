@@ -80,7 +80,7 @@ def collect_rows() -> list[Row]:
     rows: list[Row] = []
 
     add_symbol(rows, "memory", "context + scoped eager lifecycle", [
-        "gd_context_create", "gd_begin", "gd_end", "gd_memory_stats_query",
+        "gd_context_create", "gd_begin_step", "gd_end_step", "gd_memory_stats_query",
     ])
     add_symbol(rows, "memory", "four logical arenas", [
         "GD_ARENA_PARAMS", "GD_ARENA_STATE", "GD_ARENA_SCRATCH", "GD_ARENA_DATA",

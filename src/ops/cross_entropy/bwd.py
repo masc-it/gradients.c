@@ -122,11 +122,11 @@ int main(int argc, char **argv)
     CHECK(ctx, gd_tensor_write(ctx, &targets, target_data, label_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
     logits.requires_grad = true;
-    CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK(ctx, gd_cross_entropy(ctx, &logits, &targets, &loss));
     CHECK(ctx, gd_backward(ctx, &loss, NULL));
     CHECK(ctx, gd_tensor_grad(ctx, &logits, &dlogits));
-    CHECK(ctx, gd_end(ctx));
+    CHECK(ctx, gd_end_step(ctx));
     CHECK(ctx, gd_synchronize(ctx));
     CHECK(ctx, gd_tensor_read(ctx, &loss, &loss_value, sizeof(loss_value)));
     CHECK(ctx, gd_tensor_read(ctx, &dlogits, grad_data, logits_bytes));

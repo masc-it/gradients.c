@@ -1,5 +1,6 @@
 #include <gradients/gradients.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,15 +32,15 @@ static void fail_status(gd_context *ctx, gd_status st, const char *expr, int lin
 
 static gd_memory_config xor_memory_config(void)
 {
-    gd_memory_config cfg;
-    cfg.params_bytes = 64U * 1024U;
-    cfg.state_bytes = 128U * 1024U;
-    cfg.scratch_slot_bytes = 256U * 1024U;
-    cfg.data_slot_bytes = 16U * 1024U;
-    cfg.scratch_slots = 3U;
-    cfg.data_slots = 3U;
-    cfg.default_alignment = 256U;
-    return cfg;
+    return (gd_memory_config){
+        .params_bytes = 64U * 1024U,
+        .state_bytes = 128U * 1024U,
+        .scratch_slot_bytes = 256U * 1024U,
+        .data_slot_bytes = 16U * 1024U,
+        .scratch_slots = 3U,
+        .data_slots = 3U,
+        .default_alignment = 256U,
+    };
 }
 
 static gd_adamw_config xor_adamw_config(void)
@@ -127,6 +128,48 @@ static void print_param_set(const gd_param_set *params)
     }
 }
 
+typedef struct xor_dataset {
+    uint16_t x[4][2];
+    uint16_t y[4][1];
+} xor_dataset;
+
+static uint64_t xor_dataset_num_samples(const void *impl)
+{
+    (void)impl;
+    return 4U;
+}
+
+static uint64_t xor_dataset_fingerprint(const void *impl)
+{
+    (void)impl;
+    return UINT64_C(0x786f725f6d6c7032);
+}
+
+static gd_status xor_collate(gd_dataset *dataset,
+                             const uint64_t *sample_ids,
+                             int batch_size,
+                             gd_batch *batch,
+                             void *user_data)
+{
+    const xor_dataset *data = (const xor_dataset *)gd_dataset_const_data(dataset);
+    int x_idx = gd_batch_field_index(batch, "x");
+    int y_idx = gd_batch_field_index(batch, "target");
+    uint16_t *x = (uint16_t *)gd_batch_host_data(batch, x_idx);
+    uint16_t *y = (uint16_t *)gd_batch_host_data(batch, y_idx);
+    int b;
+    (void)user_data;
+    if (data == NULL || sample_ids == NULL || x == NULL || y == NULL || batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        uint64_t id = sample_ids[b] % 4U;
+        x[(size_t)b * 2U + 0U] = data->x[id][0];
+        x[(size_t)b * 2U + 1U] = data->x[id][1];
+        y[(size_t)b] = data->y[id][0];
+    }
+    return GD_OK;
+}
+
 int main(void)
 {
     enum { BATCH = 4, IN = 2, OUT = 1, STEPS = 240 };
@@ -137,6 +180,11 @@ int main(void)
         1.0f, 1.0f,
     };
     static const float y_f32[BATCH * OUT] = {0.0f, 1.0f, 1.0f, 0.0f};
+    static const xor_dataset xor_data = {
+        .x = {{0x0000U, 0x0000U}, {0x0000U, 0x3c00U},
+              {0x3c00U, 0x0000U}, {0x3c00U, 0x3c00U}},
+        .y = {{0x0000U}, {0x3c00U}, {0x3c00U}, {0x0000U}},
+    };
     const gd_memory_config mem = xor_memory_config();
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
@@ -151,29 +199,58 @@ int main(void)
     xor_mlp model = {0};
     xor_mlp_init(ctx, &model);
 
-    gd_tensor x = {0};
-    gd_tensor target = {0};
-    TRY(ctx, gd_tensor_from_f32(ctx,
-                                GD_ARENA_PARAMS,
-                                GD_DTYPE_F16,
-                                GD_SHAPE(BATCH, IN),
-                                x_f32,
-                                GD_ARRAY_LEN(x_f32),
-                                false,
-                                &x));
-    TRY(ctx, gd_tensor_from_f32(ctx,
-                                GD_ARENA_PARAMS,
-                                GD_DTYPE_F16,
-                                GD_SHAPE(BATCH, OUT),
-                                y_f32,
-                                GD_ARRAY_LEN(y_f32),
-                                false,
-                                &target));
+    const gd_dataset_ops dataset_ops = {
+        .name = "xor",
+        .num_samples = xor_dataset_num_samples,
+        .fingerprint = xor_dataset_fingerprint,
+    };
+    gd_dataset *dataset = NULL;
+    gd_dataloader *loader = NULL;
+    const gd_batch_field_desc batch_fields[2] = {
+        {
+            .name = "x",
+            .dtype = GD_DTYPE_F16,
+            .rank = 2,
+            .sizes = {BATCH, IN},
+        },
+        {
+            .name = "target",
+            .dtype = GD_DTYPE_F16,
+            .rank = 2,
+            .sizes = {BATCH, OUT},
+        },
+    };
+    TRY(ctx, gd_dataset_create(&dataset_ops, (void *)&xor_data, &dataset));
+    {
+        const gd_dataloader_config dl_cfg = {
+            .batch_size = BATCH,
+            .seed = 0U,
+            .sampler = GD_SAMPLER_SEQUENTIAL,
+            .expected_dataset_fingerprint = gd_dataset_fingerprint(dataset),
+            .num_workers = 1,
+            .prefetch_factor = 2,
+        };
+        TRY(ctx, gd_dataloader_create(ctx, dataset, &dl_cfg, batch_fields, 2,
+                                      xor_collate, NULL, &loader));
+    }
+    TRY(ctx, gd_dataloader_prefetch(loader));
 
     /* Showcase optimizer groups: split hidden-layer and head parameters by module path. */
-    gd_param_group groups[] = {
-        gd_param_group_build("hidden", "xor_mlp.fc1.*", 1.0f, 0.0f, true),
-        gd_param_group_build("head", "xor_mlp.fc2.*", 1.0f, 0.0f, true),
+    const gd_param_group groups[] = {
+        {
+            .name = "hidden",
+            .match = "xor_mlp.fc1.*",
+            .lr_mult = 1.0f,
+            .weight_decay = 0.0f,
+            .trainable = true,
+        },
+        {
+            .name = "head",
+            .match = "xor_mlp.fc2.*",
+            .lr_mult = 1.0f,
+            .weight_decay = 0.0f,
+            .trainable = true,
+        },
     };
     gd_param_set params = {0};
     TRY(ctx, gd_module_collect_params(ctx, &model.mod, groups, GD_ARRAY_LEN(groups), &params));
@@ -189,19 +266,27 @@ int main(void)
     gd_module_set_training(&model.mod, true);
 
     for (int step = 0; step < STEPS; ++step) {
+        gd_batch *batch = NULL;
+        gd_tensor *x;
+        gd_tensor *target;
         gd_tensor pred_tensor;
         gd_tensor diff;
         gd_tensor sq;
         gd_tensor loss;
         const int report = step == 0 || (step + 1) % 40 == 0;
-        TRY(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
-        TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
-        TRY(ctx, gd_sub(ctx, &pred_tensor, &target, &diff));
+        TRY(ctx, gd_dataloader_next(loader, &batch));
+        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
+        x = gd_batch_tensor(batch, "x");
+        target = gd_batch_tensor(batch, "target");
+        TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
+        TRY(ctx, gd_sub(ctx, &pred_tensor, target, &diff));
         TRY(ctx, gd_mul(ctx, &diff, &diff, &sq));
         TRY(ctx, gd_reduce_mean(ctx, &sq, &loss));
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
-        TRY(ctx, gd_end(ctx));
+        TRY(ctx, gd_end_step(ctx));
+        TRY(ctx, gd_dataloader_release(loader, batch));
+        TRY(ctx, gd_dataloader_prefetch(loader));
 
         if (report) {
             float loss_value = 0.0f;
@@ -216,12 +301,17 @@ int main(void)
 
     gd_module_set_training(&model.mod, false);
     float pred[BATCH * OUT];
-    TRY(ctx, gd_begin(ctx, GD_SCOPE_EVAL));
     {
+        gd_batch *batch = NULL;
+        gd_tensor *x;
         gd_tensor pred_tensor;
-        TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
-        TRY(ctx, gd_end(ctx));
+        TRY(ctx, gd_dataloader_next(loader, &batch));
+        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
+        x = gd_batch_tensor(batch, "x");
+        TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
+        TRY(ctx, gd_end_step(ctx));
         TRY(ctx, gd_tensor_read_f32(ctx, &pred_tensor, pred, GD_ARRAY_LEN(pred)));
+        TRY(ctx, gd_dataloader_release(loader, batch));
     }
 
     const float final_loss = mean_squared_error(pred, y_f32, BATCH * OUT);
@@ -248,6 +338,8 @@ int main(void)
 
     if (correct != BATCH || final_loss > 0.05f) {
         fprintf(stderr, "mlp_xor: training did not solve XOR\n");
+        gd_dataloader_destroy(loader);
+        gd_dataset_destroy(dataset);
         gd_amp_scaler_destroy(scaler);
         gd_optimizer_destroy(optimizer);
         gd_param_set_free(&params);
@@ -256,6 +348,8 @@ int main(void)
         return 1;
     }
 
+    gd_dataloader_destroy(loader);
+    gd_dataset_destroy(dataset);
     gd_amp_scaler_destroy(scaler);
     gd_optimizer_destroy(optimizer);
     gd_param_set_free(&params);

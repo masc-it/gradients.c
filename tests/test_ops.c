@@ -243,7 +243,7 @@ static void test_matmul_linear(gd_context *ctx)
     CHECK_OK(gd_tensor_write(ctx, &b, b_data, sizeof(b_data)));
     CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
     CHECK_OK(gd_matmul(ctx, &x, &w, &y));
     memset(got, 0, sizeof(got));
     CHECK_OK(gd_tensor_read(ctx, &y, got, sizeof(got)));
@@ -348,7 +348,7 @@ static void test_matmul_linear(gd_context *ctx)
         have = f16_bits_to_f32(db_got[j]);
         CHECK(abs_f32(want - have) <= 0.03f, "linear backward db close");
     }
-    CHECK_OK(gd_end(ctx));
+    CHECK_OK(gd_end_step(ctx));
 }
 
 int main(void)

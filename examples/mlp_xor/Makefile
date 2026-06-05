@@ -3,8 +3,10 @@ BUILD_DIR := $(ROOT)/build
 LIB := $(BUILD_DIR)/libgradients.a
 METALLIB := $(BUILD_DIR)/gradients.metallib
 BIN := mlp_xor
+DATASET := data/xor-00000.gdds
 
 CC ?= cc
+PYTHON ?= python3
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
@@ -21,7 +23,10 @@ all: $(BIN)
 build-lib:
 	$(MAKE) -C $(ROOT) build
 
-$(BIN): main.c build-lib
+$(DATASET): dataset.py $(ROOT)/tools/gdds_utils.py
+	$(PYTHON) dataset.py --out-dir data --split xor
+
+$(BIN): main.c build-lib $(DATASET)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(LIB) $(LDLIBS) -o $@
 
 run: $(BIN)
@@ -29,3 +34,4 @@ run: $(BIN)
 
 clean:
 	rm -f $(BIN)
+	rm -rf data

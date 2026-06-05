@@ -2,6 +2,8 @@
 
 A tiny full-batch XOR training run that exercises the current v2 API:
 
+- GDDS disk-backed dataset generation via `dataset.py`
+- generic GDDS dataloader/collate path
 - module tree + child `gd_linear_layer`s
 - parameter collection and param groups
 - F16 `linear -> relu -> linear`
@@ -16,13 +18,17 @@ Run from this directory:
 make run
 ```
 
-or manually from the repo root:
+The Makefile first runs `dataset.py`, which writes `data/xor-00000.gdds` with
+shared utilities from `tools/gdds_utils.py`.
+
+or manually from this directory:
 
 ```sh
-make build
-cc -Iinclude -std=c11 -O2 examples/mlp_xor/main.c build/libgradients.a \
-  -framework Foundation -framework Metal -o examples/mlp_xor/mlp_xor
-GRADIENTS_METALLIB=build/gradients.metallib examples/mlp_xor/mlp_xor
+python3 dataset.py --out-dir data --split xor
+make -C ../.. build
+cc -I../../include -std=c11 -O2 main.c ../../build/libgradients.a \
+  -pthread -framework Foundation -framework Metal -o mlp_xor
+GRADIENTS_METALLIB=../../build/gradients.metallib ./mlp_xor
 ```
 
 This is now a fully in-graph loss/backward path. Host reads are used only for

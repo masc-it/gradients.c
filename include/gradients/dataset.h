@@ -1,9 +1,11 @@
 #ifndef GRADIENTS_DATASET_H
 #define GRADIENTS_DATASET_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <gradients/status.h>
+#include <gradients/tensor.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +14,17 @@ extern "C" {
 #define GD_GDTOK_MAGIC "GDTOKv1"
 #define GD_GDTOK_VERSION 1U
 #define GD_GDTOK_HEADER_SIZE 64U
+
+#define GD_GDDS_MAGIC "GDDSv1"
+#define GD_GDDS_RECORD_MAGIC "GDDR"
+#define GD_GDDS_VERSION 1U
+#define GD_GDDS_HEADER_SIZE 128U
+#define GD_GDDS_FIELD_NAME_MAX 64U
+#define GD_GDDS_FIELD_DESC_SIZE 160U
+#define GD_GDDS_INDEX_ENTRY_SIZE 16U
+#define GD_GDDS_RECORD_HEADER_SIZE 20U
+#define GD_GDDS_RECORD_FIELD_DESC_SIZE 88U
+#define GD_GDDS_MAX_FIELDS 256U
 
 typedef struct gd_dataset gd_dataset;
 
@@ -43,6 +56,40 @@ uint64_t gd_dataset_fingerprint(const gd_dataset *dataset);
 gd_status gd_dataset_get_u64(const gd_dataset *dataset,
                              const char *key,
                              uint64_t *out);
+
+typedef struct gd_gdds_field_info {
+    char name[GD_GDDS_FIELD_NAME_MAX];
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS]; /* -1 in the on-disk schema means variable. */
+} gd_gdds_field_info;
+
+typedef struct gd_gdds_sample_field {
+    char name[GD_GDDS_FIELD_NAME_MAX];
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS];
+    const void *data; /* mmap-backed; valid until dataset is destroyed. */
+    size_t nbytes;
+} gd_gdds_sample_field;
+
+gd_status gd_dataset_open_gdds(const char **paths,
+                               int n_paths,
+                               gd_dataset **out);
+gd_status gd_dataset_open_gdds_file(const char *path, gd_dataset **out);
+gd_status gd_dataset_open_gdds_split(const char *dir,
+                                     const char *split,
+                                     gd_dataset **out);
+
+int gd_gdds_dataset_field_count(const gd_dataset *dataset);
+int gd_gdds_dataset_field_index(const gd_dataset *dataset, const char *name);
+gd_status gd_gdds_dataset_field_info(const gd_dataset *dataset,
+                                     int field_index,
+                                     gd_gdds_field_info *out);
+gd_status gd_gdds_dataset_read_field(const gd_dataset *dataset,
+                                     uint64_t sample_index,
+                                     int field_index,
+                                     gd_gdds_sample_field *out);
 
 typedef enum gd_gdtok_dtype {
     GD_GDTOK_DTYPE_U16 = 1,

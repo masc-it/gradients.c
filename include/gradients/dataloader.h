@@ -117,6 +117,23 @@ gd_status gd_collate_gdtok_lm(gd_dataset *dataset,
                               gd_batch *batch,
                               void *user_data);
 
+typedef struct gd_gdds_collate_config {
+    int zero_pad; /* 0 disables padding; default when config is NULL is enabled. */
+    int truncate; /* 0 fails when a sample is larger than batch capacity. */
+} gd_gdds_collate_config;
+
+gd_status gd_gdds_init_batch_fields(const gd_dataset *dataset,
+                                    int batch_size,
+                                    gd_batch_field_desc *fields,
+                                    int field_cap,
+                                    int *n_fields_out);
+
+gd_status gd_collate_gdds(gd_dataset *dataset,
+                          const uint64_t *sample_ids,
+                          int batch_size,
+                          gd_batch *batch,
+                          void *user_data);
+
 #ifdef __cplusplus
 }
 #endif

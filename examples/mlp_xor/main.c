@@ -128,48 +128,6 @@ static void print_param_set(const gd_param_set *params)
     }
 }
 
-typedef struct xor_dataset {
-    uint16_t x[4][2];
-    uint16_t y[4][1];
-} xor_dataset;
-
-static uint64_t xor_dataset_num_samples(const void *impl)
-{
-    (void)impl;
-    return 4U;
-}
-
-static uint64_t xor_dataset_fingerprint(const void *impl)
-{
-    (void)impl;
-    return UINT64_C(0x786f725f6d6c7032);
-}
-
-static gd_status xor_collate(gd_dataset *dataset,
-                             const uint64_t *sample_ids,
-                             int batch_size,
-                             gd_batch *batch,
-                             void *user_data)
-{
-    const xor_dataset *data = (const xor_dataset *)gd_dataset_const_data(dataset);
-    int x_idx = gd_batch_field_index(batch, "x");
-    int y_idx = gd_batch_field_index(batch, "target");
-    uint16_t *x = (uint16_t *)gd_batch_host_data(batch, x_idx);
-    uint16_t *y = (uint16_t *)gd_batch_host_data(batch, y_idx);
-    int b;
-    (void)user_data;
-    if (data == NULL || sample_ids == NULL || x == NULL || y == NULL || batch_size <= 0) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    for (b = 0; b < batch_size; ++b) {
-        uint64_t id = sample_ids[b] % 4U;
-        x[(size_t)b * 2U + 0U] = data->x[id][0];
-        x[(size_t)b * 2U + 1U] = data->x[id][1];
-        y[(size_t)b] = data->y[id][0];
-    }
-    return GD_OK;
-}
-
 int main(void)
 {
     enum { BATCH = 4, IN = 2, OUT = 1, STEPS = 240 };
@@ -180,11 +138,6 @@ int main(void)
         1.0f, 1.0f,
     };
     static const float y_f32[BATCH * OUT] = {0.0f, 1.0f, 1.0f, 0.0f};
-    static const xor_dataset xor_data = {
-        .x = {{0x0000U, 0x0000U}, {0x0000U, 0x3c00U},
-              {0x3c00U, 0x0000U}, {0x3c00U, 0x3c00U}},
-        .y = {{0x0000U}, {0x3c00U}, {0x3c00U}, {0x0000U}},
-    };
     const gd_memory_config mem = xor_memory_config();
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
@@ -199,28 +152,16 @@ int main(void)
     xor_mlp model = {0};
     xor_mlp_init(ctx, &model);
 
-    const gd_dataset_ops dataset_ops = {
-        .name = "xor",
-        .num_samples = xor_dataset_num_samples,
-        .fingerprint = xor_dataset_fingerprint,
-    };
     gd_dataset *dataset = NULL;
     gd_dataloader *loader = NULL;
-    const gd_batch_field_desc batch_fields[2] = {
-        {
-            .name = "x",
-            .dtype = GD_DTYPE_F16,
-            .rank = 2,
-            .sizes = {BATCH, IN},
-        },
-        {
-            .name = "target",
-            .dtype = GD_DTYPE_F16,
-            .rank = 2,
-            .sizes = {BATCH, OUT},
-        },
-    };
-    TRY(ctx, gd_dataset_create(&dataset_ops, (void *)&xor_data, &dataset));
+    gd_batch_field_desc batch_fields[2];
+    int n_batch_fields = 0;
+    TRY(ctx, gd_dataset_open_gdds_split("data", "xor", &dataset));
+    TRY(ctx, gd_gdds_init_batch_fields(dataset,
+                                       BATCH,
+                                       batch_fields,
+                                       (int)GD_ARRAY_LEN(batch_fields),
+                                       &n_batch_fields));
     {
         const gd_dataloader_config dl_cfg = {
             .batch_size = BATCH,
@@ -230,8 +171,8 @@ int main(void)
             .num_workers = 1,
             .prefetch_factor = 2,
         };
-        TRY(ctx, gd_dataloader_create(ctx, dataset, &dl_cfg, batch_fields, 2,
-                                      xor_collate, NULL, &loader));
+        TRY(ctx, gd_dataloader_create(ctx, dataset, &dl_cfg, batch_fields, n_batch_fields,
+                                      gd_collate_gdds, NULL, &loader));
     }
     TRY(ctx, gd_dataloader_prefetch(loader));
 

@@ -18,3 +18,13 @@ I need you to implement sigmoid op capsule.
 for perf_test.c use realistic tests with variable shapes. follow the guides.
 
 Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint him.
+
+---
+
+forget about gdtok and gdvlm, they were simple experiments.
+I like the GDDS spec, implement it. Write high quality performant code.
+
+Also, create a reusable tools/gdds_utils.py script that we can reuse when preparing datasets.
+
+At the end, showcase it in xor main.c and create a dataset.py that will reuse the tools/gdds_utils.py utils. let's do it, even if it's a simple dataset, it's a good simple examples for our users.
+

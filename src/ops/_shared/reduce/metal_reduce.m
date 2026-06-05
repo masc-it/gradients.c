@@ -40,16 +40,20 @@ static id<MTLComputePipelineState> gd_reduce_axis_pso_for(gd_backend *backend,
     return nil;
 }
 
-static id<MTLComputePipelineState> gd_broadcast_axis_pso_for(gd_backend *backend, uint32_t dtype)
+static id<MTLComputePipelineState> gd_broadcast_axis_pso_for(gd_backend *backend,
+                                                               uint32_t dtype,
+                                                               bool last_axis)
 {
     if (backend == NULL) {
         return nil;
     }
     if (dtype == (uint32_t)GD_DTYPE_F16) {
-        return (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_f16_pso;
+        return last_axis ? (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_last_f16_pso :
+                           (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_f16_pso;
     }
     if (dtype == (uint32_t)GD_DTYPE_F32) {
-        return (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_f32_pso;
+        return last_axis ? (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_last_f32_pso :
+                           (__bridge id<MTLComputePipelineState>)backend->broadcast_axis_f32_pso;
     }
     return nil;
 }
@@ -68,16 +72,21 @@ static id<MTLComputePipelineState> gd_broadcast_to_pso_for(gd_backend *backend, 
     return nil;
 }
 
-static id<MTLComputePipelineState> gd_broadcast_scalar_pso_for(gd_backend *backend, uint32_t dtype)
+static id<MTLComputePipelineState> gd_broadcast_scalar_pso_for(gd_backend *backend,
+                                                                 uint32_t src_dtype,
+                                                                 uint32_t dst_dtype)
 {
     if (backend == NULL) {
         return nil;
     }
-    if (dtype == (uint32_t)GD_DTYPE_F16) {
+    if (src_dtype == (uint32_t)GD_DTYPE_F16 && dst_dtype == (uint32_t)GD_DTYPE_F16) {
         return (__bridge id<MTLComputePipelineState>)backend->broadcast_scalar_f16_pso;
     }
-    if (dtype == (uint32_t)GD_DTYPE_F32) {
+    if (src_dtype == (uint32_t)GD_DTYPE_F32 && dst_dtype == (uint32_t)GD_DTYPE_F32) {
         return (__bridge id<MTLComputePipelineState>)backend->broadcast_scalar_f32_pso;
+    }
+    if (src_dtype == (uint32_t)GD_DTYPE_F32 && dst_dtype == (uint32_t)GD_DTYPE_F16) {
+        return (__bridge id<MTLComputePipelineState>)backend->broadcast_scalar_f32_to_f16_pso;
     }
     return nil;
 }
@@ -141,6 +150,7 @@ static uint32_t gd_reduce_contiguous_simdgroups_for_stage(uint64_t src_count, ui
     }
     return gd_reduce_simdgroups_for_count(chunk);
 }
+
 
 static gd_status gd_reduce_contiguous_validate(const gd_backend_tensor_view *src,
                                                const gd_backend_tensor_view *dst)
@@ -319,14 +329,23 @@ static gd_status gd_broadcast_to_validate(const gd_backend_tensor_view *src,
 static gd_status gd_broadcast_scalar_validate(const gd_backend_tensor_view *src,
                                               const gd_backend_tensor_view *dst)
 {
-    size_t elem_size;
+    size_t src_elem_size;
+    size_t dst_elem_size;
+    bool dtype_pair_ok;
     if (!gd_metal_reduce_view_range_valid(src) || !gd_metal_reduce_view_range_valid(dst) ||
-        src->dtype != dst->dtype || src->count != 1U || dst->count > UINT32_MAX ||
-        !gd_reduce_dtype_supported(src->dtype)) {
+        src->count != 1U || dst->count > UINT32_MAX || !gd_reduce_dtype_supported(src->dtype) ||
+        !gd_reduce_dtype_supported(dst->dtype)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    elem_size = gd_reduce_dtype_size(src->dtype);
-    if (elem_size == 0U || src->offset % elem_size != 0U || dst->offset % elem_size != 0U) {
+    dtype_pair_ok = src->dtype == dst->dtype ||
+                    (src->dtype == (uint32_t)GD_DTYPE_F32 && dst->dtype == (uint32_t)GD_DTYPE_F16);
+    if (!dtype_pair_ok) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    src_elem_size = gd_reduce_dtype_size(src->dtype);
+    dst_elem_size = gd_reduce_dtype_size(dst->dtype);
+    if (src_elem_size == 0U || dst_elem_size == 0U || src->offset % src_elem_size != 0U ||
+        dst->offset % dst_elem_size != 0U) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     return GD_OK;
@@ -444,6 +463,7 @@ gd_status gd_backend_broadcast_axis(gd_backend *backend,
     MTLSize threads;
     bool immediate;
     gd_status st;
+    bool last_axis;
     if (backend == NULL || !(scale == scale)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -451,7 +471,15 @@ gd_status gd_backend_broadcast_axis(gd_backend *backend,
     if (st != GD_OK) {
         return st;
     }
-    pso = gd_broadcast_axis_pso_for(backend, src->dtype);
+    gd_broadcast_axis_fill_args(&args, src, dst, axis, scale);
+    last_axis = args.inner_count == 1U;
+    if (last_axis) {
+        size_t elem_size = gd_reduce_dtype_size(dst->dtype);
+        last_axis = elem_size != 0U &&
+                    args.reduce_count % GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH == 0U &&
+                    dst->offset % (elem_size * GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH) == 0U;
+    }
+    pso = gd_broadcast_axis_pso_for(backend, src->dtype, last_axis);
     if (pso == nil) {
         return GD_ERR_UNSUPPORTED;
     }
@@ -463,12 +491,16 @@ gd_status gd_backend_broadcast_axis(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    gd_broadcast_axis_fill_args(&args, src, dst, axis, scale);
     [encoder setComputePipelineState:pso];
     [encoder setBuffer:gd_metal_reduce_buffer(src->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_metal_reduce_buffer(dst->buffer) offset:0U atIndex:1U];
     [encoder setBytes:&args length:sizeof(args) atIndex:2U];
-    {
+    if (last_axis) {
+        size_t row_vectors = ((size_t)args.reduce_count + GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH - 1U) /
+                             GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH;
+        grid = MTLSizeMake((NSUInteger)row_vectors, (NSUInteger)args.outer_count, 1U);
+        threads = MTLSizeMake(gd_reduce_threads_for_count(row_vectors), 1U, 1U);
+    } else {
         NSUInteger tx = args.inner_count < GD_METAL_REDUCE_MAX_THREADS_PER_GROUP ?
                             (NSUInteger)args.inner_count : GD_METAL_REDUCE_MAX_THREADS_PER_GROUP;
         NSUInteger ty_cap;
@@ -574,7 +606,7 @@ gd_status gd_backend_broadcast_scalar(gd_backend *backend,
     if (st != GD_OK) {
         return st;
     }
-    pso = gd_broadcast_scalar_pso_for(backend, src->dtype);
+    pso = gd_broadcast_scalar_pso_for(backend, src->dtype, dst->dtype);
     if (pso == nil) {
         return GD_ERR_UNSUPPORTED;
     }
@@ -586,7 +618,7 @@ gd_status gd_backend_broadcast_scalar(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    elem_size = gd_reduce_dtype_size(src->dtype);
+    elem_size = gd_reduce_dtype_size(dst->dtype);
     vectorized = elem_size != 0U &&
                  dst->offset % (elem_size * GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH) == 0U;
     grid_count = vectorized ? (dst->count / GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH) +

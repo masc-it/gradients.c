@@ -213,11 +213,12 @@ static inline gd_status gd_reduce_axis_backward_dispatch(gd_context *ctx,
     return GD_OK;
 }
 
-static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
-                                                   const gd_tensor *x,
-                                                   gd_tensor *out,
-                                                   gd_op_kind op_kind,
-                                                   float final_scale)
+static inline gd_status gd_reduce_all_forward_impl_dtype(gd_context *ctx,
+                                                         const gd_tensor *x,
+                                                         gd_tensor *out,
+                                                         gd_op_kind op_kind,
+                                                         gd_dtype result_dtype,
+                                                         float final_scale)
 {
     gd_status st;
     gd_tensor result;
@@ -231,6 +232,10 @@ static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
     if (ctx == NULL || x == NULL || out == NULL || !(final_scale == final_scale)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    if (result_dtype != GD_DTYPE_F16 && result_dtype != GD_DTYPE_F32) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "reduce output currently supports f16/f32 tensors only");
+    }
     st = gd_reduce_validate_input(ctx, x);
     if (st != GD_OK) {
         return st;
@@ -239,7 +244,7 @@ static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, 0U, NULL, 256U, &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, result_dtype, 0U, NULL, 256U, &result);
     if (st != GD_OK) {
         return st;
     }
@@ -311,6 +316,18 @@ static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
     }
     *out = result;
     return GD_OK;
+}
+
+static inline gd_status gd_reduce_all_forward_impl(gd_context *ctx,
+                                                   const gd_tensor *x,
+                                                   gd_tensor *out,
+                                                   gd_op_kind op_kind,
+                                                   float final_scale)
+{
+    if (x == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_reduce_all_forward_impl_dtype(ctx, x, out, op_kind, x->dtype, final_scale);
 }
 
 static inline gd_status gd_reduce_axis_forward_impl(gd_context *ctx,
@@ -443,6 +460,7 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
     gd_tensor dx;
     gd_backend_tensor_view gv;
     gd_backend_tensor_view dxv;
+    bool grad_dtype_ok;
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
@@ -457,9 +475,11 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    if (grad_out->dtype != x->dtype || grad_out->rank != 0U || !gd_tensor_is_contiguous(grad_out)) {
+    grad_dtype_ok = grad_out->dtype == x->dtype ||
+                    (x->dtype == GD_DTYPE_F16 && grad_out->dtype == GD_DTYPE_F32);
+    if (!grad_dtype_ok || grad_out->rank != 0U || !gd_tensor_is_contiguous(grad_out)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
-                                    "reduce backward requires scalar grad_out with matching dtype");
+                                    "reduce backward requires scalar grad_out with compatible dtype");
     }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &dx);
     if (st != GD_OK) {

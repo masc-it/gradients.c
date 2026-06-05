@@ -46,10 +46,13 @@ struct gd_backend {
     void *reduce_axis_last_f32_pso;
     void *broadcast_axis_f16_pso;
     void *broadcast_axis_f32_pso;
+    void *broadcast_axis_last_f16_pso;
+    void *broadcast_axis_last_f32_pso;
     void *broadcast_to_f16_pso;
     void *broadcast_to_f32_pso;
     void *broadcast_scalar_f16_pso;
     void *broadcast_scalar_f32_pso;
+    void *broadcast_scalar_f32_to_f16_pso;
     void *cross_entropy_loss_f16_pso;
     void *cross_entropy_loss_stats_f16_pso;
     void *cross_entropy_backward_f16_pso;

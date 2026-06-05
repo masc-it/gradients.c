@@ -30,6 +30,8 @@ gd_status gd_download(gd_context *ctx, const gd_tensor *src, void *dst, size_t n
 
 gd_status gd_tensor_write(gd_context *ctx, gd_tensor *dst, const void *src, size_t nbytes);
 gd_status gd_tensor_read(gd_context *ctx, const gd_tensor *src, void *dst, size_t nbytes);
+gd_status gd_tensor_write_f32(gd_context *ctx, gd_tensor *dst, const float *src, size_t count);
+gd_status gd_tensor_read_f32(gd_context *ctx, const gd_tensor *src, float *dst, size_t count);
 
 #ifdef __cplusplus
 }

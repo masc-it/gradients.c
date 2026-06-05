@@ -1,6 +1,7 @@
 #include <gradients/tensor.h>
 
 #include "backend.h"
+#include "dtype_internal.h"
 #include "memory_internal.h"
 
 #include <stdint.h>
@@ -83,34 +84,6 @@ static gd_status gd_shape_numel(uint32_t rank, const int64_t *shape, int64_t *ou
     }
     *out_numel = n;
     return GD_OK;
-}
-
-static float gd_f16_bits_to_f32(uint16_t bits)
-{
-    uint32_t sign = ((uint32_t)bits & 0x8000U) << 16;
-    int32_t exp = (int32_t)(((uint32_t)bits >> 10) & 0x1fU);
-    uint32_t mant = (uint32_t)bits & 0x3ffU;
-    union {
-        uint32_t u;
-        float f;
-    } v;
-    if (exp == 0) {
-        if (mant == 0U) {
-            v.u = sign;
-            return v.f;
-        }
-        while ((mant & 0x400U) == 0U) {
-            mant <<= 1U;
-            exp -= 1;
-        }
-        mant &= 0x3ffU;
-        exp += 1;
-    } else if (exp == 31) {
-        v.u = sign | 0x7f800000U | (mant << 13);
-        return v.f;
-    }
-    v.u = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (mant << 13);
-    return v.f;
 }
 
 static gd_status gd_shape_storage_nbytes(gd_dtype dtype,

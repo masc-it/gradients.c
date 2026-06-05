@@ -186,7 +186,7 @@ gd_status gd_backend_broadcast_to(gd_backend *backend,
                                   const gd_backend_tensor_view *src,
                                   const gd_backend_tensor_view *dst,
                                   float scale);
-/* dst[i] = src[0] * scale for contiguous tensors. */
+/* dst[i] = src[0] * scale for contiguous tensors; supports same dtype and f32 scalar to f16 dst. */
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,

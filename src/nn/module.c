@@ -141,6 +141,26 @@ static bool gd_module_wildcard_match(const char *pattern, const char *text)
     return *pattern == '\0';
 }
 
+static uint64_t gd_module_hash_string(const char *text)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    if (text == NULL) {
+        return hash;
+    }
+    while (*text != '\0') {
+        hash ^= (uint64_t)(unsigned char)*text;
+        hash *= 1099511628211ULL;
+        text++;
+    }
+    return hash;
+}
+
+static uint64_t gd_module_mix_seed(uint64_t seed, const char *path)
+{
+    uint64_t hash = gd_module_hash_string(path);
+    return seed ^ (hash + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U));
+}
+
 static gd_status gd_module_join_path(const char *prefix,
                                      const char *name,
                                      char out[GD_MODULE_PATH_MAX])
@@ -442,6 +462,13 @@ gd_linear_layer_config gd_linear_layer_config_make(int64_t in_features,
     return config;
 }
 
+gd_linear_layer_config gd_linear_layer_config_build(int64_t in_features,
+                                                    int64_t out_features,
+                                                    gd_dtype dtype)
+{
+    return gd_linear_layer_config_make(in_features, out_features, dtype, 0U);
+}
+
 gd_status gd_module_init(gd_context *ctx, gd_module *module, const char *name)
 {
     gd_status st;
@@ -653,6 +680,108 @@ gd_status gd_module_unfreeze(gd_module *module, const char *pattern)
         return GD_ERR_INVALID_ARGUMENT;
     }
     return gd_module_apply_trainable(module, module->name, pattern, true);
+}
+
+static gd_status gd_module_init_param_tensor(gd_context *ctx,
+                                             gd_tensor *tensor,
+                                             const char *path,
+                                             const gd_init_spec *init)
+{
+    if (ctx == NULL || tensor == NULL || init == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    switch (init->kind) {
+    case GD_INIT_EMPTY:
+        return GD_OK;
+    case GD_INIT_ZERO:
+        return gd_tensor_zero_(ctx, tensor);
+    case GD_INIT_ONE:
+        return gd_tensor_one_(ctx, tensor);
+    case GD_INIT_RAND_UNIFORM:
+        return gd_tensor_rand_uniform_(ctx,
+                                       tensor,
+                                       gd_module_mix_seed(init->seed, path),
+                                       init->low,
+                                       init->high);
+    default:
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid module param init kind");
+    }
+}
+
+static gd_status gd_module_init_params_impl(gd_context *ctx,
+                                            gd_module *module,
+                                            const char *prefix,
+                                            const char *pattern,
+                                            const gd_init_spec *init)
+{
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || module == NULL || init == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < module->param_count; ++i) {
+        char param_path[GD_MODULE_PATH_MAX];
+        gd_module_param_entry *entry = &module->params[i];
+        if (entry->tensor == NULL) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, entry->name, param_path);
+        if (st != GD_OK) {
+            return gd_module_set_error(ctx, st, "module param init path too long");
+        }
+        if (pattern == NULL || gd_module_wildcard_match(pattern, param_path)) {
+            st = gd_module_init_param_tensor(ctx, entry->tensor, param_path, init);
+            if (st != GD_OK) {
+                return st;
+            }
+        }
+    }
+    for (i = 0U; i < module->child_count; ++i) {
+        char child_path[GD_MODULE_PATH_MAX];
+        gd_module_child_entry *child = &module->children[i];
+        if (child->module == NULL) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, child->name, child_path);
+        if (st != GD_OK) {
+            return gd_module_set_error(ctx, st, "module child init path too long");
+        }
+        st = gd_module_init_params_impl(ctx, child->module, child_path, pattern, init);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
+gd_status gd_module_init_params_uniform(gd_context *ctx,
+                                        gd_module *module,
+                                        const char *pattern,
+                                        float low,
+                                        float high,
+                                        uint64_t seed)
+{
+    gd_init_spec init;
+    if (ctx == NULL || module == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!(low <= high)) {
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid module uniform init range");
+    }
+    init = gd_init_rand_uniform(seed, low, high);
+    return gd_module_init_params_impl(ctx, module, module->name, pattern, &init);
+}
+
+gd_status gd_module_init_params_zero(gd_context *ctx,
+                                     gd_module *module,
+                                     const char *pattern)
+{
+    gd_init_spec init;
+    if (ctx == NULL || module == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    init = gd_init_zero();
+    return gd_module_init_params_impl(ctx, module, module->name, pattern, &init);
 }
 
 gd_param_group gd_param_group_build(const char *name,

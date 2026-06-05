@@ -1,7 +1,5 @@
 #include <gradients/gradients.h>
 
-#include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,98 +29,6 @@ static void fail_status(gd_context *ctx, gd_status st, const char *expr, int lin
         }                                                                     \
     } while (0)
 
-static uint16_t f32_to_f16_bits(float value)
-{
-    union {
-        float f;
-        uint32_t u;
-    } v;
-    uint32_t sign;
-    int32_t exp;
-    uint32_t mant;
-    uint32_t out_exp;
-    uint32_t out_mant;
-    v.f = value;
-    sign = (v.u >> 16) & 0x8000U;
-    exp = (int32_t)((v.u >> 23) & 0xffU) - 127;
-    mant = v.u & 0x7fffffU;
-    if (((v.u >> 23) & 0xffU) == 0xffU) {
-        return (uint16_t)(sign | (mant == 0U ? 0x7c00U : 0x7e00U));
-    }
-    if (exp > 15) {
-        return (uint16_t)(sign | 0x7c00U);
-    }
-    if (exp < -14) {
-        uint32_t shifted;
-        uint32_t remainder;
-        uint32_t halfway;
-        int32_t shift = -14 - exp;
-        if (shift > 24) {
-            return (uint16_t)sign;
-        }
-        mant |= 0x800000U;
-        shifted = mant >> (uint32_t)(shift + 13);
-        remainder = mant & ((1U << (uint32_t)(shift + 13)) - 1U);
-        halfway = 1U << (uint32_t)(shift + 12);
-        if (remainder > halfway || (remainder == halfway && (shifted & 1U) != 0U)) {
-            shifted += 1U;
-        }
-        return (uint16_t)(sign | shifted);
-    }
-    out_exp = (uint32_t)(exp + 15);
-    out_mant = mant >> 13;
-    {
-        uint32_t remainder = mant & 0x1fffU;
-        if (remainder > 0x1000U || (remainder == 0x1000U && (out_mant & 1U) != 0U)) {
-            out_mant += 1U;
-            if (out_mant == 0x400U) {
-                out_mant = 0U;
-                out_exp += 1U;
-                if (out_exp >= 31U) {
-                    return (uint16_t)(sign | 0x7c00U);
-                }
-            }
-        }
-    }
-    return (uint16_t)(sign | (out_exp << 10) | out_mant);
-}
-
-static float f16_bits_to_f32(uint16_t bits)
-{
-    uint32_t sign = ((uint32_t)bits & 0x8000U) << 16;
-    int32_t exp = (int32_t)(((uint32_t)bits >> 10) & 0x1fU);
-    uint32_t mant = (uint32_t)bits & 0x3ffU;
-    union {
-        uint32_t u;
-        float f;
-    } v;
-    if (exp == 0) {
-        if (mant == 0U) {
-            v.u = sign;
-            return v.f;
-        }
-        while ((mant & 0x400U) == 0U) {
-            mant <<= 1U;
-            exp -= 1;
-        }
-        mant &= 0x3ffU;
-        exp += 1;
-    } else if (exp == 31) {
-        v.u = sign | 0x7f800000U | (mant << 13);
-        return v.f;
-    }
-    v.u = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (mant << 13);
-    return v.f;
-}
-
-static void pack_f16(const float *src, uint16_t *dst, size_t count)
-{
-    size_t i;
-    for (i = 0U; i < count; ++i) {
-        dst[i] = f32_to_f16_bits(src[i]);
-    }
-}
-
 static gd_memory_config xor_memory_config(void)
 {
     gd_memory_config cfg;
@@ -136,40 +42,39 @@ static gd_memory_config xor_memory_config(void)
     return cfg;
 }
 
-static void write_initial_weights(gd_context *ctx, xor_mlp *model)
+static gd_adamw_config xor_adamw_config(void)
 {
-    static const float fc1_w_f32[2U * 4U] = {
-         0.80f,  0.80f, -0.30f,  0.20f,
-         0.80f,  0.80f,  0.25f, -0.25f,
-    };
-    static const float fc1_b_f32[4U] = {-0.10f, -0.90f, 0.0f, 0.0f};
-    static const float fc2_w_f32[4U * 1U] = {1.20f, -1.70f, 0.10f, -0.10f};
-    static const float fc2_b_f32[1U] = {0.0f};
-    uint16_t fc1_w[2U * 4U];
-    uint16_t fc1_b[4U];
-    uint16_t fc2_w[4U * 1U];
-    uint16_t fc2_b[1U];
-    pack_f16(fc1_w_f32, fc1_w, 2U * 4U);
-    pack_f16(fc1_b_f32, fc1_b, 4U);
-    pack_f16(fc2_w_f32, fc2_w, 4U * 1U);
-    pack_f16(fc2_b_f32, fc2_b, 1U);
-    TRY(ctx, gd_tensor_write(ctx, &model->fc1.weight, fc1_w, sizeof(fc1_w)));
-    TRY(ctx, gd_tensor_write(ctx, &model->fc1.bias, fc1_b, sizeof(fc1_b)));
-    TRY(ctx, gd_tensor_write(ctx, &model->fc2.weight, fc2_w, sizeof(fc2_w)));
-    TRY(ctx, gd_tensor_write(ctx, &model->fc2.bias, fc2_b, sizeof(fc2_b)));
+    gd_adamw_config cfg = gd_adamw_config_default();
+    cfg.lr = 5.0e-2f;
+    cfg.weight_decay = 0.0f;
+    return cfg;
+}
+
+static gd_amp_config xor_amp_config(void)
+{
+    gd_amp_config cfg = gd_amp_config_default();
+    cfg.init_scale = 64.0f;
+    cfg.growth_interval = 32U;
+    cfg.max_scale = 4096.0f;
+    return cfg;
 }
 
 static void xor_mlp_init(gd_context *ctx, xor_mlp *model)
 {
-    gd_linear_layer_config fc1_cfg;
-    gd_linear_layer_config fc2_cfg;
+    enum { INIT_SEED = 42 };
+    const gd_linear_layer_config fc1_cfg = gd_linear_layer_config_build(2, 4, GD_DTYPE_F16);
+    const gd_linear_layer_config fc2_cfg = gd_linear_layer_config_build(4, 1, GD_DTYPE_F16);
     memset(model, 0, sizeof(*model));
-    fc1_cfg = gd_linear_layer_config_make(2, 4, GD_DTYPE_F16, 11U);
-    fc2_cfg = gd_linear_layer_config_make(4, 1, GD_DTYPE_F16, 22U);
     TRY(ctx, gd_module_init(ctx, &model->mod, "xor_mlp"));
     TRY(ctx, gd_linear_layer_init_child(ctx, &model->mod, "fc1", &model->fc1, &fc1_cfg));
     TRY(ctx, gd_linear_layer_init_child(ctx, &model->mod, "fc2", &model->fc2, &fc2_cfg));
-    write_initial_weights(ctx, model);
+    TRY(ctx, gd_module_init_params_uniform(ctx,
+                                           &model->mod,
+                                           "xor_mlp.*.weight",
+                                           -1.0f,
+                                           1.0f,
+                                           INIT_SEED));
+    TRY(ctx, gd_module_init_params_zero(ctx, &model->mod, "xor_mlp.*.bias"));
 }
 
 static void xor_mlp_deinit(xor_mlp *model)
@@ -232,29 +137,9 @@ int main(void)
         1.0f, 1.0f,
     };
     static const float y_f32[BATCH * OUT] = {0.0f, 1.0f, 1.0f, 0.0f};
+    const gd_memory_config mem = xor_memory_config();
     gd_context *ctx = NULL;
-    gd_optimizer *optimizer = NULL;
-    gd_amp_scaler *scaler = NULL;
-    gd_memory_config mem = xor_memory_config();
-    gd_adamw_config adam = gd_adamw_config_default();
-    gd_amp_config amp = gd_amp_config_default();
-    gd_param_group groups[2];
-    gd_param_set params;
-    xor_mlp model;
-    gd_tensor x;
-    gd_tensor target;
-    const int64_t x_shape[2] = {BATCH, IN};
-    const int64_t y_shape[2] = {BATCH, OUT};
-    uint16_t x_f16[BATCH * IN];
-    uint16_t y_f16[BATCH * OUT];
-    uint16_t pred_f16[BATCH * OUT];
-    float pred[BATCH * OUT];
-    float final_loss;
-    int step;
-    int correct;
-    gd_status st;
-
-    st = gd_context_create(&mem, &ctx);
+    gd_status st = gd_context_create(&mem, &ctx);
     if (st == GD_ERR_UNSUPPORTED) {
         printf("mlp_xor: skipped (no supported gradients.c backend)\n");
         return 0;
@@ -263,49 +148,44 @@ int main(void)
         fail_status(ctx, st, "gd_context_create", __LINE__);
     }
 
+    xor_mlp model = {0};
     xor_mlp_init(ctx, &model);
 
-    pack_f16(x_f32, x_f16, BATCH * IN);
-    pack_f16(y_f32, y_f16, BATCH * OUT);
+    const int64_t x_shape[2] = {BATCH, IN};
+    const int64_t y_shape[2] = {BATCH, OUT};
+    gd_tensor x = {0};
+    gd_tensor target = {0};
     TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
     TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, y_shape, 256U, &target));
-    TRY(ctx, gd_tensor_write(ctx, &x, x_f16, sizeof(x_f16)));
-    TRY(ctx, gd_tensor_write(ctx, &target, y_f16, sizeof(y_f16)));
+    TRY(ctx, gd_tensor_write_f32(ctx, &x, x_f32, GD_ARRAY_LEN(x_f32)));
+    TRY(ctx, gd_tensor_write_f32(ctx, &target, y_f32, GD_ARRAY_LEN(y_f32)));
     x.requires_grad = false;
     target.requires_grad = false;
 
-    memset(groups, 0, sizeof(groups));
-    groups[0].name = "hidden";
-    groups[0].match = "xor_mlp.fc1.*";
-    groups[0].lr_mult = 1.0f;
-    groups[0].weight_decay = 0.0f;
-    groups[0].trainable = true;
-    groups[1].name = "head";
-    groups[1].match = "xor_mlp.fc2.*";
-    groups[1].lr_mult = 1.0f;
-    groups[1].weight_decay = 0.0f;
-    groups[1].trainable = true;
-    TRY(ctx, gd_module_collect_params(ctx, &model.mod, groups, 2U, &params));
+    /* Showcase optimizer groups: split hidden-layer and head parameters by module path. */
+    gd_param_group groups[] = {
+        gd_param_group_build("hidden", "xor_mlp.fc1.*", 1.0f, 0.0f, true),
+        gd_param_group_build("head", "xor_mlp.fc2.*", 1.0f, 0.0f, true),
+    };
+    gd_param_set params = {0};
+    TRY(ctx, gd_module_collect_params(ctx, &model.mod, groups, GD_ARRAY_LEN(groups), &params));
     print_param_set(&params);
 
-    adam.lr = 5.0e-2f;
-    adam.weight_decay = 0.0f;
-    amp.init_scale = 64.0f;
-    amp.growth_interval = 32U;
-    amp.max_scale = 4096.0f;
+    const gd_adamw_config adam = xor_adamw_config();
+    const gd_amp_config amp = xor_amp_config();
+    gd_optimizer *optimizer = NULL;
+    gd_amp_scaler *scaler = NULL;
     TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
     TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
     TRY(ctx, gd_context_seal_params(ctx));
     gd_module_set_training(&model.mod, true);
 
-    for (step = 0; step < STEPS; ++step) {
+    for (int step = 0; step < STEPS; ++step) {
         gd_tensor pred_tensor;
         gd_tensor diff;
         gd_tensor sq;
         gd_tensor loss;
-        uint16_t loss_bits = 0U;
-        float loss_value = 0.0f;
-        int report = step == 0 || (step + 1) % 40 == 0;
+        const int report = step == 0 || (step + 1) % 40 == 0;
         TRY(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
         TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
         TRY(ctx, gd_sub(ctx, &pred_tensor, &target, &diff));
@@ -316,8 +196,8 @@ int main(void)
         TRY(ctx, gd_end(ctx));
 
         if (report) {
-            TRY(ctx, gd_tensor_read(ctx, &loss, &loss_bits, sizeof(loss_bits)));
-            loss_value = f16_bits_to_f32(loss_bits);
+            float loss_value = 0.0f;
+            TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
             printf("step=%3d loss=%.6f scale=%.1f overflow=%s\n",
                    step + 1,
                    (double)loss_value,
@@ -327,33 +207,30 @@ int main(void)
     }
 
     gd_module_set_training(&model.mod, false);
+    float pred[BATCH * OUT];
     TRY(ctx, gd_begin(ctx, GD_SCOPE_EVAL));
     {
         gd_tensor pred_tensor;
-        size_t i;
         TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
         TRY(ctx, gd_end(ctx));
-        TRY(ctx, gd_tensor_read(ctx, &pred_tensor, pred_f16, sizeof(pred_f16)));
-        for (i = 0U; i < BATCH * OUT; ++i) {
-            pred[i] = f16_bits_to_f32(pred_f16[i]);
-        }
+        TRY(ctx, gd_tensor_read_f32(ctx, &pred_tensor, pred, GD_ARRAY_LEN(pred)));
     }
 
-    final_loss = mean_squared_error(pred, y_f32, BATCH * OUT);
-    correct = 0;
+    const float final_loss = mean_squared_error(pred, y_f32, BATCH * OUT);
+    int correct = 0;
     printf("\nfinal predictions:\n");
-    for (step = 0; step < BATCH; ++step) {
-        int label = pred[step] >= 0.5f ? 1 : 0;
-        int target = y_f32[step] >= 0.5f ? 1 : 0;
-        if (label == target) {
+    for (int sample = 0; sample < BATCH; ++sample) {
+        int label = pred[sample] >= 0.5f ? 1 : 0;
+        int target_label = y_f32[sample] >= 0.5f ? 1 : 0;
+        if (label == target_label) {
             correct += 1;
         }
         printf("  [%.0f %.0f] -> %.4f class=%d target=%d\n",
-               (double)x_f32[step * IN + 0],
-               (double)x_f32[step * IN + 1],
-               (double)pred[step],
+               (double)x_f32[sample * IN + 0],
+               (double)x_f32[sample * IN + 1],
+               (double)pred[sample],
                label,
-               target);
+               target_label);
     }
     printf("final_loss=%.6f accuracy=%d/%d optimizer_steps=%llu\n",
            (double)final_loss,

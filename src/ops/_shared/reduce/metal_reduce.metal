@@ -317,6 +317,58 @@ kernel void gd_broadcast_axis_f32_kernel(device const uchar *srcbuf [[buffer(0)]
     dst[dst_i] = src[src_i] * args.scale;
 }
 
+kernel void gd_broadcast_axis_last_f16_kernel(device const uchar *srcbuf [[buffer(0)]],
+                                              device uchar *dstbuf [[buffer(1)]],
+                                              constant gd_metal_reduce_axis_args &args [[buffer(2)]],
+                                              uint3 gid [[thread_position_in_grid]])
+{
+    const ulong col = ulong(gid.x) * ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH);
+    const ulong row = ulong(gid.y);
+    if (row >= args.outer_count || col >= args.reduce_count) {
+        return;
+    }
+    const ulong dst_base = row * ulong(args.reduce_count) + col;
+    device const half *src = reinterpret_cast<device const half *>(srcbuf + args.src_offset);
+    device half *dst = reinterpret_cast<device half *>(dstbuf + args.dst_offset);
+    const half value = half(float(src[row]) * args.scale);
+    if (col + 3ul < args.reduce_count) {
+        device half4 *dst4 = reinterpret_cast<device half4 *>(dstbuf + args.dst_offset);
+        dst4[dst_base / ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH)] = half4(value, value, value, value);
+        return;
+    }
+    for (ulong lane = 0ul; lane < ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH); ++lane) {
+        if (col + lane < args.reduce_count) {
+            dst[dst_base + lane] = value;
+        }
+    }
+}
+
+kernel void gd_broadcast_axis_last_f32_kernel(device const uchar *srcbuf [[buffer(0)]],
+                                              device uchar *dstbuf [[buffer(1)]],
+                                              constant gd_metal_reduce_axis_args &args [[buffer(2)]],
+                                              uint3 gid [[thread_position_in_grid]])
+{
+    const ulong col = ulong(gid.x) * ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH);
+    const ulong row = ulong(gid.y);
+    if (row >= args.outer_count || col >= args.reduce_count) {
+        return;
+    }
+    const ulong dst_base = row * ulong(args.reduce_count) + col;
+    device const float *src = reinterpret_cast<device const float *>(srcbuf + args.src_offset);
+    device float *dst = reinterpret_cast<device float *>(dstbuf + args.dst_offset);
+    const float value = src[row] * args.scale;
+    if (col + 3ul < args.reduce_count) {
+        device float4 *dst4 = reinterpret_cast<device float4 *>(dstbuf + args.dst_offset);
+        dst4[dst_base / ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH)] = float4(value, value, value, value);
+        return;
+    }
+    for (ulong lane = 0ul; lane < ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH); ++lane) {
+        if (col + lane < args.reduce_count) {
+            dst[dst_base + lane] = value;
+        }
+    }
+}
+
 kernel void gd_broadcast_to_f16_kernel(device const uchar *srcbuf [[buffer(0)]],
                                        device uchar *dstbuf [[buffer(1)]],
                                        constant gd_metal_broadcast_to_args &args [[buffer(2)]],
@@ -386,6 +438,32 @@ kernel void gd_broadcast_scalar_f32_kernel(device const uchar *srcbuf [[buffer(0
         if (ulong(gid) < vec_count) {
             device float4 *dst4 = reinterpret_cast<device float4 *>(dstbuf + args.dst_offset);
             dst4[gid] = float4(value, value, value, value);
+            return;
+        }
+        const ulong i = vec_count * ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH) + (ulong(gid) - vec_count);
+        if (i < args.dst_count) {
+            dst[i] = value;
+        }
+        return;
+    }
+    if (ulong(gid) < args.dst_count) {
+        dst[gid] = value;
+    }
+}
+
+kernel void gd_broadcast_scalar_f32_to_f16_kernel(device const uchar *srcbuf [[buffer(0)]],
+                                                  device uchar *dstbuf [[buffer(1)]],
+                                                  constant gd_metal_broadcast_scalar_args &args [[buffer(2)]],
+                                                  uint gid [[thread_position_in_grid]])
+{
+    device const float *src = reinterpret_cast<device const float *>(srcbuf + args.src_offset);
+    device half *dst = reinterpret_cast<device half *>(dstbuf + args.dst_offset);
+    const half value = half(src[0] * args.scale);
+    if (args.vector_width == uint(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH)) {
+        const ulong vec_count = args.dst_count / ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH);
+        if (ulong(gid) < vec_count) {
+            device half4 *dst4 = reinterpret_cast<device half4 *>(dstbuf + args.dst_offset);
+            dst4[gid] = half4(value, value, value, value);
             return;
         }
         const ulong i = vec_count * ulong(GD_METAL_REDUCE_SCALAR_VECTOR_WIDTH) + (ulong(gid) - vec_count);

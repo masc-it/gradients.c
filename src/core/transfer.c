@@ -1,11 +1,13 @@
 #include <gradients/transfer.h>
 
 #include "backend.h"
+#include "dtype_internal.h"
 #include "memory_internal.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 static bool gd_range_inside(size_t capacity, size_t offset, size_t nbytes)
 {
@@ -159,4 +161,109 @@ gd_status gd_tensor_write(gd_context *ctx, gd_tensor *dst, const void *src, size
 gd_status gd_tensor_read(gd_context *ctx, const gd_tensor *src, void *dst, size_t nbytes)
 {
     return gd_download(ctx, src, dst, nbytes);
+}
+
+static gd_status gd_tensor_f32_transfer_validate(gd_context *ctx,
+                                                 const gd_tensor *tensor,
+                                                 size_t count,
+                                                 const char *message)
+{
+    gd_status st;
+    int64_t numel;
+    if (ctx == NULL || tensor == NULL || count == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_validate(ctx, tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (tensor->dtype != GD_DTYPE_F16 && tensor->dtype != GD_DTYPE_F32) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "f32 tensor transfer supports f16 and f32 tensors");
+    }
+    if (!gd_tensor_is_contiguous(tensor)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "f32 tensor transfer requires contiguous tensor");
+    }
+    st = gd_tensor_numel(tensor, &numel);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, message);
+    }
+    if (numel < 0 || (uint64_t)numel != (uint64_t)count) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "f32 tensor transfer count mismatch");
+    }
+    return GD_OK;
+}
+
+gd_status gd_tensor_write_f32(gd_context *ctx, gd_tensor *dst, const float *src, size_t count)
+{
+    gd_status st;
+    size_t i;
+    size_t nbytes;
+    uint16_t *packed;
+    if (ctx == NULL || dst == NULL || src == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_f32_transfer_validate(ctx, dst, count, "f32 tensor write invalid shape");
+    if (st != GD_OK) {
+        return st;
+    }
+    if (dst->dtype == GD_DTYPE_F32) {
+        if (count > SIZE_MAX / sizeof(src[0])) {
+            return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor write size overflow");
+        }
+        return gd_tensor_write(ctx, dst, src, count * sizeof(src[0]));
+    }
+    if (count > SIZE_MAX / sizeof(packed[0])) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor write size overflow");
+    }
+    nbytes = count * sizeof(packed[0]);
+    packed = (uint16_t *)malloc(nbytes);
+    if (packed == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor write pack allocation failed");
+    }
+    for (i = 0U; i < count; ++i) {
+        packed[i] = gd_f32_to_f16_bits(src[i]);
+    }
+    st = gd_tensor_write(ctx, dst, packed, nbytes);
+    free(packed);
+    return st;
+}
+
+gd_status gd_tensor_read_f32(gd_context *ctx, const gd_tensor *src, float *dst, size_t count)
+{
+    gd_status st;
+    size_t i;
+    size_t nbytes;
+    uint16_t *packed;
+    if (ctx == NULL || src == NULL || dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_f32_transfer_validate(ctx, src, count, "f32 tensor read invalid shape");
+    if (st != GD_OK) {
+        return st;
+    }
+    if (src->dtype == GD_DTYPE_F32) {
+        if (count > SIZE_MAX / sizeof(dst[0])) {
+            return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor read size overflow");
+        }
+        return gd_tensor_read(ctx, src, dst, count * sizeof(dst[0]));
+    }
+    if (count > SIZE_MAX / sizeof(packed[0])) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor read size overflow");
+    }
+    nbytes = count * sizeof(packed[0]);
+    packed = (uint16_t *)malloc(nbytes);
+    if (packed == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "f32 tensor read pack allocation failed");
+    }
+    st = gd_tensor_read(ctx, src, packed, nbytes);
+    if (st == GD_OK) {
+        for (i = 0U; i < count; ++i) {
+            dst[i] = gd_f16_bits_to_f32(packed[i]);
+        }
+    }
+    free(packed);
+    return st;
 }

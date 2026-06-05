@@ -17,7 +17,12 @@ gd_status gd_reduce_mean(gd_context *ctx, const gd_tensor *x, gd_tensor *out)
     if (st != GD_OK) {
         return st;
     }
-    return gd_reduce_all_forward_impl(ctx, x, out, GD_OP_REDUCE_MEAN, 1.0f / (float)count);
+    return gd_reduce_all_forward_impl_dtype(ctx,
+                                            x,
+                                            out,
+                                            GD_OP_REDUCE_MEAN,
+                                            x->dtype == GD_DTYPE_F16 ? GD_DTYPE_F32 : x->dtype,
+                                            1.0f / (float)count);
 }
 
 gd_status gd_reduce_mean_axis(gd_context *ctx,

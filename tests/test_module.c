@@ -36,6 +36,11 @@ static bool path_is(const gd_param_set *set, uint32_t index, const char *path)
            strcmp(set->items[index].path, path) == 0;
 }
 
+static float abs_f32(float x)
+{
+    return x < 0.0f ? -x : x;
+}
+
 static void test_linear_child_module(gd_context *ctx)
 {
     gd_module root;
@@ -48,6 +53,9 @@ static void test_linear_child_module(gd_context *ctx)
     gd_tensor x;
     gd_tensor y;
     int64_t x_shape[2] = {4, 2};
+    float fc1_weight[2U * 4U];
+    float fc1_bias[4U];
+    uint32_t i;
 
     fc1_cfg = gd_linear_layer_config_make(2, 4, GD_DTYPE_F16, 11U);
     fc2_cfg = gd_linear_layer_config_make(4, 1, GD_DTYPE_F16, 22U);
@@ -68,6 +76,19 @@ static void test_linear_child_module(gd_context *ctx)
     CHECK(params.items[0].group_index == 0 && params.items[2].group_index == 1,
           "param groups matched by path");
     gd_param_set_free(&params);
+
+    CHECK_OK(gd_module_init_params_uniform(ctx, &root, "xor.fc1.weight", -1.0f, 1.0f, 42U));
+    CHECK_OK(gd_tensor_read_f32(ctx, &fc1.weight, fc1_weight, GD_ARRAY_LEN(fc1_weight)));
+    for (i = 0U; i < GD_ARRAY_LEN(fc1_weight); ++i) {
+        CHECK(fc1_weight[i] >= -1.0f && fc1_weight[i] <= 1.0f,
+              "module uniform init stays in range");
+    }
+    CHECK_OK(gd_tensor_one_(ctx, &fc1.bias));
+    CHECK_OK(gd_module_init_params_zero(ctx, &root, "xor.fc1.bias"));
+    CHECK_OK(gd_tensor_read_f32(ctx, &fc1.bias, fc1_bias, GD_ARRAY_LEN(fc1_bias)));
+    for (i = 0U; i < GD_ARRAY_LEN(fc1_bias); ++i) {
+        CHECK(abs_f32(fc1_bias[i]) <= 1.0e-6f, "module zero init clears matching bias");
+    }
 
     CHECK_OK(gd_module_freeze(&root, "xor.fc1.*"));
     CHECK_OK(gd_module_parameters(ctx, &root, &params));

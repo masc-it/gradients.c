@@ -166,6 +166,9 @@ gd_linear_layer_config gd_linear_layer_config_make(int64_t in_features,
                                                    int64_t out_features,
                                                    gd_dtype dtype,
                                                    uint64_t seed);
+gd_linear_layer_config gd_linear_layer_config_build(int64_t in_features,
+                                                    int64_t out_features,
+                                                    gd_dtype dtype);
 
 gd_status gd_module_init(gd_context *ctx, gd_module *module, const char *name);
 gd_status gd_module_init_child(gd_context *ctx,
@@ -194,6 +197,15 @@ gd_status gd_module_buffer(gd_context *ctx,
 void gd_module_set_training(gd_module *module, bool training);
 gd_status gd_module_freeze(gd_module *module, const char *pattern);
 gd_status gd_module_unfreeze(gd_module *module, const char *pattern);
+gd_status gd_module_init_params_uniform(gd_context *ctx,
+                                        gd_module *module,
+                                        const char *pattern,
+                                        float low,
+                                        float high,
+                                        uint64_t seed);
+gd_status gd_module_init_params_zero(gd_context *ctx,
+                                     gd_module *module,
+                                     const char *pattern);
 
 gd_param_group gd_param_group_build(const char *name,
                                     const char *match,

@@ -18,6 +18,11 @@
 #define CHECK_OK(expr) CHECK((expr) == GD_OK, #expr)
 #define CHECK_STATUS(expr, status) CHECK((expr) == (status), #expr)
 
+static float abs_f32(float x)
+{
+    return x < 0.0f ? -x : x;
+}
+
 static gd_memory_config transfer_config(void)
 {
     gd_memory_config cfg;
@@ -58,6 +63,38 @@ static void test_param_transfer(gd_context *ctx)
     bad = param;
     bad.storage.offset = param.storage.offset + param.storage.nbytes + 1U;
     CHECK_STATUS(gd_upload(ctx, src, sizeof(src), &bad), GD_ERR_BAD_STATE);
+    gd_context_clear_error(ctx);
+}
+
+static void test_f32_transfer(gd_context *ctx)
+{
+    const int64_t shape[1] = {4};
+    const float src[4] = {0.0f, 1.0f, -2.0f, 3.25f};
+    float dst[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    gd_tensor f16;
+    gd_tensor f32;
+    gd_tensor i32;
+    int32_t i32_src[4] = {1, 2, 3, 4};
+    uint32_t i;
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 64U, &f16));
+    CHECK_OK(gd_tensor_write_f32(ctx, &f16, src, GD_ARRAY_LEN(src)));
+    CHECK_OK(gd_tensor_read_f32(ctx, &f16, dst, GD_ARRAY_LEN(dst)));
+    for (i = 0U; i < GD_ARRAY_LEN(src); ++i) {
+        CHECK(abs_f32(dst[i] - src[i]) <= 1.0e-3f, "f32 transfer converts through f16");
+    }
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape, 64U, &f32));
+    CHECK_OK(gd_tensor_write_f32(ctx, &f32, src, GD_ARRAY_LEN(src)));
+    memset(dst, 0, sizeof(dst));
+    CHECK_OK(gd_tensor_read_f32(ctx, &f32, dst, GD_ARRAY_LEN(dst)));
+    CHECK(memcmp(src, dst, sizeof(src)) == 0, "f32 transfer preserves f32 values");
+
+    CHECK_STATUS(gd_tensor_read_f32(ctx, &f32, dst, GD_ARRAY_LEN(dst) - 1U), GD_ERR_INVALID_ARGUMENT);
+    gd_context_clear_error(ctx);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, shape, 64U, &i32));
+    CHECK_OK(gd_tensor_write(ctx, &i32, i32_src, sizeof(i32_src)));
+    CHECK_STATUS(gd_tensor_read_f32(ctx, &i32, dst, GD_ARRAY_LEN(dst)), GD_ERR_UNSUPPORTED);
     gd_context_clear_error(ctx);
 }
 
@@ -148,6 +185,7 @@ int main(void)
     }
     CHECK(ctx != NULL, "context created");
     test_param_transfer(ctx);
+    test_f32_transfer(ctx);
     test_scope_transfer(ctx);
     CHECK_OK(gd_synchronize(ctx));
     CHECK_OK(gd_memory_stats_query(ctx, &stats));

@@ -143,22 +143,6 @@ static void expect_tensor_f16(gd_context *ctx,
     }
 }
 
-static void expect_tensor_f32(gd_context *ctx,
-                              const gd_tensor *tensor,
-                              const float *want,
-                              uint32_t count,
-                              const char *what)
-{
-    float got[16];
-    uint32_t i;
-    CHECK(count <= 16U, "test helper count");
-    memset(got, 0, sizeof(got));
-    CHECK_OK(gd_tensor_read(ctx, tensor, got, (size_t)count * sizeof(got[0])));
-    for (i = 0U; i < count; ++i) {
-        CHECK(abs_f32(got[i] - want[i]) <= 1.0e-6f, what);
-    }
-}
-
 static void run_binary_ops_test(void)
 {
     enum { COUNT = 6 };
@@ -239,18 +223,20 @@ static void run_binary_ops_test(void)
     }
     expect_tensor_f16(ctx, &out, want, COUNT, "mul f16 forward");
 
-    CHECK_OK(gd_add(ctx, &x32, &y32, &out));
-    for (i = 0U; i < COUNT; ++i) {
-        want[i] = x_f32[i] + y_f32[i];
-    }
-    expect_tensor_f32(ctx, &out, want, COUNT, "add f32 forward");
-
-    CHECK_OK(gd_add(ctx, &x32, &b32, &out));
+    CHECK_OK(gd_add(ctx, &x, &b, &out));
     CHECK(out.rank == 2U && out.shape[0] == 2 && out.shape[1] == 3, "broadcast add output shape");
     for (i = 0U; i < COUNT; ++i) {
         want[i] = x_f32[i] + b_f32[i % 3U];
     }
-    expect_tensor_f32(ctx, &out, want, COUNT, "add f32 broadcast forward");
+    expect_tensor_f16(ctx, &out, want, COUNT, "add f16 broadcast forward");
+
+    st = gd_add(ctx, &x32, &y32, &out);
+    CHECK(st == GD_ERR_UNSUPPORTED, "add f32 unsupported");
+    gd_context_clear_error(ctx);
+
+    st = gd_add(ctx, &x32, &b32, &out);
+    CHECK(st == GD_ERR_UNSUPPORTED, "add f32 broadcast unsupported");
+    gd_context_clear_error(ctx);
 
     st = gd_mul(ctx, &x32, &b32, &out);
     CHECK(st == GD_ERR_UNSUPPORTED, "mul f32 unsupported");
@@ -261,6 +247,13 @@ static void run_binary_ops_test(void)
         want[i] = x_f32[i] * b_f32[i % 3U];
     }
     expect_tensor_f16(ctx, &out, want, COUNT, "mul f16 broadcast forward");
+
+    CHECK_OK(gd_add_backward(ctx, &x, &b, &g, &dx, &dy));
+    expect_tensor_f16(ctx, &dx, g_f32, COUNT, "add broadcast backward dx");
+    for (i = 0U; i < 3U; ++i) {
+        want[i] = g_f32[i] + g_f32[i + 3U];
+    }
+    expect_tensor_f16(ctx, &dy, want, 3U, "add broadcast backward dy");
 
     CHECK_OK(gd_sub_backward(ctx, &x, &y, &g, &dx, &dy));
     expect_tensor_f16(ctx, &dx, g_f32, COUNT, "sub backward dx");
@@ -308,6 +301,19 @@ static void run_binary_ops_test(void)
         want[i] = g_f32[i] * x_f32[i] + g_f32[i + 3U] * x_f32[i + 3U];
     }
     expect_tensor_f16(ctx, &dy, want, 3U, "mul broadcast autograd dy");
+    CHECK_OK(gd_end(ctx));
+
+    CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
+    CHECK_OK(gd_add(ctx, &x, &b, &out));
+    CHECK_OK(gd_backward(ctx, &out, &g));
+    CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
+    expect_tensor_f16(ctx, &dx, g_f32, COUNT, "add broadcast autograd dx");
+    CHECK_OK(gd_tensor_grad(ctx, &b, &dy));
+    CHECK(dy.rank == 1U && dy.shape[0] == 3, "add broadcast autograd dy shape");
+    for (i = 0U; i < 3U; ++i) {
+        want[i] = g_f32[i] + g_f32[i + 3U];
+    }
+    expect_tensor_f16(ctx, &dy, want, 3U, "add broadcast autograd dy");
     CHECK_OK(gd_end(ctx));
 
     gd_context_destroy(ctx);

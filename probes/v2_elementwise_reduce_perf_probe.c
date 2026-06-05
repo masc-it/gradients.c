@@ -475,7 +475,8 @@ static bool perf_run_case(const perf_case *pcase, int warmup, int iters)
     }
     for (i = 0U; i < sizeof(ops) / sizeof(ops[0]); ++i) {
         if (pcase->dtype != GD_DTYPE_F16 &&
-            (ops[i] == PERF_OP_MUL || ops[i] == PERF_OP_MUL_BIAS ||
+            (ops[i] == PERF_OP_ADD || ops[i] == PERF_OP_ADD_BIAS ||
+             ops[i] == PERF_OP_MUL || ops[i] == PERF_OP_MUL_BIAS ||
              ops[i] == PERF_OP_CROSS_ENTROPY || ops[i] == PERF_OP_CROSS_ENTROPY_BWD ||
              ops[i] == PERF_OP_MSE_GRAPH)) {
             printf("[ELEM][PERF] case=%s dtype=%s op=%-22s skipped=f16_only\n",

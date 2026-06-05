@@ -296,6 +296,7 @@ int main(void)
     TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
     TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
     TRY(ctx, gd_context_seal_params(ctx));
+    gd_module_set_training(&model.mod, true);
 
     for (step = 0; step < STEPS; ++step) {
         gd_tensor pred_tensor;
@@ -304,23 +305,19 @@ int main(void)
         gd_tensor loss;
         uint16_t loss_bits = 0U;
         float loss_value = 0.0f;
-        size_t i;
+        int report = step == 0 || (step + 1) % 40 == 0;
         TRY(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
         TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
         TRY(ctx, gd_sub(ctx, &pred_tensor, &target, &diff));
         TRY(ctx, gd_mul(ctx, &diff, &diff, &sq));
         TRY(ctx, gd_reduce_mean(ctx, &sq, &loss));
-        TRY(ctx, gd_tensor_read(ctx, &pred_tensor, pred_f16, sizeof(pred_f16)));
-        TRY(ctx, gd_tensor_read(ctx, &loss, &loss_bits, sizeof(loss_bits)));
-        loss_value = f16_bits_to_f32(loss_bits);
-        for (i = 0U; i < BATCH * OUT; ++i) {
-            pred[i] = f16_bits_to_f32(pred_f16[i]);
-        }
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
         TRY(ctx, gd_end(ctx));
 
-        if (step == 0 || (step + 1) % 40 == 0) {
+        if (report) {
+            TRY(ctx, gd_tensor_read(ctx, &loss, &loss_bits, sizeof(loss_bits)));
+            loss_value = f16_bits_to_f32(loss_bits);
             printf("step=%3d loss=%.6f scale=%.1f overflow=%s\n",
                    step + 1,
                    (double)loss_value,
@@ -329,19 +326,18 @@ int main(void)
         }
     }
 
-    TRY(ctx, gd_synchronize(ctx));
+    gd_module_set_training(&model.mod, false);
     TRY(ctx, gd_begin(ctx, GD_SCOPE_EVAL));
     {
         gd_tensor pred_tensor;
         size_t i;
         TRY(ctx, xor_mlp_forward(ctx, &model, &x, &pred_tensor));
+        TRY(ctx, gd_end(ctx));
         TRY(ctx, gd_tensor_read(ctx, &pred_tensor, pred_f16, sizeof(pred_f16)));
         for (i = 0U; i < BATCH * OUT; ++i) {
             pred[i] = f16_bits_to_f32(pred_f16[i]);
         }
     }
-    TRY(ctx, gd_end(ctx));
-    TRY(ctx, gd_synchronize(ctx));
 
     final_loss = mean_squared_error(pred, y_f32, BATCH * OUT);
     correct = 0;

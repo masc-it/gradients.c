@@ -120,6 +120,7 @@ size_t gd_tensor_storage_offset(const gd_tensor *tensor);
 
 gd_status gd_tensor_numel(const gd_tensor *tensor, int64_t *out_numel);
 gd_status gd_tensor_logical_nbytes(const gd_tensor *tensor, size_t *out_nbytes);
+gd_status gd_tensor_item(gd_context *ctx, const gd_tensor *src, float *out);
 gd_status gd_tensor_validate(gd_context *ctx, const gd_tensor *tensor);
 
 #ifdef __cplusplus

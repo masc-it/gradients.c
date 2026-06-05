@@ -116,8 +116,8 @@ int main(int argc, char **argv)
 
     logits_shape[0] = (int64_t)rows; logits_shape[1] = (int64_t)classes;
     target_shape[0] = (int64_t)rows;
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, (gd_dtype)dtype, 2U, logits_shape, 256U, &logits));
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, target_shape, 256U, &targets));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, (gd_dtype)dtype, gd_shape_make(2U, logits_shape), 256U, &logits));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK(ctx, gd_tensor_write(ctx, &logits, logits_data, logits_bytes));
     CHECK(ctx, gd_tensor_write(ctx, &targets, target_data, label_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));

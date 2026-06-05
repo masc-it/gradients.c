@@ -151,16 +151,24 @@ int main(void)
     xor_mlp model = {0};
     xor_mlp_init(ctx, &model);
 
-    const int64_t x_shape[2] = {BATCH, IN};
-    const int64_t y_shape[2] = {BATCH, OUT};
     gd_tensor x = {0};
     gd_tensor target = {0};
-    TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    TRY(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, y_shape, 256U, &target));
-    TRY(ctx, gd_tensor_write_f32(ctx, &x, x_f32, GD_ARRAY_LEN(x_f32)));
-    TRY(ctx, gd_tensor_write_f32(ctx, &target, y_f32, GD_ARRAY_LEN(y_f32)));
-    x.requires_grad = false;
-    target.requires_grad = false;
+    TRY(ctx, gd_tensor_from_f32(ctx,
+                                GD_ARENA_PARAMS,
+                                GD_DTYPE_F16,
+                                GD_SHAPE(BATCH, IN),
+                                x_f32,
+                                GD_ARRAY_LEN(x_f32),
+                                false,
+                                &x));
+    TRY(ctx, gd_tensor_from_f32(ctx,
+                                GD_ARENA_PARAMS,
+                                GD_DTYPE_F16,
+                                GD_SHAPE(BATCH, OUT),
+                                y_f32,
+                                GD_ARRAY_LEN(y_f32),
+                                false,
+                                &target));
 
     /* Showcase optimizer groups: split hidden-layer and head parameters by module path. */
     gd_param_group groups[] = {

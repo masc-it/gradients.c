@@ -295,36 +295,9 @@ static bool mul_perf_create_model(const mul_perf_case *pcase, mul_perf_model *mo
             return false;
         }
     }
-    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                          GD_ARENA_PARAMS,
-                                                          GD_DTYPE_F16,
-                                                          pcase->rank,
-                                                          pcase->x_shape,
-                                                          256U,
-                                                          101U,
-                                                          -1.0f,
-                                                          1.0f,
-                                                          &model->x));
-    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                          GD_ARENA_PARAMS,
-                                                          GD_DTYPE_F16,
-                                                          pcase->y_rank,
-                                                          pcase->y_shape,
-                                                          256U,
-                                                          202U,
-                                                          -1.0f,
-                                                          1.0f,
-                                                          &model->y));
-    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                          GD_ARENA_PARAMS,
-                                                          GD_DTYPE_F16,
-                                                          model->rank,
-                                                          model->out_shape,
-                                                          256U,
-                                                          303U,
-                                                          -1.0f,
-                                                          1.0f,
-                                                          &model->grad));
+    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(pcase->rank, pcase->x_shape), 256U, 101U, -1.0f, 1.0f, &model->x));
+    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(pcase->y_rank, pcase->y_shape), 256U, 202U, -1.0f, 1.0f, &model->y));
+    MUL_PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(model->rank, model->out_shape), 256U, 303U, -1.0f, 1.0f, &model->grad));
     MUL_PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     MUL_PERF_REQUIRE_OK(model->ctx, gd_synchronize(model->ctx));
     printf("[MUL] case=%s op=%s out_rank=%u out_elems=%zu out_tensor=%.1fMiB x_elems=%zu y_elems=%zu scratch_slot=%.1fMiB\n",

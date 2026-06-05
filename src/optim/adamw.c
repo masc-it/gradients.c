@@ -265,13 +265,7 @@ static gd_status gd_adamw_init_slot(gd_context *ctx,
     slot->trainable = ref->trainable;
     slot->has_master = ref->tensor->dtype == GD_DTYPE_F16;
     if (slot->has_master) {
-        st = gd_tensor_empty(ctx,
-                             GD_ARENA_STATE,
-                             GD_DTYPE_F32,
-                             ref->tensor->rank,
-                             ref->tensor->shape,
-                             256U,
-                             &slot->master);
+        st = gd_tensor_empty(ctx, GD_ARENA_STATE, GD_DTYPE_F32, gd_shape_make(ref->tensor->rank, ref->tensor->shape), 256U, &slot->master);
         if (st != GD_OK) {
             return st;
         }
@@ -282,23 +276,11 @@ static gd_status gd_adamw_init_slot(gd_context *ctx,
         slot->master.requires_grad = false;
         slot->master.is_leaf = false;
     }
-    st = gd_tensor_zeros(ctx,
-                         GD_ARENA_STATE,
-                         GD_DTYPE_F32,
-                         ref->tensor->rank,
-                         ref->tensor->shape,
-                         256U,
-                         &slot->m);
+    st = gd_tensor_zeros(ctx, GD_ARENA_STATE, GD_DTYPE_F32, gd_shape_make(ref->tensor->rank, ref->tensor->shape), 256U, &slot->m);
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_zeros(ctx,
-                         GD_ARENA_STATE,
-                         GD_DTYPE_F32,
-                         ref->tensor->rank,
-                         ref->tensor->shape,
-                         256U,
-                         &slot->v);
+    st = gd_tensor_zeros(ctx, GD_ARENA_STATE, GD_DTYPE_F32, gd_shape_make(ref->tensor->rank, ref->tensor->shape), 256U, &slot->v);
     if (st != GD_OK) {
         return st;
     }
@@ -532,8 +514,7 @@ gd_status gd_adamw_create(gd_context *ctx,
     optimizer->param_count = write_index;
     {
         const int64_t flag_shape[1] = {1};
-        st = gd_tensor_zeros(ctx, GD_ARENA_STATE, GD_DTYPE_I32, 1U, flag_shape, 256U,
-                             &optimizer->found_inf);
+        st = gd_tensor_zeros(ctx, GD_ARENA_STATE, GD_DTYPE_I32, gd_shape_make(1U, flag_shape), 256U, &optimizer->found_inf);
         if (st != GD_OK) {
             gd_optimizer_destroy(optimizer);
             return st;

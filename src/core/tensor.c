@@ -419,8 +419,7 @@ static gd_status gd_tensor_fill_pattern(gd_context *ctx, gd_tensor *tensor, uint
 static gd_status gd_tensor_alloc_then_zero_or_one(gd_context *ctx,
                                                   gd_arena_kind arena,
                                                   gd_dtype dtype,
-                                                  uint32_t rank,
-                                                  const int64_t *shape,
+                                                  gd_shape shape,
                                                   size_t alignment,
                                                   bool one,
                                                   gd_tensor *out)
@@ -433,7 +432,7 @@ static gd_status gd_tensor_alloc_then_zero_or_one(gd_context *ctx,
     if (ctx == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_tensor_empty(ctx, arena, dtype, rank, shape, alignment, &tensor);
+    st = gd_tensor_empty(ctx, arena, dtype, shape, alignment, &tensor);
     if (st != GD_OK) {
         return st;
     }
@@ -448,8 +447,7 @@ static gd_status gd_tensor_alloc_then_zero_or_one(gd_context *ctx,
 gd_status gd_tensor_empty(gd_context *ctx,
                           gd_arena_kind arena,
                           gd_dtype dtype,
-                          uint32_t rank,
-                          const int64_t *shape,
+                          gd_shape shape,
                           size_t alignment,
                           gd_tensor *out)
 {
@@ -462,7 +460,7 @@ gd_status gd_tensor_empty(gd_context *ctx,
     if (ctx == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_shape_storage_nbytes(dtype, rank, shape, &nbytes);
+    st = gd_shape_storage_nbytes(dtype, shape.rank, shape.dims, &nbytes);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "invalid tensor allocation shape");
     }
@@ -475,9 +473,9 @@ gd_status gd_tensor_empty(gd_context *ctx,
     tensor.dtype = dtype;
     tensor.device = GD_DEVICE_GPU;
     tensor.layout = GD_LAYOUT_STRIDED;
-    tensor.rank = rank;
-    if (rank > 0U) {
-        memcpy(tensor.shape, shape, (size_t)rank * sizeof(tensor.shape[0]));
+    tensor.rank = shape.rank;
+    if (shape.rank > 0U) {
+        memcpy(tensor.shape, shape.dims, (size_t)shape.rank * sizeof(tensor.shape[0]));
     }
     gd_tensor_set_contiguous_strides(&tensor);
     st = gd_context_alloc_span(ctx, arena, nbytes, alignment, &tensor.storage);
@@ -499,43 +497,39 @@ gd_status gd_tensor_empty(gd_context *ctx,
 gd_status gd_tensor_zeros(gd_context *ctx,
                           gd_arena_kind arena,
                           gd_dtype dtype,
-                          uint32_t rank,
-                          const int64_t *shape,
+                          gd_shape shape,
                           size_t alignment,
                           gd_tensor *out)
 {
-    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, rank, shape, alignment, false, out);
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, shape, alignment, false, out);
 }
 
 gd_status gd_tensor_ones(gd_context *ctx,
                          gd_arena_kind arena,
                          gd_dtype dtype,
-                         uint32_t rank,
-                         const int64_t *shape,
+                         gd_shape shape,
                          size_t alignment,
                          gd_tensor *out)
 {
-    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, rank, shape, alignment, true, out);
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, shape, alignment, true, out);
 }
 
 gd_status gd_tensor_rand(gd_context *ctx,
                          gd_arena_kind arena,
                          gd_dtype dtype,
-                         uint32_t rank,
-                         const int64_t *shape,
+                         gd_shape shape,
                          size_t alignment,
                          uint64_t seed,
                          gd_tensor *out)
 {
-    return gd_tensor_rand_uniform(ctx, arena, dtype, rank, shape, alignment,
+    return gd_tensor_rand_uniform(ctx, arena, dtype, shape, alignment,
                                   seed, 0.0f, 1.0f, out);
 }
 
 gd_status gd_tensor_rand_uniform(gd_context *ctx,
                                  gd_arena_kind arena,
                                  gd_dtype dtype,
-                                 uint32_t rank,
-                                 const int64_t *shape,
+                                 gd_shape shape,
                                  size_t alignment,
                                  uint64_t seed,
                                  float low,
@@ -558,11 +552,11 @@ gd_status gd_tensor_rand_uniform(gd_context *ctx,
     if (!(low <= high)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid range");
     }
-    st = gd_shape_storage_nbytes(dtype, rank, shape, &unused_nbytes);
+    st = gd_shape_storage_nbytes(dtype, shape.rank, shape.dims, &unused_nbytes);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "invalid tensor rand shape");
     }
-    st = gd_tensor_empty(ctx, arena, dtype, rank, shape, alignment, &tensor);
+    st = gd_tensor_empty(ctx, arena, dtype, shape, alignment, &tensor);
     if (st != GD_OK) {
         return st;
     }
@@ -644,7 +638,7 @@ gd_status gd_tensor_contiguous(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, arena, src->dtype, src->rank, src->shape, alignment, out);
+    st = gd_tensor_empty(ctx, arena, src->dtype, gd_shape_make(src->rank, src->shape), alignment, out);
     if (st != GD_OK) {
         return st;
     }

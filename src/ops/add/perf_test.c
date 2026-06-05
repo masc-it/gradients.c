@@ -243,38 +243,11 @@ static bool add_perf_create_model(const add_perf_case *pcase, add_perf_model *mo
         return false;
     }
     ADD_PERF_REQUIRE_OK(model->ctx,
-                        gd_tensor_rand_uniform(model->ctx,
-                                               GD_ARENA_PARAMS,
-                                               GD_DTYPE_F16,
-                                               pcase->x_rank,
-                                               pcase->x_shape,
-                                               256U,
-                                               11U,
-                                               -1.0f,
-                                               1.0f,
-                                               &model->x));
+                        gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(pcase->x_rank, pcase->x_shape), 256U, 11U, -1.0f, 1.0f, &model->x));
     ADD_PERF_REQUIRE_OK(model->ctx,
-                        gd_tensor_rand_uniform(model->ctx,
-                                               GD_ARENA_PARAMS,
-                                               GD_DTYPE_F16,
-                                               pcase->y_rank,
-                                               pcase->y_shape,
-                                               256U,
-                                               22U,
-                                               -1.0f,
-                                               1.0f,
-                                               &model->y));
+                        gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(pcase->y_rank, pcase->y_shape), 256U, 22U, -1.0f, 1.0f, &model->y));
     ADD_PERF_REQUIRE_OK(model->ctx,
-                        gd_tensor_rand_uniform(model->ctx,
-                                               GD_ARENA_PARAMS,
-                                               GD_DTYPE_F16,
-                                               model->out_rank,
-                                               model->out_shape,
-                                               256U,
-                                               33U,
-                                               -0.5f,
-                                               0.5f,
-                                               &model->grad));
+                        gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(model->out_rank, model->out_shape), 256U, 33U, -0.5f, 0.5f, &model->grad));
     ADD_PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     return true;
 }

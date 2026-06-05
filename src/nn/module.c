@@ -389,32 +389,28 @@ static gd_status gd_module_init_tensor(gd_context *ctx,
         return gd_tensor_empty(ctx,
                                arena,
                                spec->dtype,
-                               spec->rank,
-                               spec->shape,
+                               gd_shape_make(spec->rank, spec->shape),
                                spec->alignment,
                                out);
     case GD_INIT_ZERO:
         return gd_tensor_zeros(ctx,
                                arena,
                                spec->dtype,
-                               spec->rank,
-                               spec->shape,
+                               gd_shape_make(spec->rank, spec->shape),
                                spec->alignment,
                                out);
     case GD_INIT_ONE:
         return gd_tensor_ones(ctx,
                               arena,
                               spec->dtype,
-                              spec->rank,
-                              spec->shape,
+                              gd_shape_make(spec->rank, spec->shape),
                               spec->alignment,
                               out);
     case GD_INIT_RAND_UNIFORM:
         return gd_tensor_rand_uniform(ctx,
                                       arena,
                                       spec->dtype,
-                                      spec->rank,
-                                      spec->shape,
+                                      gd_shape_make(spec->rank, spec->shape),
                                       spec->alignment,
                                       actual_init.seed,
                                       actual_init.low,
@@ -426,19 +422,18 @@ static gd_status gd_module_init_tensor(gd_context *ctx,
 }
 
 gd_tensor_spec gd_tensor_spec_make(gd_dtype dtype,
-                                   uint32_t rank,
-                                   const int64_t *shape,
+                                   gd_shape shape,
                                    size_t alignment)
 {
     gd_tensor_spec spec;
     uint32_t i;
     memset(&spec, 0, sizeof(spec));
     spec.dtype = dtype;
-    spec.rank = rank;
+    spec.rank = shape.rank;
     spec.alignment = alignment;
-    if (shape != NULL && rank <= GD_MAX_DIMS) {
-        for (i = 0U; i < rank; ++i) {
-            spec.shape[i] = shape[i];
+    if (shape.rank <= GD_MAX_DIMS) {
+        for (i = 0U; i < shape.rank; ++i) {
+            spec.shape[i] = shape.dims[i];
         }
     }
     return spec;
@@ -961,7 +956,7 @@ gd_status gd_linear_layer_init(gd_context *ctx,
     layer->has_bias = config->use_bias;
     weight_shape[0] = config->in_features;
     weight_shape[1] = config->out_features;
-    weight_spec = gd_tensor_spec_make(config->dtype, 2U, weight_shape, config->alignment);
+    weight_spec = gd_tensor_spec_make(config->dtype, gd_shape_make(2U, weight_shape), config->alignment);
     weight_init = gd_init_rand_uniform(config->seed, config->weight_low, config->weight_high);
     st = gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &weight_init, &layer->weight);
     if (st != GD_OK) {
@@ -970,7 +965,7 @@ gd_status gd_linear_layer_init(gd_context *ctx,
     }
     if (config->use_bias) {
         bias_shape[0] = config->out_features;
-        bias_spec = gd_tensor_spec_make(config->dtype, 1U, bias_shape, config->alignment);
+        bias_spec = gd_tensor_spec_make(config->dtype, gd_shape_make(1U, bias_shape), config->alignment);
         bias_init = gd_init_zero();
         st = gd_module_param(ctx, &layer->mod, "bias", &bias_spec, &bias_init, &layer->bias);
         if (st != GD_OK) {

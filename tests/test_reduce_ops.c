@@ -189,7 +189,7 @@ static void test_reduce_forward_backward(void)
     float ref_sum = 0.0f;
     uint32_t i;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(2U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -242,7 +242,7 @@ static void test_reduce_axis_forward_backward(void)
     gd_tensor dx;
     uint32_t i;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(2U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -315,8 +315,8 @@ static void test_mse_graph(void)
     create_context_or_skip(&cfg, &ctx);
     pack_f16(pred_data, pred_h, COUNT);
     pack_f16(target_data, target_h, COUNT);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &pred));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &target));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &pred));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &target));
     CHECK_OK(gd_tensor_write(ctx, &pred, pred_h, sizeof(pred_h)));
     CHECK_OK(gd_tensor_write(ctx, &target, target_h, sizeof(target_h)));
     pred.requires_grad = true;
@@ -361,7 +361,7 @@ static void test_reduce_f16(void)
     for (i = 0U; i < COUNT; ++i) {
         want += x_f32[i];
     }
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     CHECK_OK(gd_context_seal_params(ctx));
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
@@ -411,7 +411,7 @@ static void test_reduce_f16_large_multistage(void)
         want += value;
     }
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, (size_t)COUNT * sizeof(*x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -472,7 +472,7 @@ static void test_reduce_mean_f16_large_multistage(void)
     }
     want_mean = want_sum / (float)COUNT;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, (size_t)COUNT * sizeof(*x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -535,7 +535,7 @@ static void test_reduce_f16_axis_rank3(void)
     uint32_t inner;
     create_context_or_skip(&cfg, &ctx);
     pack_f16(x_f32, x_h, COUNT);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 3U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -590,7 +590,7 @@ static void test_reduce_mean_f16_axis_rank3(void)
     uint32_t inner;
     create_context_or_skip(&cfg, &ctx);
     pack_f16(x_f32, x_h, COUNT);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 3U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, shape), 256U, &x));
     CHECK_OK(gd_tensor_write(ctx, &x, x_h, sizeof(x_h)));
     x.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));

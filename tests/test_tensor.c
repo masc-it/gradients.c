@@ -63,13 +63,13 @@ static void test_params_tensor(gd_context *ctx)
     CHECK(gd_dtype_size(GD_DTYPE_F16) == 2U, "f16 dtype size");
     CHECK(gd_dtype_size(GD_DTYPE_F32) == 4U, "f32 dtype size");
     CHECK_OK(gd_memory_stats_query(ctx, &before));
-    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, bad_shape, 64U, &bad),
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, bad_shape), 64U, &bad),
                  GD_ERR_INVALID_ARGUMENT);
     CHECK_OK(gd_memory_stats_query(ctx, &after));
     CHECK(before.params.offset == after.params.offset, "bad tensor shape does not allocate");
     gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 64U, &param));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 64U, &param));
     CHECK(param.dtype == GD_DTYPE_F16 && param.device == GD_DEVICE_GPU, "param dtype/device");
     CHECK(param.storage.arena == GD_ARENA_PARAMS && param.storage.slot == -1, "param arena metadata");
     CHECK(param.storage.offset % 64U == 0U, "param storage alignment");
@@ -83,38 +83,36 @@ static void test_params_tensor(gd_context *ctx)
     CHECK(gd_tensor_storage_offset(&param) == param.storage.offset, "param view offset zero");
     CHECK_OK(gd_tensor_validate(ctx, &param));
 
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, fill_shape, 64U, &zeros));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, fill_shape), 64U, &zeros));
     CHECK_OK(gd_tensor_read(ctx, &zeros, zero_bits, sizeof(zero_bits)));
     CHECK(zero_bits[0] == 0U && zero_bits[1] == 0U && zero_bits[2] == 0U && zero_bits[3] == 0U,
           "zeros initializes f16 storage");
 
-    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape, 64U, &ones));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, &ones));
     CHECK_OK(gd_tensor_read(ctx, &ones, one_values, sizeof(one_values)));
     CHECK(one_values[0] == 1.0f && one_values[1] == 1.0f &&
           one_values[2] == 1.0f && one_values[3] == 1.0f,
           "ones initializes f32 storage");
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, scalar_shape, 64U, &scalar_f16));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, scalar_shape), 64U, &scalar_f16));
     CHECK_OK(gd_tensor_write(ctx, &scalar_f16, &scalar_f16_bits, sizeof(scalar_f16_bits)));
     CHECK_OK(gd_tensor_item(ctx, &scalar_f16, &scalar_item));
     CHECK(scalar_item == -2.0f, "tensor item converts f16 scalar to f32");
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, scalar_shape, 64U, &scalar_f32));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, scalar_shape), 64U, &scalar_f32));
     CHECK_OK(gd_tensor_write(ctx, &scalar_f32, &scalar_f32_value, sizeof(scalar_f32_value)));
     CHECK_OK(gd_tensor_item(ctx, &scalar_f32, &scalar_item));
     CHECK(scalar_item == 3.25f, "tensor item reads f32 scalar");
 
     CHECK_STATUS(gd_tensor_item(ctx, &ones, &scalar_item), GD_ERR_INVALID_ARGUMENT);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, scalar_shape, 64U, &scalar_i32));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, scalar_shape), 64U, &scalar_i32));
     CHECK_OK(gd_tensor_write(ctx, &scalar_i32, &scalar_i32_value, sizeof(scalar_i32_value)));
     CHECK_STATUS(gd_tensor_item(ctx, &scalar_i32, &scalar_item), GD_ERR_UNSUPPORTED);
     gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
-                                    64U, 1234U, -1.0f, 1.0f, &rand_a));
-    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
-                                    64U, 1234U, -1.0f, 1.0f, &rand_b));
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1234U, -1.0f, 1.0f, &rand_a));
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1234U, -1.0f, 1.0f, &rand_b));
     CHECK_OK(gd_tensor_read(ctx, &rand_a, rand_values_a, sizeof(rand_values_a)));
     CHECK_OK(gd_tensor_read(ctx, &rand_b, rand_values_b, sizeof(rand_values_b)));
     CHECK(memcmp(rand_values_a, rand_values_b, sizeof(rand_values_a)) == 0,
@@ -126,15 +124,13 @@ static void test_params_tensor(gd_context *ctx)
           "rand_uniform stays in requested range");
 
     CHECK_OK(gd_memory_stats_query(ctx, &before));
-    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, fill_shape,
-                                        64U, 1U, 0.0f, 1.0f, &bad),
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, fill_shape), 64U, 1U, 0.0f, 1.0f, &bad),
                  GD_ERR_UNSUPPORTED);
     CHECK_OK(gd_memory_stats_query(ctx, &after));
     CHECK(before.params.offset == after.params.offset,
           "unsupported rand dtype does not allocate");
     gd_context_clear_error(ctx);
-    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, fill_shape,
-                                        64U, 1U, 2.0f, 1.0f, &bad),
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1U, 2.0f, 1.0f, &bad),
                  GD_ERR_INVALID_ARGUMENT);
     CHECK_OK(gd_memory_stats_query(ctx, &after));
     CHECK(before.params.offset == after.params.offset,
@@ -155,7 +151,7 @@ static void test_params_tensor(gd_context *ctx)
     gd_context_clear_error(ctx);
 
     CHECK_OK(gd_context_seal_params(ctx));
-    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 64U, &bad),
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 64U, &bad),
                  GD_ERR_FROZEN);
     gd_context_clear_error(ctx);
 }
@@ -176,7 +172,7 @@ static void test_scope_tensor_views(gd_context *ctx)
     uint64_t hidden_generation;
     float scratch_fill[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, hidden_shape, 64U, &hidden),
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden),
                  GD_ERR_BAD_STATE);
     gd_context_clear_error(ctx);
 
@@ -184,10 +180,9 @@ static void test_scope_tensor_views(gd_context *ctx)
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, 2U, token_shape, 64U, &tokens));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, hidden_shape, 64U, &hidden));
-    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, scratch_fill_shape,
-                            64U, &scratch_ones));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, gd_shape_make(2U, token_shape), 64U, &tokens));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, scratch_fill_shape), 64U, &scratch_ones));
     hidden_slot = hidden.storage.slot;
     hidden_generation = hidden.storage.generation;
     CHECK(tokens.storage.arena == GD_ARENA_DATA, "tokens live in data arena");

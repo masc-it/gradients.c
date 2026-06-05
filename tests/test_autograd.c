@@ -275,13 +275,13 @@ static void test_fanout_many_loss(gd_context *ctx)
     reduce_rows(g1_data, M, P, db_ref);
     matmul_tn(y_ref, g2_data, M, N, Q, du_ref);
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, w_shape, 256U, &w));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, v_shape, 256U, &v));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, b_shape, 256U, &b));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, u_shape, 256U, &u));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, g1_shape, 256U, &g1));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, g2_shape, 256U, &g2));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256U, &w));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, v_shape), 256U, &v));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, b_shape), 256U, &b));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, u_shape), 256U, &u));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, g1_shape), 256U, &g1));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, g2_shape), 256U, &g2));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     CHECK_OK(gd_tensor_write(ctx, &w, w_data, sizeof(w_data)));
     CHECK_OK(gd_tensor_write(ctx, &v, v_data, sizeof(v_data)));

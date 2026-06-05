@@ -170,8 +170,8 @@ int main(int argc, char **argv)
     st = gd_context_create(&cfg, &ctx);
     if (st == GD_ERR_UNSUPPORTED) { printf("SKIP unsupported backend\n"); rc = 77; goto done; }
     if (check_status(ctx, st, "gd_context_create") != 0 || ctx == NULL) { goto fail; }
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, rank, shape, 256U, &x));
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, grad_rank, grad_rank == 0U ? NULL : grad_shape, 256U, &grad_out));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, gd_shape_make(rank, shape), 256U, &x));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, gd_shape_make(grad_rank, grad_rank == 0U ? NULL : grad_shape), 256U, &grad_out));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, x_bytes));
     CHECK(ctx, gd_tensor_write(ctx, &grad_out, grad_data, grad_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));

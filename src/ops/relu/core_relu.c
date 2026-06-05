@@ -76,7 +76,7 @@ gd_status gd_relu(gd_context *ctx, const gd_tensor *x, gd_tensor *out)
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &y);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &y);
     if (st != GD_OK) {
         return st;
     }
@@ -129,7 +129,7 @@ gd_status gd_relu_backward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }

@@ -194,46 +194,10 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
     x_shape[1] = pcase->hidden;
     bias_shape[0] = pcase->hidden;
     label_shape[0] = pcase->tokens;
-    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                       GD_ARENA_PARAMS,
-                                                       pcase->dtype,
-                                                       2U,
-                                                       x_shape,
-                                                       256U,
-                                                       11U,
-                                                       -1.0f,
-                                                       1.0f,
-                                                       &model->x));
-    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                       GD_ARENA_PARAMS,
-                                                       pcase->dtype,
-                                                       2U,
-                                                       x_shape,
-                                                       256U,
-                                                       22U,
-                                                       -1.0f,
-                                                       1.0f,
-                                                       &model->y));
-    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                       GD_ARENA_PARAMS,
-                                                       pcase->dtype,
-                                                       2U,
-                                                       x_shape,
-                                                       256U,
-                                                       33U,
-                                                       -1.0f,
-                                                       1.0f,
-                                                       &model->target));
-    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx,
-                                                       GD_ARENA_PARAMS,
-                                                       pcase->dtype,
-                                                       1U,
-                                                       bias_shape,
-                                                       256U,
-                                                       44U,
-                                                       -0.25f,
-                                                       0.25f,
-                                                       &model->bias));
+    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(2U, x_shape), 256U, 11U, -1.0f, 1.0f, &model->x));
+    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(2U, x_shape), 256U, 22U, -1.0f, 1.0f, &model->y));
+    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(2U, x_shape), 256U, 33U, -1.0f, 1.0f, &model->target));
+    PERF_REQUIRE_OK(model->ctx, gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(1U, bias_shape), 256U, 44U, -0.25f, 0.25f, &model->bias));
     labels = (int32_t *)malloc((size_t)pcase->tokens * sizeof(*labels));
     if (labels == NULL) {
         return false;
@@ -241,13 +205,7 @@ static bool perf_create_model(const perf_case *pcase, perf_model *model)
     for (int64_t i = 0; i < pcase->tokens; ++i) {
         labels[i] = (int32_t)(i % pcase->hidden);
     }
-    st = gd_tensor_empty(model->ctx,
-                         GD_ARENA_PARAMS,
-                         GD_DTYPE_I32,
-                         1U,
-                         label_shape,
-                         256U,
-                         &model->labels);
+    st = gd_tensor_empty(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, label_shape), 256U, &model->labels);
     if (!perf_status_ok(model->ctx, st, "gd_tensor_empty labels")) {
         free(labels);
         return false;

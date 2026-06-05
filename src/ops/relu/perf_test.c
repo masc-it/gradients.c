@@ -176,27 +176,9 @@ static bool relu_perf_create_model(const relu_perf_case *pcase, relu_perf_model 
     shape[0] = pcase->rows;
     shape[1] = pcase->cols;
     RELU_PERF_REQUIRE_OK(model->ctx,
-                         gd_tensor_rand_uniform(model->ctx,
-                                                GD_ARENA_PARAMS,
-                                                GD_DTYPE_F16,
-                                                2U,
-                                                shape,
-                                                256U,
-                                                1234U,
-                                                -1.0f,
-                                                1.0f,
-                                                &model->x));
+                         gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, 1234U, -1.0f, 1.0f, &model->x));
     RELU_PERF_REQUIRE_OK(model->ctx,
-                         gd_tensor_rand_uniform(model->ctx,
-                                                GD_ARENA_PARAMS,
-                                                GD_DTYPE_F16,
-                                                2U,
-                                                shape,
-                                                256U,
-                                                5678U,
-                                                -0.5f,
-                                                0.5f,
-                                                &model->grad));
+                         gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, 5678U, -0.5f, 0.5f, &model->grad));
     RELU_PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     return true;
 }

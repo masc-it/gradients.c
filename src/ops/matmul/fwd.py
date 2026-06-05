@@ -209,8 +209,8 @@ int main(int argc, char **argv)
     w_shape[0] = (int64_t)k;
     w_shape[1] = (int64_t)n;
 
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, w_shape, 256U, &w));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256U, &w));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, x_bytes));
     CHECK(ctx, gd_tensor_write(ctx, &w, w_data, w_bytes));
     CHECK(ctx, gd_context_seal_params(ctx));

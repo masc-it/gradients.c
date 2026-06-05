@@ -73,13 +73,7 @@ static gd_status gd_mul_empty_like(gd_context *ctx, const gd_tensor *shape_like,
     if (ctx == NULL || shape_like == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_tensor_empty(ctx,
-                         GD_ARENA_SCRATCH,
-                         shape_like->dtype,
-                         shape_like->rank,
-                         shape_like->shape,
-                         256U,
-                         out);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, shape_like->dtype, gd_shape_make(shape_like->rank, shape_like->shape), 256U, out);
     if (st != GD_OK) {
         return st;
     }

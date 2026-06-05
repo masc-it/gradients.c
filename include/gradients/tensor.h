@@ -13,6 +13,38 @@ extern "C" {
 #endif
 
 #define GD_MAX_DIMS 8U
+#ifndef GD_ARRAY_LEN
+#define GD_ARRAY_LEN(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
+#endif
+
+typedef struct gd_shape {
+    uint32_t rank;
+    int64_t dims[GD_MAX_DIMS];
+} gd_shape;
+
+#define GD_SHAPE(...)                                                         \
+    ((gd_shape){                                                              \
+        (uint32_t)(sizeof((int64_t[]){__VA_ARGS__}) / sizeof(int64_t)),       \
+        {__VA_ARGS__}                                                         \
+    })
+#define GD_SCALAR_SHAPE ((gd_shape){0U, {0}})
+
+static inline gd_shape gd_shape_make(uint32_t rank, const int64_t *dims)
+{
+    gd_shape shape;
+    uint32_t i;
+    shape.rank = rank;
+    for (i = 0U; i < GD_MAX_DIMS; ++i) {
+        shape.dims[i] = 0;
+    }
+    if (dims != NULL) {
+        uint32_t n = rank < GD_MAX_DIMS ? rank : GD_MAX_DIMS;
+        for (i = 0U; i < n; ++i) {
+            shape.dims[i] = dims[i];
+        }
+    }
+    return shape;
+}
 
 typedef enum gd_dtype {
     GD_DTYPE_INVALID = 0,
@@ -55,37 +87,32 @@ const char *gd_dtype_name(gd_dtype dtype);
 gd_status gd_tensor_empty(gd_context *ctx,
                           gd_arena_kind arena,
                           gd_dtype dtype,
-                          uint32_t rank,
-                          const int64_t *shape,
+                          gd_shape shape,
                           size_t alignment,
                           gd_tensor *out);
 gd_status gd_tensor_zeros(gd_context *ctx,
                           gd_arena_kind arena,
                           gd_dtype dtype,
-                          uint32_t rank,
-                          const int64_t *shape,
+                          gd_shape shape,
                           size_t alignment,
                           gd_tensor *out);
 gd_status gd_tensor_ones(gd_context *ctx,
                          gd_arena_kind arena,
                          gd_dtype dtype,
-                         uint32_t rank,
-                         const int64_t *shape,
+                         gd_shape shape,
                          size_t alignment,
                          gd_tensor *out);
 gd_status gd_tensor_rand(gd_context *ctx,
                          gd_arena_kind arena,
                          gd_dtype dtype,
-                         uint32_t rank,
-                         const int64_t *shape,
+                         gd_shape shape,
                          size_t alignment,
                          uint64_t seed,
                          gd_tensor *out);
 gd_status gd_tensor_rand_uniform(gd_context *ctx,
                                  gd_arena_kind arena,
                                  gd_dtype dtype,
-                                 uint32_t rank,
-                                 const int64_t *shape,
+                                 gd_shape shape,
                                  size_t alignment,
                                  uint64_t seed,
                                  float low,

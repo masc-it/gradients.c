@@ -507,7 +507,7 @@ gd_module_collect_params(ctx, &model->mod, groups, n_groups, &param_set);
 Normal layer code should use create-and-register helpers instead of manually registering every tensor:
 
 ```c
-gd_tensor_spec w = gd_tensor_spec_make(GD_DTYPE_F16, 2, w_shape, 256);
+gd_tensor_spec w = gd_tensor_spec_make(GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256);
 gd_init_spec init = gd_init_rand_uniform(seed, -0.02f, 0.02f);
 gd_module_param(ctx, &m->mod, "weight", &w, &init, &m->weight);
 

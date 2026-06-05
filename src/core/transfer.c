@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 static bool gd_range_inside(size_t capacity, size_t offset, size_t nbytes)
 {
@@ -266,4 +267,35 @@ gd_status gd_tensor_read_f32(gd_context *ctx, const gd_tensor *src, float *dst, 
     }
     free(packed);
     return st;
+}
+
+gd_status gd_tensor_from_f32(gd_context *ctx,
+                             gd_arena_kind arena,
+                             gd_dtype dtype,
+                             gd_shape shape,
+                             const float *src,
+                             size_t count,
+                             bool requires_grad,
+                             gd_tensor *out)
+{
+    gd_tensor tensor;
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || src == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_empty(ctx, arena, dtype, shape, 256U, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_write_f32(ctx, &tensor, src, count);
+    if (st != GD_OK) {
+        return st;
+    }
+    tensor.requires_grad = requires_grad;
+    tensor.is_leaf = true;
+    *out = tensor;
+    return GD_OK;
 }

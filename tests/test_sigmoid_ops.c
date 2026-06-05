@@ -161,8 +161,8 @@ static void test_sigmoid_f32_forward_backward(void)
     gd_tensor dx_auto;
     uint32_t i;
     CHECK_OK(gd_context_create(&cfg, &ctx));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &x));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, shape, 256U, &g));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(2U, shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(2U, shape), 256U, &g));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     CHECK_OK(gd_tensor_write(ctx, &g, g_data, sizeof(g_data)));
     CHECK_OK(gd_context_seal_params(ctx));
@@ -234,8 +234,8 @@ static void test_sigmoid_f16_forward_backward(void)
         g_data[i] = f32_to_f16_bits(g_values[i]);
     }
     CHECK_OK(gd_context_create(&cfg, &ctx));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &x));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &g));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &g));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     CHECK_OK(gd_tensor_write(ctx, &g, g_data, sizeof(g_data)));
     CHECK_OK(gd_context_seal_params(ctx));
@@ -292,7 +292,7 @@ static void test_sigmoid_rejects_i32(void)
     gd_tensor x;
     gd_tensor y;
     CHECK_OK(gd_context_create(&cfg, &ctx));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, shape), 256U, &x));
     CHECK_OK(gd_context_seal_params(ctx));
     CHECK_STATUS(gd_sigmoid(ctx, &x, &y), GD_ERR_UNSUPPORTED);
     gd_context_destroy(ctx);

@@ -199,7 +199,7 @@ static void test_relu_f32_unsupported(gd_context *ctx)
     const int64_t shape[1] = {1};
     gd_tensor x;
     gd_tensor y;
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape, 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, shape), 256U, &x));
     CHECK_STATUS(gd_relu(ctx, &x, &y), GD_ERR_UNSUPPORTED);
 }
 
@@ -235,9 +235,9 @@ static void test_matmul_linear(gd_context *ctx)
     fill_x(x_data, M, K);
     fill_w(w_data, K, N);
     fill_b(b_data, N);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, w_shape, 256U, &w));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, b_shape, 256U, &b));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256U, &w));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, b_shape), 256U, &b));
     CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     CHECK_OK(gd_tensor_write(ctx, &w, w_data, sizeof(w_data)));
     CHECK_OK(gd_tensor_write(ctx, &b, b_data, sizeof(b_data)));

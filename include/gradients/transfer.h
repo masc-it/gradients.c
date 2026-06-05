@@ -32,6 +32,14 @@ gd_status gd_tensor_write(gd_context *ctx, gd_tensor *dst, const void *src, size
 gd_status gd_tensor_read(gd_context *ctx, const gd_tensor *src, void *dst, size_t nbytes);
 gd_status gd_tensor_write_f32(gd_context *ctx, gd_tensor *dst, const float *src, size_t count);
 gd_status gd_tensor_read_f32(gd_context *ctx, const gd_tensor *src, float *dst, size_t count);
+gd_status gd_tensor_from_f32(gd_context *ctx,
+                             gd_arena_kind arena,
+                             gd_dtype dtype,
+                             gd_shape shape,
+                             const float *src,
+                             size_t count,
+                             bool requires_grad,
+                             gd_tensor *out);
 
 #ifdef __cplusplus
 }

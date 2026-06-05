@@ -83,7 +83,7 @@ gd_status gd_matmul_backward(gd_context *ctx,
     if (need_grad_x) {
         dx_shape[0] = x->shape[0];
         dx_shape[1] = x->shape[1];
-        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U, dx_shape, 256U, &dx);
+        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, dx_shape), 256U, &dx);
         if (st != GD_OK) {
             return st;
         }
@@ -98,7 +98,7 @@ gd_status gd_matmul_backward(gd_context *ctx,
     if (need_grad_w) {
         dw_shape[0] = w->shape[0];
         dw_shape[1] = w->shape[1];
-        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U, dw_shape, 256U, &dw);
+        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, dw_shape), 256U, &dw);
         if (st != GD_OK) {
             return st;
         }

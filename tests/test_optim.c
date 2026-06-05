@@ -140,8 +140,8 @@ static void run_amp_adamw_test(void)
         p0[i] = f32_to_f16_bits(p0_f32[i]);
         grad_bits[i] = f32_to_f16_bits(g0_f32[i]);
     }
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &param));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 256U, &grad_seed));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &param));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &grad_seed));
     CHECK_OK(gd_tensor_write(ctx, &param, p0, sizeof(p0)));
     CHECK_OK(gd_tensor_write(ctx, &grad_seed, grad_bits, sizeof(grad_bits)));
     param.requires_grad = true;

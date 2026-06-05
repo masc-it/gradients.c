@@ -293,13 +293,7 @@ static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
     }
     slot = &bwd->tape->grads[bwd->tape->n_grads];
     memset(slot, 0, sizeof(*slot));
-    st = gd_tensor_zeros(bwd->ctx,
-                         GD_ARENA_SCRATCH,
-                         like->dtype,
-                         like->rank,
-                         like->shape,
-                         GD_AUTOGRAD_GRAD_ALIGNMENT,
-                         &slot->grad);
+    st = gd_tensor_zeros(bwd->ctx, GD_ARENA_SCRATCH, like->dtype, gd_shape_make(like->rank, like->shape), GD_AUTOGRAD_GRAD_ALIGNMENT, &slot->grad);
     if (st != GD_OK) {
         return st;
     }
@@ -510,13 +504,7 @@ static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
         if (scale == 1.0f) {
             return gd_autograd_accumulate(bwd, output->id, grad_output);
         }
-        st = gd_tensor_empty(bwd->ctx,
-                             GD_ARENA_SCRATCH,
-                             grad_output->dtype,
-                             grad_output->rank,
-                             grad_output->shape,
-                             GD_AUTOGRAD_GRAD_ALIGNMENT,
-                             &seed);
+        st = gd_tensor_empty(bwd->ctx, GD_ARENA_SCRATCH, grad_output->dtype, gd_shape_make(grad_output->rank, grad_output->shape), GD_AUTOGRAD_GRAD_ALIGNMENT, &seed);
         if (st != GD_OK) {
             return st;
         }
@@ -528,13 +516,7 @@ static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
         }
         return gd_autograd_accumulate(bwd, output->id, &seed);
     }
-    st = gd_tensor_ones(bwd->ctx,
-                        GD_ARENA_SCRATCH,
-                        output->dtype,
-                        output->rank,
-                        output->shape,
-                        GD_AUTOGRAD_GRAD_ALIGNMENT,
-                        &seed);
+    st = gd_tensor_ones(bwd->ctx, GD_ARENA_SCRATCH, output->dtype, gd_shape_make(output->rank, output->shape), GD_AUTOGRAD_GRAD_ALIGNMENT, &seed);
     if (st != GD_OK) {
         return st;
     }

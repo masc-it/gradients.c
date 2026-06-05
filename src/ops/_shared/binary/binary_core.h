@@ -187,7 +187,7 @@ static inline gd_status gd_binary_apply_impl(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, out_rank, out_shape, 256U, &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(out_rank, out_shape), 256U, &result);
     if (st != GD_OK) {
         return st;
     }
@@ -269,13 +269,7 @@ static inline gd_status gd_binary_scale_to_shape(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "binary backward flat scale count mismatch");
     }
-    st = gd_tensor_empty(ctx,
-                         GD_ARENA_SCRATCH,
-                         shape_like->dtype,
-                         shape_like->rank,
-                         shape_like->shape,
-                         256U,
-                         &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, shape_like->dtype, gd_shape_make(shape_like->rank, shape_like->shape), 256U, &result);
     if (st != GD_OK) {
         return st;
     }
@@ -345,13 +339,7 @@ static inline gd_status gd_binary_sum_to_shape(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "binary sum_to_shape rank mismatch");
     }
-    st = gd_tensor_empty(ctx,
-                         GD_ARENA_SCRATCH,
-                         shape_like->dtype,
-                         shape_like->rank,
-                         shape_like->shape,
-                         256U,
-                         &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, shape_like->dtype, gd_shape_make(shape_like->rank, shape_like->shape), 256U, &result);
     if (st != GD_OK) {
         return st;
     }

@@ -99,7 +99,7 @@ static void test_linear_child_module(gd_context *ctx)
     gd_param_set_free(&params);
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_DATA, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_DATA, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
     CHECK_OK(gd_linear_layer_forward(ctx, &fc1, &x, &y));
     CHECK(y.rank == 2U && y.shape[0] == 4 && y.shape[1] == 4,
           "linear layer forward output shape");

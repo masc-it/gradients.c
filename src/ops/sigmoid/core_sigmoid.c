@@ -95,7 +95,7 @@ gd_status gd_sigmoid(gd_context *ctx, const gd_tensor *x, gd_tensor *out)
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &y);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &y);
     if (st != GD_OK) {
         return st;
     }
@@ -148,7 +148,7 @@ gd_status gd_sigmoid_backward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }
@@ -193,13 +193,7 @@ gd_status gd_sigmoid_backward_from_output(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx,
-                         GD_ARENA_SCRATCH,
-                         sigmoid_out->dtype,
-                         sigmoid_out->rank,
-                         sigmoid_out->shape,
-                         256U,
-                         &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, sigmoid_out->dtype, gd_shape_make(sigmoid_out->rank, sigmoid_out->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }

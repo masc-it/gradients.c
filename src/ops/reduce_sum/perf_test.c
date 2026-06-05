@@ -257,38 +257,14 @@ static bool reduce_perf_create_model(const reduce_perf_case *pcase, reduce_perf_
         return false;
     }
     REDUCE_PERF_REQUIRE_OK(model->ctx,
-                           gd_tensor_rand_uniform(model->ctx,
-                                                  GD_ARENA_PARAMS,
-                                                  pcase->dtype,
-                                                  pcase->rank,
-                                                  pcase->shape,
-                                                  256U,
-                                                  1001U,
-                                                  -1.0f,
-                                                  1.0f,
-                                                  &model->x));
+                           gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(pcase->rank, pcase->shape), 256U, 1001U, -1.0f, 1.0f, &model->x));
     REDUCE_PERF_REQUIRE_OK(model->ctx,
-                           gd_tensor_empty(model->ctx,
-                                           GD_ARENA_PARAMS,
-                                           pcase->dtype,
-                                           0U,
-                                           NULL,
-                                           256U,
-                                           &model->scalar_grad));
+                           gd_tensor_empty(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(0U, NULL), 256U, &model->scalar_grad));
     if (!reduce_perf_write_scalar_one(model->ctx, &model->scalar_grad, pcase->dtype)) {
         return false;
     }
     REDUCE_PERF_REQUIRE_OK(model->ctx,
-                           gd_tensor_rand_uniform(model->ctx,
-                                                  GD_ARENA_PARAMS,
-                                                  pcase->dtype,
-                                                  model->axis_rank,
-                                                  model->axis_rank == 0U ? NULL : model->axis_shape,
-                                                  256U,
-                                                  2002U,
-                                                  -0.5f,
-                                                  0.5f,
-                                                  &model->axis_grad));
+                           gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(model->axis_rank, model->axis_rank == 0U ? NULL : model->axis_shape), 256U, 2002U, -0.5f, 0.5f, &model->axis_grad));
     REDUCE_PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     return true;
 }

@@ -47,7 +47,7 @@ static void test_param_transfer(gd_context *ctx)
     gd_tensor bad;
 
     memset(dst, 0, sizeof(dst));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 64U, &param));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 64U, &param));
     CHECK_OK(gd_upload(ctx, src, sizeof(src), &param));
     CHECK_OK(gd_download(ctx, &param, dst, sizeof(dst)));
     CHECK(memcmp(src, dst, sizeof(src)) == 0, "param upload/download roundtrip");
@@ -68,7 +68,6 @@ static void test_param_transfer(gd_context *ctx)
 
 static void test_f32_transfer(gd_context *ctx)
 {
-    const int64_t shape[1] = {4};
     const float src[4] = {0.0f, 1.0f, -2.0f, 3.25f};
     float dst[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     gd_tensor f16;
@@ -77,14 +76,15 @@ static void test_f32_transfer(gd_context *ctx)
     int32_t i32_src[4] = {1, 2, 3, 4};
     uint32_t i;
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 64U, &f16));
-    CHECK_OK(gd_tensor_write_f32(ctx, &f16, src, GD_ARRAY_LEN(src)));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, GD_SHAPE(4), src,
+                                GD_ARRAY_LEN(src), true, &f16));
+    CHECK(f16.requires_grad, "tensor_from_f32 applies requires_grad flag");
     CHECK_OK(gd_tensor_read_f32(ctx, &f16, dst, GD_ARRAY_LEN(dst)));
     for (i = 0U; i < GD_ARRAY_LEN(src); ++i) {
         CHECK(abs_f32(dst[i] - src[i]) <= 1.0e-3f, "f32 transfer converts through f16");
     }
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape, 64U, &f32));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, GD_SHAPE(4), 64U, &f32));
     CHECK_OK(gd_tensor_write_f32(ctx, &f32, src, GD_ARRAY_LEN(src)));
     memset(dst, 0, sizeof(dst));
     CHECK_OK(gd_tensor_read_f32(ctx, &f32, dst, GD_ARRAY_LEN(dst)));
@@ -92,7 +92,7 @@ static void test_f32_transfer(gd_context *ctx)
 
     CHECK_STATUS(gd_tensor_read_f32(ctx, &f32, dst, GD_ARRAY_LEN(dst) - 1U), GD_ERR_INVALID_ARGUMENT);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, shape, 64U, &i32));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, GD_SHAPE(4), 64U, &i32));
     CHECK_OK(gd_tensor_write(ctx, &i32, i32_src, sizeof(i32_src)));
     CHECK_STATUS(gd_tensor_read_f32(ctx, &i32, dst, GD_ARRAY_LEN(dst)), GD_ERR_UNSUPPORTED);
     gd_context_clear_error(ctx);
@@ -127,12 +127,12 @@ static void test_scope_transfer(gd_context *ctx)
     CHECK_OK(gd_begin(ctx, GD_SCOPE_TRAIN));
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, 2U, token_shape, 64U, &tokens));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, gd_shape_make(2U, token_shape), 64U, &tokens));
     CHECK_OK(gd_tensor_write(ctx, &tokens, tokens_src, sizeof(tokens_src)));
     CHECK_OK(gd_tensor_read(ctx, &tokens, tokens_dst, sizeof(tokens_dst)));
     CHECK(memcmp(tokens_src, tokens_dst, sizeof(tokens_src)) == 0, "active data tensor write/read roundtrip");
 
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, hidden_shape, 64U, &hidden));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden));
     scratch_slot = hidden.storage.slot;
     scratch_generation = hidden.storage.generation;
     CHECK_OK(gd_tensor_write(ctx, &hidden, hidden_src, sizeof(hidden_src)));
@@ -142,7 +142,7 @@ static void test_scope_transfer(gd_context *ctx)
     CHECK(!gd_tensor_is_contiguous(&suffix), "middle-dim suffix is non-contiguous");
     CHECK_STATUS(gd_tensor_read(ctx, &suffix, hidden_dst, 24U * sizeof(hidden_dst[0])), GD_ERR_UNSUPPORTED);
     gd_context_clear_error(ctx);
-    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, ordered_shape, 64U, &ordered));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, ordered_shape), 64U, &ordered));
     CHECK_OK(gd_tensor_write(ctx, &ordered, ordered_src, sizeof(ordered_src)));
     gd_debug_set_heap_guard(false);
     CHECK(gd_debug_heap_alloc_count() == heap_before, "transfer hot path does not heap allocate");

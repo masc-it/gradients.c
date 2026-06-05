@@ -14,9 +14,6 @@ extern "C" {
 
 #define GD_MODULE_NAME_MAX 64U
 #define GD_MODULE_PATH_MAX 256U
-#ifndef GD_ARRAY_LEN
-#define GD_ARRAY_LEN(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
-#endif
 
 typedef enum gd_module_init_kind {
     GD_INIT_EMPTY = 0,
@@ -158,8 +155,7 @@ static inline gd_init_spec gd_init_rand_uniform(uint64_t seed, float low, float 
 }
 
 gd_tensor_spec gd_tensor_spec_make(gd_dtype dtype,
-                                   uint32_t rank,
-                                   const int64_t *shape,
+                                   gd_shape shape,
                                    size_t alignment);
 
 gd_linear_layer_config gd_linear_layer_config_make(int64_t in_features,

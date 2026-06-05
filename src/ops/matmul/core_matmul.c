@@ -51,7 +51,7 @@ gd_status gd_matmul(gd_context *ctx, const gd_tensor *x, const gd_tensor *w, gd_
     }
     y_shape[0] = x->shape[0];
     y_shape[1] = w->shape[1];
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U, y_shape, 256U, &y);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, y_shape), 256U, &y);
     if (st != GD_OK) {
         return st;
     }

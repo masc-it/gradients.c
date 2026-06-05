@@ -227,7 +227,7 @@ gd_status gd_cross_entropy(gd_context *ctx,
         return st;
     }
     row_shape[0] = x->shape[0];
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, row_shape, 256U, &row_loss);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, row_shape), 256U, &row_loss);
     if (st != GD_OK) {
         return st;
     }
@@ -236,11 +236,11 @@ gd_status gd_cross_entropy(gd_context *ctx,
     memset(&row_inv_sum, 0, sizeof(row_inv_sum));
     need_stats = x->requires_grad && gd_context_scope_mode(ctx) == GD_SCOPE_TRAIN;
     if (need_stats) {
-        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, row_shape, 256U, &row_max);
+        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, row_shape), 256U, &row_max);
         if (st != GD_OK) {
             return st;
         }
-        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, row_shape, 256U, &row_inv_sum);
+        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, row_shape), 256U, &row_inv_sum);
         if (st != GD_OK) {
             return st;
         }
@@ -325,7 +325,7 @@ gd_status gd_cross_entropy_backward(gd_context *ctx,
     if (grad_x == NULL) {
         return GD_OK;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, x->rank, x->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }
@@ -374,7 +374,7 @@ gd_status gd_cross_entropy_backward_with_stats(gd_context *ctx,
     if (grad_logits == NULL) {
         return GD_OK;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, logits->rank, logits->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(logits->rank, logits->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }

@@ -244,7 +244,7 @@ static inline gd_status gd_reduce_all_forward_impl_dtype(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, result_dtype, 0U, NULL, 256U, &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, result_dtype, gd_shape_make(0U, NULL), 256U, &result);
     if (st != GD_OK) {
         return st;
     }
@@ -270,7 +270,7 @@ static inline gd_status gd_reduce_all_forward_impl_dtype(gd_context *ctx,
                 return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "reduce partial count overflow");
             }
             partial_shape[0] = (int64_t)next_count;
-            st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, partial_dtype, 1U, partial_shape, 256U, &partial);
+            st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, partial_dtype, gd_shape_make(1U, partial_shape), 256U, &partial);
             if (st != GD_OK) {
                 return st;
             }
@@ -362,13 +362,7 @@ static inline gd_status gd_reduce_axis_forward_impl(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx,
-                         GD_ARENA_SCRATCH,
-                         x->dtype,
-                         out_rank,
-                         out_rank == 0U ? NULL : out_shape,
-                         256U,
-                         &result);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(out_rank, out_rank == 0U ? NULL : out_shape), 256U, &result);
     if (st != GD_OK) {
         return st;
     }
@@ -437,7 +431,7 @@ static inline gd_status gd_reduce_axis_backward_impl(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "reduce axis backward grad_out shape mismatch");
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }
@@ -481,7 +475,7 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "reduce backward requires scalar grad_out with compatible dtype");
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, x->rank, x->shape, 256U, &dx);
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
         return st;
     }

@@ -1,0 +1,20 @@
+I am a senior Deep Learning Engineer at Google. I need your expertise for the following problem/question.
+
+context: @docs/guides/register_op.md , @docs/guides/metal_tips.md , @src/ops/reduce_mean
+
+I need you to read that op capsule and provide a report about its implementation quality. 
+specifically for the metal backend. the goal for this library is to be as optimized as possible. 
+for perf_test.c use realistic tests with variable shapes.
+
+Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint him.
+
+
+I am a senior Deep Learning Engineer at Google. I need your expertise for the following problem/question.
+
+context: @docs/guides/register_op.md , @docs/guides/metal_tips.md 
+
+I need you to implement sigmoid op capsule.
+
+for perf_test.c use realistic tests with variable shapes. follow the guides.
+
+Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint him.

@@ -203,8 +203,7 @@ static void test_invalid_init_no_arena_leak(qa_counts *qa)
     memset(&bad, 0xff, sizeof(bad));
     QA_EXPECT_OK(qa, gd_memory_stats_query(ctx, &before));
     QA_EXPECT_STATUS(qa,
-                     gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, shape,
-                                            64U, 7U, 0.0f, 1.0f, &bad),
+                     gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, shape), 64U, 7U, 0.0f, 1.0f, &bad),
                      GD_ERR_UNSUPPORTED);
     QA_EXPECT_OK(qa, gd_memory_stats_query(ctx, &after));
     qa_check(qa, bad.storage.nbytes == 0U,
@@ -218,8 +217,7 @@ static void test_invalid_init_no_arena_leak(qa_counts *qa)
     memset(&bad, 0xff, sizeof(bad));
     QA_EXPECT_OK(qa, gd_memory_stats_query(ctx, &before));
     QA_EXPECT_STATUS(qa,
-                     gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape,
-                                            64U, 9U, 2.0f, 1.0f, &bad),
+                     gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, 9U, 2.0f, 1.0f, &bad),
                      GD_ERR_INVALID_ARGUMENT);
     QA_EXPECT_OK(qa, gd_memory_stats_query(ctx, &after));
     qa_check(qa, bad.storage.nbytes == 0U,
@@ -247,7 +245,7 @@ static void test_active_scope_blocking_read(qa_counts *qa)
     }
 
     QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
-    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, shape, 64U, &t));
+    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, &t));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &t, got_before_end, sizeof(got_before_end)));
     qa_check_f32x4(qa,
                    "blocking tensor_read inside active scope observes queued fill",
@@ -273,7 +271,7 @@ static void test_active_scope_write_order(qa_counts *qa)
     }
 
     QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
-    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 1U, shape, 64U, &t));
+    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, &t));
     QA_EXPECT_OK(qa, gd_tensor_write(ctx, &t, src, sizeof(src)));
     QA_EXPECT_OK(qa, gd_end(ctx));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &t, got, sizeof(got)));
@@ -299,7 +297,7 @@ static void test_ring_generation_and_stale_views(qa_counts *qa)
     }
 
     QA_EXPECT_OK(qa, gd_begin(ctx, GD_SCOPE_TRAIN));
-    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U, shape, 64U, &hidden));
+    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, shape), 64U, &hidden));
     QA_EXPECT_OK(qa, gd_tensor_slice(ctx, &hidden, 1U, 2, 3, &suffix));
     first_slot = hidden.storage.slot;
     first_generation = hidden.storage.generation;
@@ -354,16 +352,14 @@ static void test_hot_path_heap_guard_and_transfers(qa_counts *qa)
     heap_before = gd_debug_heap_alloc_count();
     gd_debug_set_heap_guard(true);
 
-    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, 2U,
-                                     token_shape, 64U, &tokens));
+    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, gd_shape_make(2U, token_shape), 64U, &tokens));
     QA_EXPECT_OK(qa, gd_tensor_write(ctx, &tokens, tokens_src, sizeof(tokens_src)));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &tokens, tokens_dst, sizeof(tokens_dst)));
     qa_check(qa, memcmp(tokens_src, tokens_dst, sizeof(tokens_src)) == 0,
              "data tensor write/read roundtrip in active scope",
              "data tensor write/read mismatch");
 
-    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 3U,
-                                     hidden_shape, 64U, &hidden));
+    QA_EXPECT_OK(qa, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden));
     QA_EXPECT_OK(qa, gd_tensor_slice(ctx, &hidden, 1U, 2, 3, &suffix));
     QA_EXPECT_OK(qa, gd_tensor_contiguous(ctx, GD_ARENA_SCRATCH, &suffix, 64U, &compact));
     qa_check(qa, compact.storage.offset != hidden.storage.offset && gd_tensor_is_contiguous(&compact),
@@ -402,24 +398,22 @@ static void test_dtype_fill_and_rand(qa_counts *qa)
         return;
     }
 
-    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U, shape, 64U, &f16_one));
+    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 64U, &f16_one));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &f16_one, f16_bits, sizeof(f16_bits)));
     qa_check(qa, f16_bits[0] == 0x3c00U && f16_bits[1] == 0x3c00U &&
                     f16_bits[2] == 0x3c00U && f16_bits[3] == 0x3c00U,
              "f16 ones uses canonical one bit pattern",
              "f16 ones bit pattern mismatch");
 
-    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_BF16, 1U, shape, 64U, &bf16_one));
+    QA_EXPECT_OK(qa, gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_BF16, gd_shape_make(1U, shape), 64U, &bf16_one));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &bf16_one, bf16_bits, sizeof(bf16_bits)));
     qa_check(qa, bf16_bits[0] == 0x3f80U && bf16_bits[1] == 0x3f80U &&
                     bf16_bits[2] == 0x3f80U && bf16_bits[3] == 0x3f80U,
              "bf16 ones uses canonical one bit pattern",
              "bf16 ones bit pattern mismatch");
 
-    QA_EXPECT_OK(qa, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape,
-                                            64U, 12345U, -0.25f, 0.75f, &f32_rand_a));
-    QA_EXPECT_OK(qa, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 1U, shape,
-                                            64U, 12345U, -0.25f, 0.75f, &f32_rand_b));
+    QA_EXPECT_OK(qa, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, 12345U, -0.25f, 0.75f, &f32_rand_a));
+    QA_EXPECT_OK(qa, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, shape), 64U, 12345U, -0.25f, 0.75f, &f32_rand_b));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &f32_rand_a, rand_a, sizeof(rand_a)));
     QA_EXPECT_OK(qa, gd_tensor_read(ctx, &f32_rand_b, rand_b, sizeof(rand_b)));
     for (i = 0U; i < (uint32_t)QA_ARRAY_LEN(rand_a); ++i) {

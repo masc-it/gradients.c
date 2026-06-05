@@ -220,27 +220,9 @@ static bool sigmoid_perf_create_model(const sigmoid_perf_case *pcase, sigmoid_pe
         return false;
     }
     SIGMOID_PERF_REQUIRE_OK(model->ctx,
-                            gd_tensor_rand_uniform(model->ctx,
-                                                   GD_ARENA_PARAMS,
-                                                   pcase->dtype,
-                                                   pcase->rank,
-                                                   pcase->shape,
-                                                   256U,
-                                                   1234U,
-                                                   -6.0f,
-                                                   6.0f,
-                                                   &model->x));
+                            gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(pcase->rank, pcase->shape), 256U, 1234U, -6.0f, 6.0f, &model->x));
     SIGMOID_PERF_REQUIRE_OK(model->ctx,
-                            gd_tensor_rand_uniform(model->ctx,
-                                                   GD_ARENA_PARAMS,
-                                                   pcase->dtype,
-                                                   pcase->rank,
-                                                   pcase->shape,
-                                                   256U,
-                                                   5678U,
-                                                   -0.5f,
-                                                   0.5f,
-                                                   &model->grad));
+                            gd_tensor_rand_uniform(model->ctx, GD_ARENA_PARAMS, pcase->dtype, gd_shape_make(pcase->rank, pcase->shape), 256U, 5678U, -0.5f, 0.5f, &model->grad));
     SIGMOID_PERF_REQUIRE_OK(model->ctx, gd_context_seal_params(model->ctx));
     return true;
 }

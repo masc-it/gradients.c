@@ -104,7 +104,7 @@ int main(int argc, char **argv)
     if (st == GD_ERR_UNSUPPORTED) { printf("SKIP unsupported backend\n"); rc = 77; goto done; }
     if (check_status(ctx, st, "gd_context_create") != 0 || ctx == NULL) { goto fail; }
     shape[0] = (int64_t)rows; shape[1] = (int64_t)cols;
-    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, shape, 256U, &x));
+    CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &x));
     CHECK(ctx, gd_tensor_write(ctx, &x, x_data, bytes));
     CHECK(ctx, gd_context_seal_params(ctx));
     CHECK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));

@@ -90,8 +90,8 @@ static void test_cross_entropy_rejects_f32_logits(void)
     gd_tensor targets;
     gd_tensor loss;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, 2U, logits_shape, 256U, &logits));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, target_shape, 256U, &targets));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(2U, logits_shape), 256U, &logits));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     CHECK_OK(gd_context_seal_params(ctx));
     CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
@@ -119,8 +119,8 @@ static void test_cross_entropy_f16_zero_logits_small(void)
     uint16_t got_grad[COUNT];
     uint32_t i;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, logits_shape, 256U, &logits));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, target_shape, 256U, &targets));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, logits_shape), 256U, &logits));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     logits.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -162,13 +162,13 @@ static void test_cross_entropy_f16_direct_backward(void)
     uint16_t got_grad[COUNT];
     uint32_t i;
     create_context_or_skip(&cfg, &ctx);
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, logits_shape, 256U, &logits));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, target_shape, 256U, &targets));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, logits_shape), 256U, &logits));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     CHECK_OK(gd_context_seal_params(ctx));
 
     CHECK_OK(gd_begin(ctx, GD_SCOPE_INFER));
-    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, 0U, NULL, 256U, &grad_seed));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(0U, NULL), 256U, &grad_seed));
     CHECK_OK(gd_cross_entropy_backward(ctx, &logits, &targets, &grad_seed, &dlogits, NULL));
     CHECK_OK(gd_tensor_read(ctx, &dlogits, got_grad, sizeof(got_grad)));
     for (i = 0U; i < COUNT; ++i) {
@@ -202,8 +202,8 @@ static void test_cross_entropy_f16_thousands_classes(void)
     create_context_or_skip(&cfg, &ctx);
     got_grad = (uint16_t *)calloc((size_t)COUNT, sizeof(*got_grad));
     CHECK(got_grad != NULL, "gradient host allocation");
-    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, logits_shape, 256U, &logits));
-    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, 1U, target_shape, 256U, &targets));
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, logits_shape), 256U, &logits));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &targets, labels, sizeof(labels)));
     logits.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));

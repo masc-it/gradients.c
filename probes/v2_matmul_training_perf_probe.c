@@ -523,36 +523,16 @@ static bool perf_model_init(gd_context *ctx, const perf_case *shape, perf_model 
     qkv_bias_shape[0] = 3 * shape->hidden;
     proj_bias_shape[0] = shape->hidden;
     gate_bias_shape[0] = shape->intermediate;
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
-                                                qkv_shape, 256U, 101U,
-                                                -0.02f, 0.02f, &model->w_qkv));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
-                                                proj_shape, 256U, 102U,
-                                                -0.02f, 0.02f, &model->w_proj));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
-                                                gate_shape, 256U, 103U,
-                                                -0.02f, 0.02f, &model->w_gate));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
-                                                gate_shape, 256U, 104U,
-                                                -0.02f, 0.02f, &model->w_up));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U,
-                                                down_shape, 256U, 105U,
-                                                -0.02f, 0.02f, &model->w_down));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
-                                                qkv_bias_shape, 256U, 106U,
-                                                -0.02f, 0.02f, &model->b_qkv));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
-                                                proj_bias_shape, 256U, 107U,
-                                                -0.02f, 0.02f, &model->b_proj));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
-                                                gate_bias_shape, 256U, 108U,
-                                                -0.02f, 0.02f, &model->b_gate));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
-                                                gate_bias_shape, 256U, 109U,
-                                                -0.02f, 0.02f, &model->b_up));
-    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 1U,
-                                                proj_bias_shape, 256U, 110U,
-                                                -0.02f, 0.02f, &model->b_down));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, qkv_shape), 256U, 101U, -0.02f, 0.02f, &model->w_qkv));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, proj_shape), 256U, 102U, -0.02f, 0.02f, &model->w_proj));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, gate_shape), 256U, 103U, -0.02f, 0.02f, &model->w_gate));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, gate_shape), 256U, 104U, -0.02f, 0.02f, &model->w_up));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, down_shape), 256U, 105U, -0.02f, 0.02f, &model->w_down));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, qkv_bias_shape), 256U, 106U, -0.02f, 0.02f, &model->b_qkv));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, proj_bias_shape), 256U, 107U, -0.02f, 0.02f, &model->b_proj));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, gate_bias_shape), 256U, 108U, -0.02f, 0.02f, &model->b_gate));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, gate_bias_shape), 256U, 109U, -0.02f, 0.02f, &model->b_up));
+    PERF_REQUIRE_OK(ctx, gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, proj_bias_shape), 256U, 110U, -0.02f, 0.02f, &model->b_down));
     PERF_REQUIRE_OK(ctx, gd_context_seal_params(ctx));
     return true;
 }
@@ -616,7 +596,7 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
     head_v_shape[0] = model->tokens;
     head_v_shape[1] = model->head_dim;
     PERF_REQUIRE_OK(ctx, gd_begin(ctx, GD_SCOPE_TRAIN));
-    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
+    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
     if (!perf_linear_step(ctx, &x, &model->w_qkv, &model->b_qkv, include_backward, &qkv)) {
         return false;
     }
@@ -626,12 +606,9 @@ static bool perf_model_step(gd_context *ctx, const perf_model *model, bool inclu
         gd_tensor scores;
         gd_tensor v;
         gd_tensor head_ctx;
-        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U,
-                                            head_q_shape, 256U, &q));
-        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U,
-                                            head_kt_shape, 256U, &kt));
-        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, 2U,
-                                            head_v_shape, 256U, &v));
+        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, head_q_shape), 256U, &q));
+        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, head_kt_shape), 256U, &kt));
+        PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, head_v_shape), 256U, &v));
         if (!perf_matmul_step(ctx, &q, &kt, include_backward, &scores)) {
             return false;
         }
@@ -772,8 +749,8 @@ static bool perf_smoke_correctness(perf_totals *totals)
 
     perf_fill_x(x_data, M, K);
     perf_fill_w(w_data, K, N);
-    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, x_shape, 256U, &x));
-    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, 2U, w_shape, 256U, &w));
+    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    PERF_REQUIRE_OK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256U, &w));
     PERF_REQUIRE_OK(ctx, gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
     PERF_REQUIRE_OK(ctx, gd_tensor_write(ctx, &w, w_data, sizeof(w_data)));
     PERF_REQUIRE_OK(ctx, gd_context_seal_params(ctx));

@@ -186,6 +186,11 @@ gd_status gd_backend_broadcast_to(gd_backend *backend,
                                   const gd_backend_tensor_view *src,
                                   const gd_backend_tensor_view *dst,
                                   float scale);
+/* Sigmoid autograd fast path: grad_x = grad_out * y * (1 - y), using saved forward y. */
+gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
+                                                  const gd_backend_tensor_view *sigmoid_out,
+                                                  const gd_backend_tensor_view *grad_out,
+                                                  const gd_backend_tensor_view *grad_x);
 /* dst[i] = src[0] * scale for contiguous tensors; supports same dtype and f32 scalar to f16 dst. */
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,

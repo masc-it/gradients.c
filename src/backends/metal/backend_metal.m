@@ -280,6 +280,22 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
         return st;
     }
 #include "metal_ops_generated.inc"
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_f32_kernel", &backend->sigmoid_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_f32_kernel", &backend->sigmoid_backward_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_saved_f16_kernel", &backend->sigmoid_backward_saved_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_saved_f32_kernel", &backend->sigmoid_backward_saved_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     return GD_OK;
 }
 
@@ -383,6 +399,18 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->adamw_pso != NULL) {
         CFRelease(backend->adamw_pso);
+    }
+    if (backend->sigmoid_backward_saved_f32_pso != NULL) {
+        CFRelease(backend->sigmoid_backward_saved_f32_pso);
+    }
+    if (backend->sigmoid_backward_saved_f16_pso != NULL) {
+        CFRelease(backend->sigmoid_backward_saved_f16_pso);
+    }
+    if (backend->sigmoid_backward_f32_pso != NULL) {
+        CFRelease(backend->sigmoid_backward_f32_pso);
+    }
+    if (backend->sigmoid_f32_pso != NULL) {
+        CFRelease(backend->sigmoid_f32_pso);
     }
     if (backend->cross_entropy_backward_stats_f16_pso != NULL) {
         CFRelease(backend->cross_entropy_backward_stats_f16_pso);

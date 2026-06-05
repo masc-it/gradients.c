@@ -55,3 +55,13 @@
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_kernel",
+                                &backend->unary_pso[GD_OP_SIGMOID]);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_kernel",
+                                &backend->unary_backward_pso[GD_OP_SIGMOID]);
+    if (st != GD_OK) {
+        return st;
+    }

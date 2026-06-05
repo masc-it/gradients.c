@@ -60,3 +60,25 @@ gd_status gd_backend_sub(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_sigmoid(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_sigmoid_backward(gd_backend *backend,
+                                   const gd_backend_tensor_view *x,
+                                   const gd_backend_tensor_view *grad_out,
+                                   const gd_backend_tensor_view *grad_x)
+{
+    (void)backend;
+    (void)x;
+    (void)grad_out;
+    (void)grad_x;
+    return GD_ERR_UNSUPPORTED;
+}
+

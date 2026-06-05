@@ -296,6 +296,18 @@ gd_status gd_backend_broadcast_to(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
+                                                  const gd_backend_tensor_view *sigmoid_out,
+                                                  const gd_backend_tensor_view *grad_out,
+                                                  const gd_backend_tensor_view *grad_x)
+{
+    (void)backend;
+    (void)sigmoid_out;
+    (void)grad_out;
+    (void)grad_x;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,

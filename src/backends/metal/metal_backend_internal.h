@@ -28,6 +28,10 @@ struct gd_backend {
     void *amp_unscale_pso;
     void *unary_pso[GD_OP_COUNT];
     void *unary_backward_pso[GD_OP_COUNT];
+    void *sigmoid_f32_pso;
+    void *sigmoid_backward_f32_pso;
+    void *sigmoid_backward_saved_f16_pso;
+    void *sigmoid_backward_saved_f32_pso;
     void *binary_pso[GD_OP_COUNT];
     void *binary_bcast_pso[GD_OP_COUNT];
     void *binary_row_bcast_pso[GD_OP_COUNT];

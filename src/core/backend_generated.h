@@ -26,4 +26,12 @@ gd_status gd_backend_sub(gd_backend *backend,
                           const gd_backend_tensor_view *y,
                           const gd_backend_tensor_view *out);
 
+gd_status gd_backend_sigmoid(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *y);
+gd_status gd_backend_sigmoid_backward(gd_backend *backend,
+                                   const gd_backend_tensor_view *x,
+                                   const gd_backend_tensor_view *grad_out,
+                                   const gd_backend_tensor_view *grad_x);
+
 #endif /* GD_CORE_BACKEND_GENERATED_H */

@@ -27,7 +27,7 @@ CFLAGS ?= -std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -Werror \
           -Wmissing-prototypes -Wno-unused-parameter
 LDFLAGS ?=
 LDLIBS ?=
-LDLIBS += -pthread
+LDLIBS += -pthread -lm
 PROBE_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Wpedantic
 TOOL_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic
 PERF_BUILD_DIR ?= build-perf

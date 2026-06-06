@@ -16,6 +16,8 @@
 #define MNIST_DEFAULT_EPOCHS 2
 #define MNIST_DEFAULT_REPORT_EVERY 100
 #define MNIST_DEFAULT_DROPOUT_P 0.10f
+#define MNIST_DEFAULT_LR_MAX 1.0e-3f
+#define MNIST_DEFAULT_LR_MIN 1.0e-4f
 #define MNIST_DROPOUT_SEED UINT64_C(0xd00d5eed12340000)
 
 typedef struct mnist_mlp {
@@ -32,6 +34,9 @@ typedef struct mnist_config {
     int train_batch;
     int eval_batch;
     float dropout_p;
+    float lr_max;
+    float lr_min;
+    int lr_warmup_steps; /* -1 means auto after total_steps is known. */
 } mnist_config;
 
 typedef struct mnist_transform_state {
@@ -222,6 +227,11 @@ static mnist_config mnist_config_from_env(void)
 {
     const char *data_dir_env = getenv("GD_MNIST_DATA_DIR");
     const char *data_dir = (data_dir_env != NULL && data_dir_env[0] != '\0') ? data_dir_env : "data";
+    const float lr_max = env_float("GD_MNIST_LR_MAX", MNIST_DEFAULT_LR_MAX, 0.0f, 100.0f);
+    const float lr_min_fallback = MNIST_DEFAULT_LR_MIN <= lr_max ?
+                                      MNIST_DEFAULT_LR_MIN :
+                                      lr_max * 0.1f;
+    const float lr_min = env_float("GD_MNIST_LR_MIN", lr_min_fallback, 0.0f, lr_max);
     return (mnist_config){
         .data_dir = data_dir,
         .train_epochs = env_int("GD_MNIST_EPOCHS", MNIST_DEFAULT_EPOCHS, 1, 1000000),
@@ -229,6 +239,9 @@ static mnist_config mnist_config_from_env(void)
         .train_batch = MNIST_TRAIN_BATCH,
         .eval_batch = MNIST_EVAL_BATCH,
         .dropout_p = env_float("GD_MNIST_DROPOUT_P", MNIST_DEFAULT_DROPOUT_P, 0.0f, 0.95f),
+        .lr_max = lr_max,
+        .lr_min = lr_min,
+        .lr_warmup_steps = env_int("GD_MNIST_LR_WARMUP", -1, -1, 1000000000),
     };
 }
 
@@ -254,10 +267,10 @@ static gd_memory_config mnist_memory_config(void)
     };
 }
 
-static gd_adamw_config mnist_adamw_config(void)
+static gd_adamw_config mnist_adamw_config(float lr)
 {
     gd_adamw_config cfg = gd_adamw_config_default();
-    cfg.lr = 1.0e-3f;
+    cfg.lr = lr;
     cfg.weight_decay = 1.0e-4f;
     return cfg;
 }
@@ -447,6 +460,7 @@ static void train_mnist(gd_context *ctx,
                         gd_dataloader *loader,
                         gd_optimizer *optimizer,
                         gd_amp_scaler *scaler,
+                        const gd_lr_scheduler_config *lr_config,
                         const mnist_config *config,
                         size_t steps_per_epoch,
                         size_t train_steps)
@@ -454,7 +468,7 @@ static void train_mnist(gd_context *ctx,
     double last_report_time;
     size_t last_report_step = 0U;
     const size_t report_every = config != NULL ? (size_t)config->report_every : 0U;
-    if (config == NULL || steps_per_epoch == 0U || train_steps == 0U) {
+    if (config == NULL || lr_config == NULL || steps_per_epoch == 0U || train_steps == 0U) {
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train_mnist", __LINE__);
     }
     gd_module_set_training(&model->mod, true);
@@ -465,12 +479,14 @@ static void train_mnist(gd_context *ctx,
         gd_tensor *target;
         gd_tensor logits;
         gd_tensor loss;
+        float lr = 0.0f;
         const size_t current_step = step + 1U;
         const size_t epoch = step / steps_per_epoch + 1U;
         const size_t epoch_step = step % steps_per_epoch + 1U;
         const int report = report_every > 0U &&
                            (step == 0U || current_step % report_every == 0U ||
                             current_step == train_steps);
+        TRY(ctx, gd_lr_scheduler_value(lr_config, (uint64_t)step, &lr));
         TRY(ctx, gd_dataloader_next(loader, &batch));
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
         image = required_batch_tensor(ctx, batch, "image", __LINE__);
@@ -482,7 +498,7 @@ static void train_mnist(gd_context *ctx,
                                     &logits));
         TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
-        TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
+        TRY(ctx, gd_optimizer_step_amp_lr(ctx, optimizer, scaler, lr));
         TRY(ctx, gd_end_step(ctx));
         TRY(ctx, gd_dataloader_release(loader, batch));
         TRY(ctx, gd_dataloader_prefetch(loader));
@@ -494,13 +510,14 @@ static void train_mnist(gd_context *ctx,
             const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
             float loss_value = 0.0f;
             TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-            printf("epoch=%zu/%d batch=%zu/%zu step=%zu loss=%.6f batch/s=%.2f\n",
+            printf("epoch=%zu/%d batch=%zu/%zu step=%zu loss=%.6f lr=%.6g batch/s=%.2f\n",
                    epoch,
                    config->train_epochs,
                    epoch_step,
                    steps_per_epoch,
                    current_step,
                    (double)loss_value,
+                   (double)lr,
                    batches_per_sec);
             last_report_time = now;
             last_report_step = current_step;
@@ -523,6 +540,7 @@ int main(void)
     gd_dataloader *test_loader = NULL;
     mnist_mlp model = {0};
     gd_param_set params = {0};
+    gd_lr_scheduler_config lr_config = {0};
     gd_optimizer *optimizer = NULL;
     gd_amp_scaler *scaler = NULL;
     int correct = 0;
@@ -587,7 +605,7 @@ int main(void)
     print_param_set(&params);
 
     {
-        const gd_adamw_config adam = mnist_adamw_config();
+        const gd_adamw_config adam = mnist_adamw_config(config.lr_max);
         const gd_amp_config amp = mnist_amp_config();
         TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
         TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
@@ -605,6 +623,21 @@ int main(void)
     }
     samples_per_epoch = (size_t)gd_dataloader_samples_per_epoch(train_loader);
     train_steps = (size_t)config.train_epochs * steps_per_epoch;
+    lr_config = gd_lr_scheduler_config_default();
+    lr_config.max_lr = config.lr_max;
+    lr_config.min_lr = config.lr_min;
+    lr_config.total_steps = (uint64_t)train_steps;
+    if (config.lr_warmup_steps >= 0) {
+        lr_config.warmup_steps = (uint64_t)config.lr_warmup_steps;
+    } else {
+        const size_t auto_warmup = train_steps < 100U ? train_steps / 10U : 100U;
+        lr_config.warmup_steps = (uint64_t)auto_warmup;
+    }
+    {
+        float initial_lr = 0.0f;
+        TRY(ctx, gd_lr_scheduler_value(&lr_config, 0U, &initial_lr));
+        (void)initial_lr;
+    }
     printf("dataset: dir=%s train=%zu test=%zu storage=u8 transform=f16_normalize batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
            config.data_dir,
            train_samples,
@@ -615,12 +648,20 @@ int main(void)
            steps_per_epoch,
            samples_per_epoch,
            train_steps);
+    printf("optim: cosine_lr max=%.6g min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.4g\n",
+           (double)lr_config.max_lr,
+           (double)lr_config.min_lr,
+           (unsigned long long)lr_config.warmup_steps,
+           (unsigned long long)lr_config.total_steps,
+           1.0e-4,
+           (double)gd_amp_scaler_scale(scaler));
 
     train_mnist(ctx,
                 &model,
                 train_loader,
                 optimizer,
                 scaler,
+                &lr_config,
                 &config,
                 steps_per_epoch,
                 train_steps);

@@ -35,6 +35,7 @@ Useful knobs:
 
 ```sh
 GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 GD_MNIST_DROPOUT_P=0.10 make run
+GD_MNIST_LR_MAX=0.001 GD_MNIST_LR_MIN=0.0001 GD_MNIST_LR_WARMUP=100 make run
 make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
 ```
 

@@ -5,6 +5,7 @@
 #include "../core/backend.h"
 #include "../core/memory_internal.h"
 
+#include <float.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,9 +43,14 @@ struct gd_amp_scaler {
     bool last_found_inf;
 };
 
+static bool gd_adamw_lr_valid(float lr)
+{
+    return lr == lr && lr >= 0.0f && lr <= FLT_MAX;
+}
+
 static bool gd_adamw_config_valid(const gd_adamw_config *config)
 {
-    return config != NULL && config->lr >= 0.0f && config->beta1 >= 0.0f &&
+    return config != NULL && gd_adamw_lr_valid(config->lr) && config->beta1 >= 0.0f &&
            config->beta1 < 1.0f && config->beta2 >= 0.0f && config->beta2 < 1.0f &&
            config->eps > 0.0f && config->weight_decay >= 0.0f;
 }
@@ -294,7 +300,8 @@ static gd_status gd_adamw_init_slot(gd_context *ctx,
 static gd_status gd_optimizer_step_param(gd_context *ctx,
                                          gd_optimizer_param *slot,
                                          const gd_tensor *grad,
-                                         const gd_adamw_config *config)
+                                         const gd_adamw_config *config,
+                                         float base_lr)
 {
     gd_backend_adamw_desc desc;
     float beta1_power;
@@ -334,7 +341,7 @@ static gd_status gd_optimizer_step_param(gd_context *ctx,
     desc.count = slot->count;
     desc.param_dtype = (uint32_t)slot->param->dtype;
     desc.grad_dtype = (uint32_t)grad->dtype;
-    desc.lr = config->lr * slot->lr_mult;
+    desc.lr = base_lr * slot->lr_mult;
     desc.beta1 = config->beta1;
     desc.beta2 = config->beta2;
     desc.eps = config->eps;
@@ -586,13 +593,16 @@ static gd_status gd_optimizer_unscale_grad(gd_context *ctx,
     return GD_OK;
 }
 
-gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
+gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float lr)
 {
     bool updated = false;
     uint32_t i;
     gd_status st;
     if (ctx == NULL || optimizer == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_adamw_lr_valid(lr)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid optimizer lr");
     }
     st = gd_optimizer_require_train_scope(ctx);
     if (st != GD_OK) {
@@ -612,7 +622,7 @@ gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
         if (st != GD_OK) {
             return st;
         }
-        st = gd_optimizer_step_param(ctx, slot, &grad, &optimizer->config);
+        st = gd_optimizer_step_param(ctx, slot, &grad, &optimizer->config, lr);
         if (st != GD_OK) {
             return st;
         }
@@ -624,7 +634,18 @@ gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
     return GD_OK;
 }
 
-gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp_scaler *scaler)
+gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
+{
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_optimizer_step_lr(ctx, optimizer, optimizer->config.lr);
+}
+
+gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
+                                   gd_optimizer *optimizer,
+                                   gd_amp_scaler *scaler,
+                                   float lr)
 {
     bool updated = false;
     int32_t found_inf = 0;
@@ -634,8 +655,11 @@ gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp
     if (ctx == NULL || optimizer == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    if (!gd_adamw_lr_valid(lr)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid optimizer lr");
+    }
     if (scaler == NULL || !scaler->config.enabled) {
-        return gd_optimizer_step(ctx, optimizer);
+        return gd_optimizer_step_lr(ctx, optimizer, lr);
     }
     st = gd_optimizer_require_train_scope(ctx);
     if (st != GD_OK) {
@@ -690,7 +714,7 @@ gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp
         if (st != GD_OK) {
             return st;
         }
-        st = gd_optimizer_step_param(ctx, slot, &grad, &optimizer->config);
+        st = gd_optimizer_step_param(ctx, slot, &grad, &optimizer->config, lr);
         if (st != GD_OK) {
             return st;
         }
@@ -701,6 +725,14 @@ gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp
         gd_amp_scaler_update(scaler, false);
     }
     return GD_OK;
+}
+
+gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp_scaler *scaler)
+{
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_optimizer_step_amp_lr(ctx, optimizer, scaler, optimizer->config.lr);
 }
 
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer)

@@ -68,6 +68,22 @@ gd_status gd_reshape_backward(gd_context *ctx,
                               const gd_tensor *grad_out,
                               gd_tensor *grad_x);
 
+/* Materialized PyTorch-style axis permutation. `axes` has length n_axes ==
+ * x->rank and names the input axis used for each output axis. Negative axes are
+ * accepted. Input and grad_out must be contiguous; outputs are contiguous. */
+gd_status gd_permute(gd_context *ctx,
+                     const gd_tensor *x,
+                     const int32_t *axes,
+                     uint32_t n_axes,
+                     gd_tensor *out);
+
+gd_status gd_permute_backward(gd_context *ctx,
+                              const gd_tensor *x,
+                              const gd_tensor *grad_out,
+                              const int32_t *axes,
+                              uint32_t n_axes,
+                              gd_tensor *grad_x);
+
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
  * Hq must be a multiple of Hkv. Output has q's shape and dtype.

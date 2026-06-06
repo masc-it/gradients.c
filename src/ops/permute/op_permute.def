@@ -1,0 +1,2 @@
+# Custom materialized layout-changing signature; this file registers GD_OP_PERMUTE.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

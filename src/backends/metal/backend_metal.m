@@ -295,6 +295,70 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_u8_kernel", &backend->permute_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_u16_kernel", &backend->permute_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_u32_kernel", &backend->permute_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u8_kernel", &backend->permute_block_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u16_kernel", &backend->permute_block_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u32_kernel", &backend->permute_block_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_suffix16_kernel", &backend->permute_suffix16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u8_kernel", &backend->permute_hwc_to_chw_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u16_kernel", &backend->permute_hwc_to_chw_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u32_kernel", &backend->permute_hwc_to_chw_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u8_kernel", &backend->permute_chw_to_hwc_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u16_kernel", &backend->permute_chw_to_hwc_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u32_kernel", &backend->permute_chw_to_hwc_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u8_kernel", &backend->permute_transpose_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u16_kernel", &backend->permute_transpose_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u32_kernel", &backend->permute_transpose_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_kernel", &backend->sdpa_varlen_pso);
     if (st != GD_OK) {
         return st;
@@ -549,6 +613,54 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->sdpa_varlen_pso != NULL) {
         CFRelease(backend->sdpa_varlen_pso);
+    }
+    if (backend->permute_transpose_u32_pso != NULL) {
+        CFRelease(backend->permute_transpose_u32_pso);
+    }
+    if (backend->permute_transpose_u16_pso != NULL) {
+        CFRelease(backend->permute_transpose_u16_pso);
+    }
+    if (backend->permute_transpose_u8_pso != NULL) {
+        CFRelease(backend->permute_transpose_u8_pso);
+    }
+    if (backend->permute_chw_to_hwc_u32_pso != NULL) {
+        CFRelease(backend->permute_chw_to_hwc_u32_pso);
+    }
+    if (backend->permute_chw_to_hwc_u16_pso != NULL) {
+        CFRelease(backend->permute_chw_to_hwc_u16_pso);
+    }
+    if (backend->permute_chw_to_hwc_u8_pso != NULL) {
+        CFRelease(backend->permute_chw_to_hwc_u8_pso);
+    }
+    if (backend->permute_hwc_to_chw_u32_pso != NULL) {
+        CFRelease(backend->permute_hwc_to_chw_u32_pso);
+    }
+    if (backend->permute_hwc_to_chw_u16_pso != NULL) {
+        CFRelease(backend->permute_hwc_to_chw_u16_pso);
+    }
+    if (backend->permute_hwc_to_chw_u8_pso != NULL) {
+        CFRelease(backend->permute_hwc_to_chw_u8_pso);
+    }
+    if (backend->permute_suffix16_pso != NULL) {
+        CFRelease(backend->permute_suffix16_pso);
+    }
+    if (backend->permute_block_u32_pso != NULL) {
+        CFRelease(backend->permute_block_u32_pso);
+    }
+    if (backend->permute_block_u16_pso != NULL) {
+        CFRelease(backend->permute_block_u16_pso);
+    }
+    if (backend->permute_block_u8_pso != NULL) {
+        CFRelease(backend->permute_block_u8_pso);
+    }
+    if (backend->permute_u32_pso != NULL) {
+        CFRelease(backend->permute_u32_pso);
+    }
+    if (backend->permute_u16_pso != NULL) {
+        CFRelease(backend->permute_u16_pso);
+    }
+    if (backend->permute_u8_pso != NULL) {
+        CFRelease(backend->permute_u8_pso);
     }
     if (backend->concat_from_full_u32_pso != NULL) {
         CFRelease(backend->concat_from_full_u32_pso);

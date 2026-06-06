@@ -312,6 +312,21 @@ gd_status gd_backend_concat_from_full(gd_backend *backend,
                                       const gd_backend_tensor_view *dst,
                                       const gd_backend_concat_args *args);
 
+typedef struct gd_backend_permute_args {
+    uint64_t count;                    /* Number of elements to materialize. */
+    uint64_t inner;                    /* Contiguous suffix copied without index remap. */
+    uint32_t rank;                     /* Tensor rank, <= GD_MAX_DIMS. */
+    uint32_t active_rank;              /* rank minus optimized contiguous suffix rank. */
+    uint32_t axes[8];                  /* Output axis d reads input axis axes[d]. */
+    uint32_t reserved0;
+} gd_backend_permute_args;
+
+/* Materialize dst = src.permute(axes) for contiguous src/dst tensors. */
+gd_status gd_backend_permute(gd_backend *backend,
+                             const gd_backend_tensor_view *src,
+                             const gd_backend_tensor_view *dst,
+                             const gd_backend_permute_args *args);
+
 typedef struct gd_backend_sdpa_varlen_args {
     float scale;
     uint32_t causal;

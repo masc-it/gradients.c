@@ -3,7 +3,7 @@
 A tiny full-batch XOR training run that exercises the current v2 API:
 
 - GDDS disk-backed dataset generation via `dataset.py`
-- generic GDDS dataloader/collate path
+- self-describing GDDS dataloader/collate path
 - random no-replacement sampler
 - module tree + child `gd_linear_layer`s
 - parameter collection and param groups

@@ -14,8 +14,8 @@ from gdds_utils import FieldSpec, tensor, write_gdds_split  # noqa: E402
 
 
 FIELDS = [
-    FieldSpec("x", "f16", (2,)),
-    FieldSpec("target", "f16", (1,)),
+    FieldSpec("x", "f16", (2,), collate="stack"),
+    FieldSpec("target", "f16", (1,), collate="stack"),
 ]
 
 SAMPLES = [

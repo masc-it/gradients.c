@@ -36,19 +36,6 @@ typedef enum gd_batch_state {
     GD_BATCH_RETIRED = 5,
 } gd_batch_state;
 
-typedef struct gd_batch_field_desc {
-    const char *name;
-    gd_dtype dtype;
-    int rank;
-    int64_t sizes[GD_BATCH_MAX_RANK];
-} gd_batch_field_desc;
-
-typedef gd_status (*gd_collate_fn)(gd_dataset *dataset,
-                                   const uint64_t *sample_ids,
-                                   int batch_size,
-                                   gd_batch *batch,
-                                   void *user_data);
-
 typedef struct gd_dataloader_config {
     int batch_size;
     uint64_t expected_dataset_fingerprint; /* 0 disables check. */
@@ -76,17 +63,14 @@ gd_dataloader_config gd_dataloader_config_default(int batch_size);
 gd_dataloader_config gd_dataloader_config_build(const gd_dataset *dataset,
                                                 int batch_size);
 
-/* `sampler` may be NULL for deterministic sequential sampling. Non-NULL
-   samplers are borrowed by the dataloader and must outlive it. The current
-   fixed-batch dataloader always drops the last incomplete batch. */
+/* `dataset` must be GDDS. Batch fields and collation are inferred from GDDS
+   metadata written during dataset prep. `sampler` may be NULL for deterministic
+   sequential sampling. Non-NULL samplers are borrowed by the dataloader and must
+   outlive it. The fixed-batch dataloader drops the last incomplete batch. */
 gd_status gd_dataloader_create(gd_context *ctx,
                                gd_dataset *dataset,
                                gd_sampler *sampler,
                                const gd_dataloader_config *cfg,
-                               const gd_batch_field_desc *fields,
-                               int n_fields,
-                               gd_collate_fn collate,
-                               void *collate_data,
                                gd_dataloader **out);
 void gd_dataloader_destroy(gd_dataloader *dl);
 
@@ -114,31 +98,6 @@ void *gd_batch_host_data(gd_batch *batch, int field_index);
 gd_tensor *gd_batch_tensor_at(gd_batch *batch, int field_index);
 gd_tensor *gd_batch_tensor(gd_batch *batch, const char *name);
 const uint64_t *gd_batch_sample_ids(const gd_batch *batch);
-
-/* Built-in collate for fixed-block GDTOK language-model batches.
-   Requires fields named: tokens, targets, positions. All int32 [B,T]. */
-gd_status gd_collate_gdtok_lm(gd_dataset *dataset,
-                              const uint64_t *sample_ids,
-                              int batch_size,
-                              gd_batch *batch,
-                              void *user_data);
-
-typedef struct gd_gdds_collate_config {
-    int zero_pad; /* 0 disables padding; default when config is NULL is enabled. */
-    int truncate; /* 0 fails when a sample is larger than batch capacity. */
-} gd_gdds_collate_config;
-
-gd_status gd_gdds_init_batch_fields(const gd_dataset *dataset,
-                                    int batch_size,
-                                    gd_batch_field_desc *fields,
-                                    int field_cap,
-                                    int *n_fields_out);
-
-gd_status gd_collate_gdds(gd_dataset *dataset,
-                          const uint64_t *sample_ids,
-                          int batch_size,
-                          gd_batch *batch,
-                          void *user_data);
 
 #ifdef __cplusplus
 }

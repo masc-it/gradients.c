@@ -7,7 +7,6 @@
 #include <gradients/transfer.h>
 #include <gradients/dataset.h>
 #include <gradients/dataloader.h>
-#include <gradients/dataset_vlm.h>
 #include <gradients/ops.h>
 #include <gradients/autograd.h>
 #include <gradients/module.h>

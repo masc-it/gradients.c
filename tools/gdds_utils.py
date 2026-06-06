@@ -52,20 +52,47 @@ DTYPE_SIZES: dict[str, int] = {
     "u8": 1,
 }
 
+COLLATE_CODES: dict[str, int] = {
+    "stack": 0,
+    "pad_longest": 1,
+    "packed_sequence": 2,
+    "generated": 3,
+}
+GENERATED_CODES: dict[str, int] = {
+    "none": 0,
+    "lengths": 1,
+    "mask": 2,
+    "cu_seqlens": 3,
+    "positions": 4,
+}
+
 
 @dataclass(frozen=True)
 class FieldSpec:
     """One field in the GDDS schema.
 
     `shape` is the per-sample shape, without the dataloader batch dimension.
-    Use -1 for variable dimensions.  The generic `gd_gdds_init_batch_fields`
-    helper can infer batch fields only for fixed shapes; variable-shaped fields
-    need explicit batch capacities and optional truncation in the C collate config.
+    Use -1 for the leading variable sequence dimension when `collate` is
+    `pad_longest` or `packed_sequence`.
+
+    Optional generated batch-only fields can be requested with `emit_lengths`,
+    `emit_mask`, `emit_cu_seqlens`, and `emit_positions`. They are stored in the
+    GDDS schema but not in per-sample records; the C dataloader materializes them
+    during collation.
     """
 
     name: str
     dtype: str
     shape: tuple[int, ...]
+    collate: str = "stack"
+    ragged_dim: int | None = None
+    pad_value: Any = 0
+    generated: str | None = None
+    source: str | None = None
+    emit_lengths: str | None = None
+    emit_mask: str | None = None
+    emit_cu_seqlens: str | None = None
+    emit_positions: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,19 +129,48 @@ def _fnv64_str(h: int, value: str) -> int:
     return _fnv64_update(h, value.encode("utf-8") + b"\0")
 
 
-def schema_hash(fields: Sequence[FieldSpec]) -> int:
+def _field_flags(field: FieldSpec, field_index: Mapping[str, int]) -> int:
+    collate = COLLATE_CODES[field.collate]
+    generated = GENERATED_CODES[field.generated or "none"]
+    ragged = 0 if field.ragged_dim is None else int(field.ragged_dim) + 1
+    source = 0 if field.source is None else field_index[field.source] + 1
+    if not 0 <= ragged <= GDDS_MAX_DIMS:
+        raise ValueError(f"field {field.name!r} ragged_dim is out of range")
+    if not 0 <= source <= GDDS_MAX_FIELDS:
+        raise ValueError(f"field {field.name!r} source index is out of range")
+    return collate | (generated << 8) | (ragged << 16) | (source << 24)
+
+
+def _pad_value_bits(field: FieldSpec) -> int:
+    if field.collate != "pad_longest":
+        return 0
+    packed = pack_values(field.dtype, field.pad_value)
+    if len(packed) != DTYPE_SIZES[field.dtype] or len(packed) > 8:
+        raise ValueError(f"field {field.name!r} pad_value must be a scalar {field.dtype}")
+    return int.from_bytes(packed.ljust(8, b"\0"), "little")
+
+
+def schema_hash(fields: Sequence[FieldSpec | Mapping[str, Any]]) -> int:
     """Return the schema hash used by the C runtime."""
 
+    fields_norm = _normalize_fields(fields)
+    field_index = {field.name: i for i, field in enumerate(fields_norm)}
     h = FNV_OFFSET
     h = _fnv64_str(h, "gdds-schema-v1")
-    h = _fnv64_u64(h, len(fields))
-    for field in fields:
+    h = _fnv64_u64(h, len(fields_norm))
+    for field in fields_norm:
         h = _fnv64_str(h, field.name)
         h = _fnv64_u64(h, DTYPE_CODES[field.dtype])
         h = _fnv64_u64(h, len(field.shape))
         padded = tuple(field.shape) + (0,) * (GDDS_MAX_DIMS - len(field.shape))
         for dim in padded:
             h = _fnv64_i64(h, dim)
+    metadata = any(_field_flags(field, field_index) or _pad_value_bits(field) for field in fields_norm)
+    if metadata:
+        h = _fnv64_str(h, "gdds-collate-v1")
+        for field in fields_norm:
+            h = _fnv64_u64(h, _field_flags(field, field_index))
+            h = _fnv64_u64(h, _pad_value_bits(field))
     return h or 1
 
 
@@ -125,6 +181,33 @@ def _normalize_dtype(dtype: str) -> str:
     return dtype
 
 
+def _normalize_collate(collate: str) -> str:
+    collate = collate.lower()
+    if collate not in COLLATE_CODES:
+        raise ValueError(f"unsupported GDDS collate mode: {collate!r}")
+    return collate
+
+
+def _normalize_generated(generated: str | None) -> str | None:
+    if generated is None:
+        return None
+    generated = generated.lower()
+    if generated not in GENERATED_CODES or generated == "none":
+        raise ValueError(f"unsupported GDDS generated field kind: {generated!r}")
+    return generated
+
+
+def _normalize_optional_name(value: Any) -> str | None:
+    if value is None or value is False:
+        return None
+    if value is True:
+        raise ValueError("generated field names must be explicit strings")
+    text = str(value)
+    if not text:
+        raise ValueError("generated field name cannot be empty")
+    return text
+
+
 def _normalize_field(field: FieldSpec | Mapping[str, Any]) -> FieldSpec:
     if isinstance(field, FieldSpec):
         out = field
@@ -133,8 +216,19 @@ def _normalize_field(field: FieldSpec | Mapping[str, Any]) -> FieldSpec:
             name=str(field["name"]),
             dtype=str(field["dtype"]),
             shape=tuple(int(x) for x in field["shape"]),
+            collate=str(field.get("collate", "stack")),
+            ragged_dim=None if field.get("ragged_dim") is None else int(field["ragged_dim"]),
+            pad_value=field.get("pad_value", 0),
+            generated=None if field.get("generated") is None else str(field["generated"]),
+            source=None if field.get("source") is None else str(field["source"]),
+            emit_lengths=_normalize_optional_name(field.get("emit_lengths")),
+            emit_mask=_normalize_optional_name(field.get("emit_mask")),
+            emit_cu_seqlens=_normalize_optional_name(field.get("emit_cu_seqlens")),
+            emit_positions=_normalize_optional_name(field.get("emit_positions")),
         )
     dtype = _normalize_dtype(out.dtype)
+    collate = _normalize_collate(out.collate)
+    generated = _normalize_generated(out.generated)
     if not out.name:
         raise ValueError("field name cannot be empty")
     encoded = out.name.encode("utf-8")
@@ -147,11 +241,84 @@ def _normalize_field(field: FieldSpec | Mapping[str, Any]) -> FieldSpec:
             continue
         if dim <= 0:
             raise ValueError(f"field {out.name!r} has invalid shape {out.shape!r}")
-    return FieldSpec(out.name, dtype, tuple(out.shape))
+    ragged_dim = out.ragged_dim
+    if collate in {"pad_longest", "packed_sequence"}:
+        variable_dims = [i for i, dim in enumerate(out.shape) if dim == -1]
+        if variable_dims != [0]:
+            raise ValueError(f"field {out.name!r} {collate} requires leading shape -1")
+        if ragged_dim is None:
+            ragged_dim = 0
+        if ragged_dim != 0:
+            raise ValueError(f"field {out.name!r} currently supports ragged_dim=0 only")
+    elif collate == "stack":
+        if any(dim == -1 for dim in out.shape):
+            raise ValueError(f"field {out.name!r} stack collation requires fixed shape")
+        ragged_dim = None
+    elif collate == "generated":
+        if generated is None or out.source is None:
+            raise ValueError(f"generated field {out.name!r} requires generated and source")
+        ragged_dim = None
+    if collate != "generated" and (generated is not None or out.source is not None):
+        raise ValueError(f"field {out.name!r} source/generated are only valid for generated fields")
+    return FieldSpec(
+        out.name,
+        dtype,
+        tuple(out.shape),
+        collate,
+        ragged_dim,
+        out.pad_value,
+        generated,
+        out.source,
+        _normalize_optional_name(out.emit_lengths),
+        _normalize_optional_name(out.emit_mask),
+        _normalize_optional_name(out.emit_cu_seqlens),
+        _normalize_optional_name(out.emit_positions),
+    )
+
+
+def _generated_field(name: str, kind: str, source: FieldSpec) -> FieldSpec:
+    dtype = "u8" if kind == "mask" else "i32"
+    return FieldSpec(
+        name=name,
+        dtype=dtype,
+        shape=(-1,),
+        collate="generated",
+        generated=kind,
+        source=source.name,
+    )
 
 
 def _normalize_fields(fields: Sequence[FieldSpec | Mapping[str, Any]]) -> list[FieldSpec]:
-    out = [_normalize_field(f) for f in fields]
+    base = [_normalize_field(f) for f in fields]
+    out: list[FieldSpec] = []
+    for field in base:
+        stored_field = FieldSpec(
+            name=field.name,
+            dtype=field.dtype,
+            shape=field.shape,
+            collate=field.collate,
+            ragged_dim=field.ragged_dim,
+            pad_value=field.pad_value,
+            generated=field.generated,
+            source=field.source,
+        )
+        out.append(stored_field)
+        if field.collate == "generated":
+            continue
+        if field.emit_lengths is not None:
+            out.append(_generated_field(field.emit_lengths, "lengths", field))
+        if field.emit_mask is not None:
+            if field.collate != "pad_longest":
+                raise ValueError(f"field {field.name!r} emit_mask requires pad_longest collation")
+            out.append(_generated_field(field.emit_mask, "mask", field))
+        if field.emit_cu_seqlens is not None:
+            if field.collate != "packed_sequence":
+                raise ValueError(f"field {field.name!r} emit_cu_seqlens requires packed_sequence collation")
+            out.append(_generated_field(field.emit_cu_seqlens, "cu_seqlens", field))
+        if field.emit_positions is not None:
+            if field.collate != "packed_sequence":
+                raise ValueError(f"field {field.name!r} emit_positions requires packed_sequence collation")
+            out.append(_generated_field(field.emit_positions, "positions", field))
     if not out:
         raise ValueError("GDDS schema must contain at least one field")
     if len(out) > GDDS_MAX_FIELDS:
@@ -159,6 +326,27 @@ def _normalize_fields(fields: Sequence[FieldSpec | Mapping[str, Any]]) -> list[F
     names = [f.name for f in out]
     if len(names) != len(set(names)):
         raise ValueError("GDDS field names must be unique")
+    field_by_name = {field.name: field for field in out}
+    for field in out:
+        if field.source is None:
+            continue
+        source = field_by_name.get(field.source)
+        if source is None:
+            raise ValueError(f"generated field {field.name!r} references unknown source {field.source!r}")
+        if source.collate == "generated":
+            raise ValueError(f"generated field {field.name!r} cannot use generated source {field.source!r}")
+        if field.generated == "lengths":
+            if field.dtype != "i32" or source.collate not in {"pad_longest", "packed_sequence"}:
+                raise ValueError(f"generated lengths field {field.name!r} requires i32 varlen source")
+        elif field.generated == "mask":
+            if field.dtype not in {"u8", "i32"} or source.collate != "pad_longest":
+                raise ValueError(f"generated mask field {field.name!r} requires u8/i32 pad_longest source")
+        elif field.generated == "cu_seqlens":
+            if field.dtype != "i32" or source.collate != "packed_sequence":
+                raise ValueError(f"generated cu_seqlens field {field.name!r} requires i32 packed_sequence source")
+        elif field.generated == "positions":
+            if field.dtype != "i32" or source.collate != "packed_sequence":
+                raise ValueError(f"generated positions field {field.name!r} requires i32 packed_sequence source")
     return out
 
 
@@ -306,6 +494,7 @@ def _sample_tensor(value: Any, field: FieldSpec) -> TensorData:
 
 
 def _encode_schema(fields: Sequence[FieldSpec]) -> bytes:
+    field_index = {field.name: i for i, field in enumerate(fields)}
     out = bytearray(len(fields) * GDDS_FIELD_DESC_SIZE)
     for i, field in enumerate(fields):
         base = i * GDDS_FIELD_DESC_SIZE
@@ -315,7 +504,8 @@ def _encode_schema(fields: Sequence[FieldSpec]) -> bytes:
         struct.pack_into("<I", out, base + 68, len(field.shape))
         padded = tuple(field.shape) + (0,) * (GDDS_MAX_DIMS - len(field.shape))
         struct.pack_into("<8q", out, base + 72, *padded)
-        struct.pack_into("<Q", out, base + 136, 0)
+        struct.pack_into("<Q", out, base + 136, _field_flags(field, field_index))
+        struct.pack_into("<Q", out, base + 144, _pad_value_bits(field))
     return bytes(out)
 
 
@@ -323,6 +513,8 @@ def _encode_record(fields: Sequence[FieldSpec], sample: Mapping[str, Any]) -> by
     payload = bytearray()
     entries: list[bytes] = []
     for field_id, field in enumerate(fields):
+        if field.collate == "generated":
+            continue
         if field.name not in sample:
             raise ValueError(f"sample missing GDDS field {field.name!r}")
         value = _sample_tensor(sample[field.name], field)
@@ -375,6 +567,23 @@ def _build_header(
     struct.pack_into("<Q", header, 64, schema_hash_value)
     struct.pack_into("<Q", header, 72, data_hash)
     return bytes(header)
+
+
+def field_metadata(field: FieldSpec) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": field.name,
+        "dtype": field.dtype,
+        "shape": list(field.shape),
+        "collate": field.collate,
+    }
+    if field.ragged_dim is not None:
+        item["ragged_dim"] = field.ragged_dim
+    if field.collate == "pad_longest":
+        item["pad_value"] = field.pad_value
+    if field.collate == "generated":
+        item["generated"] = field.generated
+        item["source"] = field.source
+    return item
 
 
 def write_gdds_shard(
@@ -479,9 +688,7 @@ def write_gdds_split(
             "format": "GDDS",
             "version": GDDS_VERSION,
             "schema_hash": f"0x{schema_hash(fields_norm):016x}",
-            "fields": [
-                {"name": f.name, "dtype": f.dtype, "shape": list(f.shape)} for f in fields_norm
-            ],
+            "fields": [field_metadata(f) for f in fields_norm],
             "splits": {
                 split: {
                     "samples": total,
@@ -498,6 +705,7 @@ __all__ = [
     "DTYPE_NAMES",
     "DTYPE_SIZES",
     "FieldSpec",
+    "field_metadata",
     "TensorData",
     "pack_values",
     "schema_hash",

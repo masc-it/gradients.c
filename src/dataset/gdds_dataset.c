@@ -1,8 +1,9 @@
-#include <gradients/dataloader.h>
-#include <gradients/dataset.h>
+#include "dataloader_internal.h"
+#include "dataset_internal.h"
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,6 +36,15 @@
 #define GD_GDDS_FIELD_RANK_OFFSET 68U
 #define GD_GDDS_FIELD_SHAPE_OFFSET 72U
 #define GD_GDDS_FIELD_FLAGS_OFFSET 136U
+#define GD_GDDS_FIELD_PAD_VALUE_OFFSET 144U
+
+#define GD_GDDS_FIELD_FLAGS_COLLATE_MASK UINT64_C(0x00000000000000ff)
+#define GD_GDDS_FIELD_FLAGS_GENERATED_MASK UINT64_C(0x000000000000ff00)
+#define GD_GDDS_FIELD_FLAGS_RAGGED_DIM_MASK UINT64_C(0x0000000000ff0000)
+#define GD_GDDS_FIELD_FLAGS_SOURCE_MASK UINT64_C(0x00000000ff000000)
+#define GD_GDDS_FIELD_FLAGS_GENERATED_SHIFT 8U
+#define GD_GDDS_FIELD_FLAGS_RAGGED_DIM_SHIFT 16U
+#define GD_GDDS_FIELD_FLAGS_SOURCE_SHIFT 24U
 
 #define GD_GDDS_RECORD_MAGIC_OFFSET 0U
 #define GD_GDDS_RECORD_FIELD_COUNT_OFFSET 4U
@@ -158,9 +168,29 @@ static uint64_t gd_gdds_fnv64_str(uint64_t h, const char *s)
     return gd_gdds_fnv64_bytes(h, s, strlen(s) + 1U);
 }
 
+static uint64_t gd_gdds_pack_field_flags(const gd_gdds_field_info *field)
+{
+    uint64_t flags = 0U;
+    if (field == NULL) {
+        return 0U;
+    }
+    flags |= (uint64_t)field->collate & UINT64_C(0xff);
+    flags |= (((uint64_t)field->generated) & UINT64_C(0xff)) << GD_GDDS_FIELD_FLAGS_GENERATED_SHIFT;
+    if (field->ragged_dim >= 0) {
+        flags |= (((uint64_t)field->ragged_dim + 1U) & UINT64_C(0xff)) <<
+                 GD_GDDS_FIELD_FLAGS_RAGGED_DIM_SHIFT;
+    }
+    if (field->source_field >= 0) {
+        flags |= (((uint64_t)field->source_field + 1U) & UINT64_C(0xff)) <<
+                 GD_GDDS_FIELD_FLAGS_SOURCE_SHIFT;
+    }
+    return flags;
+}
+
 static uint64_t gd_gdds_schema_hash(const gd_gdds_field_info *fields, int n_fields)
 {
     uint64_t h = GD_GDDS_FNV_OFFSET;
+    int has_collate_metadata = 0;
     int i;
     int d;
     h = gd_gdds_fnv64_str(h, "gdds-schema-v1");
@@ -171,6 +201,16 @@ static uint64_t gd_gdds_schema_hash(const gd_gdds_field_info *fields, int n_fiel
         h = gd_gdds_fnv64_u64(h, (uint64_t)fields[i].rank);
         for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
             h = gd_gdds_fnv64_i64(h, fields[i].shape[d]);
+        }
+        if (gd_gdds_pack_field_flags(&fields[i]) != 0U || fields[i].pad_value_bits != 0U) {
+            has_collate_metadata = 1;
+        }
+    }
+    if (has_collate_metadata != 0) {
+        h = gd_gdds_fnv64_str(h, "gdds-collate-v1");
+        for (i = 0; i < n_fields; ++i) {
+            h = gd_gdds_fnv64_u64(h, gd_gdds_pack_field_flags(&fields[i]));
+            h = gd_gdds_fnv64_u64(h, fields[i].pad_value_bits);
         }
     }
     return h != 0U ? h : 1U;
@@ -421,9 +461,63 @@ static gd_status gd_gdds_read_schema(const uint8_t *map,
                 return GD_ERR_INVALID_ARGUMENT;
             }
         }
-        (void)gd_gdds_get_le64(src + GD_GDDS_FIELD_FLAGS_OFFSET);
+        {
+            const uint64_t flags = gd_gdds_get_le64(src + GD_GDDS_FIELD_FLAGS_OFFSET);
+            const uint64_t collate = flags & GD_GDDS_FIELD_FLAGS_COLLATE_MASK;
+            const uint64_t generated = (flags & GD_GDDS_FIELD_FLAGS_GENERATED_MASK) >>
+                                       GD_GDDS_FIELD_FLAGS_GENERATED_SHIFT;
+            const uint64_t ragged = (flags & GD_GDDS_FIELD_FLAGS_RAGGED_DIM_MASK) >>
+                                    GD_GDDS_FIELD_FLAGS_RAGGED_DIM_SHIFT;
+            const uint64_t source_field = (flags & GD_GDDS_FIELD_FLAGS_SOURCE_MASK) >>
+                                          GD_GDDS_FIELD_FLAGS_SOURCE_SHIFT;
+            if (collate > (uint64_t)GD_GDDS_COLLATE_GENERATED ||
+                generated > (uint64_t)GD_GDDS_GENERATED_POSITIONS ||
+                ragged > (uint64_t)GD_MAX_DIMS ||
+                source_field > (uint64_t)GD_GDDS_MAX_FIELDS) {
+                free(fields);
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            fields[i].collate = (gd_gdds_collate_mode)collate;
+            fields[i].generated = (gd_gdds_generated_kind)generated;
+            fields[i].ragged_dim = ragged == 0U ? -1 : (int)ragged - 1;
+            fields[i].source_field = source_field == 0U ? -1 : (int)source_field - 1;
+            fields[i].pad_value_bits = gd_gdds_get_le64(src + GD_GDDS_FIELD_PAD_VALUE_OFFSET);
+            if (fields[i].collate == GD_GDDS_COLLATE_GENERATED) {
+                if (fields[i].generated == GD_GDDS_GENERATED_NONE || fields[i].ragged_dim >= 0 ||
+                    fields[i].pad_value_bits != 0U || fields[i].source_field < 0 ||
+                    fields[i].source_field >= (int)header->field_count) {
+                    free(fields);
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+            } else {
+                if (fields[i].generated != GD_GDDS_GENERATED_NONE || fields[i].source_field >= 0) {
+                    free(fields);
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+                if (fields[i].collate == GD_GDDS_COLLATE_STACK) {
+                    if (fields[i].pad_value_bits != 0U) {
+                        free(fields);
+                        return GD_ERR_INVALID_ARGUMENT;
+                    }
+                    fields[i].ragged_dim = -1;
+                } else if (fields[i].ragged_dim != 0 || fields[i].rank <= 0 || fields[i].shape[0] != -1 ||
+                           (fields[i].collate != GD_GDDS_COLLATE_PAD_LONGEST &&
+                            fields[i].pad_value_bits != 0U)) {
+                    free(fields);
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+            }
+        }
         for (j = 0U; j < i; ++j) {
             if (strcmp(fields[j].name, fields[i].name) == 0) {
+                free(fields);
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+    for (i = 0U; i < header->field_count; ++i) {
+        if (fields[i].collate == GD_GDDS_COLLATE_GENERATED) {
+            if (fields[fields[i].source_field].collate == GD_GDDS_COLLATE_GENERATED) {
                 free(fields);
                 return GD_ERR_INVALID_ARGUMENT;
             }
@@ -558,7 +652,10 @@ static int gd_gdds_fields_equal(const gd_gdds_field_info *a,
     }
     for (i = 0; i < n_fields; ++i) {
         if (strcmp(a[i].name, b[i].name) != 0 || a[i].dtype != b[i].dtype ||
-            a[i].rank != b[i].rank) {
+            a[i].rank != b[i].rank || a[i].collate != b[i].collate ||
+            a[i].generated != b[i].generated || a[i].ragged_dim != b[i].ragged_dim ||
+            a[i].source_field != b[i].source_field ||
+            a[i].pad_value_bits != b[i].pad_value_bits) {
             return 0;
         }
         for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
@@ -595,26 +692,6 @@ static uint64_t gd_gdds_fingerprint_cb(const void *impl_v)
 {
     const gd_gdds_dataset_impl *impl = (const gd_gdds_dataset_impl *)impl_v;
     return impl != NULL ? impl->fingerprint : 0U;
-}
-
-static gd_status gd_gdds_get_u64_cb(const void *impl_v, const char *key, uint64_t *out)
-{
-    const gd_gdds_dataset_impl *impl = (const gd_gdds_dataset_impl *)impl_v;
-    if (impl == NULL || key == NULL || out == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    if (strcmp(key, "n_samples") == 0) {
-        *out = impl->n_samples;
-    } else if (strcmp(key, "n_shards") == 0) {
-        *out = (uint64_t)impl->n_shards;
-    } else if (strcmp(key, "field_count") == 0) {
-        *out = (uint64_t)impl->n_fields;
-    } else if (strcmp(key, "schema_hash") == 0) {
-        *out = impl->schema_hash;
-    } else {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    return GD_OK;
 }
 
 static gd_status gd_gdds_impl_from_dataset(const gd_dataset *dataset,
@@ -800,7 +877,6 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
         .name = "gdds",
         .num_samples = gd_gdds_num_samples_cb,
         .fingerprint = gd_gdds_fingerprint_cb,
-        .get_u64 = gd_gdds_get_u64_cb,
         .destroy = gd_gdds_impl_destroy,
     };
     gd_gdds_dataset_impl *impl;
@@ -1069,98 +1145,244 @@ gd_status gd_gdds_dataset_read_field(const gd_dataset *dataset,
     return GD_OK;
 }
 
-gd_status gd_gdds_init_batch_fields(const gd_dataset *dataset,
-                                    int batch_size,
-                                    gd_batch_field_desc *fields,
-                                    int field_cap,
-                                    int *n_fields_out)
+
+static gd_status gd_gdds_require_source_field(const gd_gdds_dataset_impl *impl,
+                                              int source_field,
+                                              gd_gdds_collate_mode expected)
 {
-    const gd_gdds_dataset_impl *impl;
-    int i;
-    int d;
-    gd_status status;
-    if (fields == NULL || n_fields_out == NULL || batch_size <= 0 || field_cap < 0) {
+    if (impl == NULL || source_field < 0 || source_field >= impl->n_fields) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    if (impl->fields[source_field].collate != expected) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_validate_varlen_source(const gd_gdds_field_info *info)
+{
+    int d;
+    if (info == NULL || info->rank <= 0 || info->rank > (int)GD_MAX_DIMS ||
+        info->ragged_dim != 0 || info->shape[0] != -1) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (d = 1; d < info->rank; ++d) {
+        if (info->shape[d] <= 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_init_one_batch_field(const gd_gdds_dataset_impl *impl,
+                                              int field_index,
+                                              int batch_size,
+                                              gd_batch_field_desc *out)
+{
+    const gd_gdds_field_info *info;
+    int d;
+    if (impl == NULL || out == NULL || field_index < 0 || field_index >= impl->n_fields ||
+        batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    info = &impl->fields[field_index];
+    memset(out, 0, sizeof(*out));
+    out->name = info->name;
+    out->dtype = info->dtype;
+    switch (info->collate) {
+    case GD_GDDS_COLLATE_STACK:
+        if (info->rank + 1 > (int)GD_BATCH_MAX_RANK) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        out->rank = info->rank + 1;
+        out->sizes[0] = (int64_t)batch_size;
+        for (d = 0; d < info->rank; ++d) {
+            if (info->shape[d] <= 0) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            out->sizes[d + 1] = info->shape[d];
+        }
+        break;
+    case GD_GDDS_COLLATE_PAD_LONGEST:
+        if (gd_gdds_validate_varlen_source(info) != GD_OK ||
+            info->rank + 1 > (int)GD_BATCH_MAX_RANK) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        out->rank = info->rank + 1;
+        out->sizes[0] = (int64_t)batch_size;
+        out->sizes[1] = -1;
+        for (d = 1; d < info->rank; ++d) {
+            out->sizes[d + 1] = info->shape[d];
+        }
+        break;
+    case GD_GDDS_COLLATE_PACKED_SEQUENCE:
+        if (gd_gdds_validate_varlen_source(info) != GD_OK) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        out->rank = info->rank;
+        out->sizes[0] = -1;
+        for (d = 1; d < info->rank; ++d) {
+            out->sizes[d] = info->shape[d];
+        }
+        break;
+    case GD_GDDS_COLLATE_GENERATED:
+        switch (info->generated) {
+        case GD_GDDS_GENERATED_LENGTHS:
+            if (info->dtype != GD_DTYPE_I32) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            if (gd_gdds_require_source_field(impl,
+                                             info->source_field,
+                                             GD_GDDS_COLLATE_PAD_LONGEST) != GD_OK &&
+                gd_gdds_require_source_field(impl,
+                                             info->source_field,
+                                             GD_GDDS_COLLATE_PACKED_SEQUENCE) != GD_OK) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            out->rank = 1;
+            out->sizes[0] = (int64_t)batch_size;
+            break;
+        case GD_GDDS_GENERATED_MASK:
+            if (info->dtype != GD_DTYPE_U8 && info->dtype != GD_DTYPE_I32) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            if (gd_gdds_require_source_field(impl,
+                                             info->source_field,
+                                             GD_GDDS_COLLATE_PAD_LONGEST) != GD_OK) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            out->rank = 2;
+            out->sizes[0] = (int64_t)batch_size;
+            out->sizes[1] = -1;
+            break;
+        case GD_GDDS_GENERATED_CU_SEQLENS:
+            if (info->dtype != GD_DTYPE_I32 ||
+                gd_gdds_require_source_field(impl,
+                                             info->source_field,
+                                             GD_GDDS_COLLATE_PACKED_SEQUENCE) != GD_OK) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            out->rank = 1;
+            out->sizes[0] = (int64_t)batch_size + 1;
+            break;
+        case GD_GDDS_GENERATED_POSITIONS:
+            if (info->dtype != GD_DTYPE_I32 ||
+                gd_gdds_require_source_field(impl,
+                                             info->source_field,
+                                             GD_GDDS_COLLATE_PACKED_SEQUENCE) != GD_OK) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            out->rank = 1;
+            out->sizes[0] = -1;
+            break;
+        default:
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        break;
+    default:
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+gd_status _gd_gdds_init_batch_fields(const gd_dataset *dataset,
+                                      int batch_size,
+                                      gd_batch_field_desc **fields_out,
+                                      int *n_fields_out)
+{
+    const gd_gdds_dataset_impl *impl;
+    gd_batch_field_desc *fields;
+    int i;
+    gd_status status;
+    if (fields_out == NULL || n_fields_out == NULL || batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *fields_out = NULL;
     *n_fields_out = 0;
     status = gd_gdds_impl_from_dataset(dataset, &impl);
     if (status != GD_OK) {
         return status;
     }
-    if (field_cap < impl->n_fields) {
-        return GD_ERR_INVALID_ARGUMENT;
+    fields = (gd_batch_field_desc *)calloc((size_t)impl->n_fields, sizeof(*fields));
+    if (fields == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
     }
     for (i = 0; i < impl->n_fields; ++i) {
-        if (impl->fields[i].rank + 1 > (int)GD_BATCH_MAX_RANK) {
-            return GD_ERR_INVALID_ARGUMENT;
-        }
-        for (d = 0; d < impl->fields[i].rank; ++d) {
-            if (impl->fields[i].shape[d] < 0) {
-                return GD_ERR_INVALID_ARGUMENT;
-            }
+        status = gd_gdds_init_one_batch_field(impl, i, batch_size, &fields[i]);
+        if (status != GD_OK) {
+            free(fields);
+            return status;
         }
     }
-    for (i = 0; i < impl->n_fields; ++i) {
-        memset(&fields[i], 0, sizeof(fields[i]));
-        fields[i].name = impl->fields[i].name;
-        fields[i].dtype = impl->fields[i].dtype;
-        fields[i].rank = impl->fields[i].rank + 1;
-        fields[i].sizes[0] = (int64_t)batch_size;
-        for (d = 0; d < impl->fields[i].rank; ++d) {
-            fields[i].sizes[d + 1] = impl->fields[i].shape[d];
-        }
-    }
+    *fields_out = fields;
     *n_fields_out = impl->n_fields;
     return GD_OK;
 }
 
-static gd_status gd_gdds_batch_tail_shape(const gd_batch *batch,
-                                          int field_index,
-                                          int batch_size,
-                                          int64_t *tail_shape,
-                                          int *tail_rank_out,
-                                          size_t *item_nbytes_out)
+static gd_status gd_gdds_field_shape_nbytes(const gd_gdds_field_info *info,
+                                            size_t *out)
 {
-    int rank;
-    gd_dtype dtype;
+    if (info == NULL || info->collate != GD_GDDS_COLLATE_STACK) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_gdds_shape_nbytes(info->shape, info->rank, info->dtype, out);
+}
+
+static gd_status gd_gdds_varlen_tail_nbytes(const gd_gdds_field_info *info,
+                                            size_t *out)
+{
+    if (gd_gdds_validate_varlen_source(info) != GD_OK || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_gdds_tail_nbytes(&info->shape[1], info->rank - 1, info->dtype, out);
+}
+
+static gd_status gd_gdds_validate_record_field_shape(const gd_gdds_field_info *info,
+                                                     const gd_gdds_record_field_view *view)
+{
     int d;
-    if (batch == NULL || tail_shape == NULL || tail_rank_out == NULL ||
-        item_nbytes_out == NULL || field_index < 0) {
+    if (info == NULL || view == NULL || view->rank != info->rank) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    rank = gd_batch_field_rank(batch, field_index);
-    dtype = gd_batch_field_dtype(batch, field_index);
-    if (rank <= 0 || rank > (int)GD_BATCH_MAX_RANK ||
-        gd_batch_field_dim(batch, field_index, 0) != (int64_t)batch_size) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    for (d = 0; d < rank - 1; ++d) {
-        tail_shape[d] = gd_batch_field_dim(batch, field_index, d + 1);
-        if (tail_shape[d] <= 0) {
+    for (d = 0; d < info->rank; ++d) {
+        if (view->shape[d] <= 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        if (info->shape[d] != -1 && info->shape[d] != view->shape[d]) {
             return GD_ERR_INVALID_ARGUMENT;
         }
     }
-    for (; d < (int)GD_MAX_DIMS; ++d) {
-        tail_shape[d] = 0;
-    }
-    *tail_rank_out = rank - 1;
-    return gd_gdds_tail_nbytes(tail_shape, rank - 1, dtype, item_nbytes_out);
+    return GD_OK;
 }
 
-static int gd_gdds_schema_exact_to_batch(const gd_gdds_field_info *info,
-                                         const int64_t *tail_shape,
-                                         int tail_rank)
+static gd_status gd_gdds_fill_scalar(void *dst,
+                                     size_t nbytes,
+                                     gd_dtype dtype,
+                                     uint64_t value_bits)
 {
-    int d;
-    if (info == NULL || tail_shape == NULL || info->rank != tail_rank) {
-        return 0;
+    size_t item_size;
+    size_t count;
+    uint8_t scalar[8];
+    size_t i;
+    if (dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    for (d = 0; d < tail_rank; ++d) {
-        if (info->shape[d] < 0 || info->shape[d] != tail_shape[d]) {
-            return 0;
-        }
+    item_size = gd_dtype_size(dtype);
+    if (item_size == 0U || item_size > sizeof(scalar) || nbytes % item_size != 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    return 1;
+    if (value_bits == 0U) {
+        memset(dst, 0, nbytes);
+        return GD_OK;
+    }
+    for (i = 0U; i < sizeof(scalar); ++i) {
+        scalar[i] = (uint8_t)((value_bits >> (8U * (uint32_t)i)) & UINT64_C(0xff));
+    }
+    count = nbytes / item_size;
+    for (i = 0U; i < count; ++i) {
+        memcpy((uint8_t *)dst + i * item_size, scalar, item_size);
+    }
+    return GD_OK;
 }
 
 static gd_status gd_gdds_strides(const int64_t *shape,
@@ -1297,73 +1519,136 @@ static gd_status gd_gdds_copy_value(uint8_t *dst,
     return GD_OK;
 }
 
-gd_status gd_collate_gdds(gd_dataset *dataset,
-                          const uint64_t *sample_ids,
-                          int batch_size,
-                          gd_batch *batch,
-                          void *user_data)
+static gd_status gd_gdds_batch_field_sizes(const gd_gdds_dataset_impl *impl,
+                                           int field_index,
+                                           int batch_size,
+                                           const int64_t *max_lens,
+                                           const int64_t *total_lens,
+                                           int64_t sizes[GD_BATCH_MAX_RANK],
+                                           int *rank_out)
 {
-    const gd_gdds_collate_config *cfg = (const gd_gdds_collate_config *)user_data;
-    const gd_gdds_dataset_impl *impl;
-    int out_count;
-    int ds_index[GD_GDDS_MAX_FIELDS];
-    int exact[GD_GDDS_MAX_FIELDS];
-    int tail_rank[GD_GDDS_MAX_FIELDS];
-    int64_t tail_shape[GD_GDDS_MAX_FIELDS][GD_MAX_DIMS];
-    size_t item_nbytes[GD_GDDS_MAX_FIELDS];
-    int zero_pad = cfg == NULL ? 1 : (cfg->zero_pad != 0 ? 1 : 0);
-    int truncate = cfg == NULL ? 0 : (cfg->truncate != 0 ? 1 : 0);
+    const gd_gdds_field_info *info;
+    const gd_gdds_field_info *source;
+    int d;
+    if (impl == NULL || max_lens == NULL || total_lens == NULL || sizes == NULL ||
+        rank_out == NULL || field_index < 0 || field_index >= impl->n_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    info = &impl->fields[field_index];
+    memset(sizes, 0, (size_t)GD_BATCH_MAX_RANK * sizeof(sizes[0]));
+    switch (info->collate) {
+    case GD_GDDS_COLLATE_STACK:
+        sizes[0] = (int64_t)batch_size;
+        for (d = 0; d < info->rank; ++d) {
+            sizes[d + 1] = info->shape[d];
+        }
+        *rank_out = info->rank + 1;
+        return GD_OK;
+    case GD_GDDS_COLLATE_PAD_LONGEST:
+        sizes[0] = (int64_t)batch_size;
+        sizes[1] = max_lens[field_index];
+        for (d = 1; d < info->rank; ++d) {
+            sizes[d + 1] = info->shape[d];
+        }
+        *rank_out = info->rank + 1;
+        return GD_OK;
+    case GD_GDDS_COLLATE_PACKED_SEQUENCE:
+        sizes[0] = total_lens[field_index];
+        for (d = 1; d < info->rank; ++d) {
+            sizes[d] = info->shape[d];
+        }
+        *rank_out = info->rank;
+        return GD_OK;
+    case GD_GDDS_COLLATE_GENERATED:
+        source = &impl->fields[info->source_field];
+        (void)source;
+        switch (info->generated) {
+        case GD_GDDS_GENERATED_LENGTHS:
+            sizes[0] = (int64_t)batch_size;
+            *rank_out = 1;
+            return GD_OK;
+        case GD_GDDS_GENERATED_MASK:
+            sizes[0] = (int64_t)batch_size;
+            sizes[1] = max_lens[info->source_field];
+            *rank_out = 2;
+            return GD_OK;
+        case GD_GDDS_GENERATED_CU_SEQLENS:
+            sizes[0] = (int64_t)batch_size + 1;
+            *rank_out = 1;
+            return GD_OK;
+        case GD_GDDS_GENERATED_POSITIONS:
+            sizes[0] = total_lens[info->source_field];
+            *rank_out = 1;
+            return GD_OK;
+        default:
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    default:
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+}
+
+static gd_status gd_gdds_prepare_batch_storage(gd_batch *batch,
+                                               const gd_gdds_dataset_impl *impl,
+                                               int batch_size,
+                                               const int64_t *max_lens,
+                                               const int64_t *total_lens)
+{
     int i;
-    int b;
     gd_status status;
-    if (dataset == NULL || sample_ids == NULL || batch == NULL || batch_size <= 0) {
+    if (batch == NULL || impl == NULL || max_lens == NULL || total_lens == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    status = gd_gdds_impl_from_dataset(dataset, &impl);
-    if (status != GD_OK) {
-        return status;
-    }
-    out_count = gd_batch_field_count(batch);
-    if (out_count <= 0 || out_count > (int)GD_GDDS_MAX_FIELDS) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    for (i = 0; i < out_count; ++i) {
-        const char *name = gd_batch_field_name(batch, i);
-        gd_gdds_field_info info;
-        void *host = gd_batch_host_data(batch, i);
-        size_t field_nbytes;
-        ds_index[i] = gd_gdds_dataset_field_index(dataset, name);
-        if (ds_index[i] < 0 || host == NULL) {
-            return GD_ERR_INVALID_ARGUMENT;
-        }
-        status = gd_gdds_dataset_field_info(dataset, ds_index[i], &info);
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        int64_t sizes[GD_BATCH_MAX_RANK];
+        int rank = 0;
+        status = gd_gdds_batch_field_sizes(impl,
+                                           i,
+                                           batch_size,
+                                           max_lens,
+                                           total_lens,
+                                           sizes,
+                                           &rank);
         if (status != GD_OK) {
             return status;
         }
-        if (gd_batch_field_dtype(batch, i) != info.dtype) {
-            return GD_ERR_INVALID_ARGUMENT;
-        }
-        status = gd_gdds_batch_tail_shape(batch,
-                                          i,
-                                          batch_size,
-                                          tail_shape[i],
-                                          &tail_rank[i],
-                                          &item_nbytes[i]);
+        status = _gd_batch_resize_field(batch, i, info->dtype, rank, sizes, 0);
         if (status != GD_OK) {
             return status;
         }
-        if (tail_rank[i] != info.rank) {
-            return GD_ERR_INVALID_ARGUMENT;
+        if (info->collate == GD_GDDS_COLLATE_PAD_LONGEST) {
+            status = gd_gdds_fill_scalar(gd_batch_host_data(batch, i),
+                                         gd_batch_field_nbytes(batch, i),
+                                         info->dtype,
+                                         info->pad_value_bits);
+        } else {
+            status = gd_gdds_fill_scalar(gd_batch_host_data(batch, i),
+                                         gd_batch_field_nbytes(batch, i),
+                                         info->dtype,
+                                         0U);
         }
-        exact[i] = gd_gdds_schema_exact_to_batch(&info, tail_shape[i], tail_rank[i]);
-        field_nbytes = gd_batch_field_nbytes(batch, i);
-        if ((uint64_t)item_nbytes[i] > (uint64_t)(SIZE_MAX / (size_t)batch_size) ||
-            field_nbytes != item_nbytes[i] * (size_t)batch_size) {
-            return GD_ERR_INVALID_ARGUMENT;
+        if (status != GD_OK) {
+            return status;
         }
-        if (exact[i] == 0 && zero_pad != 0) {
-            (void)memset(host, 0, field_nbytes);
-        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_compute_batch_lengths(const gd_gdds_dataset_impl *impl,
+                                               const uint64_t *sample_ids,
+                                               int batch_size,
+                                               int64_t *lengths,
+                                               int64_t *max_lens,
+                                               int64_t *total_lens,
+                                               int64_t *offsets)
+{
+    int b;
+    int i;
+    gd_status status;
+    if (impl == NULL || sample_ids == NULL || lengths == NULL || max_lens == NULL ||
+        total_lens == NULL || offsets == NULL || batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
     for (b = 0; b < batch_size; ++b) {
         gd_gdds_record_view record;
@@ -1371,23 +1656,405 @@ gd_status gd_collate_gdds(gd_dataset *dataset,
         if (status != GD_OK) {
             return status;
         }
-        for (i = 0; i < out_count; ++i) {
-            uint8_t *row = (uint8_t *)gd_batch_host_data(batch, i) +
-                           (size_t)b * item_nbytes[i];
-            const gd_gdds_record_field_view *view = record.by_field[ds_index[i]];
-            if (view == NULL || view->rank != tail_rank[i]) {
+        for (i = 0; i < impl->n_fields; ++i) {
+            const gd_gdds_field_info *info = &impl->fields[i];
+            const gd_gdds_record_field_view *view;
+            if (info->collate == GD_GDDS_COLLATE_GENERATED) {
+                continue;
+            }
+            view = record.by_field[i];
+            if (view == NULL) {
                 return GD_ERR_INVALID_ARGUMENT;
             }
-            status = gd_gdds_copy_value(row,
-                                        tail_shape[i],
-                                        view,
-                                        gd_batch_field_dtype(batch, i),
-                                        truncate,
-                                        zero_pad);
+            status = gd_gdds_validate_record_field_shape(info, view);
             if (status != GD_OK) {
                 return status;
             }
+            if (info->collate == GD_GDDS_COLLATE_STACK) {
+                size_t expected_nbytes = 0U;
+                status = gd_gdds_field_shape_nbytes(info, &expected_nbytes);
+                if (status != GD_OK || expected_nbytes != view->nbytes) {
+                    return status != GD_OK ? status : GD_ERR_INVALID_ARGUMENT;
+                }
+            } else {
+                const int64_t len = view->shape[0];
+                if (len <= 0 || len > (int64_t)INT32_MAX) {
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+                lengths[(size_t)i * (size_t)batch_size + (size_t)b] = len;
+                if (len > max_lens[i]) {
+                    max_lens[i] = len;
+                }
+                if (INT64_MAX - total_lens[i] < len) {
+                    return GD_ERR_OUT_OF_MEMORY;
+                }
+                total_lens[i] += len;
+            }
+        }
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        int64_t total = 0;
+        offsets[(size_t)i * (size_t)(batch_size + 1)] = 0;
+        if (info->collate != GD_GDDS_COLLATE_PAD_LONGEST &&
+            info->collate != GD_GDDS_COLLATE_PACKED_SEQUENCE) {
+            continue;
+        }
+        for (b = 0; b < batch_size; ++b) {
+            const int64_t len = lengths[(size_t)i * (size_t)batch_size + (size_t)b];
+            total += len;
+            offsets[(size_t)i * (size_t)(batch_size + 1) + (size_t)b + 1U] = total;
+        }
+        if (total != total_lens[i] || total > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
         }
     }
     return GD_OK;
+}
+
+static gd_status gd_gdds_copy_stack_field(gd_batch *batch,
+                                          int field_index,
+                                          int batch_row,
+                                          const gd_gdds_field_info *info,
+                                          const gd_gdds_record_field_view *view)
+{
+    size_t sample_nbytes = 0U;
+    uint8_t *dst;
+    gd_status status;
+    if (batch == NULL || info == NULL || view == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_gdds_field_shape_nbytes(info, &sample_nbytes);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (view->nbytes != sample_nbytes) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (uint8_t *)gd_batch_host_data(batch, field_index) +
+          (size_t)batch_row * sample_nbytes;
+    memcpy(dst, view->data, sample_nbytes);
+    return GD_OK;
+}
+
+static gd_status gd_gdds_copy_pad_field(gd_batch *batch,
+                                        int field_index,
+                                        int batch_row,
+                                        const gd_gdds_field_info *info,
+                                        const gd_gdds_record_field_view *view)
+{
+    int64_t dst_shape[GD_MAX_DIMS];
+    size_t row_nbytes = 0U;
+    uint8_t *dst;
+    int d;
+    gd_status status;
+    if (batch == NULL || info == NULL || view == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst_shape[0] = gd_batch_field_dim(batch, field_index, 1);
+    for (d = 1; d < info->rank; ++d) {
+        dst_shape[d] = info->shape[d];
+    }
+    for (; d < (int)GD_MAX_DIMS; ++d) {
+        dst_shape[d] = 0;
+    }
+    status = gd_gdds_shape_nbytes(dst_shape, info->rank, info->dtype, &row_nbytes);
+    if (status != GD_OK) {
+        return status;
+    }
+    dst = (uint8_t *)gd_batch_host_data(batch, field_index) +
+          (size_t)batch_row * row_nbytes;
+    return gd_gdds_copy_value(dst, dst_shape, view, info->dtype, 0, 1);
+}
+
+static gd_status gd_gdds_copy_packed_field(gd_batch *batch,
+                                           int field_index,
+                                           int batch_row,
+                                           const gd_gdds_field_info *info,
+                                           const gd_gdds_record_field_view *view,
+                                           const int64_t *offsets,
+                                           int batch_size)
+{
+    size_t token_nbytes = 0U;
+    uint8_t *dst;
+    int64_t offset;
+    gd_status status;
+    if (batch == NULL || info == NULL || view == NULL || offsets == NULL || batch_row < 0 ||
+        batch_row >= batch_size) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_gdds_varlen_tail_nbytes(info, &token_nbytes);
+    if (status != GD_OK) {
+        return status;
+    }
+    offset = offsets[(size_t)field_index * (size_t)(batch_size + 1) + (size_t)batch_row];
+    if (offset < 0 || (uint64_t)offset > (uint64_t)(SIZE_MAX / token_nbytes)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    dst = (uint8_t *)gd_batch_host_data(batch, field_index) + (size_t)offset * token_nbytes;
+    memcpy(dst, view->data, view->nbytes);
+    return GD_OK;
+}
+
+static gd_status gd_gdds_fill_lengths(gd_batch *batch,
+                                      int field_index,
+                                      int source_field,
+                                      int batch_size,
+                                      const int64_t *lengths)
+{
+    int32_t *dst;
+    int b;
+    if (batch == NULL || lengths == NULL || source_field < 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (int32_t *)gd_batch_host_data(batch, field_index);
+    if (dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        const int64_t len = lengths[(size_t)source_field * (size_t)batch_size + (size_t)b];
+        if (len < 0 || len > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        dst[b] = (int32_t)len;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_fill_mask(gd_batch *batch,
+                                   int field_index,
+                                   int source_field,
+                                   int batch_size,
+                                   const int64_t *lengths)
+{
+    const gd_dtype dtype = gd_batch_field_dtype(batch, field_index);
+    const int64_t width = gd_batch_field_dim(batch, field_index, 1);
+    int b;
+    if (batch == NULL || lengths == NULL || source_field < 0 || width <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (dtype == GD_DTYPE_U8) {
+        uint8_t *dst = (uint8_t *)gd_batch_host_data(batch, field_index);
+        if (dst == NULL) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (b = 0; b < batch_size; ++b) {
+            const int64_t len = lengths[(size_t)source_field * (size_t)batch_size + (size_t)b];
+            if (len < 0 || len > width) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            memset(dst + (size_t)b * (size_t)width, 1, (size_t)len);
+        }
+        return GD_OK;
+    }
+    if (dtype == GD_DTYPE_I32) {
+        int32_t *dst = (int32_t *)gd_batch_host_data(batch, field_index);
+        int64_t j;
+        if (dst == NULL) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (b = 0; b < batch_size; ++b) {
+            const int64_t len = lengths[(size_t)source_field * (size_t)batch_size + (size_t)b];
+            if (len < 0 || len > width) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            for (j = 0; j < len; ++j) {
+                dst[(size_t)b * (size_t)width + (size_t)j] = 1;
+            }
+        }
+        return GD_OK;
+    }
+    return GD_ERR_INVALID_ARGUMENT;
+}
+
+static gd_status gd_gdds_fill_cu_seqlens(gd_batch *batch,
+                                         int field_index,
+                                         int source_field,
+                                         int batch_size,
+                                         const int64_t *offsets)
+{
+    int32_t *dst;
+    int b;
+    if (batch == NULL || offsets == NULL || source_field < 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (int32_t *)gd_batch_host_data(batch, field_index);
+    if (dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b <= batch_size; ++b) {
+        const int64_t offset = offsets[(size_t)source_field * (size_t)(batch_size + 1) + (size_t)b];
+        if (offset < 0 || offset > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        dst[b] = (int32_t)offset;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_fill_positions(gd_batch *batch,
+                                        int field_index,
+                                        int source_field,
+                                        int batch_size,
+                                        const int64_t *offsets)
+{
+    int32_t *dst;
+    int b;
+    if (batch == NULL || offsets == NULL || source_field < 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (int32_t *)gd_batch_host_data(batch, field_index);
+    if (dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        const int64_t begin = offsets[(size_t)source_field * (size_t)(batch_size + 1) + (size_t)b];
+        const int64_t end = offsets[(size_t)source_field * (size_t)(batch_size + 1) + (size_t)b + 1U];
+        int64_t p;
+        if (begin < 0 || end < begin || end > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (p = begin; p < end; ++p) {
+            dst[p] = (int32_t)(p - begin);
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_fill_generated_field(gd_batch *batch,
+                                              const gd_gdds_field_info *info,
+                                              int field_index,
+                                              int batch_size,
+                                              const int64_t *lengths,
+                                              const int64_t *offsets)
+{
+    if (batch == NULL || info == NULL || info->collate != GD_GDDS_COLLATE_GENERATED) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    switch (info->generated) {
+    case GD_GDDS_GENERATED_LENGTHS:
+        return gd_gdds_fill_lengths(batch, field_index, info->source_field, batch_size, lengths);
+    case GD_GDDS_GENERATED_MASK:
+        return gd_gdds_fill_mask(batch, field_index, info->source_field, batch_size, lengths);
+    case GD_GDDS_GENERATED_CU_SEQLENS:
+        return gd_gdds_fill_cu_seqlens(batch, field_index, info->source_field, batch_size, offsets);
+    case GD_GDDS_GENERATED_POSITIONS:
+        return gd_gdds_fill_positions(batch, field_index, info->source_field, batch_size, offsets);
+    default:
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+}
+
+gd_status _gd_collate_gdds(gd_dataset *dataset,
+                            const uint64_t *sample_ids,
+                            int batch_size,
+                            gd_batch *batch,
+                            void *user_data)
+{
+    const gd_gdds_dataset_impl *impl;
+    int64_t *lengths = NULL;
+    int64_t *max_lens = NULL;
+    int64_t *total_lens = NULL;
+    int64_t *offsets = NULL;
+    int b;
+    int i;
+    gd_status status;
+    (void)user_data;
+    if (dataset == NULL || sample_ids == NULL || batch == NULL || batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_gdds_impl_from_dataset(dataset, &impl);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (gd_batch_field_count(batch) != impl->n_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const char *name = gd_batch_field_name(batch, i);
+        if (name == NULL || strcmp(name, impl->fields[i].name) != 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    lengths = (int64_t *)calloc((size_t)impl->n_fields * (size_t)batch_size, sizeof(*lengths));
+    max_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*max_lens));
+    total_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*total_lens));
+    offsets = (int64_t *)calloc((size_t)impl->n_fields * ((size_t)batch_size + 1U), sizeof(*offsets));
+    if (lengths == NULL || max_lens == NULL || total_lens == NULL || offsets == NULL) {
+        status = GD_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    status = gd_gdds_compute_batch_lengths(impl,
+                                           sample_ids,
+                                           batch_size,
+                                           lengths,
+                                           max_lens,
+                                           total_lens,
+                                           offsets);
+    if (status != GD_OK) {
+        goto done;
+    }
+    status = gd_gdds_prepare_batch_storage(batch, impl, batch_size, max_lens, total_lens);
+    if (status != GD_OK) {
+        goto done;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        gd_gdds_record_view record;
+        status = gd_gdds_parse_record(impl, sample_ids[b], &record);
+        if (status != GD_OK) {
+            goto done;
+        }
+        for (i = 0; i < impl->n_fields; ++i) {
+            const gd_gdds_field_info *info = &impl->fields[i];
+            const gd_gdds_record_field_view *view;
+            if (info->collate == GD_GDDS_COLLATE_GENERATED) {
+                continue;
+            }
+            view = record.by_field[i];
+            if (view == NULL) {
+                status = GD_ERR_INVALID_ARGUMENT;
+                goto done;
+            }
+            switch (info->collate) {
+            case GD_GDDS_COLLATE_STACK:
+                status = gd_gdds_copy_stack_field(batch, i, b, info, view);
+                break;
+            case GD_GDDS_COLLATE_PAD_LONGEST:
+                status = gd_gdds_copy_pad_field(batch, i, b, info, view);
+                break;
+            case GD_GDDS_COLLATE_PACKED_SEQUENCE:
+                status = gd_gdds_copy_packed_field(batch,
+                                                   i,
+                                                   b,
+                                                   info,
+                                                   view,
+                                                   offsets,
+                                                   batch_size);
+                break;
+            default:
+                status = GD_ERR_INVALID_ARGUMENT;
+                break;
+            }
+            if (status != GD_OK) {
+                goto done;
+            }
+        }
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        if (info->collate != GD_GDDS_COLLATE_GENERATED) {
+            continue;
+        }
+        status = gd_gdds_fill_generated_field(batch, info, i, batch_size, lengths, offsets);
+        if (status != GD_OK) {
+            goto done;
+        }
+    }
+
+done:
+    free(offsets);
+    free(total_lens);
+    free(max_lens);
+    free(lengths);
+    return status;
 }

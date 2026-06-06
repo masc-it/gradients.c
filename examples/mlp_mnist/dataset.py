@@ -15,7 +15,7 @@ from urllib.request import urlretrieve
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from gdds_utils import FieldSpec, TensorData, schema_hash, tensor, write_gdds_split  # noqa: E402
+from gdds_utils import FieldSpec, TensorData, field_metadata, schema_hash, tensor, write_gdds_split  # noqa: E402
 
 
 SERVER = "https://raw.githubusercontent.com/fgnt/mnist/master"
@@ -26,8 +26,8 @@ TRAIN_SAMPLES = 60_000
 TEST_SAMPLES = 10_000
 
 FIELDS = [
-    FieldSpec("image", "f16", (IMAGE_PIXELS,)),
-    FieldSpec("target", "i32", ()),
+    FieldSpec("image", "f16", (IMAGE_PIXELS,), collate="stack"),
+    FieldSpec("target", "i32", (), collate="stack"),
 ]
 
 SPLITS = {
@@ -141,10 +141,7 @@ def write_manifest(out_dir: Path, split_counts: Mapping[str, int], split_paths: 
         "format": "GDDS",
         "version": 1,
         "schema_hash": f"0x{schema_hash(FIELDS):016x}",
-        "fields": [
-            {"name": field.name, "dtype": field.dtype, "shape": list(field.shape)}
-            for field in FIELDS
-        ],
+        "fields": [field_metadata(field) for field in FIELDS],
         "normalization": {
             "image": "flattened 28x28 pixels as f16, value = uint8 / 255.0",
             "target": "int32 class id in [0, 9]",

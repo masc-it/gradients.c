@@ -6,7 +6,7 @@ A compact MNIST classifier that follows the same v2 patterns as
 - `dataset.py` downloads raw MNIST IDX gzip files and writes GDDS shards
 - images are normalized to `[0, 1]`, flattened to `[784]`, and stored as F16
 - labels are stored as scalar I32 class ids for `gd_cross_entropy`
-- generic GDDS dataloader/collate path
+- self-describing GDDS dataloader/collate path
 - random no-replacement training sampler
 - module tree + child `gd_linear_layer`s
 - F16 `linear -> relu -> linear` logits
@@ -32,7 +32,7 @@ Raw MNIST gzip files are cached under `data/raw`.
 Useful knobs:
 
 ```sh
-GD_MNIST_TRAIN_STEPS=1500 GD_MNIST_REPORT_EVERY=100 make run
+GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 make run
 GD_MNIST_MIN_ACCURACY=0.80 make run
 make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
 ```

@@ -14,12 +14,26 @@
 #define GD_DL_MAX_PREFETCH_FACTOR 16
 #define GD_DL_MAX_SLOTS 1024
 
+typedef struct gd_batch_field_desc {
+    const char *name;
+    gd_dtype dtype;
+    int rank;
+    int64_t sizes[GD_BATCH_MAX_RANK];
+} gd_batch_field_desc;
+
+typedef gd_status (*gd_collate_fn)(gd_dataset *dataset,
+                                   const uint64_t *sample_ids,
+                                   int batch_size,
+                                   gd_batch *batch,
+                                   void *user_data);
+
 typedef struct gd_batch_field {
     char *name;
     gd_dtype dtype;
     int rank;
     int64_t sizes[GD_BATCH_MAX_RANK];
     size_t nbytes;
+    size_t host_capacity_nbytes;
     void *host_data;
     gd_tensor tensor;
     bool has_tensor;
@@ -90,6 +104,23 @@ struct gd_dataloader {
     char worker_error[256];
     gd_dataloader_metrics metrics;
 };
+
+gd_status _gd_batch_resize_field(gd_batch *batch,
+                                  int field_index,
+                                  gd_dtype dtype,
+                                  int rank,
+                                  const int64_t *sizes,
+                                  int zero_fill);
+
+gd_status _gd_gdds_init_batch_fields(const gd_dataset *dataset,
+                                      int batch_size,
+                                      gd_batch_field_desc **fields_out,
+                                      int *n_fields_out);
+gd_status _gd_collate_gdds(gd_dataset *dataset,
+                            const uint64_t *sample_ids,
+                            int batch_size,
+                            gd_batch *batch,
+                            void *user_data);
 
 gd_status gd_dl_fill_slot(gd_dataloader *dl,
                           gd_batch *slot,

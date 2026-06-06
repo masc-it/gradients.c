@@ -13,7 +13,7 @@
 #define MNIST_TRAIN_BATCH 128
 #define MNIST_EVAL_BATCH 100
 
-#define MNIST_DEFAULT_STEPS 1000
+#define MNIST_DEFAULT_EPOCHS 2
 #define MNIST_DEFAULT_REPORT_EVERY 100
 #define MNIST_DEFAULT_MIN_ACCURACY 0.85f
 
@@ -199,34 +199,16 @@ static gd_status create_gdds_loader(gd_context *ctx,
                                     int batch_size,
                                     gd_dataloader **out)
 {
-    gd_batch_field_desc batch_fields[2];
-    int n_batch_fields = 0;
     gd_dataloader_config cfg;
     gd_status st;
     if (out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
-    st = gd_gdds_init_batch_fields(dataset,
-                                   batch_size,
-                                   batch_fields,
-                                   (int)GD_ARRAY_LEN(batch_fields),
-                                   &n_batch_fields);
-    if (st != GD_OK) {
-        return st;
-    }
     cfg = gd_dataloader_config_build(dataset, batch_size);
     cfg.num_workers = 1;
     cfg.prefetch_factor = 2;
-    st = gd_dataloader_create(ctx,
-                              dataset,
-                              sampler,
-                              &cfg,
-                              batch_fields,
-                              n_batch_fields,
-                              gd_collate_gdds,
-                              NULL,
-                              out);
+    st = gd_dataloader_create(ctx, dataset, sampler, &cfg, out);
     if (st != GD_OK) {
         return st;
     }
@@ -303,7 +285,7 @@ static void evaluate_accuracy(gd_context *ctx,
 
 int main(void)
 {
-    const int train_steps = env_int("GD_MNIST_TRAIN_STEPS", MNIST_DEFAULT_STEPS, 1, 1000000);
+    const int train_epochs = env_int("GD_MNIST_EPOCHS", MNIST_DEFAULT_EPOCHS, 1, 1000000);
     const int report_every = env_int("GD_MNIST_REPORT_EVERY", MNIST_DEFAULT_REPORT_EVERY, 0, 1000000);
     const float min_accuracy = env_float("GD_MNIST_MIN_ACCURACY",
                                          MNIST_DEFAULT_MIN_ACCURACY,
@@ -325,6 +307,8 @@ int main(void)
     gd_amp_scaler *scaler = NULL;
     int correct = 0;
     uint64_t total = 0U;
+    uint64_t steps_per_epoch = 0U;
+    uint64_t train_steps = 0U;
     float accuracy;
 
     if (st == GD_ERR_UNSUPPORTED) {
@@ -337,12 +321,6 @@ int main(void)
 
     TRY(ctx, gd_dataset_open_gdds_split(data_dir, "train", &train_dataset));
     TRY(ctx, gd_dataset_open_gdds_split(data_dir, "test", &test_dataset));
-    printf("dataset: dir=%s train=%llu test=%llu batch=%d steps=%d\n",
-           data_dir,
-           (unsigned long long)gd_dataset_num_samples(train_dataset),
-           (unsigned long long)gd_dataset_num_samples(test_dataset),
-           MNIST_TRAIN_BATCH,
-           train_steps);
 
     mnist_mlp_init(ctx, &model);
     {
@@ -379,17 +357,36 @@ int main(void)
                                 train_sampler,
                                 MNIST_TRAIN_BATCH,
                                 &train_loader));
+    steps_per_epoch = gd_dataloader_steps_per_epoch(train_loader);
+    if (steps_per_epoch == 0U || steps_per_epoch > UINT64_MAX / (uint64_t)train_epochs) {
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "GD_MNIST_EPOCHS", __LINE__);
+    }
+    train_steps = (uint64_t)train_epochs * steps_per_epoch;
+    printf("dataset: dir=%s train=%llu test=%llu batch=%d epochs=%d steps_per_epoch=%llu samples_per_epoch=%llu total_steps=%llu\n",
+           data_dir,
+           (unsigned long long)gd_dataset_num_samples(train_dataset),
+           (unsigned long long)gd_dataset_num_samples(test_dataset),
+           MNIST_TRAIN_BATCH,
+           train_epochs,
+           (unsigned long long)steps_per_epoch,
+           (unsigned long long)gd_dataloader_samples_per_epoch(train_loader),
+           (unsigned long long)train_steps);
 
     gd_module_set_training(&model.mod, true);
     double last_report_time = wall_seconds();
-    int last_report_step = 0;
-    for (int step = 0; step < train_steps; ++step) {
+    uint64_t last_report_step = 0U;
+    for (uint64_t step = 0U; step < train_steps; ++step) {
         gd_batch *batch = NULL;
         gd_tensor *image;
         gd_tensor *target;
         gd_tensor logits;
         gd_tensor loss;
-        const int report = report_every > 0 && (step == 0 || (step + 1) % report_every == 0);
+        const uint64_t current_step = step + 1U;
+        const uint64_t epoch = step / steps_per_epoch + 1U;
+        const uint64_t epoch_step = step % steps_per_epoch + 1U;
+        const int report = report_every > 0 &&
+                           (step == 0U || current_step % (uint64_t)report_every == 0U ||
+                            current_step == train_steps);
         TRY(ctx, gd_dataloader_next(train_loader, &batch));
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
         image = required_batch_tensor(ctx, batch, "image", __LINE__);
@@ -403,15 +400,18 @@ int main(void)
         TRY(ctx, gd_dataloader_prefetch(train_loader));
 
         if (report) {
-            const int current_step = step + 1;
             const double now = wall_seconds();
             const double elapsed = now - last_report_time;
-            const int batches = current_step - last_report_step;
+            const uint64_t batches = current_step - last_report_step;
             const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
             float loss_value = 0.0f;
             TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-            printf("step=%4d loss=%.6f batch/s=%.2f\n",
-                   current_step,
+            printf("epoch=%llu/%d batch=%llu/%llu step=%llu loss=%.6f batch/s=%.2f\n",
+                   (unsigned long long)epoch,
+                   train_epochs,
+                   (unsigned long long)epoch_step,
+                   (unsigned long long)steps_per_epoch,
+                   (unsigned long long)current_step,
                    (double)loss_value,
                    batches_per_sec);
             last_report_time = now;

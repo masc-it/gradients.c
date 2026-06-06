@@ -193,7 +193,11 @@ static gd_status gd_dl_field_nbytes(const gd_batch_field_desc *desc, size_t *out
         return GD_ERR_INVALID_ARGUMENT;
     }
     for (i = 0; i < desc->rank; ++i) {
-        if (desc->sizes[i] <= 0) {
+        if (desc->sizes[i] < 0) {
+            *out = 0U;
+            return GD_OK;
+        }
+        if (desc->sizes[i] == 0) {
             return GD_ERR_INVALID_ARGUMENT;
         }
         if ((uint64_t)desc->sizes[i] > (uint64_t)(SIZE_MAX / numel)) {
@@ -305,11 +309,12 @@ static gd_status gd_batch_init_slot(gd_dataloader *dl, int index, gd_batch *slot
         dst->dtype = src->dtype;
         dst->rank = src->rank;
         dst->nbytes = nbytes;
+        dst->host_capacity_nbytes = nbytes;
         for (d = 0; d < GD_BATCH_MAX_RANK; ++d) {
             dst->sizes[d] = src->sizes[d];
         }
-        dst->host_data = malloc(nbytes);
-        if (dst->name == NULL || dst->host_data == NULL) {
+        dst->host_data = nbytes > 0U ? malloc(nbytes) : NULL;
+        if (dst->name == NULL || (nbytes > 0U && dst->host_data == NULL)) {
             gd_batch_destroy_slot(slot);
             return GD_ERR_OUT_OF_MEMORY;
         }
@@ -371,7 +376,22 @@ gd_status gd_dl_fill_slot(gd_dataloader *dl,
     slot->data_generation = data_generation;
     for (i = 0; i < slot->n_fields; ++i) {
         gd_batch_field *field = &slot->fields[i];
-        gd_shape shape = gd_shape_make((uint32_t)field->rank, field->sizes);
+        gd_shape shape;
+        int d;
+        if (field->rank < 0 || field->rank > GD_BATCH_MAX_RANK ||
+            field->nbytes == 0U || field->host_data == NULL) {
+            (void)gd_context_data_slot_abort(dl->ctx, data_slot, data_generation);
+            gd_batch_clear_data_binding(slot);
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (d = 0; d < field->rank; ++d) {
+            if (field->sizes[d] <= 0) {
+                (void)gd_context_data_slot_abort(dl->ctx, data_slot, data_generation);
+                gd_batch_clear_data_binding(slot);
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+        }
+        shape = gd_shape_make((uint32_t)field->rank, field->sizes);
         status = gd_context_data_slot_tensor(dl->ctx,
                                              data_slot,
                                              data_generation,
@@ -668,13 +688,11 @@ gd_status gd_dataloader_create(gd_context *ctx,
                                gd_dataset *dataset,
                                gd_sampler *sampler,
                                const gd_dataloader_config *cfg,
-                               const gd_batch_field_desc *fields,
-                               int n_fields,
-                               gd_collate_fn collate,
-                               void *collate_data,
                                gd_dataloader **out)
 {
     gd_dataloader *dl;
+    gd_batch_field_desc *fields = NULL;
+    int n_fields = 0;
     int n_workers = 0;
     int prefetch_factor = 0;
     int n_slots = 0;
@@ -684,7 +702,7 @@ gd_status gd_dataloader_create(gd_context *ctx,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
-    if (ctx == NULL || dataset == NULL || cfg == NULL || collate == NULL) {
+    if (ctx == NULL || dataset == NULL || cfg == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (cfg->batch_size <= 0 || gd_dataset_num_samples(dataset) == 0U) {
@@ -703,21 +721,29 @@ gd_status gd_dataloader_create(gd_context *ctx,
         cfg->expected_dataset_fingerprint != gd_dataset_fingerprint(dataset)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    status = _gd_gdds_init_batch_fields(dataset, cfg->batch_size, &fields, &n_fields);
+    if (status != GD_OK) {
+        return status;
+    }
     status = gd_dl_validate_fields(fields, n_fields);
     if (status != GD_OK) {
+        free(fields);
         return status;
     }
     status = gd_normalize_config(cfg, &n_workers, &prefetch_factor, &n_slots);
     if (status != GD_OK) {
+        free(fields);
         return status;
     }
     {
         gd_memory_stats mem_stats;
         status = gd_memory_stats_query(ctx, &mem_stats);
         if (status != GD_OK) {
+            free(fields);
             return status;
         }
         if (mem_stats.data.slots == 0U) {
+            free(fields);
             return GD_ERR_BAD_STATE;
         }
         if ((uint32_t)n_slots > mem_stats.data.slots) {
@@ -726,6 +752,7 @@ gd_status gd_dataloader_create(gd_context *ctx,
     }
     dl = (gd_dataloader *)calloc(1U, sizeof(*dl));
     if (dl == NULL) {
+        free(fields);
         return GD_ERR_OUT_OF_MEMORY;
     }
     dl->ctx = ctx;
@@ -737,12 +764,13 @@ gd_status gd_dataloader_create(gd_context *ctx,
     dl->n_workers = n_workers;
     dl->n_slots = n_slots;
     dl->n_fields = n_fields;
-    dl->collate = collate;
-    dl->collate_data = collate_data;
+    dl->collate = _gd_collate_gdds;
+    dl->collate_data = NULL;
     dl->steps_per_epoch = gd_dataset_num_samples(dataset) / (uint64_t)cfg->batch_size;
     dl->samples_per_epoch = dl->steps_per_epoch * (uint64_t)cfg->batch_size;
     dl->worker_status = GD_OK;
     status = gd_copy_fields(dl, fields);
+    free(fields);
     if (status != GD_OK) {
         gd_dataloader_destroy(dl);
         return status;

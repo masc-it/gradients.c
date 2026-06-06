@@ -156,8 +156,6 @@ int main(void)
     gd_batch *batch = NULL;
     gd_gdds_field_info info;
     gd_gdds_sample_field sample_field;
-    gd_batch_field_desc fields[2];
-    int n_fields = 0;
     uint16_t x[8];
     uint16_t target[4];
     gd_memory_config mem = gdds_memory_config();
@@ -185,10 +183,6 @@ int main(void)
         return 0;
     }
     CHECK_OK(st);
-    CHECK_OK(gd_gdds_init_batch_fields(dataset, 4, fields, 2, &n_fields));
-    CHECK(n_fields == 2 && fields[0].rank == 2 && fields[0].sizes[0] == 4 &&
-              fields[0].sizes[1] == 2,
-          "batch fields inferred");
     {
         const gd_dataloader_config cfg = {
             .batch_size = 4,
@@ -196,8 +190,7 @@ int main(void)
             .num_workers = 1,
             .prefetch_factor = 2,
         };
-        CHECK_OK(gd_dataloader_create(ctx, dataset, NULL, &cfg, fields, n_fields,
-                                      gd_collate_gdds, NULL, &loader));
+        CHECK_OK(gd_dataloader_create(ctx, dataset, NULL, &cfg, &loader));
     }
     CHECK_OK(gd_dataloader_prefetch(loader));
     CHECK_OK(gd_dataloader_next(loader, &batch));

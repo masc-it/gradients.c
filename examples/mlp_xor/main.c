@@ -155,14 +155,7 @@ int main(void)
     gd_dataset *dataset = NULL;
     gd_sampler *sampler = NULL;
     gd_dataloader *loader = NULL;
-    gd_batch_field_desc batch_fields[2];
-    int n_batch_fields = 0;
     TRY(ctx, gd_dataset_open_gdds_split("data", "xor", &dataset));
-    TRY(ctx, gd_gdds_init_batch_fields(dataset,
-                                       BATCH,
-                                       batch_fields,
-                                       (int)GD_ARRAY_LEN(batch_fields),
-                                       &n_batch_fields));
     TRY(ctx, gd_sampler_create_random(dataset, 42U, &sampler));
     {
         const gd_dataloader_config dl_cfg = {
@@ -171,8 +164,7 @@ int main(void)
             .num_workers = 1,
             .prefetch_factor = 2,
         };
-        TRY(ctx, gd_dataloader_create(ctx, dataset, sampler, &dl_cfg, batch_fields, n_batch_fields,
-                                      gd_collate_gdds, NULL, &loader));
+        TRY(ctx, gd_dataloader_create(ctx, dataset, sampler, &dl_cfg, &loader));
     }
     TRY(ctx, gd_dataloader_prefetch(loader));
 

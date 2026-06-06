@@ -37,6 +37,22 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
 
+/* Materialized PyTorch-style concat along axis. Inputs must be contiguous,
+ * non-scalar tensors with matching dtype/rank and equal non-axis dimensions.
+ * Negative axes are accepted. Output is a new contiguous tensor. */
+gd_status gd_concat(gd_context *ctx,
+                    const gd_tensor *const *inputs,
+                    uint32_t n_inputs,
+                    int32_t axis,
+                    gd_tensor *out);
+
+gd_status gd_concat_backward(gd_context *ctx,
+                             const gd_tensor *grad_out,
+                             const gd_tensor *const *inputs,
+                             uint32_t n_inputs,
+                             int32_t axis,
+                             gd_tensor *grad_inputs);
+
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
  * Hq must be a multiple of Hkv. Output has q's shape and dtype.

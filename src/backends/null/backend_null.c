@@ -540,6 +540,30 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_concat_to_full(gd_backend *backend,
+                                    const gd_backend_tensor_view *src,
+                                    const gd_backend_tensor_view *dst,
+                                    const gd_backend_concat_args *args)
+{
+    (void)backend;
+    (void)src;
+    (void)dst;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_concat_from_full(gd_backend *backend,
+                                      const gd_backend_tensor_view *src,
+                                      const gd_backend_tensor_view *dst,
+                                      const gd_backend_concat_args *args)
+{
+    (void)backend;
+    (void)src;
+    (void)dst;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_sdpa_varlen(gd_backend *backend,
                                  const gd_backend_tensor_view *q,
                                  const gd_backend_tensor_view *k,

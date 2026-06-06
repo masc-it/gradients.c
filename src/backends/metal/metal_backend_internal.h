@@ -75,6 +75,12 @@ struct gd_backend {
     void *huber_forward_f32_pso;
     void *huber_backward_f16_pso;
     void *huber_backward_f32_pso;
+    void *concat_to_full_u8_pso;
+    void *concat_to_full_u16_pso;
+    void *concat_to_full_u32_pso;
+    void *concat_from_full_u8_pso;
+    void *concat_from_full_u16_pso;
+    void *concat_from_full_u32_pso;
     void *sdpa_varlen_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_pso;
     void *sdpa_varlen_bwd_stats_pso;

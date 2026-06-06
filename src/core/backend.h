@@ -292,6 +292,26 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
                                     const gd_backend_tensor_view *grad_y,
                                     float scale,
                                     float delta);
+
+typedef struct gd_backend_concat_args {
+    uint64_t count;       /* Number of elements in the slice tensor. */
+    uint64_t inner;       /* Product of dimensions after the concat axis. */
+    uint64_t slice_axis;  /* Axis length of the slice tensor. */
+    uint64_t full_axis;   /* Axis length of the materialized concat tensor. */
+    uint64_t axis_offset; /* Slice axis offset within the full tensor. */
+} gd_backend_concat_args;
+
+/* Copy contiguous src slice into its position in contiguous dst concat output. */
+gd_status gd_backend_concat_to_full(gd_backend *backend,
+                                    const gd_backend_tensor_view *src,
+                                    const gd_backend_tensor_view *dst,
+                                    const gd_backend_concat_args *args);
+/* Copy one contiguous grad slice out of a contiguous full concat gradient. */
+gd_status gd_backend_concat_from_full(gd_backend *backend,
+                                      const gd_backend_tensor_view *src,
+                                      const gd_backend_tensor_view *dst,
+                                      const gd_backend_concat_args *args);
+
 typedef struct gd_backend_sdpa_varlen_args {
     float scale;
     uint32_t causal;

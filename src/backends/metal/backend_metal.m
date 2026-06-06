@@ -271,6 +271,30 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u8_kernel", &backend->concat_to_full_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u16_kernel", &backend->concat_to_full_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u32_kernel", &backend->concat_to_full_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u8_kernel", &backend->concat_from_full_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u16_kernel", &backend->concat_from_full_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u32_kernel", &backend->concat_from_full_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_kernel", &backend->sdpa_varlen_pso);
     if (st != GD_OK) {
         return st;
@@ -525,6 +549,24 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->sdpa_varlen_pso != NULL) {
         CFRelease(backend->sdpa_varlen_pso);
+    }
+    if (backend->concat_from_full_u32_pso != NULL) {
+        CFRelease(backend->concat_from_full_u32_pso);
+    }
+    if (backend->concat_from_full_u16_pso != NULL) {
+        CFRelease(backend->concat_from_full_u16_pso);
+    }
+    if (backend->concat_from_full_u8_pso != NULL) {
+        CFRelease(backend->concat_from_full_u8_pso);
+    }
+    if (backend->concat_to_full_u32_pso != NULL) {
+        CFRelease(backend->concat_to_full_u32_pso);
+    }
+    if (backend->concat_to_full_u16_pso != NULL) {
+        CFRelease(backend->concat_to_full_u16_pso);
+    }
+    if (backend->concat_to_full_u8_pso != NULL) {
+        CFRelease(backend->concat_to_full_u8_pso);
     }
     if (backend->dropout_backward_mask_f32_pso != NULL) {
         CFRelease(backend->dropout_backward_mask_f32_pso);

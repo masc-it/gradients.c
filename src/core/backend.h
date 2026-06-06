@@ -312,6 +312,25 @@ gd_status gd_backend_concat_from_full(gd_backend *backend,
                                       const gd_backend_tensor_view *dst,
                                       const gd_backend_concat_args *args);
 
+typedef struct gd_backend_split_args {
+    uint64_t count;       /* Number of elements in the slice tensor. */
+    uint64_t inner;       /* Product of dimensions after the split axis. */
+    uint64_t slice_axis;  /* Axis length of the slice tensor. */
+    uint64_t full_axis;   /* Axis length of the full input/gradient tensor. */
+    uint64_t axis_offset; /* Slice axis offset within the full tensor. */
+} gd_backend_split_args;
+
+/* Copy one contiguous split output from a contiguous full input tensor. */
+gd_status gd_backend_split_from_full(gd_backend *backend,
+                                     const gd_backend_tensor_view *full,
+                                     const gd_backend_tensor_view *slice,
+                                     const gd_backend_split_args *args);
+/* Copy one contiguous split grad output into its full input-gradient position. */
+gd_status gd_backend_split_to_full(gd_backend *backend,
+                                   const gd_backend_tensor_view *slice,
+                                   const gd_backend_tensor_view *full,
+                                   const gd_backend_split_args *args);
+
 typedef struct gd_backend_permute_args {
     uint64_t count;                    /* Number of elements to materialize. */
     uint64_t inner;                    /* Contiguous suffix copied without index remap. */

@@ -53,6 +53,25 @@ gd_status gd_concat_backward(gd_context *ctx,
                              int32_t axis,
                              gd_tensor *grad_inputs);
 
+/* Materialized PyTorch-style split along axis. Input must be contiguous and
+ * non-scalar. sizes has length n_outputs and positive entries summing to the
+ * input axis dimension. Negative axes are accepted. Outputs are new contiguous
+ * tensors, suitable for downstream kernels that require contiguous inputs. */
+gd_status gd_split(gd_context *ctx,
+                   const gd_tensor *x,
+                   const int64_t *sizes,
+                   uint32_t n_outputs,
+                   int32_t axis,
+                   gd_tensor *outputs);
+
+gd_status gd_split_backward(gd_context *ctx,
+                            const gd_tensor *x,
+                            const gd_tensor *const *grad_outputs,
+                            const int64_t *sizes,
+                            uint32_t n_outputs,
+                            int32_t axis,
+                            gd_tensor *grad_x);
+
 /* Metadata-only PyTorch-style reshape view. Input must be contiguous and the
  * requested shape must preserve element count. One requested dimension may be
  * -1 to infer it. Zero-size dimensions are not supported by the tensor runtime.

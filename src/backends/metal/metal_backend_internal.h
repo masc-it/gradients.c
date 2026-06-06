@@ -81,6 +81,14 @@ struct gd_backend {
     void *concat_from_full_u8_pso;
     void *concat_from_full_u16_pso;
     void *concat_from_full_u32_pso;
+    void *split_from_full_u8_pso;
+    void *split_from_full_u16_pso;
+    void *split_from_full_u32_pso;
+    void *split_to_full_u8_pso;
+    void *split_to_full_u16_pso;
+    void *split_to_full_u32_pso;
+    void *split_from_full_vec16_pso;
+    void *split_to_full_vec16_pso;
     void *permute_u8_pso;
     void *permute_u16_pso;
     void *permute_u32_pso;

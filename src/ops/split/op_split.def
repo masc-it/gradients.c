@@ -1,0 +1,2 @@
+# Custom variadic multi-output public/backend signature; this file registers GD_OP_SPLIT.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

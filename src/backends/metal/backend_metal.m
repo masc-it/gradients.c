@@ -295,6 +295,38 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u8_kernel", &backend->split_from_full_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u16_kernel", &backend->split_from_full_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u32_kernel", &backend->split_from_full_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u8_kernel", &backend->split_to_full_u8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u16_kernel", &backend->split_to_full_u16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u32_kernel", &backend->split_to_full_u32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_vec16_kernel", &backend->split_from_full_vec16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_vec16_kernel", &backend->split_to_full_vec16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_permute_u8_kernel", &backend->permute_u8_pso);
     if (st != GD_OK) {
         return st;
@@ -670,6 +702,30 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->concat_from_full_u8_pso != NULL) {
         CFRelease(backend->concat_from_full_u8_pso);
+    }
+    if (backend->split_to_full_vec16_pso != NULL) {
+        CFRelease(backend->split_to_full_vec16_pso);
+    }
+    if (backend->split_from_full_vec16_pso != NULL) {
+        CFRelease(backend->split_from_full_vec16_pso);
+    }
+    if (backend->split_to_full_u32_pso != NULL) {
+        CFRelease(backend->split_to_full_u32_pso);
+    }
+    if (backend->split_to_full_u16_pso != NULL) {
+        CFRelease(backend->split_to_full_u16_pso);
+    }
+    if (backend->split_to_full_u8_pso != NULL) {
+        CFRelease(backend->split_to_full_u8_pso);
+    }
+    if (backend->split_from_full_u32_pso != NULL) {
+        CFRelease(backend->split_from_full_u32_pso);
+    }
+    if (backend->split_from_full_u16_pso != NULL) {
+        CFRelease(backend->split_from_full_u16_pso);
+    }
+    if (backend->split_from_full_u8_pso != NULL) {
+        CFRelease(backend->split_from_full_u8_pso);
     }
     if (backend->concat_to_full_u32_pso != NULL) {
         CFRelease(backend->concat_to_full_u32_pso);

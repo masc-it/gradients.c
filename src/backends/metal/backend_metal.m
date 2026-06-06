@@ -271,6 +271,38 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_f16_kernel", &backend->embedding_forward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_f32_kernel", &backend->embedding_forward_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_vec16_f16_kernel", &backend->embedding_forward_vec16_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_vec16_f32_kernel", &backend->embedding_forward_vec16_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_zero_f32_kernel", &backend->embedding_zero_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_backward_scatter_f16_kernel", &backend->embedding_backward_scatter_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_backward_scatter_f32_kernel", &backend->embedding_backward_scatter_f32_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_embedding_cast_f32_to_f16_kernel", &backend->embedding_cast_f32_to_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_forward_f16_kernel", &backend->rms_norm_forward_f16_pso);
     if (st != GD_OK) {
         return st;
@@ -873,6 +905,30 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->mse_forward_f16_pso != NULL) {
         CFRelease(backend->mse_forward_f16_pso);
+    }
+    if (backend->embedding_cast_f32_to_f16_pso != NULL) {
+        CFRelease(backend->embedding_cast_f32_to_f16_pso);
+    }
+    if (backend->embedding_backward_scatter_f32_pso != NULL) {
+        CFRelease(backend->embedding_backward_scatter_f32_pso);
+    }
+    if (backend->embedding_backward_scatter_f16_pso != NULL) {
+        CFRelease(backend->embedding_backward_scatter_f16_pso);
+    }
+    if (backend->embedding_zero_f32_pso != NULL) {
+        CFRelease(backend->embedding_zero_f32_pso);
+    }
+    if (backend->embedding_forward_vec16_f32_pso != NULL) {
+        CFRelease(backend->embedding_forward_vec16_f32_pso);
+    }
+    if (backend->embedding_forward_vec16_f16_pso != NULL) {
+        CFRelease(backend->embedding_forward_vec16_f16_pso);
+    }
+    if (backend->embedding_forward_f32_pso != NULL) {
+        CFRelease(backend->embedding_forward_f32_pso);
+    }
+    if (backend->embedding_forward_f16_pso != NULL) {
+        CFRelease(backend->embedding_forward_f16_pso);
     }
     if (backend->rms_norm_wgrad_reduce_f32_pso != NULL) {
         CFRelease(backend->rms_norm_wgrad_reduce_f32_pso);

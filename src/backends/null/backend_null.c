@@ -352,6 +352,36 @@ gd_status gd_backend_dropout_backward_mask(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_embedding_forward(gd_backend *backend,
+                                       const gd_backend_tensor_view *table,
+                                       const gd_backend_tensor_view *ids,
+                                       const gd_backend_tensor_view *out,
+                                       const gd_backend_embedding_args *args)
+{
+    (void)backend;
+    (void)table;
+    (void)ids;
+    (void)out;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_embedding_backward(gd_backend *backend,
+                                        const gd_backend_tensor_view *grad_out,
+                                        const gd_backend_tensor_view *ids,
+                                        const gd_backend_tensor_view *grad_table,
+                                        const gd_backend_tensor_view *scratch,
+                                        const gd_backend_embedding_args *args)
+{
+    (void)backend;
+    (void)grad_out;
+    (void)ids;
+    (void)grad_table;
+    (void)scratch;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,

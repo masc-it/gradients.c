@@ -211,6 +211,26 @@ gd_status gd_backend_dropout_backward_mask(gd_backend *backend,
                                            const gd_backend_tensor_view *grad_x,
                                            float scale);
 
+typedef struct gd_backend_embedding_args {
+    uint64_t ids_count; /* Number of token ids. */
+    uint64_t vocab;     /* Table rows. */
+    uint64_t dim;       /* Table columns / embedding width. */
+} gd_backend_embedding_args;
+
+/* Embedding lookup: out = table[ids], table [vocab, dim], ids contiguous I32. */
+gd_status gd_backend_embedding_forward(gd_backend *backend,
+                                       const gd_backend_tensor_view *table,
+                                       const gd_backend_tensor_view *ids,
+                                       const gd_backend_tensor_view *out,
+                                       const gd_backend_embedding_args *args);
+/* Embedding table grad. F16 grad_table requires a contiguous F32 scratch table. */
+gd_status gd_backend_embedding_backward(gd_backend *backend,
+                                        const gd_backend_tensor_view *grad_out,
+                                        const gd_backend_tensor_view *ids,
+                                        const gd_backend_tensor_view *grad_table,
+                                        const gd_backend_tensor_view *scratch,
+                                        const gd_backend_embedding_args *args);
+
 typedef struct gd_backend_rope_args {
     float theta;
     uint32_t n_dims;

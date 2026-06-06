@@ -79,6 +79,14 @@ struct gd_backend {
     void *huber_forward_f32_pso;
     void *huber_backward_f16_pso;
     void *huber_backward_f32_pso;
+    void *embedding_forward_f16_pso;
+    void *embedding_forward_f32_pso;
+    void *embedding_forward_vec16_f16_pso;
+    void *embedding_forward_vec16_f32_pso;
+    void *embedding_zero_f32_pso;
+    void *embedding_backward_scatter_f16_pso;
+    void *embedding_backward_scatter_f32_pso;
+    void *embedding_cast_f32_to_f16_pso;
     void *rms_norm_forward_f16_pso;
     void *rms_norm_forward_stats_f16_pso;
     void *rms_norm_forward_f32_pso;

@@ -37,6 +37,21 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
 
+/* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
+ * contiguous I32 tensor with rank >= 1. Output is contiguous with shape
+ * ids.shape + [dim] and table dtype. Invalid ids produce NaN output values;
+ * backward ignores invalid ids. */
+gd_status gd_embedding(gd_context *ctx,
+                       const gd_tensor *table,
+                       const gd_tensor *ids,
+                       gd_tensor *out);
+
+gd_status gd_embedding_backward(gd_context *ctx,
+                                const gd_tensor *table,
+                                const gd_tensor *ids,
+                                const gd_tensor *grad_out,
+                                gd_tensor *grad_table);
+
 /* Root-mean-square normalization over the last dimension:
  * out[row, c] = x[row, c] * weight[c] / sqrt(mean_c(x[row, c]^2) + eps).
  * x and weight must be contiguous F16/F32 tensors with matching dtype; weight

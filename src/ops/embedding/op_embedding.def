@@ -1,0 +1,2 @@
+# Custom embedding public/backend signature; this file registers GD_OP_EMBEDDING.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

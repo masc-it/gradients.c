@@ -17,7 +17,10 @@ gd_status gd_matmul(gd_context *ctx,
                     const gd_tensor *w,
                     gd_tensor *out);
 
-/* Computes out = x @ w + bias. Pass bias=NULL for out = x @ w. */
+/* Fully-connected projection with optional bias:
+ * x [..., K], w [K, N], optional bias [N] -> out [..., N].
+ * Rank-N inputs are flattened over leading dimensions for GEMM; rank-2
+ * row-strided inputs are accepted, while other rank-N inputs must be contiguous. */
 gd_status gd_linear(gd_context *ctx,
                     const gd_tensor *x,
                     const gd_tensor *w,

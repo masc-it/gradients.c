@@ -155,9 +155,14 @@ good work.
 
 ---
 
+I need your expertise in writing the first gpt training example for gradients.c, complete of data prep script + main.c for training
+
+you will use data from @~/projects/dnn.c/docs/promessi_sposi.txt and properly process it using gdds utils, train and val splits.
+
 I expect a new folder: examples/gpt_lm/
 
-use relu activation function, rmsnorm, rope. for this first pass I just want to have a fully working gpt example, where I can see the loss decreasing.
+use relu activation function, rmsnorm, rope.
+for this first pass I just want to have a fully working gpt example, where I can see the loss decreasing.
 
 write high quality, clean and performant code.
 

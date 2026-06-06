@@ -1,47 +1,8 @@
-#include <gradients/ops.h>
+#include "linear_impl.h"
 
 #include "../autograd_impl.h"
-#include "../op_common.h"
 
 #include <string.h>
-
-static gd_status gd_linear_validate(gd_context *ctx,
-                                    const gd_tensor *x,
-                                    const gd_tensor *w,
-                                    const gd_tensor *bias)
-{
-    gd_status st;
-    if (ctx == NULL || x == NULL || w == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    st = gd_tensor_validate(ctx, x);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_tensor_validate(ctx, w);
-    if (st != GD_OK) {
-        return st;
-    }
-    if (bias != NULL) {
-        st = gd_tensor_validate(ctx, bias);
-        if (st != GD_OK) {
-            return st;
-        }
-    }
-    if (x->dtype != GD_DTYPE_F16 || w->dtype != GD_DTYPE_F16 ||
-        (bias != NULL && bias->dtype != GD_DTYPE_F16)) {
-        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "linear currently supports f16 tensors only");
-    }
-    if (x->rank != 2U || w->rank != 2U || (bias != NULL && bias->rank != 1U) ||
-        x->shape[1] != w->shape[0] || (bias != NULL && bias->shape[0] != w->shape[1])) {
-        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "linear shape mismatch");
-    }
-    if (x->strides[1] != 1 || w->strides[1] != 1 ||
-        (bias != NULL && bias->strides[0] != 1)) {
-        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "linear requires row-strided inputs");
-    }
-    return GD_OK;
-}
 
 gd_status gd_linear(gd_context *ctx,
                     const gd_tensor *x,
@@ -51,7 +12,7 @@ gd_status gd_linear(gd_context *ctx,
 {
     gd_status st;
     gd_tensor y;
-    int64_t y_shape[2];
+    gd_linear_shape_info info;
     gd_backend_matrix_view xv;
     gd_backend_matrix_view wv;
     gd_backend_matrix_view yv;
@@ -62,24 +23,31 @@ gd_status gd_linear(gd_context *ctx,
     if (ctx == NULL || x == NULL || w == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_linear_validate(ctx, x, w, bias);
+    st = gd_linear_validate_common(ctx, x, w, bias, &info);
     if (st != GD_OK) {
         return st;
     }
-    y_shape[0] = x->shape[0];
-    y_shape[1] = w->shape[1];
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(2U, y_shape), 256U, &y);
+    st = gd_tensor_empty(ctx,
+                         GD_ARENA_SCRATCH,
+                         GD_DTYPE_F16,
+                         gd_shape_make(info.rank, info.out_shape),
+                         256U,
+                         &y);
     if (st != GD_OK) {
         return st;
     }
     memset(&bv, 0, sizeof(bv));
-    if (!gd_op_matrix_view_from_tensor(x, &xv) ||
+    if (!gd_linear_flat_matrix_view_from_tensor(x, info.rows, info.k, &xv) ||
         !gd_op_matrix_view_from_tensor(w, &wv) ||
-        !gd_op_matrix_view_from_tensor(&y, &yv) ||
+        !gd_linear_flat_matrix_view_from_tensor(&y, info.rows, info.n, &yv) ||
         (bias != NULL && !gd_op_vector_view_from_tensor(bias, &bv))) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "linear invalid backend view");
     }
-    st = gd_backend_linear(gd_context_backend(ctx), &xv, &wv, bias != NULL ? &bv : NULL, &yv);
+    if (bias == NULL) {
+        st = gd_backend_matmul(gd_context_backend(ctx), &xv, &wv, &yv);
+    } else {
+        st = gd_backend_linear(gd_context_backend(ctx), &xv, &wv, &bv, &yv);
+    }
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend linear failed");
     }

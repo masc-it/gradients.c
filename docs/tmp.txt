@@ -14,11 +14,11 @@ I am a senior Deep Learning Engineer at Google. I need your expertise for the fo
 
 context: @docs/guides/register_op.md , @docs/guides/metal_tips.md 
 
-I need you to implement huber op capsule.
+I need you to implement dropout op capsule.
 
 for perf_test.c use realistic tests with variable shapes. follow the guides.
 
-at the end, update xor main.c with it.
+at the end, update mlp_mnist main.c with it.
 
 Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint him.
 

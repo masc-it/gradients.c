@@ -15,11 +15,14 @@
 
 #define MNIST_DEFAULT_EPOCHS 2
 #define MNIST_DEFAULT_REPORT_EVERY 100
+#define MNIST_DEFAULT_DROPOUT_P 0.10f
+#define MNIST_DROPOUT_SEED UINT64_C(0xd00d5eed12340000)
 
 typedef struct mnist_mlp {
     gd_module mod;
     gd_linear_layer fc1;
     gd_linear_layer fc2;
+    float dropout_p;
 } mnist_mlp;
 
 typedef struct mnist_config {
@@ -28,6 +31,7 @@ typedef struct mnist_config {
     int report_every;
     int train_batch;
     int eval_batch;
+    float dropout_p;
 } mnist_config;
 
 static void fail_status(gd_context *ctx, gd_status st, const char *expr, int line)
@@ -71,6 +75,27 @@ static int env_int(const char *name, int fallback, int min_value, int max_value)
     return (int)parsed;
 }
 
+static float env_float(const char *name, float fallback, float min_value, float max_value)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    float parsed;
+    if (text == NULL || text[0] == '\0') {
+        return fallback;
+    }
+    errno = 0;
+    parsed = strtof(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || parsed < min_value || parsed > max_value) {
+        fprintf(stderr,
+                "mlp_mnist: ignoring invalid %s=%s; using %.3f\n",
+                name,
+                text,
+                (double)fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
 static mnist_config mnist_config_from_env(void)
 {
     const char *data_dir_env = getenv("GD_MNIST_DATA_DIR");
@@ -81,6 +106,7 @@ static mnist_config mnist_config_from_env(void)
         .report_every = env_int("GD_MNIST_REPORT_EVERY", MNIST_DEFAULT_REPORT_EVERY, 0, 1000000),
         .train_batch = MNIST_TRAIN_BATCH,
         .eval_batch = MNIST_EVAL_BATCH,
+        .dropout_p = env_float("GD_MNIST_DROPOUT_P", MNIST_DEFAULT_DROPOUT_P, 0.0f, 0.95f),
     };
 }
 
@@ -137,7 +163,7 @@ static gd_linear_layer_config mnist_linear_config(int64_t in_features,
     return cfg;
 }
 
-static void mnist_mlp_init(gd_context *ctx, mnist_mlp *model)
+static void mnist_mlp_init(gd_context *ctx, mnist_mlp *model, float dropout_p)
 {
     const gd_linear_layer_config fc1_cfg = mnist_linear_config(MNIST_INPUT_DIM,
                                                                MNIST_HIDDEN_DIM,
@@ -148,6 +174,7 @@ static void mnist_mlp_init(gd_context *ctx, mnist_mlp *model)
                                                                202U,
                                                                0.217f);
     memset(model, 0, sizeof(*model));
+    model->dropout_p = dropout_p;
     TRY(ctx, gd_module_init(ctx, &model->mod, "mnist_mlp"));
     TRY(ctx, gd_linear_layer_init_child(ctx, &model->mod, "fc1", &model->fc1, &fc1_cfg));
     TRY(ctx, gd_linear_layer_init_child(ctx, &model->mod, "fc2", &model->fc2, &fc2_cfg));
@@ -163,10 +190,12 @@ static void mnist_mlp_deinit(mnist_mlp *model)
 static gd_status mnist_mlp_forward(gd_context *ctx,
                                    mnist_mlp *model,
                                    const gd_tensor *x,
+                                   uint64_t dropout_seed,
                                    gd_tensor *out)
 {
     gd_tensor hidden;
     gd_tensor activated;
+    gd_tensor dropped;
     gd_status st;
     st = gd_linear_layer_forward(ctx, &model->fc1, x, &hidden);
     if (st != GD_OK) {
@@ -176,7 +205,16 @@ static gd_status mnist_mlp_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    return gd_linear_layer_forward(ctx, &model->fc2, &activated, out);
+    st = gd_dropout(ctx,
+                    &activated,
+                    model->dropout_p,
+                    model->mod.training,
+                    dropout_seed,
+                    &dropped);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_linear_layer_forward(ctx, &model->fc2, &dropped, out);
 }
 
 static void print_param_set(const gd_param_set *params)
@@ -264,7 +302,7 @@ static void evaluate_accuracy(gd_context *ctx,
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
         image = required_batch_tensor(ctx, batch, "image", __LINE__);
         target = required_batch_tensor(ctx, batch, "target", __LINE__);
-        TRY(ctx, mnist_mlp_forward(ctx, model, image, &pred));
+        TRY(ctx, mnist_mlp_forward(ctx, model, image, 0U, &pred));
         TRY(ctx, gd_end_step(ctx));
         TRY(ctx, gd_tensor_read_f32(ctx, &pred, logits, GD_ARRAY_LEN(logits)));
         TRY(ctx, gd_tensor_read(ctx, target, labels, sizeof(labels)));
@@ -314,7 +352,11 @@ static void train_mnist(gd_context *ctx,
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
         image = required_batch_tensor(ctx, batch, "image", __LINE__);
         target = required_batch_tensor(ctx, batch, "target", __LINE__);
-        TRY(ctx, mnist_mlp_forward(ctx, model, image, &logits));
+        TRY(ctx, mnist_mlp_forward(ctx,
+                                    model,
+                                    image,
+                                    MNIST_DROPOUT_SEED ^ current_step,
+                                    &logits));
         TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
         TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
@@ -377,7 +419,7 @@ int main(void)
     TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &train_dataset));
     TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "test", &test_dataset));
 
-    mnist_mlp_init(ctx, &model);
+    mnist_mlp_init(ctx, &model, config.dropout_p);
     {
         const gd_param_group groups[] = {
             {
@@ -417,12 +459,13 @@ int main(void)
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "GD_MNIST_EPOCHS", __LINE__);
     }
     train_steps = (uint64_t)config.train_epochs * steps_per_epoch;
-    printf("dataset: dir=%s train=%llu test=%llu batch=%d epochs=%d steps_per_epoch=%llu samples_per_epoch=%llu total_steps=%llu\n",
+    printf("dataset: dir=%s train=%llu test=%llu batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%llu samples_per_epoch=%llu total_steps=%llu\n",
            config.data_dir,
            (unsigned long long)gd_dataset_num_samples(train_dataset),
            (unsigned long long)gd_dataset_num_samples(test_dataset),
            config.train_batch,
            config.train_epochs,
+           (double)config.dropout_p,
            (unsigned long long)steps_per_epoch,
            (unsigned long long)gd_dataloader_samples_per_epoch(train_loader),
            (unsigned long long)train_steps);

@@ -13,6 +13,7 @@ extern const gd_autograd_rule gd_bwd_rule_cross_entropy;
 extern const gd_autograd_rule gd_bwd_rule_sigmoid;
 extern const gd_autograd_rule gd_bwd_rule_mse;
 extern const gd_autograd_rule gd_bwd_rule_huber;
+extern const gd_autograd_rule gd_bwd_rule_dropout;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -27,6 +28,7 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_SIGMOID] = &gd_bwd_rule_sigmoid,
     [GD_OP_MSE] = &gd_bwd_rule_mse,
     [GD_OP_HUBER] = &gd_bwd_rule_huber,
+    [GD_OP_DROPOUT] = &gd_bwd_rule_dropout,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

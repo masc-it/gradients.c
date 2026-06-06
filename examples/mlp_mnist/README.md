@@ -9,7 +9,7 @@ A compact MNIST classifier that follows the same v2 patterns as
 - self-describing GDDS dataloader/collate path
 - random no-replacement training sampler
 - module tree + child `gd_linear_layer`s
-- F16 `linear -> relu -> linear` logits
+- F16 `linear -> relu -> dropout -> linear` logits
 - fused in-graph cross-entropy loss
 - reverse-mode autograd from scalar loss
 - `gd_backward_scaled` + AdamW AMP step
@@ -33,7 +33,7 @@ Raw MNIST gzip files are cached under `data/raw`.
 Useful knobs:
 
 ```sh
-GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 make run
+GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 GD_MNIST_DROPOUT_P=0.10 make run
 make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
 ```
 

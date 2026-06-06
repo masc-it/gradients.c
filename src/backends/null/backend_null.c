@@ -308,6 +308,50 @@ gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_dropout_forward(gd_backend *backend,
+                                     const gd_backend_tensor_view *x,
+                                     const gd_backend_tensor_view *y,
+                                     const gd_backend_tensor_view *mask,
+                                     float p,
+                                     uint64_t seed)
+{
+    (void)backend;
+    (void)x;
+    (void)y;
+    (void)mask;
+    (void)p;
+    (void)seed;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_dropout_backward(gd_backend *backend,
+                                      const gd_backend_tensor_view *grad_out,
+                                      const gd_backend_tensor_view *grad_x,
+                                      float p,
+                                      uint64_t seed)
+{
+    (void)backend;
+    (void)grad_out;
+    (void)grad_x;
+    (void)p;
+    (void)seed;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_dropout_backward_mask(gd_backend *backend,
+                                           const gd_backend_tensor_view *mask,
+                                           const gd_backend_tensor_view *grad_out,
+                                           const gd_backend_tensor_view *grad_x,
+                                           float scale)
+{
+    (void)backend;
+    (void)mask;
+    (void)grad_out;
+    (void)grad_x;
+    (void)scale;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
                                       const gd_backend_tensor_view *dst,

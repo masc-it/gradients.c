@@ -191,6 +191,25 @@ gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
                                                   const gd_backend_tensor_view *sigmoid_out,
                                                   const gd_backend_tensor_view *grad_out,
                                                   const gd_backend_tensor_view *grad_x);
+/* Inverted dropout forward: y = x * mask / (1 - p), writing a compact u8 mask. */
+gd_status gd_backend_dropout_forward(gd_backend *backend,
+                                     const gd_backend_tensor_view *x,
+                                     const gd_backend_tensor_view *y,
+                                     const gd_backend_tensor_view *mask,
+                                     float p,
+                                     uint64_t seed);
+/* Direct dropout backward recomputes the same stateless mask from p/seed. */
+gd_status gd_backend_dropout_backward(gd_backend *backend,
+                                      const gd_backend_tensor_view *grad_out,
+                                      const gd_backend_tensor_view *grad_x,
+                                      float p,
+                                      uint64_t seed);
+/* Autograd dropout backward consumes the saved compact u8 forward mask. */
+gd_status gd_backend_dropout_backward_mask(gd_backend *backend,
+                                           const gd_backend_tensor_view *mask,
+                                           const gd_backend_tensor_view *grad_out,
+                                           const gd_backend_tensor_view *grad_x,
+                                           float scale);
 /* dst[i] = src[0] * scale for contiguous tensors; supports same dtype and f32 scalar to f16 dst. */
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,

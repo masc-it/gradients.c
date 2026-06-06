@@ -118,6 +118,20 @@ gd_status gd_huber_backward(gd_context *ctx,
                            gd_tensor *grad_x,
                            gd_tensor *grad_y);
 
+gd_status gd_dropout(gd_context *ctx,
+                  const gd_tensor *x,
+                  float p,
+                  bool training,
+                  uint64_t seed,
+                  gd_tensor *out);
+
+gd_status gd_dropout_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *grad_out,
+                           float p,
+                           uint64_t seed,
+                           gd_tensor *grad_x);
+
 #ifdef __cplusplus
 }
 #endif

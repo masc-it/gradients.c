@@ -27,6 +27,7 @@ typedef struct gd_gen_op {
     bool has_autograd;
     bool api_unary;
     bool api_binary;
+    bool api_dropout;
     bool backend_unary;
     bool backend_binary;
     uint32_t old_id;
@@ -197,6 +198,8 @@ static void gd_parse_op_def(gd_gen_op *op, const char *path)
                 op->api_unary = true;
             } else if (strcmp(value, "binary") == 0) {
                 op->api_binary = true;
+            } else if (strcmp(value, "dropout") == 0) {
+                op->api_dropout = true;
             }
         } else if (strcmp(key, "backend") == 0) {
             if (strcmp(value, "unary") == 0) {
@@ -565,6 +568,26 @@ static int gd_generate_public_ops(const gd_gen_ops *ops)
                              "                           const gd_tensor *grad_out,\n"
                              "                           gd_tensor *grad_x,\n"
                              "                           gd_tensor *grad_y);\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].api_dropout) {
+            char tmp[1600];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_%s(gd_context *ctx,\n"
+                             "                  const gd_tensor *x,\n"
+                             "                  float p,\n"
+                             "                  bool training,\n"
+                             "                  uint64_t seed,\n"
+                             "                  gd_tensor *out);\n\n"
+                             "gd_status gd_%s_backward(gd_context *ctx,\n"
+                             "                           const gd_tensor *x,\n"
+                             "                           const gd_tensor *grad_out,\n"
+                             "                           float p,\n"
+                             "                           uint64_t seed,\n"
+                             "                           gd_tensor *grad_x);\n\n",
                              ops->items[i].name,
                              ops->items[i].name);
             ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);

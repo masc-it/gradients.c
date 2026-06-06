@@ -37,6 +37,54 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
 
+/* Packed variable-length scaled dot-product attention.
+ * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
+ * Hq must be a multiple of Hkv. Output has q's shape and dtype.
+ * scale <= 0 selects 1 / sqrt(Dh). */
+typedef struct gd_sdpa_varlen_config {
+    float scale;
+    bool causal;
+    int32_t sliding_window;
+    int32_t prefix_len;
+    int32_t max_seqlen;
+} gd_sdpa_varlen_config;
+
+gd_status gd_sdpa_varlen(gd_context *ctx,
+                         const gd_tensor *q,
+                         const gd_tensor *k,
+                         const gd_tensor *v,
+                         const gd_tensor *cu_seqlens,
+                         const gd_sdpa_varlen_config *config,
+                         gd_tensor *out);
+
+gd_status gd_sdpa_varlen_backward(gd_context *ctx,
+                                  const gd_tensor *q,
+                                  const gd_tensor *k,
+                                  const gd_tensor *v,
+                                  const gd_tensor *cu_seqlens,
+                                  const gd_tensor *grad_out,
+                                  const gd_sdpa_varlen_config *config,
+                                  gd_tensor *grad_q,
+                                  gd_tensor *grad_k,
+                                  gd_tensor *grad_v);
+
+/* Decode-time attention over a fixed K/V cache. q is [B,Tq,Hq,Dh], k/v cache
+ * are [B,Tmax,Hkv,Dh], cache_pos is an I32 scalar, and live keys are
+ * [0, cache_pos + Tq). Attention is causal. */
+typedef struct gd_sdpa_decode_config {
+    float scale;
+    int32_t sliding_window;
+    int32_t prefix_len;
+} gd_sdpa_decode_config;
+
+gd_status gd_sdpa_decode(gd_context *ctx,
+                         const gd_tensor *q,
+                         const gd_tensor *k_cache,
+                         const gd_tensor *v_cache,
+                         const gd_tensor *cache_pos,
+                         const gd_sdpa_decode_config *config,
+                         gd_tensor *out);
+
 /* Reduces a single axis. Negative axes are accepted Python-style. */
 gd_status gd_reduce_sum_axis(gd_context *ctx,
                              const gd_tensor *x,

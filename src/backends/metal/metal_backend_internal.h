@@ -75,6 +75,16 @@ struct gd_backend {
     void *huber_forward_f32_pso;
     void *huber_backward_f16_pso;
     void *huber_backward_f32_pso;
+    void *sdpa_varlen_pso;
+    void *sdpa_varlen_prefix_window_dh64_f16_pso;
+    void *sdpa_varlen_bwd_stats_pso;
+    void *sdpa_varlen_bwd_pso;
+    void *sdpa_varlen_bwd_dkv_pso;
+    void *sdpa_varlen_bwd_stats_dq_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_split_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_reduce_f16_pso;
+    void *sdpa_decode_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

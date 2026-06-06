@@ -540,6 +540,68 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_sdpa_varlen(gd_backend *backend,
+                                 const gd_backend_tensor_view *q,
+                                 const gd_backend_tensor_view *k,
+                                 const gd_backend_tensor_view *v,
+                                 const gd_backend_tensor_view *cu_seqlens,
+                                 const gd_backend_tensor_view *out,
+                                 const gd_backend_sdpa_varlen_args *args)
+{
+    (void)backend;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)cu_seqlens;
+    (void)out;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
+                                          const gd_backend_tensor_view *grad_out,
+                                          const gd_backend_tensor_view *q,
+                                          const gd_backend_tensor_view *k,
+                                          const gd_backend_tensor_view *v,
+                                          const gd_backend_tensor_view *cu_seqlens,
+                                          const gd_backend_tensor_view *grad_q,
+                                          const gd_backend_tensor_view *grad_k,
+                                          const gd_backend_tensor_view *grad_v,
+                                          const gd_backend_tensor_view *stats,
+                                          const gd_backend_sdpa_varlen_args *args)
+{
+    (void)backend;
+    (void)grad_out;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)cu_seqlens;
+    (void)grad_q;
+    (void)grad_k;
+    (void)grad_v;
+    (void)stats;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_sdpa_decode(gd_backend *backend,
+                                 const gd_backend_tensor_view *q,
+                                 const gd_backend_tensor_view *k_cache,
+                                 const gd_backend_tensor_view *v_cache,
+                                 const gd_backend_tensor_view *cache_pos,
+                                 const gd_backend_tensor_view *out,
+                                 const gd_backend_sdpa_decode_args *args)
+{
+    (void)backend;
+    (void)q;
+    (void)k_cache;
+    (void)v_cache;
+    (void)cache_pos;
+    (void)out;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
 {
     (void)backend;

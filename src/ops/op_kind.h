@@ -17,7 +17,9 @@ typedef enum gd_op_kind {
     GD_OP_MSE = 11,
     GD_OP_HUBER = 12,
     GD_OP_DROPOUT = 13,
-    GD_OP_COUNT = 14,
+    GD_OP_SDPA_DECODE = 14,
+    GD_OP_SDPA_VARLEN = 15,
+    GD_OP_COUNT = 16,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

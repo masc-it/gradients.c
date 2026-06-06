@@ -271,6 +271,46 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_kernel", &backend->sdpa_varlen_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel", &backend->sdpa_varlen_prefix_window_dh64_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_stats_kernel", &backend->sdpa_varlen_bwd_stats_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_kernel", &backend->sdpa_varlen_bwd_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_kernel", &backend->sdpa_varlen_bwd_dkv_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel", &backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel", &backend->sdpa_varlen_bwd_dkv_dh64_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel", &backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_reduce_f16_kernel", &backend->sdpa_varlen_bwd_dkv_reduce_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_decode_kernel", &backend->sdpa_decode_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
     if (st != GD_OK) {
         return st;
@@ -455,6 +495,36 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->adamw_pso != NULL) {
         CFRelease(backend->adamw_pso);
+    }
+    if (backend->sdpa_decode_pso != NULL) {
+        CFRelease(backend->sdpa_decode_pso);
+    }
+    if (backend->sdpa_varlen_bwd_dkv_reduce_f16_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_dkv_reduce_f16_pso);
+    }
+    if (backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso);
+    }
+    if (backend->sdpa_varlen_bwd_dkv_dh64_f16_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_dkv_dh64_f16_pso);
+    }
+    if (backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso);
+    }
+    if (backend->sdpa_varlen_bwd_dkv_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_dkv_pso);
+    }
+    if (backend->sdpa_varlen_bwd_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_pso);
+    }
+    if (backend->sdpa_varlen_bwd_stats_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_bwd_stats_pso);
+    }
+    if (backend->sdpa_varlen_prefix_window_dh64_f16_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_prefix_window_dh64_f16_pso);
+    }
+    if (backend->sdpa_varlen_pso != NULL) {
+        CFRelease(backend->sdpa_varlen_pso);
     }
     if (backend->dropout_backward_mask_f32_pso != NULL) {
         CFRelease(backend->dropout_backward_mask_f32_pso);

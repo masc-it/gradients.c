@@ -1,0 +1,2 @@
+# Custom metadata-only public signature; this file registers GD_OP_RESHAPE.
+# Prototypes are declared manually in include/gradients/ops.h.

@@ -16,6 +16,7 @@ extern const gd_autograd_rule gd_bwd_rule_huber;
 extern const gd_autograd_rule gd_bwd_rule_dropout;
 extern const gd_autograd_rule gd_bwd_rule_sdpa_varlen;
 extern const gd_autograd_rule gd_bwd_rule_concat;
+extern const gd_autograd_rule gd_bwd_rule_reshape;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -33,6 +34,7 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_DROPOUT] = &gd_bwd_rule_dropout,
     [GD_OP_SDPA_VARLEN] = &gd_bwd_rule_sdpa_varlen,
     [GD_OP_CONCAT] = &gd_bwd_rule_concat,
+    [GD_OP_RESHAPE] = &gd_bwd_rule_reshape,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

@@ -20,7 +20,8 @@ typedef enum gd_op_kind {
     GD_OP_SDPA_DECODE = 14,
     GD_OP_SDPA_VARLEN = 15,
     GD_OP_CONCAT = 16,
-    GD_OP_COUNT = 17,
+    GD_OP_RESHAPE = 17,
+    GD_OP_COUNT = 18,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

@@ -53,6 +53,21 @@ gd_status gd_concat_backward(gd_context *ctx,
                              int32_t axis,
                              gd_tensor *grad_inputs);
 
+/* Metadata-only PyTorch-style reshape view. Input must be contiguous and the
+ * requested shape must preserve element count. One requested dimension may be
+ * -1 to infer it. Zero-size dimensions are not supported by the tensor runtime.
+ * Output aliases input storage and is marked as a view. */
+gd_status gd_reshape(gd_context *ctx,
+                     const gd_tensor *x,
+                     gd_shape shape,
+                     gd_tensor *out);
+
+/* Direct backward returns a metadata-only view of grad_out with x's shape. */
+gd_status gd_reshape_backward(gd_context *ctx,
+                              const gd_tensor *x,
+                              const gd_tensor *grad_out,
+                              gd_tensor *grad_x);
+
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
  * Hq must be a multiple of Hkv. Output has q's shape and dtype.

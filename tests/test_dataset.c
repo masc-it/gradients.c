@@ -113,7 +113,6 @@ int main(void)
     CHECK_OK(gd_dataset_open_gdds_file(path, &dataset));
     CHECK(strcmp(gd_dataset_name(dataset), "gdds") == 0, "dataset name");
     CHECK(gd_dataset_num_samples(dataset) == 1U, "sample count");
-    CHECK(gd_dataset_fingerprint(dataset) != 0U, "fingerprint");
     CHECK(gd_gdds_dataset_field_count(dataset) == 1, "field count");
     CHECK(gd_gdds_dataset_field_index(dataset, "value") == 0, "field index");
     CHECK_OK(gd_gdds_dataset_field_info(dataset, 0, &info));

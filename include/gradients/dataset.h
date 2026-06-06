@@ -28,7 +28,6 @@ void gd_dataset_destroy(gd_dataset *dataset);
 
 const char *gd_dataset_name(const gd_dataset *dataset);
 uint64_t gd_dataset_num_samples(const gd_dataset *dataset);
-uint64_t gd_dataset_fingerprint(const gd_dataset *dataset);
 
 typedef enum gd_gdds_collate_mode {
     GD_GDDS_COLLATE_STACK = 0,

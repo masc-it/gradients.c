@@ -15,16 +15,6 @@ gd_dataloader_config gd_dataloader_config_default(int batch_size)
     return cfg;
 }
 
-gd_dataloader_config gd_dataloader_config_build(const gd_dataset *dataset,
-                                                int batch_size)
-{
-    gd_dataloader_config cfg = gd_dataloader_config_default(batch_size);
-    if (dataset != NULL) {
-        cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(dataset);
-    }
-    return cfg;
-}
-
 static char *gd_dl_strdup(const char *s)
 {
     size_t n;
@@ -144,7 +134,6 @@ gd_status gd_sampler_create_random(const gd_dataset *dataset,
     }
     sampler->kind = GD_SAMPLER_KIND_RANDOM;
     sampler->n_samples = n_samples;
-    sampler->dataset_fingerprint = gd_dataset_fingerprint(dataset);
     sampler->seed = seed;
     *out = sampler;
     return GD_OK;
@@ -710,15 +699,10 @@ gd_status gd_dataloader_create(gd_context *ctx,
     }
     if (sampler != NULL &&
         (sampler->kind != GD_SAMPLER_KIND_RANDOM ||
-         sampler->n_samples != gd_dataset_num_samples(dataset) ||
-         sampler->dataset_fingerprint != gd_dataset_fingerprint(dataset))) {
+         sampler->n_samples != gd_dataset_num_samples(dataset))) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (gd_dataset_num_samples(dataset) / (uint64_t)cfg->batch_size == 0U) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    if (cfg->expected_dataset_fingerprint != 0U &&
-        cfg->expected_dataset_fingerprint != gd_dataset_fingerprint(dataset)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     status = _gd_gdds_init_batch_fields(dataset, cfg->batch_size, &fields, &n_fields);

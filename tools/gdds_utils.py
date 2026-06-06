@@ -551,7 +551,6 @@ def _build_header(
     data_offset: int,
     data_nbytes: int,
     schema_hash_value: int,
-    data_hash: int,
 ) -> bytes:
     header = bytearray(GDDS_HEADER_SIZE)
     header[0:8] = GDDS_MAGIC
@@ -565,7 +564,6 @@ def _build_header(
     struct.pack_into("<Q", header, 48, data_offset)
     struct.pack_into("<Q", header, 56, data_nbytes)
     struct.pack_into("<Q", header, 64, schema_hash_value)
-    struct.pack_into("<Q", header, 72, data_hash)
     return bytes(header)
 
 
@@ -609,7 +607,6 @@ def write_gdds_shard(
     data_offset = align_up(index_offset + index_nbytes, 64)
     schema_hash_value = schema_hash(normalized_fields)
     index: list[tuple[int, int]] = []
-    data_hash = FNV_OFFSET
     cursor = data_offset
     with tmp.open("wb+") as f:
         f.write(b"\0" * GDDS_HEADER_SIZE)
@@ -620,7 +617,6 @@ def write_gdds_shard(
         for sample in samples:
             record = _encode_record(normalized_fields, sample)
             index.append((cursor, len(record)))
-            data_hash = _fnv64_update(data_hash, record)
             f.write(record)
             cursor += len(record)
         data_nbytes = cursor - data_offset
@@ -637,7 +633,6 @@ def write_gdds_shard(
                 data_offset=data_offset,
                 data_nbytes=data_nbytes,
                 schema_hash_value=schema_hash_value,
-                data_hash=data_hash or 1,
             )
         )
         f.truncate(cursor)

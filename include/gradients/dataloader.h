@@ -38,9 +38,8 @@ typedef enum gd_batch_state {
 
 typedef struct gd_dataloader_config {
     int batch_size;
-    uint64_t expected_dataset_fingerprint; /* 0 disables check. */
-    int num_workers;                       /* 0 => one background worker. */
-    int prefetch_factor;                   /* 0 => two slots per worker. */
+    int num_workers;     /* 0 => one background worker. */
+    int prefetch_factor; /* 0 => two slots per worker. */
 } gd_dataloader_config;
 
 typedef struct gd_dataloader_metrics {
@@ -54,14 +53,9 @@ typedef struct gd_dataloader_metrics {
     uint64_t max_ready_depth;
 } gd_dataloader_metrics;
 
-/* Defaults: sequential sampling when sampler is NULL, fingerprint check
-   disabled, and implementation defaults for worker/prefetch counts. */
+/* Defaults: sequential sampling when sampler is NULL and implementation
+   defaults for worker/prefetch counts. */
 gd_dataloader_config gd_dataloader_config_default(int batch_size);
-
-/* Convenience builder: defaults plus dataset fingerprint check when dataset is
-   non-NULL. */
-gd_dataloader_config gd_dataloader_config_build(const gd_dataset *dataset,
-                                                int batch_size);
 
 /* `dataset` must be GDDS. Batch fields and collation are inferred from GDDS
    metadata written during dataset prep. `sampler` may be NULL for deterministic

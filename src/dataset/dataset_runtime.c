@@ -34,8 +34,7 @@ gd_status gd_dataset_create(const gd_dataset_ops *ops,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
-    if (ops == NULL || ops->name == NULL || ops->num_samples == NULL ||
-        ops->fingerprint == NULL || impl == NULL) {
+    if (ops == NULL || ops->name == NULL || ops->num_samples == NULL || impl == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     dataset = (gd_dataset *)calloc(1U, sizeof(*dataset));
@@ -86,10 +85,3 @@ uint64_t gd_dataset_num_samples(const gd_dataset *dataset)
     return dataset->ops.num_samples(dataset->impl);
 }
 
-uint64_t gd_dataset_fingerprint(const gd_dataset *dataset)
-{
-    if (dataset == NULL || dataset->ops.fingerprint == NULL) {
-        return 0U;
-    }
-    return dataset->ops.fingerprint(dataset->impl);
-}

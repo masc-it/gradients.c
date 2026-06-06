@@ -6,13 +6,11 @@
 #include <stdint.h>
 
 typedef uint64_t (*gd_dataset_num_samples_fn)(const void *impl);
-typedef uint64_t (*gd_dataset_fingerprint_fn)(const void *impl);
 typedef void (*gd_dataset_destroy_fn)(void *impl);
 
 typedef struct gd_dataset_ops {
     const char *name;
     gd_dataset_num_samples_fn num_samples;
-    gd_dataset_fingerprint_fn fingerprint;
     gd_dataset_destroy_fn destroy;
 } gd_dataset_ops;
 

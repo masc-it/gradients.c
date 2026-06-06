@@ -242,7 +242,7 @@ static gd_status create_gdds_loader(gd_context *ctx,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
-    cfg = gd_dataloader_config_build(dataset, batch_size);
+    cfg = gd_dataloader_config_default(batch_size);
     cfg.num_workers = 1;
     cfg.prefetch_factor = 2;
     st = gd_dataloader_create(ctx, dataset, sampler, &cfg, out);
@@ -282,22 +282,22 @@ static int argmax10(const float *values)
 static void evaluate_accuracy(gd_context *ctx,
                               mnist_mlp *model,
                               gd_dataloader *loader,
-                              uint64_t n_samples,
+                              size_t n_samples,
                               int *correct_out,
-                              uint64_t *total_out)
+                              size_t *total_out)
 {
     float logits[MNIST_EVAL_BATCH * MNIST_CLASSES];
     int32_t labels[MNIST_EVAL_BATCH];
-    uint64_t seen = 0U;
+    size_t seen = 0U;
     int correct = 0;
     while (seen < n_samples) {
         gd_batch *batch = NULL;
         gd_tensor *image;
         gd_tensor *target;
         gd_tensor pred;
-        uint64_t remaining = n_samples - seen;
-        int rows = remaining < (uint64_t)MNIST_EVAL_BATCH ? (int)remaining : MNIST_EVAL_BATCH;
-        int row;
+        size_t remaining = n_samples - seen;
+        size_t rows = remaining < (size_t)MNIST_EVAL_BATCH ? remaining : (size_t)MNIST_EVAL_BATCH;
+        size_t row;
         TRY(ctx, gd_dataloader_next(loader, &batch));
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
         image = required_batch_tensor(ctx, batch, "image", __LINE__);
@@ -308,13 +308,13 @@ static void evaluate_accuracy(gd_context *ctx,
         TRY(ctx, gd_tensor_read(ctx, target, labels, sizeof(labels)));
         TRY(ctx, gd_dataloader_release(loader, batch));
         TRY(ctx, gd_dataloader_prefetch(loader));
-        for (row = 0; row < rows; ++row) {
+        for (row = 0U; row < rows; ++row) {
             int predicted = argmax10(&logits[row * MNIST_CLASSES]);
             if (predicted == labels[row]) {
                 correct += 1;
             }
         }
-        seen += (uint64_t)rows;
+        seen += rows;
     }
     *correct_out = correct;
     *total_out = n_samples;
@@ -326,27 +326,28 @@ static void train_mnist(gd_context *ctx,
                         gd_optimizer *optimizer,
                         gd_amp_scaler *scaler,
                         const mnist_config *config,
-                        uint64_t steps_per_epoch,
-                        uint64_t train_steps)
+                        size_t steps_per_epoch,
+                        size_t train_steps)
 {
     double last_report_time;
-    uint64_t last_report_step = 0U;
+    size_t last_report_step = 0U;
+    const size_t report_every = config != NULL ? (size_t)config->report_every : 0U;
     if (config == NULL || steps_per_epoch == 0U || train_steps == 0U) {
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train_mnist", __LINE__);
     }
     gd_module_set_training(&model->mod, true);
     last_report_time = wall_seconds();
-    for (uint64_t step = 0U; step < train_steps; ++step) {
+    for (size_t step = 0U; step < train_steps; ++step) {
         gd_batch *batch = NULL;
         gd_tensor *image;
         gd_tensor *target;
         gd_tensor logits;
         gd_tensor loss;
-        const uint64_t current_step = step + 1U;
-        const uint64_t epoch = step / steps_per_epoch + 1U;
-        const uint64_t epoch_step = step % steps_per_epoch + 1U;
-        const int report = config->report_every > 0 &&
-                           (step == 0U || current_step % (uint64_t)config->report_every == 0U ||
+        const size_t current_step = step + 1U;
+        const size_t epoch = step / steps_per_epoch + 1U;
+        const size_t epoch_step = step % steps_per_epoch + 1U;
+        const int report = report_every > 0U &&
+                           (step == 0U || current_step % report_every == 0U ||
                             current_step == train_steps);
         TRY(ctx, gd_dataloader_next(loader, &batch));
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
@@ -367,16 +368,16 @@ static void train_mnist(gd_context *ctx,
         if (report) {
             const double now = wall_seconds();
             const double elapsed = now - last_report_time;
-            const uint64_t batches = current_step - last_report_step;
+            const size_t batches = current_step - last_report_step;
             const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
             float loss_value = 0.0f;
             TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-            printf("epoch=%llu/%d batch=%llu/%llu step=%llu loss=%.6f batch/s=%.2f\n",
-                   (unsigned long long)epoch,
+            printf("epoch=%zu/%d batch=%zu/%zu step=%zu loss=%.6f batch/s=%.2f\n",
+                   epoch,
                    config->train_epochs,
-                   (unsigned long long)epoch_step,
-                   (unsigned long long)steps_per_epoch,
-                   (unsigned long long)current_step,
+                   epoch_step,
+                   steps_per_epoch,
+                   current_step,
                    (double)loss_value,
                    batches_per_sec);
             last_report_time = now;
@@ -402,9 +403,14 @@ int main(void)
     gd_amp_scaler *scaler = NULL;
     int correct = 0;
     int exit_code = 1;
-    uint64_t total = 0U;
-    uint64_t steps_per_epoch = 0U;
-    uint64_t train_steps = 0U;
+    size_t train_samples = 0U;
+    size_t test_samples = 0U;
+    size_t total = 0U;
+    size_t steps_per_epoch = 0U;
+    size_t samples_per_epoch = 0U;
+    size_t train_steps = 0U;
+    size_t eval_samples = 0U;
+    size_t optimizer_steps = 0U;
     float accuracy = 0.0f;
 
     if (st == GD_ERR_UNSUPPORTED) {
@@ -418,6 +424,8 @@ int main(void)
 
     TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &train_dataset));
     TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "test", &test_dataset));
+    train_samples = (size_t)gd_dataset_num_samples(train_dataset);
+    test_samples = (size_t)gd_dataset_num_samples(test_dataset);
 
     mnist_mlp_init(ctx, &model, config.dropout_p);
     {
@@ -454,21 +462,22 @@ int main(void)
                                 train_sampler,
                                 config.train_batch,
                                 &train_loader));
-    steps_per_epoch = gd_dataloader_steps_per_epoch(train_loader);
-    if (steps_per_epoch == 0U || steps_per_epoch > UINT64_MAX / (uint64_t)config.train_epochs) {
+    steps_per_epoch = (size_t)gd_dataloader_steps_per_epoch(train_loader);
+    if (steps_per_epoch == 0U || (size_t)config.train_epochs > SIZE_MAX / steps_per_epoch) {
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "GD_MNIST_EPOCHS", __LINE__);
     }
-    train_steps = (uint64_t)config.train_epochs * steps_per_epoch;
-    printf("dataset: dir=%s train=%llu test=%llu batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%llu samples_per_epoch=%llu total_steps=%llu\n",
+    samples_per_epoch = (size_t)gd_dataloader_samples_per_epoch(train_loader);
+    train_steps = (size_t)config.train_epochs * steps_per_epoch;
+    printf("dataset: dir=%s train=%zu test=%zu batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
            config.data_dir,
-           (unsigned long long)gd_dataset_num_samples(train_dataset),
-           (unsigned long long)gd_dataset_num_samples(test_dataset),
+           train_samples,
+           test_samples,
            config.train_batch,
            config.train_epochs,
            (double)config.dropout_p,
-           (unsigned long long)steps_per_epoch,
-           (unsigned long long)gd_dataloader_samples_per_epoch(train_loader),
-           (unsigned long long)train_steps);
+           steps_per_epoch,
+           samples_per_epoch,
+           train_steps);
 
     train_mnist(ctx,
                 &model,
@@ -488,13 +497,15 @@ int main(void)
                                 NULL,
                                 config.eval_batch,
                                 &test_loader));
-    evaluate_accuracy(ctx, &model, test_loader, gd_dataloader_samples_per_epoch(test_loader), &correct, &total);
+    eval_samples = (size_t)gd_dataloader_samples_per_epoch(test_loader);
+    evaluate_accuracy(ctx, &model, test_loader, eval_samples, &correct, &total);
     accuracy = total > 0U ? (float)correct / (float)total : 0.0f;
-    printf("test_accuracy=%.4f correct=%d/%llu optimizer_steps=%llu\n",
+    optimizer_steps = (size_t)gd_optimizer_step_count(optimizer);
+    printf("test_accuracy=%.4f correct=%d/%zu optimizer_steps=%zu\n",
            (double)accuracy,
            correct,
-           (unsigned long long)total,
-           (unsigned long long)gd_optimizer_step_count(optimizer));
+           total,
+           optimizer_steps);
 
     printf("mlp_mnist: ok\n");
     exit_code = 0;

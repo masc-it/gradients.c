@@ -160,7 +160,6 @@ int main(void)
     {
         const gd_dataloader_config dl_cfg = {
             .batch_size = BATCH,
-            .expected_dataset_fingerprint = gd_dataset_fingerprint(dataset),
             .num_workers = 1,
             .prefetch_factor = 2,
         };

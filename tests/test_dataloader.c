@@ -162,7 +162,7 @@ static void test_sequential_loader(gd_context *ctx, gd_dataset *dataset)
 {
     enum { BATCH = 3, STEPS = 3, COUNT = BATCH * STEPS };
     gd_dataloader *loader = NULL;
-    gd_dataloader_config cfg = gd_dataloader_config_build(dataset, BATCH);
+    gd_dataloader_config cfg = gd_dataloader_config_default(BATCH);
     int32_t ids[COUNT];
     cfg.num_workers = 1;
     cfg.prefetch_factor = 2;
@@ -184,7 +184,7 @@ static void test_random_sampler_no_replacement(gd_context *ctx, gd_dataset *data
     gd_sampler *sampler2 = NULL;
     gd_dataloader *loader = NULL;
     gd_dataloader *loader2 = NULL;
-    gd_dataloader_config cfg = gd_dataloader_config_build(dataset, BATCH);
+    gd_dataloader_config cfg = gd_dataloader_config_default(BATCH);
     int32_t epoch0[COUNT];
     int32_t epoch1[COUNT];
     int32_t epoch0_again[COUNT];

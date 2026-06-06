@@ -29,7 +29,6 @@
 #define GD_GDDS_HEADER_DATA_OFFSET 48U
 #define GD_GDDS_HEADER_DATA_NBYTES_OFFSET 56U
 #define GD_GDDS_HEADER_SCHEMA_HASH_OFFSET 64U
-#define GD_GDDS_HEADER_DATA_HASH_OFFSET 72U
 
 #define GD_GDDS_FIELD_NAME_OFFSET 0U
 #define GD_GDDS_FIELD_DTYPE_OFFSET 64U
@@ -68,7 +67,6 @@ typedef struct gd_gdds_header_internal {
     uint64_t data_offset;
     uint64_t data_nbytes;
     uint64_t schema_hash;
-    uint64_t data_hash;
 } gd_gdds_header_internal;
 
 typedef struct gd_gdds_shard {
@@ -90,7 +88,6 @@ typedef struct gd_gdds_dataset_impl {
     int n_fields;
     uint64_t n_samples;
     uint64_t schema_hash;
-    uint64_t fingerprint;
 } gd_gdds_dataset_impl;
 
 typedef struct gd_gdds_record_field_view {
@@ -379,7 +376,6 @@ static gd_status gd_gdds_read_header_from_map(const uint8_t *map,
     out->data_offset = gd_gdds_get_le64(map + GD_GDDS_HEADER_DATA_OFFSET);
     out->data_nbytes = gd_gdds_get_le64(map + GD_GDDS_HEADER_DATA_NBYTES_OFFSET);
     out->schema_hash = gd_gdds_get_le64(map + GD_GDDS_HEADER_SCHEMA_HASH_OFFSET);
-    out->data_hash = gd_gdds_get_le64(map + GD_GDDS_HEADER_DATA_HASH_OFFSET);
     if (out->version != GD_GDDS_VERSION || out->header_size != GD_GDDS_HEADER_SIZE ||
         out->field_count == 0U || out->field_count > GD_GDDS_MAX_FIELDS) {
         return GD_ERR_INVALID_ARGUMENT;
@@ -688,12 +684,6 @@ static uint64_t gd_gdds_num_samples_cb(const void *impl_v)
     return impl != NULL ? impl->n_samples : 0U;
 }
 
-static uint64_t gd_gdds_fingerprint_cb(const void *impl_v)
-{
-    const gd_gdds_dataset_impl *impl = (const gd_gdds_dataset_impl *)impl_v;
-    return impl != NULL ? impl->fingerprint : 0U;
-}
-
 static gd_status gd_gdds_impl_from_dataset(const gd_dataset *dataset,
                                            const gd_gdds_dataset_impl **out)
 {
@@ -851,32 +841,11 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
     return GD_OK;
 }
 
-static gd_status gd_gdds_compute_fingerprint(gd_gdds_dataset_impl *impl)
-{
-    uint64_t h = GD_GDDS_FNV_OFFSET;
-    int i;
-    if (impl == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    h = gd_gdds_fnv64_str(h, "gdds-dataset-v1");
-    h = gd_gdds_fnv64_u64(h, (uint64_t)impl->n_shards);
-    h = gd_gdds_fnv64_u64(h, impl->n_samples);
-    h = gd_gdds_fnv64_u64(h, impl->schema_hash);
-    for (i = 0; i < impl->n_shards; ++i) {
-        h = gd_gdds_fnv64_u64(h, impl->shards[i].header.n_samples);
-        h = gd_gdds_fnv64_u64(h, impl->shards[i].header.data_nbytes);
-        h = gd_gdds_fnv64_u64(h, impl->shards[i].header.data_hash);
-    }
-    impl->fingerprint = h != 0U ? h : 1U;
-    return GD_OK;
-}
-
 gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out)
 {
     static const gd_dataset_ops ops = {
         .name = "gdds",
         .num_samples = gd_gdds_num_samples_cb,
-        .fingerprint = gd_gdds_fingerprint_cb,
         .destroy = gd_gdds_impl_destroy,
     };
     gd_gdds_dataset_impl *impl;
@@ -932,10 +901,7 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
         sample_base += impl->shards[i].header.n_samples;
     }
     impl->n_samples = sample_base;
-    status = gd_gdds_compute_fingerprint(impl);
-    if (status == GD_OK) {
-        status = gd_dataset_create(&ops, impl, out);
-    }
+    status = gd_dataset_create(&ops, impl, out);
     if (status != GD_OK) {
         gd_gdds_impl_destroy(impl);
     }

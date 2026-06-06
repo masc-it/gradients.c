@@ -67,7 +67,6 @@ typedef enum gd_sampler_kind {
 struct gd_sampler {
     gd_sampler_kind kind;
     uint64_t n_samples;
-    uint64_t dataset_fingerprint;
     uint64_t seed;
 };
 

@@ -35,14 +35,13 @@ IMAGE_COLS = 28
 IMAGE_PIXELS = IMAGE_ROWS * IMAGE_COLS
 TRAIN_SAMPLES = 60_000
 TEST_SAMPLES = 10_000
+DATA_FORMAT_VERSION = "mnist-u8-v1"
 
 FIELDS = [
-    FieldSpec("image", "f16", (IMAGE_PIXELS,), collate="stack"),
+    FieldSpec("image", "u8", (IMAGE_PIXELS,), collate="stack"),
     FieldSpec("target", "i32", (), collate="stack"),
 ]
-MNIST_RECORD_NBYTES = (
-    GDDS_RECORD_HEADER_SIZE + 2 * GDDS_RECORD_FIELD_DESC_SIZE + IMAGE_PIXELS * 2 + 4
-)
+MNIST_RECORD_NBYTES = GDDS_RECORD_HEADER_SIZE + 2 * GDDS_RECORD_FIELD_DESC_SIZE + IMAGE_PIXELS + 4
 
 SPLITS = {
     "train": {
@@ -107,39 +106,19 @@ def load_labels(path: Path, expected_samples: int) -> bytes:
     return payload
 
 
-def pixel_lookup_tables() -> tuple[bytes, bytes]:
-    low = bytearray(256)
-    high = bytearray(256)
-    for value in range(256):
-        packed = struct.pack("<e", float(value) / 255.0)
-        low[value] = packed[0]
-        high[value] = packed[1]
-    return bytes(low), bytes(high)
-
-
-def image_to_f16(image: bytes, low_table: bytes, high_table: bytes) -> bytes:
-    if len(image) != IMAGE_PIXELS:
-        raise ValueError(f"expected {IMAGE_PIXELS} image bytes, got {len(image)}")
-    out = bytearray(IMAGE_PIXELS * 2)
-    out[0::2] = image.translate(low_table)
-    out[1::2] = image.translate(high_table)
-    return bytes(out)
-
-
 def mnist_samples(images: bytes, labels: bytes, limit: int) -> Iterator[Mapping[str, TensorData]]:
     count = len(labels)
     if len(images) != count * IMAGE_PIXELS:
         raise ValueError("image/label count mismatch")
     if limit <= 0 or limit > count:
         limit = count
-    low_table, high_table = pixel_lookup_tables()
     label_tensors = [tensor(label, "i32") for label in range(10)]
     for index in range(limit):
         offset = index * IMAGE_PIXELS
         image = images[offset : offset + IMAGE_PIXELS]
         label = labels[index]
         yield {
-            "image": TensorData("f16", (IMAGE_PIXELS,), image_to_f16(image, low_table, high_table)),
+            "image": TensorData("u8", (IMAGE_PIXELS,), image),
             "target": label_tensors[label],
         }
 
@@ -222,9 +201,12 @@ def write_manifest(
         "version": 1,
         "schema_hash": f"0x{schema_hash(FIELDS):016x}",
         "fields": [field_metadata(field) for field in FIELDS],
-        "normalization": {
-            "image": "flattened 28x28 pixels as f16, value = uint8 / 255.0",
+        "storage": {
+            "image": "flattened 28x28 pixels as raw uint8 in [0, 255]",
             "target": "int32 class id in [0, 9]",
+        },
+        "runtime_transform": {
+            "image": "main.c normalizes uint8 to f16 with value = uint8 / 255.0",
         },
         "splits": {
             split: {
@@ -234,6 +216,7 @@ def write_manifest(
             for split in split_paths
         },
         "prep": {
+            "format_version": DATA_FORMAT_VERSION,
             "max_shard_bytes": max_shard_bytes,
             "train_limit": split_counts.get("train", 0),
             "test_limit": split_counts.get("test", 0),

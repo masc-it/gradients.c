@@ -34,6 +34,27 @@ typedef struct mnist_config {
     float dropout_p;
 } mnist_config;
 
+typedef struct mnist_transform_state {
+    uint16_t u8_to_f16[256];
+} mnist_transform_state;
+
+static const gd_dataset_field_spec MNIST_TRANSFORM_FIELDS[] = {
+    {
+        .name = "image",
+        .dtype = GD_DTYPE_F16,
+        .rank = 1,
+        .shape = {MNIST_INPUT_DIM},
+        .collate = GD_GDDS_COLLATE_STACK,
+    },
+    {
+        .name = "target",
+        .dtype = GD_DTYPE_I32,
+        .rank = 0,
+        .shape = {0},
+        .collate = GD_GDDS_COLLATE_STACK,
+    },
+};
+
 static void fail_status(gd_context *ctx, gd_status st, const char *expr, int line)
 {
     fprintf(stderr,
@@ -94,6 +115,107 @@ static float env_float(const char *name, float fallback, float min_value, float 
         return fallback;
     }
     return parsed;
+}
+
+static uint16_t mnist_f32_to_f16_bits(float value)
+{
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    uint32_t sign;
+    int32_t exp;
+    uint32_t mant;
+    uint32_t out_exp;
+    uint32_t out_mant;
+    v.f = value;
+    sign = (v.u >> 16) & 0x8000U;
+    exp = (int32_t)((v.u >> 23) & 0xffU) - 127;
+    mant = v.u & 0x7fffffU;
+    if (((v.u >> 23) & 0xffU) == 0xffU) {
+        return (uint16_t)(sign | (mant == 0U ? 0x7c00U : 0x7e00U));
+    }
+    if (exp > 15) {
+        return (uint16_t)(sign | 0x7c00U);
+    }
+    if (exp < -14) {
+        uint32_t shifted;
+        uint32_t remainder;
+        uint32_t halfway;
+        int32_t shift = -14 - exp;
+        if (shift > 24) {
+            return (uint16_t)sign;
+        }
+        mant |= 0x800000U;
+        shifted = mant >> (uint32_t)(shift + 13);
+        remainder = mant & ((1U << (uint32_t)(shift + 13)) - 1U);
+        halfway = 1U << (uint32_t)(shift + 12);
+        if (remainder > halfway || (remainder == halfway && (shifted & 1U) != 0U)) {
+            shifted += 1U;
+        }
+        return (uint16_t)(sign | shifted);
+    }
+    out_exp = (uint32_t)(exp + 15);
+    out_mant = mant >> 13;
+    {
+        uint32_t remainder = mant & 0x1fffU;
+        if (remainder > 0x1000U || (remainder == 0x1000U && (out_mant & 1U) != 0U)) {
+            out_mant += 1U;
+            if (out_mant == 0x400U) {
+                out_mant = 0U;
+                out_exp += 1U;
+                if (out_exp >= 31U) {
+                    return (uint16_t)(sign | 0x7c00U);
+                }
+            }
+        }
+    }
+    return (uint16_t)(sign | (out_exp << 10) | out_mant);
+}
+
+static void mnist_transform_state_init(mnist_transform_state *state)
+{
+    int i;
+    if (state == NULL) {
+        return;
+    }
+    for (i = 0; i < 256; ++i) {
+        state->u8_to_f16[i] = mnist_f32_to_f16_bits((float)i * (1.0f / 255.0f));
+    }
+}
+
+static gd_status mnist_u8_normalize_transform(const gd_sample *src,
+                                              gd_sample *dst,
+                                              void *user_data)
+{
+    const mnist_transform_state *state = (const mnist_transform_state *)user_data;
+    const uint8_t *restrict image_u8;
+    uint16_t *restrict image_f16;
+    size_t i;
+    if (state == NULL || src == NULL || dst == NULL || gd_sample_field_count(src) < 2 ||
+        gd_sample_field_count(dst) < 2) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+
+    image_u8 = (const uint8_t *)gd_sample_field_data(src, 0);
+    image_f16 = (uint16_t *)gd_sample_mutable_field_data(dst, 0);
+    if (image_u8 == NULL || image_f16 == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i + 8U <= (size_t)MNIST_INPUT_DIM; i += 8U) {
+        image_f16[i + 0U] = state->u8_to_f16[image_u8[i + 0U]];
+        image_f16[i + 1U] = state->u8_to_f16[image_u8[i + 1U]];
+        image_f16[i + 2U] = state->u8_to_f16[image_u8[i + 2U]];
+        image_f16[i + 3U] = state->u8_to_f16[image_u8[i + 3U]];
+        image_f16[i + 4U] = state->u8_to_f16[image_u8[i + 4U]];
+        image_f16[i + 5U] = state->u8_to_f16[image_u8[i + 5U]];
+        image_f16[i + 6U] = state->u8_to_f16[image_u8[i + 6U]];
+        image_f16[i + 7U] = state->u8_to_f16[image_u8[i + 7U]];
+    }
+    for (; i < (size_t)MNIST_INPUT_DIM; ++i) {
+        image_f16[i] = state->u8_to_f16[image_u8[i]];
+    }
+    return gd_sample_copy_field(dst, 1, src, 1);
 }
 
 static mnist_config mnist_config_from_env(void)
@@ -392,6 +514,8 @@ int main(void)
     const gd_memory_config mem = mnist_memory_config();
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
+    mnist_transform_state transform_state;
+    gd_dataset_transform_config transform_cfg;
     gd_dataset *train_dataset = NULL;
     gd_dataset *test_dataset = NULL;
     gd_sampler *train_sampler = NULL;
@@ -422,8 +546,21 @@ int main(void)
         fail_status(ctx, st, "gd_context_create", __LINE__);
     }
 
-    TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &train_dataset));
-    TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "test", &test_dataset));
+    mnist_transform_state_init(&transform_state);
+    transform_cfg = (gd_dataset_transform_config){
+        .transform = mnist_u8_normalize_transform,
+        .user_data = &transform_state,
+        .output_fields = MNIST_TRANSFORM_FIELDS,
+        .n_output_fields = (int)GD_ARRAY_LEN(MNIST_TRANSFORM_FIELDS),
+    };
+    TRY(ctx, gd_dataset_open_gdds_split_with_transform(config.data_dir,
+                                                       "train",
+                                                       &transform_cfg,
+                                                       &train_dataset));
+    TRY(ctx, gd_dataset_open_gdds_split_with_transform(config.data_dir,
+                                                       "test",
+                                                       &transform_cfg,
+                                                       &test_dataset));
     train_samples = (size_t)gd_dataset_num_samples(train_dataset);
     test_samples = (size_t)gd_dataset_num_samples(test_dataset);
 
@@ -468,7 +605,7 @@ int main(void)
     }
     samples_per_epoch = (size_t)gd_dataloader_samples_per_epoch(train_loader);
     train_steps = (size_t)config.train_epochs * steps_per_epoch;
-    printf("dataset: dir=%s train=%zu test=%zu batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
+    printf("dataset: dir=%s train=%zu test=%zu storage=u8 transform=f16_normalize batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
            config.data_dir,
            train_samples,
            test_samples,

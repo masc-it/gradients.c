@@ -84,10 +84,14 @@ typedef struct gd_gdds_dataset_impl {
     uint64_t magic;
     gd_gdds_shard *shards;
     int n_shards;
+    gd_gdds_field_info *storage_fields;
+    int n_storage_fields;
     gd_gdds_field_info *fields;
     int n_fields;
     uint64_t n_samples;
     uint64_t schema_hash;
+    gd_dataset_transform_fn transform;
+    void *transform_user_data;
 } gd_gdds_dataset_impl;
 
 typedef struct gd_gdds_record_field_view {
@@ -674,6 +678,7 @@ static void gd_gdds_impl_destroy(void *impl_v)
         gd_gdds_shard_close(&impl->shards[i]);
     }
     free(impl->shards);
+    free(impl->storage_fields);
     free(impl->fields);
     free(impl);
 }
@@ -700,6 +705,176 @@ static gd_status gd_gdds_impl_from_dataset(const gd_dataset *dataset,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = impl;
+    return GD_OK;
+}
+
+static gd_status gd_gdds_validate_runtime_fields(const gd_gdds_field_info *fields,
+                                                 int n_fields)
+{
+    int i;
+    int j;
+    if (fields == NULL || n_fields <= 0 || n_fields > (int)GD_GDDS_MAX_FIELDS) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < n_fields; ++i) {
+        const gd_gdds_field_info *field = &fields[i];
+        int d;
+        if (field->name[0] == '\0' ||
+            memchr(field->name, '\0', GD_GDDS_FIELD_NAME_MAX) == NULL ||
+            gd_dtype_size(field->dtype) == 0U || field->rank < 0 ||
+            field->rank > (int)GD_MAX_DIMS ||
+            field->collate < GD_GDDS_COLLATE_STACK ||
+            field->collate > GD_GDDS_COLLATE_GENERATED ||
+            field->generated < GD_GDDS_GENERATED_NONE ||
+            field->generated > GD_GDDS_GENERATED_POSITIONS) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
+            if (d < field->rank) {
+                if (field->shape[d] != -1 && field->shape[d] <= 0) {
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+            } else if (field->shape[d] != 0) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+        }
+        switch (field->collate) {
+        case GD_GDDS_COLLATE_STACK:
+            if (field->generated != GD_GDDS_GENERATED_NONE || field->source_field >= 0 ||
+                field->pad_value_bits != 0U || field->ragged_dim != -1) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            for (d = 0; d < field->rank; ++d) {
+                if (field->shape[d] <= 0) {
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+            }
+            break;
+        case GD_GDDS_COLLATE_PAD_LONGEST:
+        case GD_GDDS_COLLATE_PACKED_SEQUENCE:
+            if (field->generated != GD_GDDS_GENERATED_NONE || field->source_field >= 0 ||
+                field->ragged_dim != 0 || field->rank <= 0 || field->shape[0] != -1 ||
+                (field->collate == GD_GDDS_COLLATE_PACKED_SEQUENCE && field->pad_value_bits != 0U)) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            for (d = 1; d < field->rank; ++d) {
+                if (field->shape[d] <= 0) {
+                    return GD_ERR_INVALID_ARGUMENT;
+                }
+            }
+            break;
+        case GD_GDDS_COLLATE_GENERATED:
+            if (field->generated == GD_GDDS_GENERATED_NONE || field->source_field < 0 ||
+                field->source_field >= n_fields || field->ragged_dim != -1 ||
+                field->pad_value_bits != 0U) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            break;
+        default:
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        for (j = i + 1; j < n_fields; ++j) {
+            if (strcmp(field->name, fields[j].name) == 0) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+    for (i = 0; i < n_fields; ++i) {
+        const gd_gdds_field_info *field = &fields[i];
+        const gd_gdds_field_info *source;
+        if (field->collate != GD_GDDS_COLLATE_GENERATED) {
+            continue;
+        }
+        source = &fields[field->source_field];
+        if (source->collate == GD_GDDS_COLLATE_GENERATED) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        switch (field->generated) {
+        case GD_GDDS_GENERATED_LENGTHS:
+            if (field->dtype != GD_DTYPE_I32 ||
+                (source->collate != GD_GDDS_COLLATE_PAD_LONGEST &&
+                 source->collate != GD_GDDS_COLLATE_PACKED_SEQUENCE)) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            break;
+        case GD_GDDS_GENERATED_MASK:
+            if ((field->dtype != GD_DTYPE_U8 && field->dtype != GD_DTYPE_I32) ||
+                source->collate != GD_GDDS_COLLATE_PAD_LONGEST) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            break;
+        case GD_GDDS_GENERATED_CU_SEQLENS:
+        case GD_GDDS_GENERATED_POSITIONS:
+            if (field->dtype != GD_DTYPE_I32 ||
+                source->collate != GD_GDDS_COLLATE_PACKED_SEQUENCE) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+            break;
+        default:
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_copy_field_specs(const gd_dataset_field_spec *specs,
+                                          int n_specs,
+                                          gd_gdds_field_info **out)
+{
+    gd_gdds_field_info *fields;
+    int i;
+    gd_status status;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    if (specs == NULL || n_specs <= 0 || n_specs > (int)GD_GDDS_MAX_FIELDS) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    fields = (gd_gdds_field_info *)calloc((size_t)n_specs, sizeof(*fields));
+    if (fields == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    for (i = 0; i < n_specs; ++i) {
+        size_t name_len;
+        int d;
+        if (specs[i].name == NULL || specs[i].name[0] == '\0') {
+            free(fields);
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        name_len = strlen(specs[i].name);
+        if (name_len >= GD_GDDS_FIELD_NAME_MAX) {
+            free(fields);
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        memcpy(fields[i].name, specs[i].name, name_len + 1U);
+        fields[i].dtype = specs[i].dtype;
+        fields[i].rank = specs[i].rank;
+        for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
+            fields[i].shape[d] = specs[i].shape[d];
+        }
+        fields[i].collate = specs[i].collate;
+        fields[i].generated = specs[i].generated;
+        fields[i].ragged_dim = specs[i].ragged_dim;
+        fields[i].source_field = specs[i].source_field;
+        fields[i].pad_value_bits = specs[i].pad_value_bits;
+        if (fields[i].collate == GD_GDDS_COLLATE_STACK) {
+            fields[i].ragged_dim = -1;
+            fields[i].source_field = -1;
+        } else if (fields[i].collate == GD_GDDS_COLLATE_PAD_LONGEST ||
+                   fields[i].collate == GD_GDDS_COLLATE_PACKED_SEQUENCE) {
+            fields[i].ragged_dim = 0;
+            fields[i].source_field = -1;
+        } else if (fields[i].collate == GD_GDDS_COLLATE_GENERATED) {
+            fields[i].ragged_dim = -1;
+        }
+    }
+    status = gd_gdds_validate_runtime_fields(fields, n_specs);
+    if (status != GD_OK) {
+        free(fields);
+        return status;
+    }
+    *out = fields;
     return GD_OK;
 }
 
@@ -775,7 +950,7 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
     record_header_nbytes = gd_gdds_get_le32(record + GD_GDDS_RECORD_HEADER_NBYTES_OFFSET);
     payload_nbytes = gd_gdds_get_le64(record + GD_GDDS_RECORD_PAYLOAD_NBYTES_OFFSET);
     if (record_field_count == 0U || record_field_count > GD_GDDS_MAX_FIELDS ||
-        record_field_count > (uint32_t)impl->n_fields) {
+        record_field_count > (uint32_t)impl->n_storage_fields) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (record_header_nbytes != GD_GDDS_RECORD_HEADER_SIZE +
@@ -795,7 +970,7 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
         uint64_t data_nbytes = gd_gdds_get_le64(entry + GD_GDDS_RECORD_FIELD_NBYTES_OFFSET);
         size_t expected_nbytes = 0U;
         int d;
-        if (field_id >= (uint32_t)impl->n_fields || rank > GD_MAX_DIMS ||
+        if (field_id >= (uint32_t)impl->n_storage_fields || rank > GD_MAX_DIMS ||
             data_offset > payload_nbytes || data_nbytes > payload_nbytes - data_offset ||
             data_nbytes > (uint64_t)SIZE_MAX) {
             return GD_ERR_INVALID_ARGUMENT;
@@ -803,7 +978,7 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
         if (out->by_field[field_id] != NULL) {
             return GD_ERR_INVALID_ARGUMENT;
         }
-        if ((int)rank != impl->fields[field_id].rank) {
+        if ((int)rank != impl->storage_fields[field_id].rank) {
             return GD_ERR_INVALID_ARGUMENT;
         }
         view->field_id = (int)field_id;
@@ -815,8 +990,8 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
                 if (view->shape[d] <= 0) {
                     return GD_ERR_INVALID_ARGUMENT;
                 }
-                if (impl->fields[field_id].shape[d] != -1 &&
-                    impl->fields[field_id].shape[d] != view->shape[d]) {
+                if (impl->storage_fields[field_id].shape[d] != -1 &&
+                    impl->storage_fields[field_id].shape[d] != view->shape[d]) {
                     return GD_ERR_INVALID_ARGUMENT;
                 }
             } else if (view->shape[d] != 0) {
@@ -825,7 +1000,7 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
         }
         status = gd_gdds_shape_nbytes(view->shape,
                                       view->rank,
-                                      impl->fields[field_id].dtype,
+                                      impl->storage_fields[field_id].dtype,
                                       &expected_nbytes);
         if (status != GD_OK) {
             return status;
@@ -841,7 +1016,10 @@ static gd_status gd_gdds_parse_record(const gd_gdds_dataset_impl *impl,
     return GD_OK;
 }
 
-gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out)
+gd_status gd_dataset_open_gdds_with_transform(const char **paths,
+                                              int n_paths,
+                                              const gd_dataset_transform_config *transform,
+                                              gd_dataset **out)
 {
     static const gd_dataset_ops ops = {
         .name = "gdds",
@@ -852,11 +1030,16 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
     uint64_t sample_base = 0U;
     int i;
     gd_status status;
+    const int has_transform = (transform != NULL && transform->transform != NULL) ? 1 : 0;
     if (out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
     if (paths == NULL || n_paths <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (has_transform != 0 &&
+        (transform->output_fields == NULL || transform->n_output_fields <= 0)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     impl = (gd_gdds_dataset_impl *)calloc(1U, sizeof(*impl));
@@ -878,19 +1061,18 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
         }
         if (i == 0) {
             size_t schema_nbytes = (size_t)impl->shards[i].header.field_count *
-                                   sizeof(*impl->fields);
-            impl->n_fields = (int)impl->shards[i].header.field_count;
-            impl->schema_hash = gd_gdds_schema_hash(impl->shards[i].fields, impl->n_fields);
-            impl->fields = (gd_gdds_field_info *)malloc(schema_nbytes);
-            if (impl->fields == NULL) {
+                                   sizeof(*impl->storage_fields);
+            impl->n_storage_fields = (int)impl->shards[i].header.field_count;
+            impl->storage_fields = (gd_gdds_field_info *)malloc(schema_nbytes);
+            if (impl->storage_fields == NULL) {
                 gd_gdds_impl_destroy(impl);
                 return GD_ERR_OUT_OF_MEMORY;
             }
-            memcpy(impl->fields, impl->shards[i].fields, schema_nbytes);
-        } else if ((int)impl->shards[i].header.field_count != impl->n_fields ||
-                   !gd_gdds_fields_equal(impl->fields,
+            memcpy(impl->storage_fields, impl->shards[i].fields, schema_nbytes);
+        } else if ((int)impl->shards[i].header.field_count != impl->n_storage_fields ||
+                   !gd_gdds_fields_equal(impl->storage_fields,
                                          impl->shards[i].fields,
-                                         impl->n_fields)) {
+                                         impl->n_storage_fields)) {
             gd_gdds_impl_destroy(impl);
             return GD_ERR_INVALID_ARGUMENT;
         }
@@ -901,6 +1083,28 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
         sample_base += impl->shards[i].header.n_samples;
     }
     impl->n_samples = sample_base;
+    if (has_transform != 0) {
+        status = gd_gdds_copy_field_specs(transform->output_fields,
+                                          transform->n_output_fields,
+                                          &impl->fields);
+        if (status != GD_OK) {
+            gd_gdds_impl_destroy(impl);
+            return status;
+        }
+        impl->n_fields = transform->n_output_fields;
+        impl->transform = transform->transform;
+        impl->transform_user_data = transform->user_data;
+    } else {
+        size_t schema_nbytes = (size_t)impl->n_storage_fields * sizeof(*impl->fields);
+        impl->fields = (gd_gdds_field_info *)malloc(schema_nbytes);
+        if (impl->fields == NULL) {
+            gd_gdds_impl_destroy(impl);
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        memcpy(impl->fields, impl->storage_fields, schema_nbytes);
+        impl->n_fields = impl->n_storage_fields;
+    }
+    impl->schema_hash = gd_gdds_schema_hash(impl->fields, impl->n_fields);
     status = gd_dataset_create(&ops, impl, out);
     if (status != GD_OK) {
         gd_gdds_impl_destroy(impl);
@@ -908,14 +1112,26 @@ gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out
     return status;
 }
 
-gd_status gd_dataset_open_gdds_file(const char *path, gd_dataset **out)
+gd_status gd_dataset_open_gdds(const char **paths, int n_paths, gd_dataset **out)
+{
+    return gd_dataset_open_gdds_with_transform(paths, n_paths, NULL, out);
+}
+
+gd_status gd_dataset_open_gdds_file_with_transform(const char *path,
+                                                   const gd_dataset_transform_config *transform,
+                                                   gd_dataset **out)
 {
     const char *paths[1];
     if (path == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     paths[0] = path;
-    return gd_dataset_open_gdds(paths, 1, out);
+    return gd_dataset_open_gdds_with_transform(paths, 1, transform, out);
+}
+
+gd_status gd_dataset_open_gdds_file(const char *path, gd_dataset **out)
+{
+    return gd_dataset_open_gdds_file_with_transform(path, NULL, out);
 }
 
 static int gd_gdds_string_ptr_cmp(const void *a, const void *b)
@@ -959,9 +1175,10 @@ static gd_status gd_gdds_push_path(char ***paths,
     return GD_OK;
 }
 
-gd_status gd_dataset_open_gdds_split(const char *dir,
-                                     const char *split,
-                                     gd_dataset **out)
+gd_status gd_dataset_open_gdds_split_with_transform(const char *dir,
+                                                    const char *split,
+                                                    const gd_dataset_transform_config *transform,
+                                                    gd_dataset **out)
 {
     DIR *dp;
     struct dirent *ent;
@@ -1018,7 +1235,7 @@ gd_status gd_dataset_open_gdds_split(const char *dir,
     }
     if (status == GD_OK) {
         qsort(paths, (size_t)count, sizeof(paths[0]), gd_gdds_string_ptr_cmp);
-        status = gd_dataset_open_gdds((const char **)paths, count, out);
+        status = gd_dataset_open_gdds_with_transform((const char **)paths, count, transform, out);
     }
     while (count > 0) {
         count -= 1;
@@ -1026,6 +1243,13 @@ gd_status gd_dataset_open_gdds_split(const char *dir,
     }
     free(paths);
     return status;
+}
+
+gd_status gd_dataset_open_gdds_split(const char *dir,
+                                     const char *split,
+                                     gd_dataset **out)
+{
+    return gd_dataset_open_gdds_split_with_transform(dir, split, NULL, out);
 }
 
 int gd_gdds_dataset_field_count(const gd_dataset *dataset)
@@ -1090,7 +1314,10 @@ gd_status gd_gdds_dataset_read_field(const gd_dataset *dataset,
     if (status != GD_OK) {
         return status;
     }
-    if (field_index < 0 || field_index >= impl->n_fields) {
+    if (impl->transform != NULL) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    if (field_index < 0 || field_index >= impl->n_storage_fields) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     status = gd_gdds_parse_record(impl, sample_index, &record);
@@ -1101,9 +1328,9 @@ gd_status gd_gdds_dataset_read_field(const gd_dataset *dataset,
     if (view == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    memcpy(out->name, impl->fields[field_index].name, sizeof(out->name));
+    memcpy(out->name, impl->storage_fields[field_index].name, sizeof(out->name));
     out->name[sizeof(out->name) - 1U] = '\0';
-    out->dtype = impl->fields[field_index].dtype;
+    out->dtype = impl->storage_fields[field_index].dtype;
     out->rank = view->rank;
     memcpy(out->shape, view->shape, sizeof(out->shape));
     out->data = view->data;
@@ -1911,6 +2138,480 @@ static gd_status gd_gdds_fill_generated_field(gd_batch *batch,
     }
 }
 
+static int gd_gdds_transform_fast_stack_ok(const gd_gdds_dataset_impl *impl)
+{
+    int i;
+    if (impl == NULL || impl->transform == NULL) {
+        return 0;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        int d;
+        if (info->collate != GD_GDDS_COLLATE_STACK) {
+            return 0;
+        }
+        for (d = 0; d < info->rank; ++d) {
+            if (info->shape[d] <= 0) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static gd_status gd_gdds_validate_batch_schema(const gd_gdds_dataset_impl *impl,
+                                               gd_batch *batch)
+{
+    int i;
+    if (impl == NULL || batch == NULL || gd_batch_field_count(batch) != impl->n_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const char *name = gd_batch_field_name(batch, i);
+        if (name == NULL || strcmp(name, impl->fields[i].name) != 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_set_source_sample_from_record(const gd_gdds_dataset_impl *impl,
+                                                       const gd_gdds_record_view *record,
+                                                       gd_sample *sample)
+{
+    int i;
+    if (impl == NULL || record == NULL || sample == NULL ||
+        sample->n_fields != impl->n_storage_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_storage_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->storage_fields[i];
+        gd_sample_field *field = &sample->fields[i];
+        const gd_gdds_record_field_view *view;
+        int d;
+        field->dtype = info->dtype;
+        field->rank = info->rank;
+        for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
+            field->shape[d] = info->shape[d];
+        }
+        field->data = NULL;
+        field->nbytes = 0U;
+        field->capacity_nbytes = 0U;
+        field->writable = 0;
+        if (info->collate == GD_GDDS_COLLATE_GENERATED) {
+            continue;
+        }
+        view = record->by_field[i];
+        if (view == NULL) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        if (gd_gdds_validate_record_field_shape(info, view) != GD_OK) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        field->rank = view->rank;
+        for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
+            field->shape[d] = view->shape[d];
+        }
+        field->data = view->data;
+        field->nbytes = view->nbytes;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_validate_sample_field(const gd_gdds_field_info *info,
+                                               const gd_sample_field *field)
+{
+    size_t expected_nbytes = 0U;
+    int d;
+    gd_status status;
+    if (info == NULL || field == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (info->collate == GD_GDDS_COLLATE_GENERATED) {
+        return GD_OK;
+    }
+    if (field->dtype != info->dtype || field->rank != info->rank ||
+        (field->data == NULL && field->nbytes > 0U)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (d = 0; d < info->rank; ++d) {
+        if (field->shape[d] <= 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        if (info->shape[d] != -1 && info->shape[d] != field->shape[d]) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    for (; d < (int)GD_MAX_DIMS; ++d) {
+        if (field->shape[d] != 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    status = gd_gdds_shape_nbytes(field->shape, field->rank, field->dtype, &expected_nbytes);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (expected_nbytes != field->nbytes) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (info->collate == GD_GDDS_COLLATE_STACK) {
+        for (d = 0; d < info->rank; ++d) {
+            if (info->shape[d] != field->shape[d]) {
+                return GD_ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_validate_transformed_sample(const gd_gdds_dataset_impl *impl,
+                                                     const gd_sample *sample)
+{
+    int i;
+    if (impl == NULL || sample == NULL || sample->n_fields != impl->n_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        gd_status status = gd_gdds_validate_sample_field(&impl->fields[i], &sample->fields[i]);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_update_lengths_from_sample(const gd_gdds_dataset_impl *impl,
+                                                    const gd_sample *sample,
+                                                    int batch_row,
+                                                    int batch_size,
+                                                    int64_t *lengths,
+                                                    int64_t *max_lens,
+                                                    int64_t *total_lens)
+{
+    int i;
+    if (impl == NULL || sample == NULL || lengths == NULL || max_lens == NULL ||
+        total_lens == NULL || batch_row < 0 || batch_row >= batch_size) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        const gd_sample_field *field = &sample->fields[i];
+        int64_t len;
+        if (info->collate != GD_GDDS_COLLATE_PAD_LONGEST &&
+            info->collate != GD_GDDS_COLLATE_PACKED_SEQUENCE) {
+            continue;
+        }
+        len = field->shape[0];
+        if (len <= 0 || len > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        lengths[(size_t)i * (size_t)batch_size + (size_t)batch_row] = len;
+        if (len > max_lens[i]) {
+            max_lens[i] = len;
+        }
+        if (INT64_MAX - total_lens[i] < len) {
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        total_lens[i] += len;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_compute_offsets_from_lengths(const gd_gdds_dataset_impl *impl,
+                                                      int batch_size,
+                                                      const int64_t *lengths,
+                                                      const int64_t *total_lens,
+                                                      int64_t *offsets)
+{
+    int i;
+    int b;
+    if (impl == NULL || lengths == NULL || total_lens == NULL || offsets == NULL ||
+        batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        int64_t total = 0;
+        offsets[(size_t)i * (size_t)(batch_size + 1)] = 0;
+        if (info->collate != GD_GDDS_COLLATE_PAD_LONGEST &&
+            info->collate != GD_GDDS_COLLATE_PACKED_SEQUENCE) {
+            continue;
+        }
+        for (b = 0; b < batch_size; ++b) {
+            const int64_t len = lengths[(size_t)i * (size_t)batch_size + (size_t)b];
+            total += len;
+            offsets[(size_t)i * (size_t)(batch_size + 1) + (size_t)b + 1U] = total;
+        }
+        if (total != total_lens[i] || total > (int64_t)INT32_MAX) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return GD_OK;
+}
+
+static void gd_gdds_sample_field_as_view(const gd_sample_field *field,
+                                         int field_index,
+                                         gd_gdds_record_field_view *view)
+{
+    int d;
+    memset(view, 0, sizeof(*view));
+    view->field_id = field_index;
+    view->rank = field->rank;
+    for (d = 0; d < (int)GD_MAX_DIMS; ++d) {
+        view->shape[d] = field->shape[d];
+    }
+    view->data = (const uint8_t *)field->data;
+    view->nbytes = field->nbytes;
+}
+
+static gd_status gd_gdds_copy_sample_field_to_batch(gd_batch *batch,
+                                                    int field_index,
+                                                    int batch_row,
+                                                    int batch_size,
+                                                    const gd_gdds_field_info *info,
+                                                    const gd_sample_field *field,
+                                                    const int64_t *offsets)
+{
+    gd_gdds_record_field_view view;
+    if (batch == NULL || info == NULL || field == NULL || offsets == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    gd_gdds_sample_field_as_view(field, field_index, &view);
+    switch (info->collate) {
+    case GD_GDDS_COLLATE_STACK:
+        return gd_gdds_copy_stack_field(batch, field_index, batch_row, info, &view);
+    case GD_GDDS_COLLATE_PAD_LONGEST:
+        return gd_gdds_copy_pad_field(batch, field_index, batch_row, info, &view);
+    case GD_GDDS_COLLATE_PACKED_SEQUENCE:
+        return gd_gdds_copy_packed_field(batch,
+                                         field_index,
+                                         batch_row,
+                                         info,
+                                         &view,
+                                         offsets,
+                                         batch_size);
+    default:
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+}
+
+static gd_status gd_gdds_alias_stack_sample_to_batch(gd_sample *sample,
+                                                     gd_batch *batch,
+                                                     const gd_gdds_dataset_impl *impl,
+                                                     int batch_row)
+{
+    int i;
+    if (sample == NULL || batch == NULL || impl == NULL || sample->n_fields != impl->n_fields) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    gd_sample_reset_from_gdds_fields(sample, impl->fields, impl->n_fields);
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        gd_sample_field *field = &sample->fields[i];
+        size_t sample_nbytes = 0U;
+        uint8_t *base;
+        gd_status status = gd_gdds_field_shape_nbytes(info, &sample_nbytes);
+        if (status != GD_OK) {
+            return status;
+        }
+        base = (uint8_t *)gd_batch_host_data(batch, i);
+        if (base == NULL) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        field->data = base + (size_t)batch_row * sample_nbytes;
+        field->nbytes = sample_nbytes;
+        field->capacity_nbytes = sample_nbytes;
+        field->writable = 1;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_gdds_collate_transformed_fast_stack(const gd_gdds_dataset_impl *impl,
+                                                        const uint64_t *sample_ids,
+                                                        int batch_size,
+                                                        gd_batch *batch)
+{
+    gd_sample src;
+    gd_sample dst;
+    int64_t *max_lens = NULL;
+    int64_t *total_lens = NULL;
+    int b;
+    gd_status status;
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    max_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*max_lens));
+    total_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*total_lens));
+    if (max_lens == NULL || total_lens == NULL) {
+        status = GD_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    status = gd_sample_init_from_gdds_fields(&src, impl->storage_fields, impl->n_storage_fields, 0);
+    if (status == GD_OK) {
+        status = gd_sample_init_from_gdds_fields(&dst, impl->fields, impl->n_fields, 0);
+    }
+    if (status != GD_OK) {
+        goto done;
+    }
+    status = gd_gdds_prepare_batch_storage(batch, impl, batch_size, max_lens, total_lens);
+    if (status != GD_OK) {
+        goto done;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        gd_gdds_record_view record;
+        status = gd_gdds_parse_record(impl, sample_ids[b], &record);
+        if (status == GD_OK) {
+            status = gd_gdds_set_source_sample_from_record(impl, &record, &src);
+        }
+        if (status == GD_OK) {
+            status = gd_gdds_alias_stack_sample_to_batch(&dst, batch, impl, b);
+        }
+        if (status == GD_OK) {
+            status = impl->transform(&src, &dst, impl->transform_user_data);
+        }
+        if (status == GD_OK) {
+            status = gd_gdds_validate_transformed_sample(impl, &dst);
+        }
+        if (status != GD_OK) {
+            goto done;
+        }
+    }
+
+done:
+    gd_sample_deinit(&dst);
+    gd_sample_deinit(&src);
+    free(total_lens);
+    free(max_lens);
+    return status;
+}
+
+static gd_status gd_gdds_collate_transformed_general(const gd_gdds_dataset_impl *impl,
+                                                     const uint64_t *sample_ids,
+                                                     int batch_size,
+                                                     gd_batch *batch)
+{
+    gd_sample src;
+    gd_sample *samples = NULL;
+    int64_t *lengths = NULL;
+    int64_t *max_lens = NULL;
+    int64_t *total_lens = NULL;
+    int64_t *offsets = NULL;
+    int b;
+    int i;
+    gd_status status;
+    memset(&src, 0, sizeof(src));
+    status = gd_sample_init_from_gdds_fields(&src, impl->storage_fields, impl->n_storage_fields, 0);
+    if (status != GD_OK) {
+        return status;
+    }
+    samples = (gd_sample *)calloc((size_t)batch_size, sizeof(*samples));
+    lengths = (int64_t *)calloc((size_t)impl->n_fields * (size_t)batch_size, sizeof(*lengths));
+    max_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*max_lens));
+    total_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*total_lens));
+    offsets = (int64_t *)calloc((size_t)impl->n_fields * ((size_t)batch_size + 1U), sizeof(*offsets));
+    if (samples == NULL || lengths == NULL || max_lens == NULL || total_lens == NULL ||
+        offsets == NULL) {
+        status = GD_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        status = gd_sample_init_from_gdds_fields(&samples[b], impl->fields, impl->n_fields, 1);
+        if (status != GD_OK) {
+            goto done;
+        }
+    }
+    for (b = 0; b < batch_size; ++b) {
+        gd_gdds_record_view record;
+        gd_sample_reset_from_gdds_fields(&samples[b], impl->fields, impl->n_fields);
+        status = gd_gdds_parse_record(impl, sample_ids[b], &record);
+        if (status == GD_OK) {
+            status = gd_gdds_set_source_sample_from_record(impl, &record, &src);
+        }
+        if (status == GD_OK) {
+            status = impl->transform(&src, &samples[b], impl->transform_user_data);
+        }
+        if (status == GD_OK) {
+            status = gd_gdds_validate_transformed_sample(impl, &samples[b]);
+        }
+        if (status == GD_OK) {
+            status = gd_gdds_update_lengths_from_sample(impl,
+                                                        &samples[b],
+                                                        b,
+                                                        batch_size,
+                                                        lengths,
+                                                        max_lens,
+                                                        total_lens);
+        }
+        if (status != GD_OK) {
+            goto done;
+        }
+    }
+    status = gd_gdds_compute_offsets_from_lengths(impl,
+                                                  batch_size,
+                                                  lengths,
+                                                  total_lens,
+                                                  offsets);
+    if (status != GD_OK) {
+        goto done;
+    }
+    status = gd_gdds_prepare_batch_storage(batch, impl, batch_size, max_lens, total_lens);
+    if (status != GD_OK) {
+        goto done;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        for (i = 0; i < impl->n_fields; ++i) {
+            const gd_gdds_field_info *info = &impl->fields[i];
+            if (info->collate == GD_GDDS_COLLATE_GENERATED) {
+                continue;
+            }
+            status = gd_gdds_copy_sample_field_to_batch(batch,
+                                                        i,
+                                                        b,
+                                                        batch_size,
+                                                        info,
+                                                        &samples[b].fields[i],
+                                                        offsets);
+            if (status != GD_OK) {
+                goto done;
+            }
+        }
+    }
+    for (i = 0; i < impl->n_fields; ++i) {
+        const gd_gdds_field_info *info = &impl->fields[i];
+        if (info->collate != GD_GDDS_COLLATE_GENERATED) {
+            continue;
+        }
+        status = gd_gdds_fill_generated_field(batch, info, i, batch_size, lengths, offsets);
+        if (status != GD_OK) {
+            goto done;
+        }
+    }
+
+done:
+    if (samples != NULL) {
+        for (i = 0; i < batch_size; ++i) {
+            gd_sample_deinit(&samples[i]);
+        }
+    }
+    free(offsets);
+    free(total_lens);
+    free(max_lens);
+    free(lengths);
+    free(samples);
+    gd_sample_deinit(&src);
+    return status;
+}
+
+static gd_status gd_gdds_collate_transformed(const gd_gdds_dataset_impl *impl,
+                                             const uint64_t *sample_ids,
+                                             int batch_size,
+                                             gd_batch *batch)
+{
+    if (gd_gdds_transform_fast_stack_ok(impl) != 0) {
+        return gd_gdds_collate_transformed_fast_stack(impl, sample_ids, batch_size, batch);
+    }
+    return gd_gdds_collate_transformed_general(impl, sample_ids, batch_size, batch);
+}
+
 gd_status _gd_collate_gdds(gd_dataset *dataset,
                             const uint64_t *sample_ids,
                             int batch_size,
@@ -1933,14 +2634,12 @@ gd_status _gd_collate_gdds(gd_dataset *dataset,
     if (status != GD_OK) {
         return status;
     }
-    if (gd_batch_field_count(batch) != impl->n_fields) {
-        return GD_ERR_INVALID_ARGUMENT;
+    status = gd_gdds_validate_batch_schema(impl, batch);
+    if (status != GD_OK) {
+        return status;
     }
-    for (i = 0; i < impl->n_fields; ++i) {
-        const char *name = gd_batch_field_name(batch, i);
-        if (name == NULL || strcmp(name, impl->fields[i].name) != 0) {
-            return GD_ERR_INVALID_ARGUMENT;
-        }
+    if (impl->transform != NULL) {
+        return gd_gdds_collate_transformed(impl, sample_ids, batch_size, batch);
     }
     lengths = (int64_t *)calloc((size_t)impl->n_fields * (size_t)batch_size, sizeof(*lengths));
     max_lens = (int64_t *)calloc((size_t)impl->n_fields, sizeof(*max_lens));

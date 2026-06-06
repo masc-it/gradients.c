@@ -4,7 +4,8 @@ A compact MNIST classifier that follows the same v2 patterns as
 `examples/mlp_xor`:
 
 - `dataset.py` downloads raw MNIST IDX gzip files and writes GDDS shards
-- images are normalized to `[0, 1]`, flattened to `[784]`, and stored as F16
+- images are flattened to `[784]` and stored as raw U8 to reduce dataset IO
+- `main.c` attaches a dataset transform that normalizes U8 images to F16 `[0, 1]`
 - labels are stored as scalar I32 class ids for `gd_cross_entropy`
 - self-describing GDDS dataloader/collate path
 - random no-replacement training sampler
@@ -54,6 +55,6 @@ Then rebuild/run:
 ```sh
 make -C ../.. build
 cc -I../../include -std=c11 -O2 main.c ../../build/libgradients.a \
-  -pthread -framework Foundation -framework Metal -o mlp_mnist
-GRADIENTS_METALLIB=../../build/gradients.metallib ./mlp_mnist
+  -pthread -framework Foundation -framework Metal -o gd_main_mlp_mnist
+GRADIENTS_METALLIB=../../build/gradients.metallib ./gd_main_mlp_mnist
 ```

@@ -6,6 +6,7 @@ BIN := gd_main_mlp_mnist
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.mnist_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.mnist_gdds.args
+DATA_FORMAT_VERSION := mnist-u8-v1
 
 CC ?= cc
 PYTHON ?= python3
@@ -40,7 +41,7 @@ data: $(DATA_STAMP)
 
 $(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py
 	@mkdir -p $(DATA_DIR)
-	@args='$(DATA_ARGS)'; \
+	@args='$(DATA_FORMAT_VERSION) $(DATA_ARGS)'; \
 	if [ -f '$(DATA_STAMP)' ] && [ -f '$(DATA_ARGS_FILE)' ] && \
 	   [ "$$(cat '$(DATA_ARGS_FILE)')" = "$$args" ]; then \
 		echo "[data] up to date $(DATA_DIR)"; \

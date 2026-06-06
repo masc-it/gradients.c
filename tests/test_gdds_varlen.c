@@ -126,6 +126,77 @@ static void write_varlen_record(FILE *f,
           "write record payload");
 }
 
+static const gd_dataset_field_spec VARLEN_TRANSFORM_FIELDS[] = {
+    {
+        .name = "tokens",
+        .dtype = GD_DTYPE_I32,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_PACKED_SEQUENCE,
+    },
+    {
+        .name = "cu_seqlens",
+        .dtype = GD_DTYPE_I32,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_GENERATED,
+        .generated = GD_GDDS_GENERATED_CU_SEQLENS,
+        .source_field = 0,
+    },
+    {
+        .name = "positions",
+        .dtype = GD_DTYPE_I32,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_GENERATED,
+        .generated = GD_GDDS_GENERATED_POSITIONS,
+        .source_field = 0,
+    },
+    {
+        .name = "x",
+        .dtype = GD_DTYPE_I32,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_PAD_LONGEST,
+        .pad_value_bits = UINT64_C(0xffffffff),
+    },
+    {
+        .name = "x_len",
+        .dtype = GD_DTYPE_I32,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_GENERATED,
+        .generated = GD_GDDS_GENERATED_LENGTHS,
+        .source_field = 3,
+    },
+    {
+        .name = "x_mask",
+        .dtype = GD_DTYPE_U8,
+        .rank = 1,
+        .shape = {-1},
+        .collate = GD_GDDS_COLLATE_GENERATED,
+        .generated = GD_GDDS_GENERATED_MASK,
+        .source_field = 3,
+    },
+};
+
+static gd_status varlen_identity_transform(const gd_sample *src,
+                                           gd_sample *dst,
+                                           void *user_data)
+{
+    gd_status status;
+    (void)user_data;
+    if (src == NULL || dst == NULL || gd_sample_field_count(src) != 6 ||
+        gd_sample_field_count(dst) != 6) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_sample_copy_field(dst, 0, src, 0);
+    if (status != GD_OK) {
+        return status;
+    }
+    return gd_sample_copy_field(dst, 3, src, 3);
+}
+
 static void write_varlen_gdds(const char *path)
 {
     enum {
@@ -192,6 +263,8 @@ int main(void)
     gd_dataset *dataset = NULL;
     gd_context *ctx = NULL;
     gd_dataloader *loader = NULL;
+    gd_dataset *transformed_dataset = NULL;
+    gd_dataloader *transformed_loader = NULL;
     gd_batch *batch = NULL;
     gd_gdds_field_info info;
     gd_memory_config mem = varlen_memory_config();
@@ -261,9 +334,61 @@ int main(void)
               x_mask[3] == 1 && x_mask[4] == 1 && x_mask[5] == 1,
           "mask");
     CHECK_OK(gd_dataloader_release(loader, batch));
+    batch = NULL;
+    gd_dataloader_destroy(loader);
+    loader = NULL;
 
+    {
+        const gd_dataset_transform_config transform_cfg = {
+            .transform = varlen_identity_transform,
+            .user_data = NULL,
+            .output_fields = VARLEN_TRANSFORM_FIELDS,
+            .n_output_fields = (int)GD_ARRAY_LEN(VARLEN_TRANSFORM_FIELDS),
+        };
+        const gd_dataloader_config cfg = {
+            .batch_size = 2,
+            .num_workers = 1,
+            .prefetch_factor = 2,
+        };
+        memset(tokens, 0, sizeof(tokens));
+        memset(cu_seqlens, 0, sizeof(cu_seqlens));
+        memset(positions, 0, sizeof(positions));
+        memset(x, 0, sizeof(x));
+        memset(x_len, 0, sizeof(x_len));
+        memset(x_mask, 0, sizeof(x_mask));
+        CHECK_OK(gd_dataset_open_gdds_file_with_transform(path, &transform_cfg, &transformed_dataset));
+        CHECK_OK(gd_dataloader_create(ctx, transformed_dataset, NULL, &cfg, &transformed_loader));
+    }
+    CHECK_OK(gd_dataloader_next(transformed_loader, &batch));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "tokens"), tokens, sizeof(tokens)));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "cu_seqlens"), cu_seqlens, sizeof(cu_seqlens)));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "positions"), positions, sizeof(positions)));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "x"), x, sizeof(x)));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "x_len"), x_len, sizeof(x_len)));
+    CHECK_OK(gd_tensor_read(ctx, gd_batch_tensor(batch, "x_mask"), x_mask, sizeof(x_mask)));
+    CHECK(tokens[0] == 1 && tokens[1] == 2 && tokens[2] == 3 &&
+              tokens[3] == 4 && tokens[4] == 5,
+          "transformed packed tokens");
+    CHECK(cu_seqlens[0] == 0 && cu_seqlens[1] == 3 && cu_seqlens[2] == 5,
+          "transformed cu seqlens");
+    CHECK(positions[0] == 0 && positions[1] == 1 && positions[2] == 2 &&
+              positions[3] == 0 && positions[4] == 1,
+          "transformed positions");
+    CHECK(x[0] == 5 && x[1] == 6 && x[2] == -1 &&
+              x[3] == 7 && x[4] == 8 && x[5] == 9,
+          "transformed pad longest values");
+    CHECK(x_len[0] == 2 && x_len[1] == 3, "transformed lengths");
+    CHECK(x_mask[0] == 1 && x_mask[1] == 1 && x_mask[2] == 0 &&
+              x_mask[3] == 1 && x_mask[4] == 1 && x_mask[5] == 1,
+          "transformed mask");
+    CHECK_OK(gd_dataloader_release(transformed_loader, batch));
+
+    gd_dataloader_destroy(transformed_loader);
     gd_dataloader_destroy(loader);
     gd_context_destroy(ctx);
+    gd_dataset_destroy(transformed_dataset);
     gd_dataset_destroy(dataset);
     (void)remove(path);
     printf("test_gdds_varlen: ok\n");

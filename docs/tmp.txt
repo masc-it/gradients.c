@@ -152,3 +152,30 @@ show performance numbers at the end.
 dont worry if other files are changing, I am working in parallel.
 
 good work.
+
+---
+
+I expect a new folder: examples/gpt_lm/
+
+use relu activation function, rmsnorm, rope. for this first pass I just want to have a fully working gpt example, where I can see the loss decreasing.
+
+write high quality, clean and performant code.
+
+you can have a look at @examples/mlp_mnist/ to understand how to prep data and the common gradients.c public apis.
+
+Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint
+him.
+---
+
+I need you to optimize rope as much as possible.both fwd and
+bwd. consider that we're gonna use it to train 12+ layers gpt.
+it must be fast.
+
+use common gpt shapes. stress test it with different batch
+sizes and sequence lengths (128-2048)
+
+compare numbers with pytorch ref script.
+at the end provide a comparison table.
+
+dont worry about other files changing, since I am working in
+parallel on other things.

@@ -2,6 +2,7 @@
 #include "metal_linear_types.h"
 
 #include <stdint.h>
+#include <string.h>
 
 static bool gd_metal_matrix_bounds_ok(const gd_backend_matrix_view *view)
 {
@@ -101,6 +102,7 @@ gd_status gd_backend_linear(gd_backend *backend,
     if (st != GD_OK) {
         return st;
     }
+    memset(&args, 0, sizeof(args));
     args.x_offset = (uint64_t)x->offset;
     args.w_offset = (uint64_t)w->offset;
     args.bias_offset = bias != NULL ? (uint64_t)bias->offset : 0U;

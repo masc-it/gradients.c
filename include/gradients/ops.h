@@ -9,6 +9,9 @@
 extern "C" {
 #endif
 
+/* PyTorch-style F16 matrix multiplication with full batch broadcasting:
+ * x [..., M, K] @ w [..., K, N] -> out [broadcast(...), M, N].
+ * Inputs must be row-strided in their innermost matrix dimensions. */
 gd_status gd_matmul(gd_context *ctx,
                     const gd_tensor *x,
                     const gd_tensor *w,
@@ -21,6 +24,8 @@ gd_status gd_linear(gd_context *ctx,
                     const gd_tensor *bias,
                     gd_tensor *out);
 
+/* Direct matmul backward. Broadcasted batch dimensions are reduced back to
+ * x/w's original shapes. Pass grad_x or grad_w as NULL to skip that gradient. */
 gd_status gd_matmul_backward(gd_context *ctx,
                              const gd_tensor *x,
                              const gd_tensor *w,

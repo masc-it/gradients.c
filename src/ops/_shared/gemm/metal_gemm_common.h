@@ -21,6 +21,28 @@ static inline void gd_store_f16(device uchar *buf, ulong byte, half v)
     *(reinterpret_cast<device half *>(buf + byte)) = v;
 }
 
+static inline ulong gd_gemm_batch_offset(constant gd_metal_gemm_args &p,
+                                         uint batch_index,
+                                         uint which)
+{
+    ulong offset = 0ul;
+    uint remaining = batch_index;
+    for (uint r = 0u; r < p.batch_rank; ++r) {
+        const uint dim_index = p.batch_rank - 1u - r;
+        const uint dim = p.batch_shape[dim_index];
+        const uint coord = dim > 0u ? remaining % dim : 0u;
+        remaining = dim > 0u ? remaining / dim : 0u;
+        if (which == 0u) {
+            offset += ulong(coord) * p.x_batch_strides[dim_index];
+        } else if (which == 1u) {
+            offset += ulong(coord) * p.w_batch_strides[dim_index];
+        } else {
+            offset += ulong(coord) * p.y_batch_strides[dim_index];
+        }
+    }
+    return offset;
+}
+
 static inline uint2 gd_simdgroup_matrix_thread_coords(uint simd_lane)
 {
     const uint qid = simd_lane / 4u;
@@ -48,10 +70,13 @@ static inline void gd_gemm_f16_reg_tile(device const uchar *xbuf,
     const ulong x_stride = p.x_row_bytes / 2ul;
     const ulong w_stride = p.w_row_bytes / 2ul;
     const ulong y_stride = p.y_row_bytes / 2ul;
-    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset);
-    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset);
+    const ulong x_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 2u);
+    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset + x_batch_offset);
+    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset + w_batch_offset);
     device const half *bias = reinterpret_cast<device const half *>(bbuf + p.bias_offset);
-    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset);
+    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset + y_batch_offset);
 
     simdgroup_matrix<half, 8, 8> x_frag[GD_METAL_GEMM_REG_NBLK];
     simdgroup_matrix<half, 8, 8> w_frag[GD_METAL_GEMM_REG_NBLK];
@@ -151,9 +176,12 @@ static inline void gd_gemm_f16_reg_nt_tile(device const uchar *xbuf,
     const ulong x_stride = p.x_row_bytes / 2ul;
     const ulong w_stride = p.w_row_bytes / 2ul;
     const ulong y_stride = p.y_row_bytes / 2ul;
-    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset);
-    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset);
-    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset);
+    const ulong x_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 2u);
+    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset + x_batch_offset);
+    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset + w_batch_offset);
+    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset + y_batch_offset);
 
     simdgroup_matrix<half, 8, 8> x_frag[GD_METAL_GEMM_REG_NBLK];
     simdgroup_matrix<half, 8, 8> w_frag[GD_METAL_GEMM_REG_NBLK];
@@ -226,9 +254,12 @@ static inline void gd_gemm_f16_reg_tn_tile(device const uchar *xbuf,
     const ulong x_stride = p.x_row_bytes / 2ul;
     const ulong w_stride = p.w_row_bytes / 2ul;
     const ulong y_stride = p.y_row_bytes / 2ul;
-    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset);
-    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset);
-    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset);
+    const ulong x_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 2u);
+    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset + x_batch_offset);
+    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset + w_batch_offset);
+    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset + y_batch_offset);
 
     simdgroup_matrix<half, 8, 8> x_frag[GD_METAL_GEMM_REG_NBLK];
     simdgroup_matrix<half, 8, 8> w_frag[GD_METAL_GEMM_REG_NBLK];
@@ -302,6 +333,9 @@ static inline void gd_gemm_f16_tile(device const uchar *xbuf,
     const uint n0 = tgpos.x * GD_METAL_GEMM_BN;
     const uint row0 = m0 + ty * GD_METAL_GEMM_TM;
     const uint col0 = n0 + tx * GD_METAL_GEMM_TN;
+    const ulong x_base_offset = p.x_offset + gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_base_offset = p.w_offset + gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_base_offset = p.y_offset + gd_gemm_batch_offset(p, tgpos.z, 2u);
 
     float4 acc[GD_METAL_GEMM_TM];
     for (uint tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
@@ -319,7 +353,7 @@ static inline void gd_gemm_f16_tile(device const uchar *xbuf,
             const uint gk = kbase + kr;
             half v = half(0.0);
             if (gr < p.rows && gk < p.inner) {
-                v = gd_load_f16(xbuf, p.x_offset + ulong(gr) * p.x_row_bytes + ulong(gk) * 2ul);
+                v = gd_load_f16(xbuf, x_base_offset + ulong(gr) * p.x_row_bytes + ulong(gk) * 2ul);
             }
             xs[kr][mr] = v;
         }
@@ -331,7 +365,7 @@ static inline void gd_gemm_f16_tile(device const uchar *xbuf,
             const uint gc = n0 + nc;
             half v = half(0.0);
             if (gc < p.cols && gk < p.inner) {
-                v = gd_load_f16(wbuf, p.w_offset + ulong(gk) * p.w_row_bytes + ulong(gc) * 2ul);
+                v = gd_load_f16(wbuf, w_base_offset + ulong(gk) * p.w_row_bytes + ulong(gc) * 2ul);
             }
             ws[kr][nc] = v;
         }
@@ -363,7 +397,7 @@ static inline void gd_gemm_f16_tile(device const uchar *xbuf,
                 if (p.has_bias != 0u) {
                     v += float(gd_load_f16(bbuf, p.bias_offset + ulong(gc) * 2ul));
                 }
-                gd_store_f16(ybuf, p.y_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(v));
+                gd_store_f16(ybuf, y_base_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(v));
             }
         }
     }
@@ -387,6 +421,9 @@ static inline void gd_gemm_f16_nt_tile(device const uchar *xbuf,
     const uint n0 = tgpos.x * GD_METAL_GEMM_BN;
     const uint row0 = m0 + ty * GD_METAL_GEMM_TM;
     const uint col0 = n0 + tx * GD_METAL_GEMM_TN;
+    const ulong x_base_offset = p.x_offset + gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_base_offset = p.w_offset + gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_base_offset = p.y_offset + gd_gemm_batch_offset(p, tgpos.z, 2u);
 
     float4 acc[GD_METAL_GEMM_TM];
     for (uint tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
@@ -404,7 +441,7 @@ static inline void gd_gemm_f16_nt_tile(device const uchar *xbuf,
             const uint gk = kbase + kr;
             half v = half(0.0);
             if (gr < p.rows && gk < p.inner) {
-                v = gd_load_f16(xbuf, p.x_offset + ulong(gr) * p.x_row_bytes + ulong(gk) * 2ul);
+                v = gd_load_f16(xbuf, x_base_offset + ulong(gr) * p.x_row_bytes + ulong(gk) * 2ul);
             }
             xs[kr][mr] = v;
         }
@@ -416,7 +453,7 @@ static inline void gd_gemm_f16_nt_tile(device const uchar *xbuf,
             const uint gc = n0 + nc;
             half v = half(0.0);
             if (gc < p.cols && gk < p.inner) {
-                v = gd_load_f16(wbuf, p.w_offset + ulong(gc) * p.w_row_bytes + ulong(gk) * 2ul);
+                v = gd_load_f16(wbuf, w_base_offset + ulong(gc) * p.w_row_bytes + ulong(gk) * 2ul);
             }
             ws[kr][nc] = v;
         }
@@ -444,7 +481,7 @@ static inline void gd_gemm_f16_nt_tile(device const uchar *xbuf,
         for (uint tn = 0; tn < GD_METAL_GEMM_TN; ++tn) {
             const uint gc = col0 + tn;
             if (gc < p.cols) {
-                gd_store_f16(ybuf, p.y_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(vals[tn]));
+                gd_store_f16(ybuf, y_base_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(vals[tn]));
             }
         }
     }
@@ -468,6 +505,9 @@ static inline void gd_gemm_f16_tn_tile(device const uchar *xbuf,
     const uint n0 = tgpos.x * GD_METAL_GEMM_BN;
     const uint row0 = m0 + ty * GD_METAL_GEMM_TM;
     const uint col0 = n0 + tx * GD_METAL_GEMM_TN;
+    const ulong x_base_offset = p.x_offset + gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_base_offset = p.w_offset + gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_base_offset = p.y_offset + gd_gemm_batch_offset(p, tgpos.z, 2u);
 
     float4 acc[GD_METAL_GEMM_TM];
     for (uint tm = 0; tm < GD_METAL_GEMM_TM; ++tm) {
@@ -485,7 +525,7 @@ static inline void gd_gemm_f16_tn_tile(device const uchar *xbuf,
             const uint gk = kbase + kr;
             half v = half(0.0);
             if (gr < p.rows && gk < p.inner) {
-                v = gd_load_f16(xbuf, p.x_offset + ulong(gk) * p.x_row_bytes + ulong(gr) * 2ul);
+                v = gd_load_f16(xbuf, x_base_offset + ulong(gk) * p.x_row_bytes + ulong(gr) * 2ul);
             }
             xs[kr][mr] = v;
         }
@@ -497,7 +537,7 @@ static inline void gd_gemm_f16_tn_tile(device const uchar *xbuf,
             const uint gc = n0 + nc;
             half v = half(0.0);
             if (gc < p.cols && gk < p.inner) {
-                v = gd_load_f16(wbuf, p.w_offset + ulong(gk) * p.w_row_bytes + ulong(gc) * 2ul);
+                v = gd_load_f16(wbuf, w_base_offset + ulong(gk) * p.w_row_bytes + ulong(gc) * 2ul);
             }
             ws[kr][nc] = v;
         }
@@ -525,7 +565,7 @@ static inline void gd_gemm_f16_tn_tile(device const uchar *xbuf,
         for (uint tn = 0; tn < GD_METAL_GEMM_TN; ++tn) {
             const uint gc = col0 + tn;
             if (gc < p.cols) {
-                gd_store_f16(ybuf, p.y_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(vals[tn]));
+                gd_store_f16(ybuf, y_base_offset + ulong(gr) * p.y_row_bytes + ulong(gc) * 2ul, half(vals[tn]));
             }
         }
     }

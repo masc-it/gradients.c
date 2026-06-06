@@ -182,6 +182,42 @@ gd_status gd_backend_matmul_tn(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_batched_matmul(gd_backend *backend,
+                                    const gd_backend_batched_matrix_view *x,
+                                    const gd_backend_batched_matrix_view *w,
+                                    const gd_backend_batched_matrix_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)w;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_batched_matmul_nt(gd_backend *backend,
+                                       const gd_backend_batched_matrix_view *x,
+                                       const gd_backend_batched_matrix_view *w,
+                                       const gd_backend_batched_matrix_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)w;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_batched_matmul_tn(gd_backend *backend,
+                                       const gd_backend_batched_matrix_view *x,
+                                       const gd_backend_batched_matrix_view *w,
+                                       const gd_backend_batched_matrix_view *y)
+{
+    (void)backend;
+    (void)x;
+    (void)w;
+    (void)y;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_linear(gd_backend *backend,
                             const gd_backend_matrix_view *x,
                             const gd_backend_matrix_view *w,

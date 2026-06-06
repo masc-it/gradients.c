@@ -27,6 +27,21 @@ typedef struct gd_backend_matrix_view {
     uint32_t dtype;
 } gd_backend_matrix_view;
 
+#define GD_BACKEND_MAX_BATCH_DIMS 6U
+
+typedef struct gd_backend_batched_matrix_view {
+    gd_backend_buffer *buffer;
+    size_t offset;
+    uint32_t rows;
+    uint32_t cols;
+    size_t row_bytes;
+    uint32_t dtype;
+    uint32_t batch_rank;
+    uint32_t batch_count;
+    uint32_t batch_shape[GD_BACKEND_MAX_BATCH_DIMS];
+    size_t batch_strides[GD_BACKEND_MAX_BATCH_DIMS];
+} gd_backend_batched_matrix_view;
+
 typedef struct gd_backend_vector_view {
     gd_backend_buffer *buffer;
     size_t offset;
@@ -138,6 +153,20 @@ gd_status gd_backend_matmul_tn(gd_backend *backend,
                                const gd_backend_matrix_view *x,
                                const gd_backend_matrix_view *w,
                                const gd_backend_matrix_view *y);
+gd_status gd_backend_batched_matmul(gd_backend *backend,
+                                    const gd_backend_batched_matrix_view *x,
+                                    const gd_backend_batched_matrix_view *w,
+                                    const gd_backend_batched_matrix_view *y);
+/* y = x * w^T, batched/broadcasted over the batch view dimensions. */
+gd_status gd_backend_batched_matmul_nt(gd_backend *backend,
+                                       const gd_backend_batched_matrix_view *x,
+                                       const gd_backend_batched_matrix_view *w,
+                                       const gd_backend_batched_matrix_view *y);
+/* y = x^T * w, batched/broadcasted over the batch view dimensions. */
+gd_status gd_backend_batched_matmul_tn(gd_backend *backend,
+                                       const gd_backend_batched_matrix_view *x,
+                                       const gd_backend_batched_matrix_view *w,
+                                       const gd_backend_batched_matrix_view *y);
 gd_status gd_backend_linear(gd_backend *backend,
                             const gd_backend_matrix_view *x,
                             const gd_backend_matrix_view *w,

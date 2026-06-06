@@ -1079,6 +1079,9 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend->reduce_rows_pso != NULL) {
         CFRelease(backend->reduce_rows_pso);
     }
+    if (backend->mps_matmul_kernel != NULL) {
+        CFRelease(backend->mps_matmul_kernel);
+    }
     if (backend->matmul_tn_reg_pso != NULL) {
         CFRelease(backend->matmul_tn_reg_pso);
     }

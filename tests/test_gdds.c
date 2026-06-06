@@ -192,13 +192,11 @@ int main(void)
     {
         const gd_dataloader_config cfg = {
             .batch_size = 4,
-            .seed = 0U,
-            .sampler = GD_SAMPLER_SEQUENTIAL,
             .expected_dataset_fingerprint = gd_dataset_fingerprint(dataset),
             .num_workers = 1,
             .prefetch_factor = 2,
         };
-        CHECK_OK(gd_dataloader_create(ctx, dataset, &cfg, fields, n_fields,
+        CHECK_OK(gd_dataloader_create(ctx, dataset, NULL, &cfg, fields, n_fields,
                                       gd_collate_gdds, NULL, &loader));
     }
     CHECK_OK(gd_dataloader_prefetch(loader));

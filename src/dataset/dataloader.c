@@ -2,7 +2,6 @@
 
 #include "../core/memory_internal.h"
 
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,19 +12,13 @@ gd_dataloader_config gd_dataloader_config_default(int batch_size)
     gd_dataloader_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.batch_size = batch_size;
-    cfg.seed = 0U;
-    cfg.sampler = GD_SAMPLER_SEQUENTIAL;
     return cfg;
 }
 
 gd_dataloader_config gd_dataloader_config_build(const gd_dataset *dataset,
-                                                int batch_size,
-                                                gd_sampler_mode sampler,
-                                                uint64_t seed)
+                                                int batch_size)
 {
     gd_dataloader_config cfg = gd_dataloader_config_default(batch_size);
-    cfg.seed = seed;
-    cfg.sampler = sampler;
     if (dataset != NULL) {
         cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(dataset);
     }
@@ -48,14 +41,118 @@ static char *gd_dl_strdup(const char *s)
     return out;
 }
 
-static uint64_t gd_dl_splitmix64(uint64_t *state)
+static uint64_t gd_dl_splitmix64_value(uint64_t x)
 {
-    uint64_t z;
-    *state += UINT64_C(0x9e3779b97f4a7c15);
-    z = *state;
-    z = (z ^ (z >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27U)) * UINT64_C(0x94d049bb133111eb);
-    return z ^ (z >> 31U);
+    x += UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31U);
+}
+
+static uint32_t gd_sampler_ceil_log2_u64(uint64_t value)
+{
+    uint32_t bits = 0U;
+    uint64_t x;
+    if (value <= 1U) {
+        return 0U;
+    }
+    x = value - 1U;
+    while (x != 0U) {
+        bits += 1U;
+        x >>= 1U;
+    }
+    return bits;
+}
+
+static uint64_t gd_sampler_feistel_round(uint64_t right,
+                                         uint64_t key,
+                                         uint32_t round,
+                                         uint64_t half_mask)
+{
+    uint64_t x = right;
+    x ^= key + UINT64_C(0x9e3779b97f4a7c15) * (uint64_t)(round + 1U);
+    x ^= (uint64_t)round << 48U;
+    return gd_dl_splitmix64_value(x) & half_mask;
+}
+
+static uint64_t gd_sampler_feistel_permute(uint64_t x,
+                                           uint64_t key,
+                                           uint32_t half_bits)
+{
+    const uint32_t rounds = 6U;
+    const uint64_t half_mask = (UINT64_C(1) << half_bits) - 1U;
+    uint64_t left = x >> half_bits;
+    uint64_t right = x & half_mask;
+    uint32_t round;
+    for (round = 0U; round < rounds; ++round) {
+        const uint64_t new_left = right;
+        const uint64_t f = gd_sampler_feistel_round(right, key, round, half_mask);
+        const uint64_t new_right = (left ^ f) & half_mask;
+        left = new_left;
+        right = new_right;
+    }
+    return (left << half_bits) | right;
+}
+
+static uint64_t gd_sampler_random_index(const gd_sampler *sampler,
+                                        uint64_t epoch,
+                                        uint64_t position)
+{
+    uint64_t x;
+    uint64_t key;
+    uint32_t bits;
+    uint32_t half_bits;
+    if (sampler == NULL || sampler->n_samples == 0U) {
+        return 0U;
+    }
+    if (sampler->n_samples == 1U) {
+        return 0U;
+    }
+    bits = gd_sampler_ceil_log2_u64(sampler->n_samples);
+    half_bits = (bits + 1U) / 2U;
+    if (half_bits > 32U) {
+        half_bits = 32U;
+    }
+    key = gd_dl_splitmix64_value(sampler->seed ^ gd_dl_splitmix64_value(epoch));
+    x = position;
+    do {
+        x = gd_sampler_feistel_permute(x, key, half_bits);
+    } while (x >= sampler->n_samples);
+    return x;
+}
+
+gd_status gd_sampler_create_random(const gd_dataset *dataset,
+                                   uint64_t seed,
+                                   gd_sampler **out)
+{
+    gd_sampler *sampler;
+    uint64_t n_samples;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    if (dataset == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    n_samples = gd_dataset_num_samples(dataset);
+    if (n_samples == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    sampler = (gd_sampler *)calloc(1U, sizeof(*sampler));
+    if (sampler == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    sampler->kind = GD_SAMPLER_KIND_RANDOM;
+    sampler->n_samples = n_samples;
+    sampler->dataset_fingerprint = gd_dataset_fingerprint(dataset);
+    sampler->seed = seed;
+    *out = sampler;
+    return GD_OK;
+}
+
+void gd_sampler_destroy(gd_sampler *sampler)
+{
+    free(sampler);
 }
 
 static uint64_t gd_dl_fnv64_bytes(uint64_t h, const void *data, size_t n)
@@ -220,15 +317,27 @@ static gd_status gd_batch_init_slot(gd_dataloader *dl, int index, gd_batch *slot
     return GD_OK;
 }
 
-static uint64_t gd_dataloader_next_sample_locked(gd_dataloader *dl)
+static uint64_t gd_dataloader_sample_at_locked(const gd_dataloader *dl,
+                                                uint64_t position)
 {
-    uint64_t n_samples = gd_dataset_num_samples(dl->dataset);
-    if (dl->cfg.sampler == GD_SAMPLER_SEQUENTIAL) {
-        uint64_t sample = dl->cursor % n_samples;
-        dl->cursor += 1U;
-        return sample;
+    if (dl->sampler != NULL) {
+        return gd_sampler_random_index(dl->sampler, dl->epoch, position);
     }
-    return gd_dl_splitmix64(&dl->rng_state) % n_samples;
+    return position;
+}
+
+static void gd_dataloader_assign_batch_locked(gd_dataloader *dl, gd_batch *slot)
+{
+    int b;
+    if (dl->samples_in_epoch + (uint64_t)dl->cfg.batch_size > dl->samples_per_epoch) {
+        dl->epoch += 1U;
+        dl->samples_in_epoch = 0U;
+    }
+    for (b = 0; b < dl->cfg.batch_size; ++b) {
+        const uint64_t position = dl->samples_in_epoch + (uint64_t)b;
+        slot->sample_ids[b] = gd_dataloader_sample_at_locked(dl, position);
+    }
+    dl->samples_in_epoch += (uint64_t)dl->cfg.batch_size;
 }
 
 gd_status gd_dl_fill_slot(gd_dataloader *dl,
@@ -406,7 +515,6 @@ static void *gd_worker_main(void *arg)
         gd_batch *slot = NULL;
         gd_dataloader_fill_stats stats;
         gd_status status;
-        int b;
         pthread_mutex_lock(&dl->mutex);
         while (dl->stop == 0) {
             slot = gd_find_free_slot_locked(dl);
@@ -423,9 +531,7 @@ static void *gd_worker_main(void *arg)
         slot->state = GD_BATCH_FILLING;
         slot->seq = dl->next_seq;
         dl->next_seq += 1U;
-        for (b = 0; b < dl->cfg.batch_size; ++b) {
-            slot->sample_ids[b] = gd_dataloader_next_sample_locked(dl);
-        }
+        gd_dataloader_assign_batch_locked(dl, slot);
         dl->filling_count += 1;
         pthread_mutex_unlock(&dl->mutex);
 
@@ -560,6 +666,7 @@ uint64_t gd_dl_schema_hash(const gd_dataloader *dl)
 
 gd_status gd_dataloader_create(gd_context *ctx,
                                gd_dataset *dataset,
+                               gd_sampler *sampler,
                                const gd_dataloader_config *cfg,
                                const gd_batch_field_desc *fields,
                                int n_fields,
@@ -580,10 +687,16 @@ gd_status gd_dataloader_create(gd_context *ctx,
     if (ctx == NULL || dataset == NULL || cfg == NULL || collate == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (cfg->batch_size <= 0 ||
-        (cfg->sampler != GD_SAMPLER_RANDOM_REPLACEMENT &&
-         cfg->sampler != GD_SAMPLER_SEQUENTIAL) ||
-        gd_dataset_num_samples(dataset) == 0U) {
+    if (cfg->batch_size <= 0 || gd_dataset_num_samples(dataset) == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (sampler != NULL &&
+        (sampler->kind != GD_SAMPLER_KIND_RANDOM ||
+         sampler->n_samples != gd_dataset_num_samples(dataset) ||
+         sampler->dataset_fingerprint != gd_dataset_fingerprint(dataset))) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (gd_dataset_num_samples(dataset) / (uint64_t)cfg->batch_size == 0U) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (cfg->expected_dataset_fingerprint != 0U &&
@@ -617,6 +730,7 @@ gd_status gd_dataloader_create(gd_context *ctx,
     }
     dl->ctx = ctx;
     dl->dataset = dataset;
+    dl->sampler = sampler;
     dl->cfg = *cfg;
     dl->cfg.num_workers = n_workers;
     dl->cfg.prefetch_factor = prefetch_factor;
@@ -625,7 +739,8 @@ gd_status gd_dataloader_create(gd_context *ctx,
     dl->n_fields = n_fields;
     dl->collate = collate;
     dl->collate_data = collate_data;
-    dl->rng_state = cfg->seed;
+    dl->steps_per_epoch = gd_dataset_num_samples(dataset) / (uint64_t)cfg->batch_size;
+    dl->samples_per_epoch = dl->steps_per_epoch * (uint64_t)cfg->batch_size;
     dl->worker_status = GD_OK;
     status = gd_copy_fields(dl, fields);
     if (status != GD_OK) {
@@ -790,6 +905,16 @@ gd_status gd_dataloader_release(gd_dataloader *dl, gd_batch *batch)
 int gd_dataloader_slot_count(const gd_dataloader *dl)
 {
     return dl != NULL ? dl->n_slots : 0;
+}
+
+uint64_t gd_dataloader_steps_per_epoch(const gd_dataloader *dl)
+{
+    return dl != NULL ? dl->steps_per_epoch : 0U;
+}
+
+uint64_t gd_dataloader_samples_per_epoch(const gd_dataloader *dl)
+{
+    return dl != NULL ? dl->samples_per_epoch : 0U;
 }
 
 void gd_dataloader_metrics_get(const gd_dataloader *dl,

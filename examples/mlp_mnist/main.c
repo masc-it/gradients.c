@@ -11,7 +11,7 @@
 #define MNIST_HIDDEN_DIM 128
 #define MNIST_CLASSES 10
 #define MNIST_TRAIN_BATCH 128
-#define MNIST_EVAL_BATCH 128
+#define MNIST_EVAL_BATCH 100
 
 #define MNIST_DEFAULT_STEPS 1000
 #define MNIST_DEFAULT_REPORT_EVERY 100
@@ -195,9 +195,8 @@ static void print_param_set(const gd_param_set *params)
 
 static gd_status create_gdds_loader(gd_context *ctx,
                                     gd_dataset *dataset,
+                                    gd_sampler *sampler,
                                     int batch_size,
-                                    gd_sampler_mode sampler,
-                                    uint64_t seed,
                                     gd_dataloader **out)
 {
     gd_batch_field_desc batch_fields[2];
@@ -216,11 +215,12 @@ static gd_status create_gdds_loader(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    cfg = gd_dataloader_config_build(dataset, batch_size, sampler, seed);
+    cfg = gd_dataloader_config_build(dataset, batch_size);
     cfg.num_workers = 1;
     cfg.prefetch_factor = 2;
     st = gd_dataloader_create(ctx,
                               dataset,
+                              sampler,
                               &cfg,
                               batch_fields,
                               n_batch_fields,
@@ -316,6 +316,7 @@ int main(void)
     gd_status st = gd_context_create(&mem, &ctx);
     gd_dataset *train_dataset = NULL;
     gd_dataset *test_dataset = NULL;
+    gd_sampler *train_sampler = NULL;
     gd_dataloader *train_loader = NULL;
     gd_dataloader *test_loader = NULL;
     mnist_mlp model = {0};
@@ -372,11 +373,11 @@ int main(void)
         TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
     }
     TRY(ctx, gd_context_seal_params(ctx));
+    TRY(ctx, gd_sampler_create_random(train_dataset, 1234U, &train_sampler));
     TRY(ctx, create_gdds_loader(ctx,
                                 train_dataset,
+                                train_sampler,
                                 MNIST_TRAIN_BATCH,
-                                GD_SAMPLER_RANDOM_REPLACEMENT,
-                                1234U,
                                 &train_loader));
 
     gd_module_set_training(&model.mod, true);
@@ -424,11 +425,10 @@ int main(void)
     gd_module_set_training(&model.mod, false);
     TRY(ctx, create_gdds_loader(ctx,
                                 test_dataset,
+                                NULL,
                                 MNIST_EVAL_BATCH,
-                                GD_SAMPLER_SEQUENTIAL,
-                                0U,
                                 &test_loader));
-    evaluate_accuracy(ctx, &model, test_loader, gd_dataset_num_samples(test_dataset), &correct, &total);
+    evaluate_accuracy(ctx, &model, test_loader, gd_dataloader_samples_per_epoch(test_loader), &correct, &total);
     accuracy = total > 0U ? (float)correct / (float)total : 0.0f;
     printf("test_accuracy=%.4f correct=%d/%llu optimizer_steps=%llu\n",
            (double)accuracy,
@@ -442,6 +442,7 @@ int main(void)
                 (double)accuracy,
                 (double)min_accuracy);
         gd_dataloader_destroy(test_loader);
+        gd_sampler_destroy(train_sampler);
         gd_dataset_destroy(test_dataset);
         gd_dataset_destroy(train_dataset);
         gd_amp_scaler_destroy(scaler);
@@ -453,6 +454,7 @@ int main(void)
     }
 
     gd_dataloader_destroy(test_loader);
+    gd_sampler_destroy(train_sampler);
     gd_dataset_destroy(test_dataset);
     gd_dataset_destroy(train_dataset);
     gd_amp_scaler_destroy(scaler);

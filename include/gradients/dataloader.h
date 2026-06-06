@@ -17,11 +17,15 @@ extern "C" {
 
 typedef struct gd_dataloader gd_dataloader;
 typedef struct gd_batch gd_batch;
+typedef struct gd_sampler gd_sampler;
 
-typedef enum gd_sampler_mode {
-    GD_SAMPLER_RANDOM_REPLACEMENT = 0,
-    GD_SAMPLER_SEQUENTIAL = 1,
-} gd_sampler_mode;
+/* RandomSampler equivalent: yields a deterministic no-replacement random order
+   over each dataloader epoch/pass. The implementation is O(1) memory; it does
+   not materialize a full permutation. */
+gd_status gd_sampler_create_random(const gd_dataset *dataset,
+                                   uint64_t seed,
+                                   gd_sampler **out);
+void gd_sampler_destroy(gd_sampler *sampler);
 
 typedef enum gd_batch_state {
     GD_BATCH_FREE = 0,
@@ -47,8 +51,6 @@ typedef gd_status (*gd_collate_fn)(gd_dataset *dataset,
 
 typedef struct gd_dataloader_config {
     int batch_size;
-    uint64_t seed;
-    gd_sampler_mode sampler;
     uint64_t expected_dataset_fingerprint; /* 0 disables check. */
     int num_workers;                       /* 0 => one background worker. */
     int prefetch_factor;                   /* 0 => two slots per worker. */
@@ -65,19 +67,21 @@ typedef struct gd_dataloader_metrics {
     uint64_t max_ready_depth;
 } gd_dataloader_metrics;
 
-/* Defaults: sequential sampling, seed 0, fingerprint check disabled, and
-   implementation defaults for worker/prefetch counts. */
+/* Defaults: sequential sampling when sampler is NULL, fingerprint check
+   disabled, and implementation defaults for worker/prefetch counts. */
 gd_dataloader_config gd_dataloader_config_default(int batch_size);
 
-/* Convenience builder: defaults plus sampler/seed and dataset fingerprint check
-   when dataset is non-NULL. */
+/* Convenience builder: defaults plus dataset fingerprint check when dataset is
+   non-NULL. */
 gd_dataloader_config gd_dataloader_config_build(const gd_dataset *dataset,
-                                                int batch_size,
-                                                gd_sampler_mode sampler,
-                                                uint64_t seed);
+                                                int batch_size);
 
+/* `sampler` may be NULL for deterministic sequential sampling. Non-NULL
+   samplers are borrowed by the dataloader and must outlive it. The current
+   fixed-batch dataloader always drops the last incomplete batch. */
 gd_status gd_dataloader_create(gd_context *ctx,
                                gd_dataset *dataset,
+                               gd_sampler *sampler,
                                const gd_dataloader_config *cfg,
                                const gd_batch_field_desc *fields,
                                int n_fields,
@@ -90,6 +94,8 @@ gd_status gd_dataloader_prefetch(gd_dataloader *dl);
 gd_status gd_dataloader_next(gd_dataloader *dl, gd_batch **batch_out);
 gd_status gd_dataloader_release(gd_dataloader *dl, gd_batch *batch);
 int gd_dataloader_slot_count(const gd_dataloader *dl);
+uint64_t gd_dataloader_steps_per_epoch(const gd_dataloader *dl);
+uint64_t gd_dataloader_samples_per_epoch(const gd_dataloader *dl);
 
 void gd_dataloader_metrics_get(const gd_dataloader *dl,
                                gd_dataloader_metrics *metrics_out);

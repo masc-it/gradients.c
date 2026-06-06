@@ -98,6 +98,178 @@ static void make_lm_fields(gd_batch_field_desc *fields, int batch_size, int bloc
     fields[2].sizes[1] = block_len;
 }
 
+typedef struct toy_dataset_impl {
+    uint64_t n_samples;
+} toy_dataset_impl;
+
+static uint64_t toy_num_samples(const void *impl)
+{
+    return ((const toy_dataset_impl *)impl)->n_samples;
+}
+
+static uint64_t toy_fingerprint(const void *impl)
+{
+    return UINT64_C(0x7d10ad0000000000) ^ ((const toy_dataset_impl *)impl)->n_samples;
+}
+
+static gd_status toy_get_u64(const void *impl, const char *key, uint64_t *out)
+{
+    (void)impl;
+    (void)key;
+    (void)out;
+    return GD_ERR_INVALID_ARGUMENT;
+}
+
+static void toy_destroy(void *impl)
+{
+    free(impl);
+}
+
+static const gd_dataset_ops toy_ops = {
+    .name = "toy",
+    .num_samples = toy_num_samples,
+    .fingerprint = toy_fingerprint,
+    .get_u64 = toy_get_u64,
+    .destroy = toy_destroy,
+};
+
+static gd_status create_toy_dataset(uint64_t n_samples, gd_dataset **out)
+{
+    toy_dataset_impl *impl;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    impl = (toy_dataset_impl *)calloc(1U, sizeof(*impl));
+    if (impl == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    impl->n_samples = n_samples;
+    {
+        gd_status st = gd_dataset_create(&toy_ops, impl, out);
+        if (st != GD_OK) {
+            free(impl);
+        }
+        return st;
+    }
+}
+
+static gd_status toy_collate(gd_dataset *dataset,
+                             const uint64_t *sample_ids,
+                             int batch_size,
+                             gd_batch *batch,
+                             void *user_data)
+{
+    int field_index;
+    int32_t *dst;
+    int i;
+    (void)dataset;
+    (void)user_data;
+    if (sample_ids == NULL || batch == NULL || batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    field_index = gd_batch_field_index(batch, "id");
+    if (field_index < 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    dst = (int32_t *)gd_batch_host_data(batch, field_index);
+    if (dst == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < batch_size; ++i) {
+        dst[i] = (int32_t)sample_ids[i];
+    }
+    return GD_OK;
+}
+
+static void make_id_field(gd_batch_field_desc *field, int batch_size)
+{
+    memset(field, 0, sizeof(*field));
+    field->name = "id";
+    field->dtype = GD_DTYPE_I32;
+    field->rank = 1;
+    field->sizes[0] = batch_size;
+}
+
+static void collect_ids(gd_context *ctx,
+                        gd_dataloader *loader,
+                        int steps,
+                        int batch_size,
+                        int32_t *out)
+{
+    int step;
+    for (step = 0; step < steps; ++step) {
+        gd_batch *batch = NULL;
+        CHECK_OK(gd_dataloader_next(loader, &batch));
+        CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
+        CHECK_OK(gd_end_step(ctx));
+        CHECK_OK(gd_tensor_read(ctx,
+                                gd_batch_tensor(batch, "id"),
+                                &out[step * batch_size],
+                                (size_t)batch_size * sizeof(out[0])));
+        CHECK_OK(gd_dataloader_release(loader, batch));
+        CHECK_OK(gd_dataloader_prefetch(loader));
+    }
+}
+
+static void expect_unique_prefix(const int32_t *ids, int count, int n_samples)
+{
+    int seen[16];
+    int i;
+    CHECK(n_samples <= (int)(sizeof(seen) / sizeof(seen[0])), "test helper capacity");
+    memset(seen, 0, sizeof(seen));
+    for (i = 0; i < count; ++i) {
+        CHECK(ids[i] >= 0 && ids[i] < n_samples, "sample id in range");
+        CHECK(seen[ids[i]] == 0, "sample id appears once per epoch prefix");
+        seen[ids[i]] = 1;
+    }
+}
+
+static void test_random_sampler_no_replacement(gd_context *ctx)
+{
+    enum { N = 10, BATCH = 3, STEPS = 3, COUNT = BATCH * STEPS };
+    gd_dataset *dataset = NULL;
+    gd_sampler *sampler = NULL;
+    gd_sampler *sampler2 = NULL;
+    gd_dataloader *loader = NULL;
+    gd_dataloader *loader2 = NULL;
+    gd_batch_field_desc field;
+    gd_dataloader_config cfg;
+    int32_t epoch0[COUNT];
+    int32_t epoch1[COUNT];
+    int32_t epoch0_again[COUNT];
+
+    CHECK_OK(create_toy_dataset(N, &dataset));
+    CHECK_OK(gd_sampler_create_random(dataset, 12345U, &sampler));
+    make_id_field(&field, BATCH);
+    cfg = gd_dataloader_config_build(dataset, BATCH);
+    cfg.num_workers = 1;
+    cfg.prefetch_factor = 2;
+    CHECK_OK(gd_dataloader_create(ctx, dataset, sampler, &cfg, &field, 1,
+                                  toy_collate, NULL, &loader));
+    CHECK(gd_dataloader_steps_per_epoch(loader) == STEPS, "steps per epoch drops tail");
+    CHECK(gd_dataloader_samples_per_epoch(loader) == COUNT, "samples per epoch drops tail");
+    CHECK_OK(gd_dataloader_prefetch(loader));
+    collect_ids(ctx, loader, STEPS, BATCH, epoch0);
+    collect_ids(ctx, loader, STEPS, BATCH, epoch1);
+    expect_unique_prefix(epoch0, COUNT, N);
+    expect_unique_prefix(epoch1, COUNT, N);
+    CHECK(memcmp(epoch0, epoch1, sizeof(epoch0)) != 0, "random sampler reshuffles next epoch");
+
+    CHECK_OK(gd_sampler_create_random(dataset, 12345U, &sampler2));
+    CHECK_OK(gd_dataloader_create(ctx, dataset, sampler2, &cfg, &field, 1,
+                                  toy_collate, NULL, &loader2));
+    CHECK_OK(gd_dataloader_prefetch(loader2));
+    collect_ids(ctx, loader2, STEPS, BATCH, epoch0_again);
+    CHECK(memcmp(epoch0, epoch0_again, sizeof(epoch0)) == 0, "random sampler deterministic seed");
+
+    gd_dataloader_destroy(loader2);
+    gd_sampler_destroy(sampler2);
+    gd_dataloader_destroy(loader);
+    gd_sampler_destroy(sampler);
+    gd_dataset_destroy(dataset);
+}
+
 int main(void)
 {
     const char *path = "/tmp/gd_v2_dataloader.gdtok";
@@ -132,14 +304,14 @@ int main(void)
     make_lm_fields(fields, 2, 4);
     memset(&cfg, 0, sizeof(cfg));
     cfg.batch_size = 2;
-    cfg.seed = 0U;
-    cfg.sampler = GD_SAMPLER_SEQUENTIAL;
     cfg.expected_dataset_fingerprint = gd_dataset_fingerprint(dataset);
     cfg.num_workers = 1;
     cfg.prefetch_factor = 2;
-    CHECK_OK(gd_dataloader_create(ctx, dataset, &cfg, fields, 3,
+    CHECK_OK(gd_dataloader_create(ctx, dataset, NULL, &cfg, fields, 3,
                                   gd_collate_gdtok_lm, NULL, &loader));
     CHECK(gd_dataloader_slot_count(loader) == 2, "slot count");
+    CHECK(gd_dataloader_steps_per_epoch(loader) == 1U, "sequential steps per epoch drops tail");
+    CHECK(gd_dataloader_samples_per_epoch(loader) == 2U, "sequential samples per epoch drops tail");
     CHECK_OK(gd_dataloader_prefetch(loader));
     CHECK_OK(gd_dataloader_next(loader, &batch));
     CHECK(gd_batch_get_state(batch) == GD_BATCH_IN_USE, "batch delivered");
@@ -164,6 +336,7 @@ int main(void)
 
     gd_dataloader_destroy(loader);
     gd_dataset_destroy(dataset);
+    test_random_sampler_no_replacement(ctx);
     gd_context_destroy(ctx);
     (void)remove(path);
     printf("test_dataloader: ok\n");

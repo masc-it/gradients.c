@@ -153,6 +153,7 @@ int main(void)
     xor_mlp_init(ctx, &model);
 
     gd_dataset *dataset = NULL;
+    gd_sampler *sampler = NULL;
     gd_dataloader *loader = NULL;
     gd_batch_field_desc batch_fields[2];
     int n_batch_fields = 0;
@@ -162,16 +163,15 @@ int main(void)
                                        batch_fields,
                                        (int)GD_ARRAY_LEN(batch_fields),
                                        &n_batch_fields));
+    TRY(ctx, gd_sampler_create_random(dataset, 42U, &sampler));
     {
         const gd_dataloader_config dl_cfg = {
             .batch_size = BATCH,
-            .seed = 0U,
-            .sampler = GD_SAMPLER_SEQUENTIAL,
             .expected_dataset_fingerprint = gd_dataset_fingerprint(dataset),
             .num_workers = 1,
             .prefetch_factor = 2,
         };
-        TRY(ctx, gd_dataloader_create(ctx, dataset, &dl_cfg, batch_fields, n_batch_fields,
+        TRY(ctx, gd_dataloader_create(ctx, dataset, sampler, &dl_cfg, batch_fields, n_batch_fields,
                                       gd_collate_gdds, NULL, &loader));
     }
     TRY(ctx, gd_dataloader_prefetch(loader));
@@ -237,17 +237,26 @@ int main(void)
     }
 
     gd_module_set_training(&model.mod, false);
-    float pred[BATCH * OUT];
+    float pred[BATCH * OUT] = {0.0f};
     {
         gd_batch *batch = NULL;
         gd_tensor *x;
         gd_tensor pred_tensor;
+        float batch_pred[BATCH * OUT];
+        const uint64_t *sample_ids;
         TRY(ctx, gd_dataloader_next(loader, &batch));
+        sample_ids = gd_batch_sample_ids(batch);
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
         x = gd_batch_tensor(batch, "x");
         TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
         TRY(ctx, gd_end_step(ctx));
-        TRY(ctx, gd_tensor_read_f32(ctx, &pred_tensor, pred, GD_ARRAY_LEN(pred)));
+        TRY(ctx, gd_tensor_read_f32(ctx, &pred_tensor, batch_pred, GD_ARRAY_LEN(batch_pred)));
+        for (int row = 0; row < BATCH; ++row) {
+            if (sample_ids[row] >= (uint64_t)BATCH) {
+                fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "sample id out of range", __LINE__);
+            }
+            pred[sample_ids[row]] = batch_pred[row];
+        }
         TRY(ctx, gd_dataloader_release(loader, batch));
     }
 
@@ -276,6 +285,7 @@ int main(void)
     if (correct != BATCH || final_loss > 0.05f) {
         fprintf(stderr, "mlp_xor: training did not solve XOR\n");
         gd_dataloader_destroy(loader);
+        gd_sampler_destroy(sampler);
         gd_dataset_destroy(dataset);
         gd_amp_scaler_destroy(scaler);
         gd_optimizer_destroy(optimizer);
@@ -286,6 +296,7 @@ int main(void)
     }
 
     gd_dataloader_destroy(loader);
+    gd_sampler_destroy(sampler);
     gd_dataset_destroy(dataset);
     gd_amp_scaler_destroy(scaler);
     gd_optimizer_destroy(optimizer);

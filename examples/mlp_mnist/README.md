@@ -7,6 +7,7 @@ A compact MNIST classifier that follows the same v2 patterns as
 - images are normalized to `[0, 1]`, flattened to `[784]`, and stored as F16
 - labels are stored as scalar I32 class ids for `gd_cross_entropy`
 - generic GDDS dataloader/collate path
+- random no-replacement training sampler
 - module tree + child `gd_linear_layer`s
 - F16 `linear -> relu -> linear` logits
 - fused in-graph cross-entropy loss
@@ -39,7 +40,7 @@ make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
 To create a smaller local GDDS dataset manually:
 
 ```sh
-python3 dataset.py --out-dir data --train-limit 4096 --test-limit 1024
+python3 dataset.py --out-dir data --train-limit 4096 --test-limit 1000
 ```
 
 `main.c` opens `data` by default; set `GD_MNIST_DATA_DIR=/path/to/gdds`

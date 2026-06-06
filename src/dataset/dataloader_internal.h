@@ -46,9 +46,21 @@ typedef struct gd_dataloader_fill_stats {
     uint64_t samples_prepared;
 } gd_dataloader_fill_stats;
 
+typedef enum gd_sampler_kind {
+    GD_SAMPLER_KIND_RANDOM = 1,
+} gd_sampler_kind;
+
+struct gd_sampler {
+    gd_sampler_kind kind;
+    uint64_t n_samples;
+    uint64_t dataset_fingerprint;
+    uint64_t seed;
+};
+
 struct gd_dataloader {
     gd_context *ctx;
     gd_dataset *dataset;
+    gd_sampler *sampler;
     gd_dataloader_config cfg;
     gd_batch_field_desc *field_descs;
     int n_fields;
@@ -68,8 +80,10 @@ struct gd_dataloader {
     int stop;
     int filling_count;
     uint64_t requested;
-    uint64_t rng_state;
-    uint64_t cursor;
+    uint64_t steps_per_epoch;
+    uint64_t samples_per_epoch;
+    uint64_t epoch;
+    uint64_t samples_in_epoch;
     uint64_t next_seq;
     uint64_t deliver_seq;
     gd_status worker_status;

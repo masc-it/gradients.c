@@ -123,6 +123,102 @@ static void ref_linear_backward(const float *x,
     }
 }
 
+static void ref_linear_transposed_weight_forward(const float *x,
+                                                 const float *w,
+                                                 const float *bias,
+                                                 size_t rows,
+                                                 size_t k,
+                                                 size_t n,
+                                                 float *out)
+{
+    size_t row;
+    for (row = 0U; row < rows; ++row) {
+        size_t col;
+        for (col = 0U; col < n; ++col) {
+            float sum = bias != NULL ? bias[col] : 0.0f;
+            size_t kk;
+            for (kk = 0U; kk < k; ++kk) {
+                sum += x[row * k + kk] * w[col * k + kk];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
+static void ref_linear_transposed_weight_backward(const float *x,
+                                                  const float *w,
+                                                  const float *grad,
+                                                  size_t rows,
+                                                  size_t k,
+                                                  size_t n,
+                                                  float *dx,
+                                                  float *dw,
+                                                  float *db)
+{
+    size_t row;
+    memset(dx, 0, rows * k * sizeof(dx[0]));
+    memset(dw, 0, n * k * sizeof(dw[0]));
+    memset(db, 0, n * sizeof(db[0]));
+    for (row = 0U; row < rows; ++row) {
+        size_t kk;
+        size_t col;
+        for (kk = 0U; kk < k; ++kk) {
+            float sum = 0.0f;
+            for (col = 0U; col < n; ++col) {
+                sum += grad[row * n + col] * w[col * k + kk];
+            }
+            dx[row * k + kk] = sum;
+        }
+        for (col = 0U; col < n; ++col) {
+            for (kk = 0U; kk < k; ++kk) {
+                dw[col * k + kk] += grad[row * n + col] * x[row * k + kk];
+            }
+            db[col] += grad[row * n + col];
+        }
+    }
+}
+
+static void ref_tied_embedding_lm_head_grad(const float *table,
+                                            const int32_t *ids,
+                                            const float *grad_logits,
+                                            size_t n_ids,
+                                            size_t vocab,
+                                            size_t dim,
+                                            float *grad_table)
+{
+    size_t i;
+    memset(grad_table, 0, vocab * dim * sizeof(grad_table[0]));
+    for (i = 0U; i < n_ids; ++i) {
+        int32_t id = ids[i];
+        size_t c;
+        if (id < 0 || (size_t)id >= vocab) {
+            continue;
+        }
+        for (c = 0U; c < dim; ++c) {
+            float d_emb = 0.0f;
+            size_t token;
+            for (token = 0U; token < vocab; ++token) {
+                d_emb += grad_logits[i * vocab + token] * table[token * dim + c];
+            }
+            grad_table[(size_t)id * dim + c] += d_emb;
+        }
+    }
+    for (i = 0U; i < n_ids; ++i) {
+        int32_t id = ids[i];
+        size_t token;
+        if (id < 0 || (size_t)id >= vocab) {
+            continue;
+        }
+        for (token = 0U; token < vocab; ++token) {
+            size_t c;
+            for (c = 0U; c < dim; ++c) {
+                grad_table[token * dim + c] +=
+                    grad_logits[i * vocab + token] * table[(size_t)id * dim + c];
+            }
+        }
+    }
+}
+
 static void assert_tensor_shape(const gd_tensor *tensor,
                                 uint32_t rank,
                                 const int64_t *shape,
@@ -133,6 +229,17 @@ static void assert_tensor_shape(const gd_tensor *tensor,
     for (axis = 0U; axis < rank; ++axis) {
         CHECK(tensor->shape[axis] == shape[axis], msg);
     }
+}
+
+static void make_i32_tensor(gd_context *ctx,
+                            gd_arena_kind arena,
+                            gd_shape shape,
+                            const int32_t *src,
+                            size_t count,
+                            gd_tensor *out)
+{
+    CHECK_OK(gd_tensor_empty(ctx, arena, GD_DTYPE_I32, shape, 256U, out));
+    CHECK_OK(gd_tensor_write(ctx, out, src, count * sizeof(*src)));
 }
 
 static void test_rank3_forward_with_bias(void)
@@ -254,6 +361,159 @@ static void test_rank1_forward_backward_no_bias(void)
     gd_context_destroy(ctx);
 }
 
+static void test_transposed_rank3_forward_backward_with_bias(void)
+{
+    const int64_t x_shape[3] = {2, 3, 4};
+    const int64_t w_shape[2] = {5, 4};
+    const int64_t b_shape[1] = {5};
+    const int64_t y_shape[3] = {2, 3, 5};
+    const size_t x_count = shape_count(x_shape, 3U);
+    const size_t w_count = shape_count(w_shape, 2U);
+    const size_t b_count = shape_count(b_shape, 1U);
+    const size_t y_count = shape_count(y_shape, 3U);
+    gd_memory_config cfg = test_config();
+    gd_context *ctx = NULL;
+    gd_tensor x;
+    gd_tensor w;
+    gd_tensor b;
+    gd_tensor g;
+    gd_tensor y;
+    gd_tensor dx;
+    gd_tensor dw;
+    gd_tensor db;
+    float x_data[24];
+    float w_data[20];
+    float b_data[5];
+    float g_data[30];
+    float xq[24];
+    float wq[20];
+    float bq[5];
+    float gq[30];
+    float got_y[30];
+    float got_dx[24];
+    float got_dw[20];
+    float got_db[5];
+    float ref_y[30];
+    float ref_dx[24];
+    float ref_dw[20];
+    float ref_db[5];
+    size_t i;
+    fill_values(x_data, x_count, 0.027f, -0.14f);
+    fill_values(w_data, w_count, 0.019f, 0.02f);
+    fill_values(b_data, b_count, 0.013f, -0.03f);
+    fill_values(g_data, y_count, 0.017f, 0.05f);
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(3U, x_shape), x_data, x_count, false, &x));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(2U, w_shape), w_data, w_count, false, &w));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(1U, b_shape), b_data, b_count, false, &b));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(3U, y_shape), g_data, y_count, false, &g));
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &x, xq, x_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &w, wq, w_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &b, bq, b_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &g, gq, y_count));
+    ref_linear_transposed_weight_forward(xq, wq, bq, 6U, 4U, 5U, ref_y);
+    ref_linear_transposed_weight_backward(xq, wq, gq, 6U, 4U, 5U, ref_dx, ref_dw, ref_db);
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_linear_transposed_weight(ctx, &x, &w, &b, &y));
+    CHECK_OK(gd_linear_transposed_weight_backward(ctx, &x, &w, &b, &g, &dx, &dw, &db));
+    assert_tensor_shape(&y, 3U, y_shape, "rank3 linear_transposed_weight output shape");
+    assert_tensor_shape(&dx, 3U, x_shape, "rank3 linear_transposed_weight dx shape");
+    assert_tensor_shape(&dw, 2U, w_shape, "rank3 linear_transposed_weight dw shape");
+    assert_tensor_shape(&db, 1U, b_shape, "rank3 linear_transposed_weight db shape");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &y, got_y, y_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &dx, got_dx, x_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &dw, got_dw, w_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &db, got_db, b_count));
+    for (i = 0U; i < y_count; ++i) {
+        check_close(got_y[i], ref_y[i], 4.0e-3f, "rank3 linear_transposed_weight forward");
+    }
+    for (i = 0U; i < x_count; ++i) {
+        check_close(got_dx[i], ref_dx[i], 4.0e-3f, "rank3 linear_transposed_weight dx");
+    }
+    for (i = 0U; i < w_count; ++i) {
+        check_close(got_dw[i], ref_dw[i], 5.0e-3f, "rank3 linear_transposed_weight dw");
+    }
+    for (i = 0U; i < b_count; ++i) {
+        check_close(got_db[i], ref_db[i], 4.0e-3f, "rank3 linear_transposed_weight db");
+    }
+    gd_context_destroy(ctx);
+}
+
+static void test_tied_embedding_lm_head_autograd(void)
+{
+    const int64_t table_shape[2] = {4, 3};
+    const int64_t ids_shape[1] = {5};
+    const int64_t logits_shape[2] = {5, 4};
+    const float table_data[12] = {
+        0.10f, -0.20f, 0.30f,
+        -0.40f, 0.50f, -0.60f,
+        0.70f, -0.80f, 0.90f,
+        -1.00f, 1.10f, -1.20f,
+    };
+    const int32_t ids_data[5] = {2, 0, 2, 3, 1};
+    const size_t table_count = shape_count(table_shape, 2U);
+    const size_t ids_count = shape_count(ids_shape, 1U);
+    const size_t logits_count = shape_count(logits_shape, 2U);
+    gd_memory_config cfg = test_config();
+    gd_context *ctx = NULL;
+    gd_tensor table;
+    gd_tensor ids;
+    gd_tensor grad_logits;
+    gd_tensor emb;
+    gd_tensor logits;
+    gd_tensor dtable;
+    float grad_logits_data[20];
+    float tableq[12];
+    float gradq[20];
+    float got_logits[20];
+    float got_dtable[12];
+    float ref_logits[20];
+    float ref_dtable[12];
+    size_t i;
+    fill_values(grad_logits_data, logits_count, 0.021f, -0.08f);
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(2U, table_shape), table_data, table_count, true, &table));
+    make_i32_tensor(ctx, GD_ARENA_PARAMS, gd_shape_make(1U, ids_shape), ids_data, ids_count, &ids);
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(2U, logits_shape), grad_logits_data, logits_count, false, &grad_logits));
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &table, tableq, table_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &grad_logits, gradq, logits_count));
+    {
+        float emb_ref[15];
+        for (i = 0U; i < ids_count; ++i) {
+            memcpy(&emb_ref[i * 3U], &tableq[(size_t)ids_data[i] * 3U], 3U * sizeof(emb_ref[0]));
+        }
+        ref_linear_transposed_weight_forward(emb_ref, tableq, NULL, 5U, 3U, 4U, ref_logits);
+    }
+    ref_tied_embedding_lm_head_grad(tableq, ids_data, gradq, 5U, 4U, 3U, ref_dtable);
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_embedding(ctx, &table, &ids, &emb));
+    CHECK_OK(gd_linear_transposed_weight(ctx, &emb, &table, NULL, &logits));
+    assert_tensor_shape(&logits, 2U, logits_shape, "tied lm head logits shape");
+    CHECK_OK(gd_backward(ctx, &logits, &grad_logits));
+    CHECK_OK(gd_tensor_grad(ctx, &table, &dtable));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &logits, got_logits, logits_count));
+    CHECK_OK(gd_tensor_read_f32(ctx, &dtable, got_dtable, table_count));
+    for (i = 0U; i < logits_count; ++i) {
+        check_close(got_logits[i], ref_logits[i], 5.0e-3f, "tied lm head logits");
+    }
+    for (i = 0U; i < table_count; ++i) {
+        check_close(got_dtable[i], ref_dtable[i], 6.0e-3f, "tied embedding table grad");
+    }
+    gd_context_destroy(ctx);
+}
+
 static void test_rank3_backward_and_autograd_with_bias(void)
 {
     const int64_t x_shape[3] = {2, 3, 4};
@@ -368,6 +628,8 @@ int main(void)
 
     test_rank3_forward_with_bias();
     test_rank1_forward_backward_no_bias();
+    test_transposed_rank3_forward_backward_with_bias();
+    test_tied_embedding_lm_head_autograd();
     test_rank3_backward_and_autograd_with_bias();
     printf("test_linear: ok\n");
     return 0;

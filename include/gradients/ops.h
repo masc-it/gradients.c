@@ -27,6 +27,16 @@ gd_status gd_linear(gd_context *ctx,
                     const gd_tensor *bias,
                     gd_tensor *out);
 
+/* Fully-connected projection using a row-major transposed weight, optimized for
+ * tied embedding / LM-head weights:
+ * x [..., K], w [N, K], optional bias [N] -> out [..., N].
+ * Forward dispatches directly to x @ w^T without materializing w^T. */
+gd_status gd_linear_transposed_weight(gd_context *ctx,
+                                      const gd_tensor *x,
+                                      const gd_tensor *w,
+                                      const gd_tensor *bias,
+                                      gd_tensor *out);
+
 /* Direct matmul backward. Broadcasted batch dimensions are reduced back to
  * x/w's original shapes. Pass grad_x or grad_w as NULL to skip that gradient. */
 gd_status gd_matmul_backward(gd_context *ctx,
@@ -44,6 +54,15 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_x,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
+
+gd_status gd_linear_transposed_weight_backward(gd_context *ctx,
+                                               const gd_tensor *x,
+                                               const gd_tensor *w,
+                                               const gd_tensor *bias,
+                                               const gd_tensor *grad_out,
+                                               gd_tensor *grad_x,
+                                               gd_tensor *grad_w,
+                                               gd_tensor *grad_bias);
 
 /* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
  * contiguous I32 tensor with rank >= 1. Output is contiguous with shape

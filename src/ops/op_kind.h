@@ -26,7 +26,8 @@ typedef enum gd_op_kind {
     GD_OP_RMS_NORM = 20,
     GD_OP_ROPE = 21,
     GD_OP_EMBEDDING = 22,
-    GD_OP_COUNT = 23,
+    GD_OP_LINEAR_TRANSPOSED_WEIGHT = 23,
+    GD_OP_COUNT = 24,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

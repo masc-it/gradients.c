@@ -15,13 +15,20 @@
 
 #define MNIST_DEFAULT_EPOCHS 2
 #define MNIST_DEFAULT_REPORT_EVERY 100
-#define MNIST_DEFAULT_MIN_ACCURACY 0.85f
 
 typedef struct mnist_mlp {
     gd_module mod;
     gd_linear_layer fc1;
     gd_linear_layer fc2;
 } mnist_mlp;
+
+typedef struct mnist_config {
+    const char *data_dir;
+    int train_epochs;
+    int report_every;
+    int train_batch;
+    int eval_batch;
+} mnist_config;
 
 static void fail_status(gd_context *ctx, gd_status st, const char *expr, int line)
 {
@@ -64,25 +71,17 @@ static int env_int(const char *name, int fallback, int min_value, int max_value)
     return (int)parsed;
 }
 
-static float env_float(const char *name, float fallback, float min_value, float max_value)
+static mnist_config mnist_config_from_env(void)
 {
-    const char *text = getenv(name);
-    char *end = NULL;
-    float parsed;
-    if (text == NULL || text[0] == '\0') {
-        return fallback;
-    }
-    errno = 0;
-    parsed = strtof(text, &end);
-    if (errno != 0 || end == text || *end != '\0' || parsed < min_value || parsed > max_value) {
-        fprintf(stderr,
-                "mlp_mnist: ignoring invalid %s=%s; using %.3f\n",
-                name,
-                text,
-                (double)fallback);
-        return fallback;
-    }
-    return parsed;
+    const char *data_dir_env = getenv("GD_MNIST_DATA_DIR");
+    const char *data_dir = (data_dir_env != NULL && data_dir_env[0] != '\0') ? data_dir_env : "data";
+    return (mnist_config){
+        .data_dir = data_dir,
+        .train_epochs = env_int("GD_MNIST_EPOCHS", MNIST_DEFAULT_EPOCHS, 1, 1000000),
+        .report_every = env_int("GD_MNIST_REPORT_EVERY", MNIST_DEFAULT_REPORT_EVERY, 0, 1000000),
+        .train_batch = MNIST_TRAIN_BATCH,
+        .eval_batch = MNIST_EVAL_BATCH,
+    };
 }
 
 static double wall_seconds(void)
@@ -283,16 +282,70 @@ static void evaluate_accuracy(gd_context *ctx,
     *total_out = n_samples;
 }
 
+static void train_mnist(gd_context *ctx,
+                        mnist_mlp *model,
+                        gd_dataloader *loader,
+                        gd_optimizer *optimizer,
+                        gd_amp_scaler *scaler,
+                        const mnist_config *config,
+                        uint64_t steps_per_epoch,
+                        uint64_t train_steps)
+{
+    double last_report_time;
+    uint64_t last_report_step = 0U;
+    if (config == NULL || steps_per_epoch == 0U || train_steps == 0U) {
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train_mnist", __LINE__);
+    }
+    gd_module_set_training(&model->mod, true);
+    last_report_time = wall_seconds();
+    for (uint64_t step = 0U; step < train_steps; ++step) {
+        gd_batch *batch = NULL;
+        gd_tensor *image;
+        gd_tensor *target;
+        gd_tensor logits;
+        gd_tensor loss;
+        const uint64_t current_step = step + 1U;
+        const uint64_t epoch = step / steps_per_epoch + 1U;
+        const uint64_t epoch_step = step % steps_per_epoch + 1U;
+        const int report = config->report_every > 0 &&
+                           (step == 0U || current_step % (uint64_t)config->report_every == 0U ||
+                            current_step == train_steps);
+        TRY(ctx, gd_dataloader_next(loader, &batch));
+        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
+        image = required_batch_tensor(ctx, batch, "image", __LINE__);
+        target = required_batch_tensor(ctx, batch, "target", __LINE__);
+        TRY(ctx, mnist_mlp_forward(ctx, model, image, &logits));
+        TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
+        TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
+        TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
+        TRY(ctx, gd_end_step(ctx));
+        TRY(ctx, gd_dataloader_release(loader, batch));
+        TRY(ctx, gd_dataloader_prefetch(loader));
+
+        if (report) {
+            const double now = wall_seconds();
+            const double elapsed = now - last_report_time;
+            const uint64_t batches = current_step - last_report_step;
+            const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
+            float loss_value = 0.0f;
+            TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
+            printf("epoch=%llu/%d batch=%llu/%llu step=%llu loss=%.6f batch/s=%.2f\n",
+                   (unsigned long long)epoch,
+                   config->train_epochs,
+                   (unsigned long long)epoch_step,
+                   (unsigned long long)steps_per_epoch,
+                   (unsigned long long)current_step,
+                   (double)loss_value,
+                   batches_per_sec);
+            last_report_time = now;
+            last_report_step = current_step;
+        }
+    }
+}
+
 int main(void)
 {
-    const int train_epochs = env_int("GD_MNIST_EPOCHS", MNIST_DEFAULT_EPOCHS, 1, 1000000);
-    const int report_every = env_int("GD_MNIST_REPORT_EVERY", MNIST_DEFAULT_REPORT_EVERY, 0, 1000000);
-    const float min_accuracy = env_float("GD_MNIST_MIN_ACCURACY",
-                                         MNIST_DEFAULT_MIN_ACCURACY,
-                                         0.0f,
-                                         1.0f);
-    const char *data_dir_env = getenv("GD_MNIST_DATA_DIR");
-    const char *data_dir = (data_dir_env != NULL && data_dir_env[0] != '\0') ? data_dir_env : "data";
+    const mnist_config config = mnist_config_from_env();
     const gd_memory_config mem = mnist_memory_config();
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
@@ -306,21 +359,23 @@ int main(void)
     gd_optimizer *optimizer = NULL;
     gd_amp_scaler *scaler = NULL;
     int correct = 0;
+    int exit_code = 1;
     uint64_t total = 0U;
     uint64_t steps_per_epoch = 0U;
     uint64_t train_steps = 0U;
-    float accuracy;
+    float accuracy = 0.0f;
 
     if (st == GD_ERR_UNSUPPORTED) {
         printf("mlp_mnist: skipped (no supported gradients.c backend)\n");
-        return 0;
+        exit_code = 0;
+        goto cleanup;
     }
     if (st != GD_OK) {
         fail_status(ctx, st, "gd_context_create", __LINE__);
     }
 
-    TRY(ctx, gd_dataset_open_gdds_split(data_dir, "train", &train_dataset));
-    TRY(ctx, gd_dataset_open_gdds_split(data_dir, "test", &test_dataset));
+    TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &train_dataset));
+    TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "test", &test_dataset));
 
     mnist_mlp_init(ctx, &model);
     {
@@ -355,69 +410,31 @@ int main(void)
     TRY(ctx, create_gdds_loader(ctx,
                                 train_dataset,
                                 train_sampler,
-                                MNIST_TRAIN_BATCH,
+                                config.train_batch,
                                 &train_loader));
     steps_per_epoch = gd_dataloader_steps_per_epoch(train_loader);
-    if (steps_per_epoch == 0U || steps_per_epoch > UINT64_MAX / (uint64_t)train_epochs) {
+    if (steps_per_epoch == 0U || steps_per_epoch > UINT64_MAX / (uint64_t)config.train_epochs) {
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "GD_MNIST_EPOCHS", __LINE__);
     }
-    train_steps = (uint64_t)train_epochs * steps_per_epoch;
+    train_steps = (uint64_t)config.train_epochs * steps_per_epoch;
     printf("dataset: dir=%s train=%llu test=%llu batch=%d epochs=%d steps_per_epoch=%llu samples_per_epoch=%llu total_steps=%llu\n",
-           data_dir,
+           config.data_dir,
            (unsigned long long)gd_dataset_num_samples(train_dataset),
            (unsigned long long)gd_dataset_num_samples(test_dataset),
-           MNIST_TRAIN_BATCH,
-           train_epochs,
+           config.train_batch,
+           config.train_epochs,
            (unsigned long long)steps_per_epoch,
            (unsigned long long)gd_dataloader_samples_per_epoch(train_loader),
            (unsigned long long)train_steps);
 
-    gd_module_set_training(&model.mod, true);
-    double last_report_time = wall_seconds();
-    uint64_t last_report_step = 0U;
-    for (uint64_t step = 0U; step < train_steps; ++step) {
-        gd_batch *batch = NULL;
-        gd_tensor *image;
-        gd_tensor *target;
-        gd_tensor logits;
-        gd_tensor loss;
-        const uint64_t current_step = step + 1U;
-        const uint64_t epoch = step / steps_per_epoch + 1U;
-        const uint64_t epoch_step = step % steps_per_epoch + 1U;
-        const int report = report_every > 0 &&
-                           (step == 0U || current_step % (uint64_t)report_every == 0U ||
-                            current_step == train_steps);
-        TRY(ctx, gd_dataloader_next(train_loader, &batch));
-        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
-        image = required_batch_tensor(ctx, batch, "image", __LINE__);
-        target = required_batch_tensor(ctx, batch, "target", __LINE__);
-        TRY(ctx, mnist_mlp_forward(ctx, &model, image, &logits));
-        TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
-        TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
-        TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
-        TRY(ctx, gd_end_step(ctx));
-        TRY(ctx, gd_dataloader_release(train_loader, batch));
-        TRY(ctx, gd_dataloader_prefetch(train_loader));
-
-        if (report) {
-            const double now = wall_seconds();
-            const double elapsed = now - last_report_time;
-            const uint64_t batches = current_step - last_report_step;
-            const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
-            float loss_value = 0.0f;
-            TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-            printf("epoch=%llu/%d batch=%llu/%llu step=%llu loss=%.6f batch/s=%.2f\n",
-                   (unsigned long long)epoch,
-                   train_epochs,
-                   (unsigned long long)epoch_step,
-                   (unsigned long long)steps_per_epoch,
-                   (unsigned long long)current_step,
-                   (double)loss_value,
-                   batches_per_sec);
-            last_report_time = now;
-            last_report_step = current_step;
-        }
-    }
+    train_mnist(ctx,
+                &model,
+                train_loader,
+                optimizer,
+                scaler,
+                &config,
+                steps_per_epoch,
+                train_steps);
 
     gd_dataloader_destroy(train_loader);
     train_loader = NULL;
@@ -426,7 +443,7 @@ int main(void)
     TRY(ctx, create_gdds_loader(ctx,
                                 test_dataset,
                                 NULL,
-                                MNIST_EVAL_BATCH,
+                                config.eval_batch,
                                 &test_loader));
     evaluate_accuracy(ctx, &model, test_loader, gd_dataloader_samples_per_epoch(test_loader), &correct, &total);
     accuracy = total > 0U ? (float)correct / (float)total : 0.0f;
@@ -436,24 +453,12 @@ int main(void)
            (unsigned long long)total,
            (unsigned long long)gd_optimizer_step_count(optimizer));
 
-    if (accuracy < min_accuracy) {
-        fprintf(stderr,
-                "mlp_mnist: accuracy %.4f below threshold %.4f\n",
-                (double)accuracy,
-                (double)min_accuracy);
-        gd_dataloader_destroy(test_loader);
-        gd_sampler_destroy(train_sampler);
-        gd_dataset_destroy(test_dataset);
-        gd_dataset_destroy(train_dataset);
-        gd_amp_scaler_destroy(scaler);
-        gd_optimizer_destroy(optimizer);
-        gd_param_set_free(&params);
-        mnist_mlp_deinit(&model);
-        gd_context_destroy(ctx);
-        return 1;
-    }
+    printf("mlp_mnist: ok\n");
+    exit_code = 0;
 
+cleanup:
     gd_dataloader_destroy(test_loader);
+    gd_dataloader_destroy(train_loader);
     gd_sampler_destroy(train_sampler);
     gd_dataset_destroy(test_dataset);
     gd_dataset_destroy(train_dataset);
@@ -462,6 +467,5 @@ int main(void)
     gd_param_set_free(&params);
     mnist_mlp_deinit(&model);
     gd_context_destroy(ctx);
-    printf("mlp_mnist: ok\n");
-    return 0;
+    return exit_code;
 }

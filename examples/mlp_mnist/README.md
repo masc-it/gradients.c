@@ -27,13 +27,13 @@ python3 dataset.py --out-dir data
 ```
 
 which writes `data/train-*.gdds`, `data/test-*.gdds`, and `data/manifest.json`.
+Subsequent `make run` calls reuse matching GDDS shards instead of rebuilding them.
 Raw MNIST gzip files are cached under `data/raw`.
 
 Useful knobs:
 
 ```sh
 GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 make run
-GD_MNIST_MIN_ACCURACY=0.80 make run
 make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
 ```
 

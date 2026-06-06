@@ -130,13 +130,72 @@ def mnist_samples(images: bytes, labels: bytes, limit: int) -> Iterator[Mapping[
         }
 
 
+def split_shards(out_dir: Path, split: str) -> list[Path]:
+    return sorted(
+        path
+        for path in out_dir.glob(f"{split}*.gdds")
+        if path.name == f"{split}.gdds" or path.name.startswith(f"{split}-")
+    )
+
+
 def remove_split_shards(out_dir: Path, split: str) -> None:
-    for path in out_dir.glob(f"{split}*.gdds"):
-        if path.name == f"{split}.gdds" or path.name.startswith(f"{split}-"):
-            path.unlink()
+    for path in split_shards(out_dir, split):
+        path.unlink()
 
 
-def write_manifest(out_dir: Path, split_counts: Mapping[str, int], split_paths: Mapping[str, list[Path]]) -> None:
+def expected_shard_samples(n_samples: int, samples_per_shard: int) -> list[int]:
+    counts: list[int] = []
+    remaining = n_samples
+    while remaining > 0:
+        count = min(samples_per_shard, remaining)
+        counts.append(count)
+        remaining -= count
+    return counts
+
+
+def read_gdds_header(path: Path) -> tuple[int, str]:
+    with path.open("rb") as handle:
+        header = handle.read(128)
+    if len(header) != 128:
+        raise ValueError(f"{path} is not a complete GDDS shard")
+    magic = header[:8]
+    version, header_size = struct.unpack_from("<II", header, 8)
+    if magic != b"GDDSv1\0\0" or version != 1 or header_size != 128:
+        raise ValueError(f"{path} is not a GDDS v1 shard")
+    n_samples = struct.unpack_from("<Q", header, 24)[0]
+    shard_schema_hash = struct.unpack_from("<Q", header, 64)[0]
+    return n_samples, f"0x{shard_schema_hash:016x}"
+
+
+def existing_gdds_ready(out_dir: Path, limits: Mapping[str, int], samples_per_shard: int) -> bool:
+    expected_schema_hash = f"0x{schema_hash(FIELDS):016x}"
+    split_paths: dict[str, list[Path]] = {}
+    try:
+        for split, n_samples in limits.items():
+            expected_counts = expected_shard_samples(n_samples, samples_per_shard)
+            expected_names = [f"{split}-{index:05d}.gdds" for index in range(len(expected_counts))]
+            actual_paths = split_shards(out_dir, split)
+            if [path.name for path in actual_paths] != expected_names:
+                return False
+            for path, expected_count in zip(actual_paths, expected_counts):
+                shard_samples, shard_schema_hash = read_gdds_header(path)
+                if shard_samples != expected_count or shard_schema_hash != expected_schema_hash:
+                    return False
+            split_paths[split] = actual_paths
+    except (OSError, ValueError, struct.error):
+        return False
+
+    write_manifest(out_dir, limits, split_paths, samples_per_shard)
+    print(f"Using existing GDDS dataset in {out_dir}")
+    return True
+
+
+def write_manifest(
+    out_dir: Path,
+    split_counts: Mapping[str, int],
+    split_paths: Mapping[str, list[Path]],
+    samples_per_shard: int,
+) -> None:
     manifest = {
         "format": "GDDS",
         "version": 1,
@@ -152,6 +211,11 @@ def write_manifest(out_dir: Path, split_counts: Mapping[str, int], split_paths: 
                 "shards": [path.name for path in split_paths[split]],
             }
             for split in split_paths
+        },
+        "prep": {
+            "samples_per_shard": samples_per_shard,
+            "train_limit": split_counts.get("train", 0),
+            "test_limit": split_counts.get("test", 0),
         },
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -186,6 +250,9 @@ def main() -> int:
         "train": positive_limit(args.train_limit, TRAIN_SAMPLES, "--train-limit"),
         "test": positive_limit(args.test_limit, TEST_SAMPLES, "--test-limit"),
     }
+    if existing_gdds_ready(out_dir, limits, args.samples_per_shard):
+        return 0
+
     split_counts: dict[str, int] = {}
     split_paths: dict[str, list[Path]] = {}
 
@@ -210,7 +277,7 @@ def main() -> int:
         for path in paths:
             print(path)
 
-    write_manifest(out_dir, split_counts, split_paths)
+    write_manifest(out_dir, split_counts, split_paths, args.samples_per_shard)
     print(out_dir / "manifest.json")
     return 0
 

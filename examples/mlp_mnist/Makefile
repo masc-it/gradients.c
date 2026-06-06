@@ -42,9 +42,7 @@ $(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py
 	@mkdir -p $(DATA_DIR)
 	@args='$(DATA_ARGS)'; \
 	if [ -f '$(DATA_STAMP)' ] && [ -f '$(DATA_ARGS_FILE)' ] && \
-	   [ "$$(cat '$(DATA_ARGS_FILE)')" = "$$args" ] && \
-	   [ '$(DATA_STAMP)' -nt dataset.py ] && \
-	   [ '$(DATA_STAMP)' -nt '$(ROOT)/tools/gdds_utils.py' ]; then \
+	   [ "$$(cat '$(DATA_ARGS_FILE)')" = "$$args" ]; then \
 		echo "[data] up to date $(DATA_DIR)"; \
 	else \
 		$(PYTHON) dataset.py $(DATA_ARGS); \
@@ -60,7 +58,7 @@ run: $(BIN)
 
 smoke:
 	$(MAKE) clean DATA_DIR=data_smoke
-	GD_MNIST_EPOCHS=1 GD_MNIST_REPORT_EVERY=5 GD_MNIST_MIN_ACCURACY=0.0 \
+	GD_MNIST_EPOCHS=1 GD_MNIST_REPORT_EVERY=5 \
 		$(MAKE) run DATA_DIR=data_smoke MNIST_TRAIN_LIMIT=4096 MNIST_TEST_LIMIT=1000
 
 clean:

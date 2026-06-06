@@ -19,6 +19,8 @@ extern const gd_autograd_rule gd_bwd_rule_concat;
 extern const gd_autograd_rule gd_bwd_rule_reshape;
 extern const gd_autograd_rule gd_bwd_rule_permute;
 extern const gd_autograd_rule gd_bwd_rule_split;
+extern const gd_autograd_rule gd_bwd_rule_rms_norm;
+extern const gd_autograd_rule gd_bwd_rule_rope;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -39,6 +41,8 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_RESHAPE] = &gd_bwd_rule_reshape,
     [GD_OP_PERMUTE] = &gd_bwd_rule_permute,
     [GD_OP_SPLIT] = &gd_bwd_rule_split,
+    [GD_OP_RMS_NORM] = &gd_bwd_rule_rms_norm,
+    [GD_OP_ROPE] = &gd_bwd_rule_rope,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

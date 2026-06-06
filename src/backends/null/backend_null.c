@@ -540,6 +540,100 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_rms_norm_forward(gd_backend *backend,
+                                      const gd_backend_tensor_view *x,
+                                      const gd_backend_tensor_view *weight,
+                                      const gd_backend_tensor_view *out,
+                                      const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)weight;
+    (void)out;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rms_norm_forward_stats(gd_backend *backend,
+                                            const gd_backend_tensor_view *x,
+                                            const gd_backend_tensor_view *weight,
+                                            const gd_backend_tensor_view *out,
+                                            const gd_backend_tensor_view *inv_rms,
+                                            const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)weight;
+    (void)out;
+    (void)inv_rms;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rms_norm_inv(gd_backend *backend,
+                                  const gd_backend_tensor_view *x,
+                                  const gd_backend_tensor_view *inv_rms,
+                                  const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)inv_rms;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rms_norm_backward(gd_backend *backend,
+                                       const gd_backend_tensor_view *x,
+                                       const gd_backend_tensor_view *weight,
+                                       const gd_backend_tensor_view *grad_out,
+                                       const gd_backend_tensor_view *grad_x,
+                                       const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)weight;
+    (void)grad_out;
+    (void)grad_x;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rms_norm_backward_stats(gd_backend *backend,
+                                             const gd_backend_tensor_view *x,
+                                             const gd_backend_tensor_view *weight,
+                                             const gd_backend_tensor_view *inv_rms,
+                                             const gd_backend_tensor_view *grad_out,
+                                             const gd_backend_tensor_view *grad_x,
+                                             const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)weight;
+    (void)inv_rms;
+    (void)grad_out;
+    (void)grad_x;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_rms_norm_weight_backward_stats(gd_backend *backend,
+                                                    const gd_backend_tensor_view *x,
+                                                    const gd_backend_tensor_view *inv_rms,
+                                                    const gd_backend_tensor_view *grad_out,
+                                                    const gd_backend_tensor_view *grad_weight,
+                                                    const gd_backend_tensor_view *partial,
+                                                    const gd_backend_rms_norm_args *args)
+{
+    (void)backend;
+    (void)x;
+    (void)inv_rms;
+    (void)grad_out;
+    (void)grad_weight;
+    (void)partial;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_concat_to_full(gd_backend *backend,
                                     const gd_backend_tensor_view *src,
                                     const gd_backend_tensor_view *dst,

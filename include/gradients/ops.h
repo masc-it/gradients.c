@@ -37,6 +37,24 @@ gd_status gd_linear_backward(gd_context *ctx,
                              gd_tensor *grad_w,
                              gd_tensor *grad_bias);
 
+/* Root-mean-square normalization over the last dimension:
+ * out[row, c] = x[row, c] * weight[c] / sqrt(mean_c(x[row, c]^2) + eps).
+ * x and weight must be contiguous F16/F32 tensors with matching dtype; weight
+ * is [last_dim]. Output is contiguous and has x's shape/dtype. */
+gd_status gd_rms_norm(gd_context *ctx,
+                      const gd_tensor *x,
+                      const gd_tensor *weight,
+                      float eps,
+                      gd_tensor *out);
+
+gd_status gd_rms_norm_backward(gd_context *ctx,
+                               const gd_tensor *x,
+                               const gd_tensor *weight,
+                               const gd_tensor *grad_out,
+                               float eps,
+                               gd_tensor *grad_x,
+                               gd_tensor *grad_weight);
+
 /* Materialized PyTorch-style concat along axis. Inputs must be contiguous,
  * non-scalar tensors with matching dtype/rank and equal non-axis dimensions.
  * Negative axes are accepted. Output is a new contiguous tensor. */
@@ -102,6 +120,30 @@ gd_status gd_permute_backward(gd_context *ctx,
                               const int32_t *axes,
                               uint32_t n_axes,
                               gd_tensor *grad_x);
+
+/* Rotary positional embedding over tensors shaped [.., heads, head_dim].
+ * pos_ids is a contiguous I32 tensor with element count equal to the product of
+ * the leading dimensions before heads. theta <= 0 selects 10000. n_dims <= 0
+ * rotates the full head_dim; otherwise n_dims must be even and <= head_dim.
+ * interleaved=false uses NeoX half-split pairs; true uses GPT-J even/odd pairs. */
+typedef struct gd_rope_config {
+    float theta;
+    int32_t n_dims;
+    bool interleaved;
+} gd_rope_config;
+
+gd_status gd_rope(gd_context *ctx,
+                  const gd_tensor *x,
+                  const gd_tensor *pos_ids,
+                  const gd_rope_config *config,
+                  gd_tensor *out);
+
+gd_status gd_rope_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *pos_ids,
+                           const gd_tensor *grad_out,
+                           const gd_rope_config *config,
+                           gd_tensor *grad_x);
 
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].

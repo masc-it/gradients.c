@@ -23,7 +23,9 @@ typedef enum gd_op_kind {
     GD_OP_RESHAPE = 17,
     GD_OP_PERMUTE = 18,
     GD_OP_SPLIT = 19,
-    GD_OP_COUNT = 20,
+    GD_OP_RMS_NORM = 20,
+    GD_OP_ROPE = 21,
+    GD_OP_COUNT = 22,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

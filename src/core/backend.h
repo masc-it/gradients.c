@@ -210,6 +210,24 @@ gd_status gd_backend_dropout_backward_mask(gd_backend *backend,
                                            const gd_backend_tensor_view *grad_out,
                                            const gd_backend_tensor_view *grad_x,
                                            float scale);
+
+typedef struct gd_backend_rope_args {
+    float theta;
+    uint32_t n_dims;
+    uint32_t interleaved;
+} gd_backend_rope_args;
+
+/* Rotary positional embedding over contiguous [.., heads, head_dim] tensors. */
+gd_status gd_backend_rope(gd_backend *backend,
+                          const gd_backend_tensor_view *x,
+                          const gd_backend_tensor_view *pos_ids,
+                          const gd_backend_tensor_view *out,
+                          const gd_backend_rope_args *args);
+gd_status gd_backend_rope_backward(gd_backend *backend,
+                                   const gd_backend_tensor_view *grad_out,
+                                   const gd_backend_tensor_view *pos_ids,
+                                   const gd_backend_tensor_view *grad_x,
+                                   const gd_backend_rope_args *args);
 /* dst[i] = src[0] * scale for contiguous tensors; supports same dtype and f32 scalar to f16 dst. */
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,
@@ -292,6 +310,57 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
                                     const gd_backend_tensor_view *grad_y,
                                     float scale,
                                     float delta);
+
+typedef struct gd_backend_rms_norm_args {
+    uint64_t rows;              /* Product of all dimensions except the last. */
+    uint64_t cols;              /* Last dimension / weight length. */
+    uint64_t row_blocks;        /* ceil(rows / wgrad_row_block) for weight grad partials. */
+    float eps;
+    uint32_t simdgroups;        /* Row-wise reduction simdgroups. */
+    uint32_t wgrad_simdgroups;  /* Partial-reduction simdgroups. */
+    uint32_t wgrad_row_block;   /* Rows per weight-gradient partial block. */
+    uint32_t reserved0;
+} gd_backend_rms_norm_args;
+
+/* RMSNorm forward; optional stats variant saves per-row inv_rms as F32 [rows]. */
+gd_status gd_backend_rms_norm_forward(gd_backend *backend,
+                                      const gd_backend_tensor_view *x,
+                                      const gd_backend_tensor_view *weight,
+                                      const gd_backend_tensor_view *out,
+                                      const gd_backend_rms_norm_args *args);
+gd_status gd_backend_rms_norm_forward_stats(gd_backend *backend,
+                                            const gd_backend_tensor_view *x,
+                                            const gd_backend_tensor_view *weight,
+                                            const gd_backend_tensor_view *out,
+                                            const gd_backend_tensor_view *inv_rms,
+                                            const gd_backend_rms_norm_args *args);
+/* Compute only per-row inv_rms for direct backward recompute paths. */
+gd_status gd_backend_rms_norm_inv(gd_backend *backend,
+                                  const gd_backend_tensor_view *x,
+                                  const gd_backend_tensor_view *inv_rms,
+                                  const gd_backend_rms_norm_args *args);
+/* Input-gradient backward, either recomputing inv_rms or consuming saved stats. */
+gd_status gd_backend_rms_norm_backward(gd_backend *backend,
+                                       const gd_backend_tensor_view *x,
+                                       const gd_backend_tensor_view *weight,
+                                       const gd_backend_tensor_view *grad_out,
+                                       const gd_backend_tensor_view *grad_x,
+                                       const gd_backend_rms_norm_args *args);
+gd_status gd_backend_rms_norm_backward_stats(gd_backend *backend,
+                                             const gd_backend_tensor_view *x,
+                                             const gd_backend_tensor_view *weight,
+                                             const gd_backend_tensor_view *inv_rms,
+                                             const gd_backend_tensor_view *grad_out,
+                                             const gd_backend_tensor_view *grad_x,
+                                             const gd_backend_rms_norm_args *args);
+/* Weight-gradient backward using F32 partials [row_blocks, cols]. */
+gd_status gd_backend_rms_norm_weight_backward_stats(gd_backend *backend,
+                                                    const gd_backend_tensor_view *x,
+                                                    const gd_backend_tensor_view *inv_rms,
+                                                    const gd_backend_tensor_view *grad_out,
+                                                    const gd_backend_tensor_view *grad_weight,
+                                                    const gd_backend_tensor_view *partial,
+                                                    const gd_backend_rms_norm_args *args);
 
 typedef struct gd_backend_concat_args {
     uint64_t count;       /* Number of elements in the slice tensor. */

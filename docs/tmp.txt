@@ -138,3 +138,17 @@ def get_mnist():
 ```
 
 Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint him.
+
+---
+
+
+I need your expertise to port embedding from @v1/src/ops/embedding/ in gradients.c
+
+context: @docs/guides/metal_tips.md @docs/guides/register_op.md
+
+write high quality performant code.
+show performance numbers at the end.
+
+dont worry if other files are changing, I am working in parallel.
+
+good work.

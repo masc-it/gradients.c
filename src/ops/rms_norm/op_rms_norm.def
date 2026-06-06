@@ -1,0 +1,2 @@
+# Custom RMSNorm public/backend signatures; this file registers GD_OP_RMS_NORM.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

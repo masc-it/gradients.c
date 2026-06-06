@@ -3,4 +3,5 @@ build*/
 
 data/
 
+gd_main_*
 __pycache__

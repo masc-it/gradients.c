@@ -2,7 +2,7 @@ ROOT := ../..
 BUILD_DIR := $(ROOT)/build
 LIB := $(BUILD_DIR)/libgradients.a
 METALLIB := $(BUILD_DIR)/gradients.metallib
-BIN := mlp_mnist
+BIN := gd_main_mlp_mnist
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.mnist_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.mnist_gdds.args
@@ -25,8 +25,8 @@ endif
 ifneq ($(MNIST_TEST_LIMIT),)
 DATA_ARGS += --test-limit $(MNIST_TEST_LIMIT)
 endif
-ifneq ($(MNIST_SAMPLES_PER_SHARD),)
-DATA_ARGS += --samples-per-shard $(MNIST_SAMPLES_PER_SHARD)
+ifneq ($(MNIST_MAX_SHARD_BYTES),)
+DATA_ARGS += --max-shard-bytes $(MNIST_MAX_SHARD_BYTES)
 endif
 
 .PHONY: all run build-lib data clean smoke FORCE

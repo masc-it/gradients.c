@@ -37,7 +37,6 @@ def main() -> int:
         args.split,
         FIELDS,
         SAMPLES,
-        samples_per_shard=len(SAMPLES),
     )
     for path in paths:
         print(path)

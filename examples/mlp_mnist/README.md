@@ -43,6 +43,9 @@ To create a smaller local GDDS dataset manually:
 python3 dataset.py --out-dir data --train-limit 4096 --test-limit 1000
 ```
 
+Dataset prep writes shards with dynamic byte-based flushing. Use
+`--max-shard-bytes` to cap shard file size.
+
 `main.c` opens `data` by default; set `GD_MNIST_DATA_DIR=/path/to/gdds`
 or run `make DATA_DIR=/path/to/gdds run` to use another directory.
 

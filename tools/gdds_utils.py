@@ -18,7 +18,9 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 import json
 import math
 import os
+import shutil
 import struct
+import tempfile
 
 GDDS_MAGIC = b"GDDSv1\0\0"
 GDDS_RECORD_MAGIC = b"GDDR"
@@ -31,6 +33,8 @@ GDDS_RECORD_HEADER_SIZE = 20
 GDDS_RECORD_FIELD_DESC_SIZE = 88
 GDDS_MAX_DIMS = 8
 GDDS_MAX_FIELDS = 256
+GDDS_DEFAULT_MAX_SHARD_BYTES = 4 * 1024 * 1024 * 1024
+GDDS_DEFAULT_INDEX_SPOOL_BYTES = 64 * 1024 * 1024
 
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -102,6 +106,16 @@ class TensorData:
     dtype: str
     shape: tuple[int, ...]
     data: bytes
+
+
+@dataclass(frozen=True)
+class GddsShardInfo:
+    """Summary for one completed GDDS shard."""
+
+    path: Path
+    samples: int
+    file_nbytes: int
+    data_nbytes: int
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -584,72 +598,354 @@ def field_metadata(field: FieldSpec) -> dict[str, Any]:
     return item
 
 
+class GddsRecordEncoder:
+    """Reusable GDDS record encoder for one field schema.
+
+    Initialize one encoder per worker/process and call :meth:`encode` for each
+    sample.  Reusing the encoder avoids re-normalizing field metadata in hot
+    preprocessing loops.
+    """
+
+    def __init__(self, fields: Sequence[FieldSpec | Mapping[str, Any]]):
+        self.fields = tuple(_normalize_fields(fields))
+
+    def encode(self, sample: Mapping[str, Any]) -> bytes:
+        return _encode_record(self.fields, sample)
+
+
+def encode_gdds_record(
+    fields: Sequence[FieldSpec | Mapping[str, Any]],
+    sample: Mapping[str, Any],
+) -> bytes:
+    """Encode one sample mapping into GDDS record bytes."""
+
+    return GddsRecordEncoder(fields).encode(sample)
+
+
+def _data_offset_for_schema(schema: bytes) -> int:
+    return align_up(GDDS_HEADER_SIZE + len(schema), 64)
+
+
+def _projected_shard_nbytes(data_offset: int, data_nbytes: int, n_samples: int) -> int:
+    index_offset = align_up(data_offset + data_nbytes, 64)
+    return index_offset + n_samples * GDDS_INDEX_ENTRY_SIZE
+
+
+def gdds_shard_nbytes(
+    fields: Sequence[FieldSpec | Mapping[str, Any]],
+    n_samples: int,
+    data_nbytes: int,
+) -> int:
+    """Return exact GDDS shard file size for data-first shard layout.
+
+    `data_nbytes` is the sum of encoded record byte sizes in the shard.
+    """
+
+    if n_samples < 0 or data_nbytes < 0:
+        raise ValueError("n_samples and data_nbytes must be non-negative")
+    schema = _encode_schema(_normalize_fields(fields))
+    return _projected_shard_nbytes(_data_offset_for_schema(schema), data_nbytes, n_samples)
+
+
+def max_fixed_records_per_shard(
+    fields: Sequence[FieldSpec | Mapping[str, Any]],
+    record_nbytes: int,
+    max_shard_bytes: int,
+) -> int:
+    """Return max fixed-size records that fit in one data-first GDDS shard."""
+
+    if record_nbytes <= 0:
+        raise ValueError("record_nbytes must be positive")
+    if max_shard_bytes <= 0:
+        raise ValueError("max_shard_bytes must be positive")
+    schema = _encode_schema(_normalize_fields(fields))
+    data_offset = _data_offset_for_schema(schema)
+    if _projected_shard_nbytes(data_offset, record_nbytes, 1) > max_shard_bytes:
+        return 0
+    per_record = record_nbytes + GDDS_INDEX_ENTRY_SIZE
+    hi = max(1, (max_shard_bytes - data_offset) // per_record + 2)
+    while _projected_shard_nbytes(data_offset, hi * record_nbytes, hi) <= max_shard_bytes:
+        hi *= 2
+    lo = 0
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _projected_shard_nbytes(data_offset, mid * record_nbytes, mid) <= max_shard_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+class _GddsShardWriter:
+    def __init__(
+        self,
+        path: Path,
+        fields: Sequence[FieldSpec],
+        schema: bytes,
+        schema_hash_value: int,
+        *,
+        index_spool_bytes: int,
+    ) -> None:
+        self.path = path
+        self.tmp_path = path.with_name(path.name + ".tmp")
+        self.fields = fields
+        self.schema = schema
+        self.schema_hash_value = schema_hash_value
+        self.schema_offset = GDDS_HEADER_SIZE
+        self.data_offset = _data_offset_for_schema(schema)
+        self.n_samples = 0
+        self.data_nbytes = 0
+        self.cursor = self.data_offset
+        self._closed = False
+        self._info: GddsShardInfo | None = None
+        self._file = None
+        self._index = None
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self.tmp_path.exists():
+            self.tmp_path.unlink()
+        self._file = self.tmp_path.open("wb+")
+        self._index = tempfile.SpooledTemporaryFile(max_size=index_spool_bytes, mode="w+b")
+        self._file.write(b"\0" * GDDS_HEADER_SIZE)
+        self._file.write(schema)
+        pad = self.data_offset - (GDDS_HEADER_SIZE + len(schema))
+        if pad > 0:
+            self._file.write(b"\0" * pad)
+
+    def can_fit(self, record_nbytes: int, max_shard_bytes: int | None) -> bool:
+        if max_shard_bytes is None:
+            return True
+        projected = _projected_shard_nbytes(
+            self.data_offset,
+            self.data_nbytes + record_nbytes,
+            self.n_samples + 1,
+        )
+        return projected <= max_shard_bytes
+
+    def write_record(self, record: bytes | bytearray | memoryview) -> None:
+        if self._closed or self._file is None or self._index is None:
+            raise ValueError("cannot write to a closed GDDS shard")
+        view = memoryview(record)
+        nbytes = view.nbytes
+        if nbytes < GDDS_RECORD_HEADER_SIZE:
+            raise ValueError("encoded GDDS record is too small")
+        self._index.write(struct.pack("<QQ", self.cursor, nbytes))
+        self._file.write(view)
+        self.cursor += nbytes
+        self.data_nbytes += nbytes
+        self.n_samples += 1
+
+    def finalize(self) -> GddsShardInfo:
+        if self._closed:
+            if self._info is None:
+                raise ValueError("GDDS shard was aborted")
+            return self._info
+        if self._file is None or self._index is None:
+            raise ValueError("GDDS shard is not open")
+        if self.n_samples == 0:
+            self.abort()
+            raise ValueError("cannot write an empty GDDS shard")
+        try:
+            index_offset = align_up(self.cursor, 64)
+            pad = index_offset - self.cursor
+            if pad > 0:
+                self._file.write(b"\0" * pad)
+            self._index.seek(0)
+            shutil.copyfileobj(self._index, self._file, length=1024 * 1024)
+            file_nbytes = index_offset + self.n_samples * GDDS_INDEX_ENTRY_SIZE
+            self._file.seek(0)
+            self._file.write(
+                _build_header(
+                    field_count=len(self.fields),
+                    n_samples=self.n_samples,
+                    schema_offset=self.schema_offset,
+                    index_offset=index_offset,
+                    data_offset=self.data_offset,
+                    data_nbytes=self.data_nbytes,
+                    schema_hash_value=self.schema_hash_value,
+                )
+            )
+            self._file.truncate(file_nbytes)
+            self._file.flush()
+            self._index.close()
+            self._file.close()
+            os.replace(self.tmp_path, self.path)
+            self._closed = True
+            self._info = GddsShardInfo(
+                path=self.path,
+                samples=self.n_samples,
+                file_nbytes=file_nbytes,
+                data_nbytes=self.data_nbytes,
+            )
+            return self._info
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        if self._index is not None:
+            self._index.close()
+            self._index = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+        try:
+            self.tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        self._closed = True
+
+
+class GddsSplitWriter:
+    """Streaming GDDS split writer with exact byte-based shard flushing.
+
+    The writer accepts samples or pre-encoded records one at a time and finalizes
+    a shard before adding a record that would exceed `max_shard_bytes`.
+    """
+
+    def __init__(
+        self,
+        directory: str | Path,
+        split: str,
+        fields: Sequence[FieldSpec | Mapping[str, Any]],
+        *,
+        max_shard_bytes: int | None = GDDS_DEFAULT_MAX_SHARD_BYTES,
+        index_spool_bytes: int = GDDS_DEFAULT_INDEX_SPOOL_BYTES,
+    ) -> None:
+        if not split:
+            raise ValueError("split name cannot be empty")
+        if max_shard_bytes is not None and max_shard_bytes <= 0:
+            raise ValueError("max_shard_bytes must be positive or None")
+        if index_spool_bytes <= 0:
+            raise ValueError("index_spool_bytes must be positive")
+        self.directory = Path(directory)
+        self.split = split
+        self.fields = tuple(_normalize_fields(fields))
+        self.max_shard_bytes = max_shard_bytes
+        self.index_spool_bytes = index_spool_bytes
+        self.encoder = GddsRecordEncoder(self.fields)
+        self.schema = _encode_schema(self.fields)
+        self.schema_hash_value = schema_hash(self.fields)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._current: _GddsShardWriter | None = None
+        self._infos: list[GddsShardInfo] = []
+        self._finished = False
+
+    @property
+    def shard_infos(self) -> list[GddsShardInfo]:
+        return list(self._infos)
+
+    @property
+    def paths(self) -> list[Path]:
+        return [info.path for info in self._infos]
+
+    def __enter__(self) -> "GddsSplitWriter":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.finish()
+        else:
+            self.abort()
+
+    def _start_shard(self) -> None:
+        path = self.directory / f"{self.split}-{len(self._infos):05d}.gdds"
+        self._current = _GddsShardWriter(
+            path,
+            self.fields,
+            self.schema,
+            self.schema_hash_value,
+            index_spool_bytes=self.index_spool_bytes,
+        )
+
+    def _finish_current(self) -> None:
+        if self._current is None:
+            return
+        info = self._current.finalize()
+        self._infos.append(info)
+        self._current = None
+
+    def write_sample(self, sample: Mapping[str, Any]) -> None:
+        self.write_record(self.encoder.encode(sample))
+
+    def write_record(self, record: bytes | bytearray | memoryview) -> None:
+        if self._finished:
+            raise ValueError("cannot write to a finished GDDS split")
+        view = memoryview(record)
+        record_nbytes = view.nbytes
+        if record_nbytes < GDDS_RECORD_HEADER_SIZE:
+            raise ValueError("encoded GDDS record is too small")
+        if self._current is None:
+            self._start_shard()
+        assert self._current is not None
+        if self._current.n_samples > 0 and not self._current.can_fit(record_nbytes, self.max_shard_bytes):
+            self._finish_current()
+            self._start_shard()
+        assert self._current is not None
+        if self._current.n_samples == 0 and not self._current.can_fit(record_nbytes, self.max_shard_bytes):
+            self._current.abort()
+            self._current = None
+            raise ValueError(
+                f"one GDDS record ({record_nbytes} bytes) exceeds max_shard_bytes={self.max_shard_bytes}"
+            )
+        self._current.write_record(view)
+
+    def finish(self) -> list[Path]:
+        if self._finished:
+            return self.paths
+        if self._current is not None:
+            if self._current.n_samples == 0:
+                self._current.abort()
+            else:
+                self._finish_current()
+        self._finished = True
+        return self.paths
+
+    def abort(self) -> None:
+        if self._current is not None:
+            self._current.abort()
+            self._current = None
+        self._finished = True
+
+
 def write_gdds_shard(
     path: str | Path,
     fields: Sequence[FieldSpec | Mapping[str, Any]],
-    samples: Sequence[Mapping[str, Any]],
+    samples: Iterable[Mapping[str, Any]],
+    *,
+    max_shard_bytes: int | None = GDDS_DEFAULT_MAX_SHARD_BYTES,
+    index_spool_bytes: int = GDDS_DEFAULT_INDEX_SPOOL_BYTES,
 ) -> Path:
     """Write one GDDS shard and return its path.
 
-    Records are streamed to disk; memory usage is O(number_of_samples) for the
-    16-byte-per-sample index plus one encoded record at a time.
+    Records are streamed to disk.  Memory usage is bounded by one encoded record
+    plus a spooled 16-byte-per-sample index.
     """
 
-    normalized_fields = _normalize_fields(fields)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    schema = _encode_schema(normalized_fields)
-    n_samples = len(samples)
-    schema_offset = GDDS_HEADER_SIZE
-    index_offset = align_up(schema_offset + len(schema), 64)
-    index_nbytes = n_samples * GDDS_INDEX_ENTRY_SIZE
-    data_offset = align_up(index_offset + index_nbytes, 64)
-    schema_hash_value = schema_hash(normalized_fields)
-    index: list[tuple[int, int]] = []
-    cursor = data_offset
-    with tmp.open("wb+") as f:
-        f.write(b"\0" * GDDS_HEADER_SIZE)
-        f.write(schema)
-        f.write(b"\0" * (index_offset - f.tell()))
-        f.write(b"\0" * index_nbytes)
-        f.write(b"\0" * (data_offset - f.tell()))
+    fields_norm = tuple(_normalize_fields(fields))
+    schema = _encode_schema(fields_norm)
+    writer = _GddsShardWriter(
+        Path(path),
+        fields_norm,
+        schema,
+        schema_hash(fields_norm),
+        index_spool_bytes=index_spool_bytes,
+    )
+    try:
         for sample in samples:
-            record = _encode_record(normalized_fields, sample)
-            index.append((cursor, len(record)))
-            f.write(record)
-            cursor += len(record)
-        data_nbytes = cursor - data_offset
-        f.seek(index_offset)
-        for offset, nbytes in index:
-            f.write(struct.pack("<QQ", offset, nbytes))
-        f.seek(0)
-        f.write(
-            _build_header(
-                field_count=len(normalized_fields),
-                n_samples=n_samples,
-                schema_offset=schema_offset,
-                index_offset=index_offset,
-                data_offset=data_offset,
-                data_nbytes=data_nbytes,
-                schema_hash_value=schema_hash_value,
-            )
-        )
-        f.truncate(cursor)
-        f.flush()
-    os.replace(tmp, path)
-    return path
-
-
-def _chunks(items: Iterable[Mapping[str, Any]], size: int) -> Iterator[list[Mapping[str, Any]]]:
-    chunk: list[Mapping[str, Any]] = []
-    for item in items:
-        chunk.append(item)
-        if len(chunk) >= size:
-            yield chunk
-            chunk = []
-    if chunk:
-        yield chunk
+            record = _encode_record(fields_norm, sample)
+            if not writer.can_fit(len(record), max_shard_bytes):
+                raise ValueError(
+                    f"GDDS shard would exceed max_shard_bytes={max_shard_bytes}; use write_gdds_split"
+                )
+            writer.write_record(record)
+        writer.finalize()
+    except BaseException:
+        writer.abort()
+        raise
+    return Path(path)
 
 
 def write_gdds_split(
@@ -658,40 +954,47 @@ def write_gdds_split(
     fields: Sequence[FieldSpec | Mapping[str, Any]],
     samples: Iterable[Mapping[str, Any]],
     *,
-    samples_per_shard: int = 8192,
+    max_shard_bytes: int | None = GDDS_DEFAULT_MAX_SHARD_BYTES,
     write_manifest: bool = True,
+    index_spool_bytes: int = GDDS_DEFAULT_INDEX_SPOOL_BYTES,
 ) -> list[Path]:
-    """Write a sharded GDDS split named `<split>-00000.gdds`, ..."""
+    """Write a sharded GDDS split named `<split>-00000.gdds`, ...
 
-    if not split:
-        raise ValueError("split name cannot be empty")
-    if samples_per_shard <= 0:
-        raise ValueError("samples_per_shard must be positive")
-    fields_norm = _normalize_fields(fields)
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
-    total = 0
-    for shard_idx, chunk in enumerate(_chunks(samples, samples_per_shard)):
-        path = directory / f"{split}-{shard_idx:05d}.gdds"
-        paths.append(write_gdds_shard(path, fields_norm, chunk))
-        total += len(chunk)
+    Shards are flushed dynamically before adding a record that would exceed
+    `max_shard_bytes`.
+    """
+
+    writer = GddsSplitWriter(
+        directory,
+        split,
+        fields,
+        max_shard_bytes=max_shard_bytes,
+        index_spool_bytes=index_spool_bytes,
+    )
+    try:
+        for sample in samples:
+            writer.write_sample(sample)
+        paths = writer.finish()
+    except BaseException:
+        writer.abort()
+        raise
     if not paths:
         raise ValueError("cannot write an empty GDDS split")
     if write_manifest:
+        fields_norm = writer.fields
         manifest = {
             "format": "GDDS",
             "version": GDDS_VERSION,
-            "schema_hash": f"0x{schema_hash(fields_norm):016x}",
+            "schema_hash": f"0x{writer.schema_hash_value:016x}",
             "fields": [field_metadata(f) for f in fields_norm],
             "splits": {
                 split: {
-                    "samples": total,
+                    "samples": sum(info.samples for info in writer.shard_infos),
                     "shards": [p.name for p in paths],
                 }
             },
         }
-        (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (Path(directory) / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return paths
 
 
@@ -699,9 +1002,22 @@ __all__ = [
     "DTYPE_CODES",
     "DTYPE_NAMES",
     "DTYPE_SIZES",
+    "GDDS_HEADER_SIZE",
+    "GDDS_FIELD_DESC_SIZE",
+    "GDDS_INDEX_ENTRY_SIZE",
+    "GDDS_RECORD_HEADER_SIZE",
+    "GDDS_RECORD_FIELD_DESC_SIZE",
+    "GDDS_DEFAULT_MAX_SHARD_BYTES",
+    "GDDS_DEFAULT_INDEX_SPOOL_BYTES",
     "FieldSpec",
     "field_metadata",
     "TensorData",
+    "GddsRecordEncoder",
+    "GddsShardInfo",
+    "GddsSplitWriter",
+    "encode_gdds_record",
+    "gdds_shard_nbytes",
+    "max_fixed_records_per_shard",
     "pack_values",
     "schema_hash",
     "tensor",

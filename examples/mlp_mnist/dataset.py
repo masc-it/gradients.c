@@ -15,7 +15,18 @@ from urllib.request import urlretrieve
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from gdds_utils import FieldSpec, TensorData, field_metadata, schema_hash, tensor, write_gdds_split  # noqa: E402
+from gdds_utils import (  # noqa: E402
+    GDDS_DEFAULT_MAX_SHARD_BYTES,
+    GDDS_RECORD_FIELD_DESC_SIZE,
+    GDDS_RECORD_HEADER_SIZE,
+    FieldSpec,
+    GddsSplitWriter,
+    TensorData,
+    field_metadata,
+    max_fixed_records_per_shard,
+    schema_hash,
+    tensor,
+)
 
 
 SERVER = "https://raw.githubusercontent.com/fgnt/mnist/master"
@@ -29,6 +40,9 @@ FIELDS = [
     FieldSpec("image", "f16", (IMAGE_PIXELS,), collate="stack"),
     FieldSpec("target", "i32", (), collate="stack"),
 ]
+MNIST_RECORD_NBYTES = (
+    GDDS_RECORD_HEADER_SIZE + 2 * GDDS_RECORD_FIELD_DESC_SIZE + IMAGE_PIXELS * 2 + 4
+)
 
 SPLITS = {
     "train": {
@@ -143,11 +157,14 @@ def remove_split_shards(out_dir: Path, split: str) -> None:
         path.unlink()
 
 
-def expected_shard_samples(n_samples: int, samples_per_shard: int) -> list[int]:
+def expected_shard_samples(n_samples: int, max_shard_bytes: int) -> list[int]:
+    shard_limit = max_fixed_records_per_shard(FIELDS, MNIST_RECORD_NBYTES, max_shard_bytes)
+    if shard_limit <= 0:
+        raise ValueError("MNIST records do not fit in max_shard_bytes")
     counts: list[int] = []
     remaining = n_samples
     while remaining > 0:
-        count = min(samples_per_shard, remaining)
+        count = min(shard_limit, remaining)
         counts.append(count)
         remaining -= count
     return counts
@@ -167,12 +184,16 @@ def read_gdds_header(path: Path) -> tuple[int, str]:
     return n_samples, f"0x{shard_schema_hash:016x}"
 
 
-def existing_gdds_ready(out_dir: Path, limits: Mapping[str, int], samples_per_shard: int) -> bool:
+def existing_gdds_ready(
+    out_dir: Path,
+    limits: Mapping[str, int],
+    max_shard_bytes: int,
+) -> bool:
     expected_schema_hash = f"0x{schema_hash(FIELDS):016x}"
     split_paths: dict[str, list[Path]] = {}
     try:
         for split, n_samples in limits.items():
-            expected_counts = expected_shard_samples(n_samples, samples_per_shard)
+            expected_counts = expected_shard_samples(n_samples, max_shard_bytes)
             expected_names = [f"{split}-{index:05d}.gdds" for index in range(len(expected_counts))]
             actual_paths = split_shards(out_dir, split)
             if [path.name for path in actual_paths] != expected_names:
@@ -185,7 +206,7 @@ def existing_gdds_ready(out_dir: Path, limits: Mapping[str, int], samples_per_sh
     except (OSError, ValueError, struct.error):
         return False
 
-    write_manifest(out_dir, limits, split_paths, samples_per_shard)
+    write_manifest(out_dir, limits, split_paths, max_shard_bytes)
     print(f"Using existing GDDS dataset in {out_dir}")
     return True
 
@@ -194,7 +215,7 @@ def write_manifest(
     out_dir: Path,
     split_counts: Mapping[str, int],
     split_paths: Mapping[str, list[Path]],
-    samples_per_shard: int,
+    max_shard_bytes: int,
 ) -> None:
     manifest = {
         "format": "GDDS",
@@ -213,7 +234,7 @@ def write_manifest(
             for split in split_paths
         },
         "prep": {
-            "samples_per_shard": samples_per_shard,
+            "max_shard_bytes": max_shard_bytes,
             "train_limit": split_counts.get("train", 0),
             "test_limit": split_counts.get("test", 0),
         },
@@ -231,17 +252,40 @@ def positive_limit(value: int, max_value: int, name: str) -> int:
     return value
 
 
+def write_mnist_split(
+    out_dir: Path,
+    split: str,
+    images: bytes,
+    labels: bytes,
+    limit: int,
+    max_shard_bytes: int,
+) -> list[Path]:
+    writer = GddsSplitWriter(
+        out_dir,
+        split,
+        FIELDS,
+        max_shard_bytes=max_shard_bytes,
+    )
+    try:
+        for sample in mnist_samples(images, labels, limit):
+            writer.write_sample(sample)
+        return writer.finish()
+    except BaseException:
+        writer.abort()
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent / "data")
     parser.add_argument("--cache-dir", type=Path, default=None)
-    parser.add_argument("--samples-per-shard", type=int, default=8192)
+    parser.add_argument("--max-shard-bytes", type=int, default=GDDS_DEFAULT_MAX_SHARD_BYTES)
     parser.add_argument("--train-limit", type=int, default=0, help="0 means all 60000 training samples")
     parser.add_argument("--test-limit", type=int, default=0, help="0 means all 10000 test samples")
     args = parser.parse_args()
 
-    if args.samples_per_shard <= 0:
-        raise ValueError("--samples-per-shard must be positive")
+    if args.max_shard_bytes <= 0:
+        raise ValueError("--max-shard-bytes must be positive")
     out_dir = args.out_dir
     cache_dir = args.cache_dir if args.cache_dir is not None else out_dir / "raw"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +294,7 @@ def main() -> int:
         "train": positive_limit(args.train_limit, TRAIN_SAMPLES, "--train-limit"),
         "test": positive_limit(args.test_limit, TEST_SAMPLES, "--test-limit"),
     }
-    if existing_gdds_ready(out_dir, limits, args.samples_per_shard):
+    if existing_gdds_ready(out_dir, limits, args.max_shard_bytes):
         return 0
 
     split_counts: dict[str, int] = {}
@@ -264,20 +308,20 @@ def main() -> int:
         labels = load_labels(label_path, expected)
         remove_split_shards(out_dir, split)
         print(f"Writing {split} GDDS split ({limits[split]} samples)")
-        paths = write_gdds_split(
+        paths = write_mnist_split(
             out_dir,
             split,
-            FIELDS,
-            mnist_samples(images, labels, limits[split]),
-            samples_per_shard=args.samples_per_shard,
-            write_manifest=False,
+            images,
+            labels,
+            limits[split],
+            args.max_shard_bytes,
         )
         split_counts[split] = limits[split]
         split_paths[split] = paths
         for path in paths:
             print(path)
 
-    write_manifest(out_dir, split_counts, split_paths, args.samples_per_shard)
+    write_manifest(out_dir, split_counts, split_paths, args.max_shard_bytes)
     print(out_dir / "manifest.json")
     return 0
 

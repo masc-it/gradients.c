@@ -2,7 +2,7 @@ ROOT := ../..
 BUILD_DIR := $(ROOT)/build
 LIB := $(BUILD_DIR)/libgradients.a
 METALLIB := $(BUILD_DIR)/gradients.metallib
-BIN := mlp_xor
+BIN := gd_main_mlp_xor
 DATASET := data/xor-00000.gdds
 
 CC ?= cc

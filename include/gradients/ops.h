@@ -64,6 +64,25 @@ gd_status gd_linear_transposed_weight_backward(gd_context *ctx,
                                                gd_tensor *grad_w,
                                                gd_tensor *grad_bias);
 
+/* PoWLU gated activation ported from v1:
+ * gate(z, m) = z * sigmoid(z) for z <= 0, otherwise
+ *              z^(m / (sqrt(z) + 1)) * sigmoid(z).
+ * out = x1 * gate(x2, m). m must satisfy 0 < m < 10.
+ * Current v2 implementation is optimized for contiguous F16 tensors. */
+gd_status gd_powlu(gd_context *ctx,
+                   const gd_tensor *x1,
+                   const gd_tensor *x2,
+                   float m,
+                   gd_tensor *out);
+
+gd_status gd_powlu_backward(gd_context *ctx,
+                            const gd_tensor *x1,
+                            const gd_tensor *x2,
+                            const gd_tensor *grad_out,
+                            float m,
+                            gd_tensor *grad_x1,
+                            gd_tensor *grad_x2);
+
 /* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
  * contiguous I32 tensor with rank >= 1. Output is contiguous with shape
  * ids.shape + [dim] and table dtype. Invalid ids produce NaN output values;

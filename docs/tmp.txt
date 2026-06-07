@@ -170,8 +170,25 @@ you can have a look at @examples/mlp_mnist/ to understand how to prep data and t
 
 Be precise and make no mistakes, my manager Filippo is waiting for this and I cannot disappoint
 him.
+
 ---
 
+I want to write a new example showcasing a gpt architecture:
+
+- token embeddings
+- rope
+- lm head tied to text embeddings
+- relu activation fn
+- rope
+- sdpa varlen kernel
+
+as a goal to see loss decreasing and assess batch/s, no generation path yet.
+
+reference file: @examples/mlp_mnist/
+
+I need you to let me know if we have all the pieces needed or not. if not, explain.
+
+---
 I need you to optimize rope as much as possible.both fwd and
 bwd. consider that we're gonna use it to train 12+ layers gpt.
 it must be fast.

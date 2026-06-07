@@ -11,5 +11,6 @@
 #include <gradients/autograd.h>
 #include <gradients/module.h>
 #include <gradients/optimizer.h>
+#include <gradients/tokenizer.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

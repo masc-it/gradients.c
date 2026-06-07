@@ -360,6 +360,21 @@ gd_status gd_backend_huber_backward(gd_backend *backend,
                                     float scale,
                                     float delta);
 
+/* PoWLU gate: out = x1 * gate(x2, m), f16 contiguous tensors. */
+gd_status gd_backend_powlu_forward(gd_backend *backend,
+                                   const gd_backend_tensor_view *x1,
+                                   const gd_backend_tensor_view *x2,
+                                   const gd_backend_tensor_view *out,
+                                   float m);
+/* PoWLU backward: optional grads receive dx1=go*gate(x2,m), dx2=go*x1*dgate(x2,m). */
+gd_status gd_backend_powlu_backward(gd_backend *backend,
+                                    const gd_backend_tensor_view *x1,
+                                    const gd_backend_tensor_view *x2,
+                                    const gd_backend_tensor_view *grad_out,
+                                    const gd_backend_tensor_view *grad_x1,
+                                    const gd_backend_tensor_view *grad_x2,
+                                    float m);
+
 typedef struct gd_backend_rms_norm_args {
     uint64_t rows;              /* Product of all dimensions except the last. */
     uint64_t cols;              /* Last dimension / weight length. */

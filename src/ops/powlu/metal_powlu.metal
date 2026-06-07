@@ -1,0 +1,92 @@
+#include <metal_stdlib>
+#include "metal_powlu_types.h"
+
+using namespace metal;
+
+static inline float gd_powlu_sigmoid_stable(const float x)
+{
+    if (x >= 0.0f) {
+        const float e = exp(-x);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = exp(x);
+    return e / (1.0f + e);
+}
+
+static inline float gd_powlu_positive_pow(const float z, const float exponent)
+{
+    return exp(exponent * log(max(z, 0x1p-126f)));
+}
+
+static inline float gd_powlu_gate(const float z, const float m)
+{
+    const float s = gd_powlu_sigmoid_stable(z);
+    if (z <= 0.0f) {
+        return z * s;
+    }
+    const float r = sqrt(z);
+    const float a = m / (r + 1.0f);
+    return gd_powlu_positive_pow(z, a) * s;
+}
+
+static inline float gd_powlu_gate_grad(const float z, const float m)
+{
+    const float s = gd_powlu_sigmoid_stable(z);
+    if (z <= 0.0f) {
+        return s * (1.0f + z * (1.0f - s));
+    }
+    const float r = sqrt(z);
+    const float rp1 = r + 1.0f;
+    const float a = m / rp1;
+    const float lz = log(max(z, 0x1p-126f));
+    const float g = exp(a * lz);
+    const float da = -m / (2.0f * r * rp1 * rp1);
+    return g * s * (a / z + da * lz + (1.0f - s));
+}
+
+kernel void gd_powlu_forward_f16_kernel(device const uchar *x1buf [[buffer(0)]],
+                                        device const uchar *x2buf [[buffer(1)]],
+                                        device uchar *outbuf [[buffer(2)]],
+                                        constant gd_metal_powlu_fwd_args &args [[buffer(3)]],
+                                        uint gid [[thread_position_in_grid]])
+{
+    const ulong base = ulong(gid) * ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD);
+    if (base >= args.count) {
+        return;
+    }
+    device const half *x1 = reinterpret_cast<device const half *>(x1buf + args.x1_offset);
+    device const half *x2 = reinterpret_cast<device const half *>(x2buf + args.x2_offset);
+    device half *out = reinterpret_cast<device half *>(outbuf + args.out_offset);
+    for (ulong i = base; i < args.count && i < base + ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD); ++i) {
+        out[i] = half(float(x1[i]) * gd_powlu_gate(float(x2[i]), args.m));
+    }
+}
+
+kernel void gd_powlu_backward_f16_kernel(device const uchar *x1buf [[buffer(0)]],
+                                         device const uchar *x2buf [[buffer(1)]],
+                                         device const uchar *gradbuf [[buffer(2)]],
+                                         device uchar *dx1buf [[buffer(3)]],
+                                         device uchar *dx2buf [[buffer(4)]],
+                                         constant gd_metal_powlu_bwd_args &args [[buffer(5)]],
+                                         uint gid [[thread_position_in_grid]])
+{
+    const ulong base = ulong(gid) * ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD);
+    if (base >= args.count) {
+        return;
+    }
+    device const half *x1 = reinterpret_cast<device const half *>(x1buf + args.x1_offset);
+    device const half *x2 = reinterpret_cast<device const half *>(x2buf + args.x2_offset);
+    device const half *grad = reinterpret_cast<device const half *>(gradbuf + args.grad_offset);
+    device half *dx1 = reinterpret_cast<device half *>(dx1buf + args.dx1_offset);
+    device half *dx2 = reinterpret_cast<device half *>(dx2buf + args.dx2_offset);
+    for (ulong i = base; i < args.count && i < base + ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD); ++i) {
+        const float z = float(x2[i]);
+        const float go = float(grad[i]);
+        if (args.write_x1 != 0u) {
+            dx1[i] = half(go * gd_powlu_gate(z, args.m));
+        }
+        if (args.write_x2 != 0u) {
+            dx2[i] = half(go * float(x1[i]) * gd_powlu_gate_grad(z, args.m));
+        }
+    }
+}

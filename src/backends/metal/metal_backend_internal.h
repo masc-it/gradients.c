@@ -80,6 +80,8 @@ struct gd_backend {
     void *huber_forward_f32_pso;
     void *huber_backward_f16_pso;
     void *huber_backward_f32_pso;
+    void *powlu_forward_f16_pso;
+    void *powlu_backward_f16_pso;
     void *embedding_forward_f16_pso;
     void *embedding_forward_f32_pso;
     void *embedding_forward_vec16_f16_pso;

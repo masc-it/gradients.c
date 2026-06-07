@@ -85,6 +85,8 @@ GEMM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_matmul_training_perf_probe
 ELEM_PERF_PROBE := $(PERF_BUILD_DIR)/$(PROBE_DIR)/v2_elementwise_reduce_perf_probe
 GEN_OPS_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gen_ops
 NEW_OP_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gradients-new-op
+TOKENIZE_TOOL := $(BUILD_DIR)/$(TOOLS_DIR)/gradients-tokenize
+TOKENIZER_SRC := $(shell find $(SRC_DIR)/tokenizer -type f -name '*.c' 2>/dev/null | sort) $(SRC_DIR)/core/status.c
 OPS_REGISTRY_STAMP := $(BUILD_DIR)/.ops-registry
 OP_UPPER = $(shell printf '%s' '$(OP)' | tr '[:lower:]' '[:upper:]')
 
@@ -93,7 +95,7 @@ OP_UPPER = $(shell printf '%s' '$(OP)' | tr '[:lower:]' '[:upper:]')
 help:
 	@printf '%s\n' 'gradients.c v2 commands:'
 	@printf '%s\n' '  make build             build static library'
-	@printf '%s\n' '  make tools             build op registry/scaffold tools'
+	@printf '%s\n' '  make tools             build op registry/scaffold/tokenizer tools'
 	@printf '%s\n' '  make test              build + run C tests'
 	@printf '%s\n' '  make check             docs-check + tests + foundation probe'
 	@printf '%s\n' '  make probes            run standalone foundation probe'
@@ -110,8 +112,8 @@ all: check
 build: ops-registry $(LIB) $(METAL_BUILD_ARTIFACTS)
 	@printf '[build] %s\n' '$(LIB)'
 
-tools: $(GEN_OPS_TOOL) $(NEW_OP_TOOL)
-	@printf '[tools] %s %s\n' '$(GEN_OPS_TOOL)' '$(NEW_OP_TOOL)'
+tools: $(GEN_OPS_TOOL) $(NEW_OP_TOOL) $(TOKENIZE_TOOL)
+	@printf '[tools] %s %s %s\n' '$(GEN_OPS_TOOL)' '$(NEW_OP_TOOL)' '$(TOKENIZE_TOOL)'
 
 ops-registry: $(OPS_REGISTRY_STAMP)
 
@@ -243,6 +245,10 @@ $(GEN_OPS_TOOL): $(TOOLS_DIR)/gen_ops.c $(CONFIG_STAMP)
 $(NEW_OP_TOOL): $(TOOLS_DIR)/gradients-new-op.c $(CONFIG_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(TOOL_CFLAGS) $< -o $@
+
+$(TOKENIZE_TOOL): $(TOOLS_DIR)/gradients-tokenize.c $(TOKENIZER_SRC) include/gradients/tokenizer.h include/gradients/status.h $(CONFIG_STAMP)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(TOOL_CFLAGS) $< $(TOKENIZER_SRC) -o $@
 
 $(BUILD_DIR)/%.o: %.c $(CONFIG_STAMP) | ops-registry
 	@mkdir -p $(@D)

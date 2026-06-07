@@ -173,12 +173,21 @@ him.
 
 ---
 
-I want to write a new example showcasing a gpt architecture:
+sounds good. Now I need you to create a new examples/gpt_lm/dataset.py that will both use the tokenizer (2048 vocab size) and gdds utils to build a packed dataset. using promessi sposi txt.
+
+saves the output in data subfolder under it.
+
+write high quality and performant code. at the end, show me 10 random samples, decoded. (so we are sure it's all good)
+
+good work.
+
+---
+
+I want to write a new example showcasing a gpt architecture under `examples/gpt_lm/` :
 
 - token embeddings
-- rope
 - lm head tied to text embeddings
-- relu activation fn
+- powlu activation fn
 - rope
 - sdpa varlen kernel
 

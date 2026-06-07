@@ -412,7 +412,7 @@ static gd_memory_config gpt_memory_config(const gpt_config *config)
                                                  (size_t)GPT_VOCAB_SIZE * gd_dtype_size(GD_DTYPE_F16),
                                                  "logit activation bytes");
     const size_t activation_scratch = checked_mul_size(hidden_bytes,
-                                                       (size_t)(64 + 96 * config->n_layers),
+                                                       (size_t)(96 + 20 * config->n_layers),
                                                        "activation scratch estimate");
     const size_t logits_scratch = checked_mul_size(logits_bytes,
                                                    8U,

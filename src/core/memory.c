@@ -15,6 +15,12 @@
 #define GD_MAX_PENDING_FENCES 1024U
 #define GD_MAX_SUBALLOC_ALIGNMENT 4096U
 #define GD_DEFAULT_ALIGNMENT 256U
+#define GD_ARENA_MAX_FREE_BLOCKS 16384U
+
+typedef struct gd_free_block {
+    size_t offset;
+    size_t nbytes;
+} gd_free_block;
 
 typedef struct gd_arena {
     gd_arena_kind kind;
@@ -26,6 +32,9 @@ typedef struct gd_arena {
     size_t watermark;
     size_t default_alignment;
     uint64_t generation;
+    gd_free_block *free_blocks;
+    uint32_t free_count;
+    uint32_t free_capacity;
     bool sealed;
 } gd_arena;
 
@@ -235,6 +244,16 @@ static gd_status gd_arena_init(gd_backend *backend,
     arena->capacity = capacity;
     arena->default_alignment = default_alignment;
     arena->generation = 1U;
+    if (kind == GD_ARENA_SCRATCH) {
+        arena->free_blocks = (gd_free_block *)gd_heap_alloc(GD_ARENA_MAX_FREE_BLOCKS *
+                                                            sizeof(arena->free_blocks[0]));
+        if (arena->free_blocks == NULL) {
+            gd_backend_buffer_destroy(arena->buffer);
+            memset(arena, 0, sizeof(*arena));
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        arena->free_capacity = GD_ARENA_MAX_FREE_BLOCKS;
+    }
     return GD_OK;
 }
 
@@ -244,16 +263,162 @@ static void gd_arena_destroy(gd_arena *arena)
         return;
     }
     gd_backend_buffer_destroy(arena->buffer);
+    free(arena->free_blocks);
     memset(arena, 0, sizeof(*arena));
 }
 
 static void gd_arena_reset(gd_arena *arena)
 {
     arena->offset = 0U;
+    arena->free_count = 0U;
     arena->generation += 1U;
     if (arena->generation == 0U) {
         arena->generation = 1U;
     }
+}
+
+static void gd_arena_remove_free_block(gd_arena *arena, uint32_t index)
+{
+    if (arena == NULL || index >= arena->free_count) {
+        return;
+    }
+    if (index + 1U < arena->free_count) {
+        memmove(&arena->free_blocks[index],
+                &arena->free_blocks[index + 1U],
+                (size_t)(arena->free_count - index - 1U) * sizeof(arena->free_blocks[0]));
+    }
+    arena->free_count -= 1U;
+}
+
+static gd_status gd_arena_alloc_from_free(gd_arena *arena,
+                                          size_t nbytes,
+                                          size_t alignment,
+                                          size_t *out_offset)
+{
+    uint32_t i;
+    uint32_t best = UINT32_MAX;
+    size_t best_waste = SIZE_MAX;
+    size_t best_aligned = 0U;
+    if (arena == NULL || out_offset == NULL || arena->free_count == 0U) {
+        return GD_ERR_BAD_STATE;
+    }
+    for (i = 0U; i < arena->free_count; ++i) {
+        const gd_free_block *block = &arena->free_blocks[i];
+        size_t aligned;
+        size_t padding;
+        size_t usable;
+        size_t waste;
+        if (!gd_align_up_size(block->offset, alignment, &aligned) || aligned < block->offset) {
+            continue;
+        }
+        padding = aligned - block->offset;
+        if (padding > block->nbytes) {
+            continue;
+        }
+        usable = block->nbytes - padding;
+        if (nbytes > usable) {
+            continue;
+        }
+        waste = usable - nbytes;
+        if (waste < best_waste) {
+            best = i;
+            best_waste = waste;
+            best_aligned = aligned;
+            if (waste == 0U) {
+                break;
+            }
+        }
+    }
+    if (best == UINT32_MAX) {
+        return GD_ERR_BAD_STATE;
+    }
+    {
+        gd_free_block *block = &arena->free_blocks[best];
+        const size_t block_start = block->offset;
+        const size_t block_end = block->offset + block->nbytes;
+        const size_t alloc_end = best_aligned + nbytes;
+        const size_t prefix = best_aligned - block_start;
+        const size_t suffix = block_end - alloc_end;
+        if (prefix != 0U && suffix != 0U) {
+            block->nbytes = prefix;
+            if (arena->free_count < arena->free_capacity) {
+                if (best + 1U < arena->free_count) {
+                    memmove(&arena->free_blocks[best + 2U],
+                            &arena->free_blocks[best + 1U],
+                            (size_t)(arena->free_count - best - 1U) * sizeof(arena->free_blocks[0]));
+                }
+                arena->free_blocks[best + 1U].offset = alloc_end;
+                arena->free_blocks[best + 1U].nbytes = suffix;
+                arena->free_count += 1U;
+            }
+        } else if (prefix != 0U) {
+            block->nbytes = prefix;
+        } else if (suffix != 0U) {
+            block->offset = alloc_end;
+            block->nbytes = suffix;
+        } else {
+            gd_arena_remove_free_block(arena, best);
+        }
+    }
+    *out_offset = best_aligned;
+    return GD_OK;
+}
+
+static gd_status gd_arena_free(gd_context *ctx, gd_arena *arena, const gd_span *span)
+{
+    uint32_t index;
+    size_t start;
+    size_t end;
+    if (ctx == NULL || arena == NULL || span == NULL || span->nbytes == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (arena->free_blocks == NULL || arena->free_capacity == 0U) {
+        return gd_set_error(ctx, GD_ERR_UNSUPPORTED, "arena does not support suballocation free");
+    }
+    if (span->offset > arena->capacity || span->nbytes > arena->capacity - span->offset) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "free span outside arena");
+    }
+    start = span->offset;
+    end = span->offset + span->nbytes;
+    for (index = 0U; index < arena->free_count && arena->free_blocks[index].offset < start; ++index) {
+    }
+    if (index > 0U) {
+        const gd_free_block *prev = &arena->free_blocks[index - 1U];
+        if (prev->offset + prev->nbytes > start) {
+            return gd_set_error(ctx, GD_ERR_BAD_STATE, "double free or overlapping free span");
+        }
+    }
+    if (index < arena->free_count && end > arena->free_blocks[index].offset) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "double free or overlapping free span");
+    }
+    {
+        const bool merge_prev = index > 0U &&
+                                arena->free_blocks[index - 1U].offset +
+                                        arena->free_blocks[index - 1U].nbytes == start;
+        const bool merge_next = index < arena->free_count && end == arena->free_blocks[index].offset;
+        if (merge_prev && merge_next) {
+            arena->free_blocks[index - 1U].nbytes += span->nbytes + arena->free_blocks[index].nbytes;
+            gd_arena_remove_free_block(arena, index);
+        } else if (merge_prev) {
+            arena->free_blocks[index - 1U].nbytes += span->nbytes;
+        } else if (merge_next) {
+            arena->free_blocks[index].offset = start;
+            arena->free_blocks[index].nbytes += span->nbytes;
+        } else {
+            if (arena->free_count >= arena->free_capacity) {
+                return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "arena free block table full");
+            }
+            if (index < arena->free_count) {
+                memmove(&arena->free_blocks[index + 1U],
+                        &arena->free_blocks[index],
+                        (size_t)(arena->free_count - index) * sizeof(arena->free_blocks[0]));
+            }
+            arena->free_blocks[index].offset = start;
+            arena->free_blocks[index].nbytes = span->nbytes;
+            arena->free_count += 1U;
+        }
+    }
+    return GD_OK;
 }
 
 static gd_status gd_arena_alloc(gd_context *ctx,
@@ -276,6 +441,18 @@ static gd_status gd_arena_alloc(gd_context *ctx,
     alignment = gd_normalize_alignment(arena, alignment);
     if (!gd_is_power_of_two(alignment) || alignment > GD_MAX_SUBALLOC_ALIGNMENT) {
         return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "arena allocation invalid alignment");
+    }
+    if (arena->free_count != 0U &&
+        gd_arena_alloc_from_free(arena, nbytes, alignment, &off) == GD_OK) {
+        out->arena = arena->kind;
+        out->slot = arena->slot;
+        out->offset = off;
+        out->nbytes = nbytes;
+        out->alignment = alignment;
+        out->generation = arena->generation;
+        out->buffer = arena->buffer;
+        out->host_ptr = arena->base + off;
+        return GD_OK;
     }
     if (!gd_align_up_size(arena->offset, alignment, &off)) {
         return gd_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "arena offset overflow");
@@ -618,6 +795,25 @@ gd_status gd_context_validate_span(gd_context *ctx, const gd_span *span, const c
                             message != NULL ? message : "span is stale");
     }
     return GD_OK;
+}
+
+gd_status gd_context_free_span(gd_context *ctx, const gd_span *span)
+{
+    gd_arena *arena;
+    if (ctx == NULL || span == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (span->arena != GD_ARENA_SCRATCH) {
+        return GD_OK;
+    }
+    if (!gd_context_span_is_live(ctx, span)) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "free span is stale");
+    }
+    if (span->slot < 0 || (uint32_t)span->slot >= ctx->scratch.n_slots) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "invalid scratch free slot");
+    }
+    arena = &ctx->scratch.slots[(uint32_t)span->slot];
+    return gd_arena_free(ctx, arena, span);
 }
 
 gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span)

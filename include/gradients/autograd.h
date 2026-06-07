@@ -30,8 +30,10 @@ gd_status gd_backward_many(gd_context *ctx,
                            const gd_tensor *const *outputs,
                            const gd_tensor *const *grad_outputs);
 
-/* Returns the accumulated gradient descriptor for tensor. The returned tensor
-   aliases internal scratch storage; copy/read it before the next gd_begin_step(). */
+/* Returns the accumulated gradient descriptor for tensor. Parameter/leaf grads
+   are retained until the next gd_begin_step(); intermediate output grads may be
+   released during backward once consumed to keep training memory bounded. The
+   returned tensor aliases internal scratch storage. */
 gd_status gd_tensor_grad(gd_context *ctx,
                          const gd_tensor *tensor,
                          gd_tensor *out_grad);

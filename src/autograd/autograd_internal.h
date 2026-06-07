@@ -36,6 +36,11 @@ typedef struct gd_grad_slot {
     bool occupied;
 } gd_grad_slot;
 
+typedef struct gd_live_span_slot {
+    gd_span span;
+    uint32_t refs;
+} gd_live_span_slot;
+
 struct gd_autograd_state {
     bool recording;
     bool user_enabled;
@@ -51,6 +56,9 @@ struct gd_autograd_state {
     gd_grad_slot *grads;
     uint32_t n_grads;
     uint32_t cap_grads;
+    gd_live_span_slot *live_spans;
+    uint32_t n_live_spans;
+    uint32_t cap_live_spans;
 };
 
 typedef struct gd_bwd_ctx {

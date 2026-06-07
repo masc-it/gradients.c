@@ -22,6 +22,7 @@ static void gd_autograd_reset(gd_autograd_state *state)
     state->n_refs = 0U;
     state->attrs_used = 0U;
     state->n_grads = 0U;
+    state->n_live_spans = 0U;
 }
 
 static void *gd_autograd_calloc(size_t count, size_t size)
@@ -47,7 +48,10 @@ gd_status gd_autograd_state_create(gd_context *ctx, gd_autograd_state **out_stat
     state->refs = (gd_tape_ref *)gd_autograd_calloc(GD_AUTOGRAD_MAX_REFS, sizeof(*state->refs));
     state->attrs = (unsigned char *)gd_autograd_calloc(GD_AUTOGRAD_MAX_ATTR_BYTES, sizeof(*state->attrs));
     state->grads = (gd_grad_slot *)gd_autograd_calloc(GD_AUTOGRAD_MAX_GRADS, sizeof(*state->grads));
-    if (state->nodes == NULL || state->refs == NULL || state->attrs == NULL || state->grads == NULL) {
+    state->live_spans = (gd_live_span_slot *)gd_autograd_calloc(GD_AUTOGRAD_MAX_REFS,
+                                                                sizeof(*state->live_spans));
+    if (state->nodes == NULL || state->refs == NULL || state->attrs == NULL ||
+        state->grads == NULL || state->live_spans == NULL) {
         gd_autograd_state_destroy(state);
         return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "autograd tape allocation failed");
     }
@@ -55,6 +59,7 @@ gd_status gd_autograd_state_create(gd_context *ctx, gd_autograd_state **out_stat
     state->cap_refs = GD_AUTOGRAD_MAX_REFS;
     state->attrs_cap = GD_AUTOGRAD_MAX_ATTR_BYTES;
     state->cap_grads = GD_AUTOGRAD_MAX_GRADS;
+    state->cap_live_spans = GD_AUTOGRAD_MAX_REFS;
     state->user_enabled = true;
     state->recording = false;
     *out_state = state;
@@ -70,6 +75,7 @@ void gd_autograd_state_destroy(gd_autograd_state *state)
     free(state->refs);
     free(state->attrs);
     free(state->grads);
+    free(state->live_spans);
     memset(state, 0, sizeof(*state));
     free(state);
 }
@@ -278,6 +284,180 @@ static const gd_grad_slot *gd_find_grad_slot_const(const gd_autograd_state *stat
     return NULL;
 }
 
+static bool gd_spans_same_allocation(const gd_span *a, const gd_span *b)
+{
+    return a != NULL && b != NULL && a->arena == b->arena && a->slot == b->slot &&
+           a->offset == b->offset && a->nbytes == b->nbytes &&
+           a->generation == b->generation && a->buffer == b->buffer;
+}
+
+static bool gd_tensor_has_releasable_scratch_storage(const gd_tensor *tensor)
+{
+    return tensor != NULL && tensor->storage.arena == GD_ARENA_SCRATCH &&
+           tensor->storage.buffer != NULL && tensor->storage.nbytes != 0U;
+}
+
+static int32_t gd_live_span_find(const gd_autograd_state *state, const gd_span *span)
+{
+    uint32_t i;
+    if (state == NULL || span == NULL) {
+        return -1;
+    }
+    for (i = 0U; i < state->n_live_spans; ++i) {
+        if (gd_spans_same_allocation(&state->live_spans[i].span, span)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static gd_status gd_live_span_add_ref(gd_autograd_state *state, const gd_tensor *tensor)
+{
+    int32_t index;
+    gd_live_span_slot *slot;
+    if (state == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_tensor_has_releasable_scratch_storage(tensor)) {
+        return GD_OK;
+    }
+    index = gd_live_span_find(state, &tensor->storage);
+    if (index >= 0) {
+        slot = &state->live_spans[(uint32_t)index];
+        if (slot->refs == UINT32_MAX) {
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        slot->refs += 1U;
+        return GD_OK;
+    }
+    if (state->n_live_spans >= state->cap_live_spans) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    slot = &state->live_spans[state->n_live_spans];
+    memset(slot, 0, sizeof(*slot));
+    slot->span = tensor->storage;
+    slot->refs = 1U;
+    state->n_live_spans += 1U;
+    return GD_OK;
+}
+
+static gd_status gd_autograd_build_live_spans(gd_autograd_state *state)
+{
+    uint32_t i;
+    gd_status st;
+    if (state == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    state->n_live_spans = 0U;
+    for (i = 0U; i < state->n_refs; ++i) {
+        st = gd_live_span_add_ref(state, &state->refs[i].tensor);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
+static bool gd_backward_seed_output(const gd_tensor *const *outputs,
+                                    uint32_t n_outputs,
+                                    uint64_t tensor_id)
+{
+    uint32_t i;
+    if (outputs == NULL || tensor_id == 0U) {
+        return false;
+    }
+    for (i = 0U; i < n_outputs; ++i) {
+        if (outputs[i] != NULL && outputs[i]->id == tensor_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static gd_status gd_live_span_release_ref(gd_context *ctx,
+                                          gd_autograd_state *state,
+                                          const gd_tensor *tensor,
+                                          const gd_tensor *const *seed_outputs,
+                                          uint32_t n_seed_outputs)
+{
+    int32_t index;
+    gd_live_span_slot *slot;
+    if (ctx == NULL || state == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_tensor_has_releasable_scratch_storage(tensor) ||
+        gd_backward_seed_output(seed_outputs, n_seed_outputs, tensor->id)) {
+        return GD_OK;
+    }
+    index = gd_live_span_find(state, &tensor->storage);
+    if (index < 0) {
+        return GD_OK;
+    }
+    slot = &state->live_spans[(uint32_t)index];
+    if (slot->refs == 0U) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "autograd live span underflow");
+    }
+    slot->refs -= 1U;
+    if (slot->refs == 0U) {
+        return gd_context_free_span(ctx, &slot->span);
+    }
+    return GD_OK;
+}
+
+static bool gd_live_span_storage_active(const gd_autograd_state *state, const gd_span *span)
+{
+    int32_t index = gd_live_span_find(state, span);
+    return index >= 0 && state->live_spans[(uint32_t)index].refs != 0U;
+}
+
+static bool gd_grad_storage_active(const gd_autograd_state *state, const gd_span *span)
+{
+    uint32_t i;
+    if (state == NULL || span == NULL) {
+        return false;
+    }
+    for (i = 0U; i < state->n_grads; ++i) {
+        if (state->grads[i].occupied &&
+            gd_spans_same_allocation(&state->grads[i].grad.storage, span)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static gd_status gd_autograd_release_temporary_contrib(gd_bwd_ctx *bwd, const gd_tensor *contrib)
+{
+    if (bwd == NULL || bwd->ctx == NULL || bwd->tape == NULL || contrib == NULL ||
+        !gd_tensor_has_releasable_scratch_storage(contrib)) {
+        return GD_OK;
+    }
+    if (gd_live_span_storage_active(bwd->tape, &contrib->storage) ||
+        gd_grad_storage_active(bwd->tape, &contrib->storage)) {
+        return GD_OK;
+    }
+    return gd_context_free_span(bwd->ctx, &contrib->storage);
+}
+
+static gd_status gd_release_grad_slot(gd_bwd_ctx *bwd, uint64_t tensor_id)
+{
+    gd_grad_slot *slot;
+    if (bwd == NULL || bwd->ctx == NULL || bwd->tape == NULL || tensor_id == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    slot = gd_find_grad_slot(bwd->tape, tensor_id);
+    if (slot == NULL) {
+        return GD_OK;
+    }
+    if (gd_tensor_has_releasable_scratch_storage(&slot->grad)) {
+        gd_status st = gd_context_free_span(bwd->ctx, &slot->grad.storage);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    memset(slot, 0, sizeof(*slot));
+    return GD_OK;
+}
+
 static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
                                      uint64_t tensor_id,
                                      const gd_tensor *like,
@@ -288,10 +468,23 @@ static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
     if (bwd == NULL || bwd->tape == NULL || like == NULL || out_slot == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (bwd->tape->n_grads >= bwd->tape->cap_grads) {
-        return gd_context_set_error(bwd->ctx, GD_ERR_OUT_OF_MEMORY, "autograd grad capacity exceeded");
+    {
+        uint32_t i;
+        slot = NULL;
+        for (i = 0U; i < bwd->tape->n_grads; ++i) {
+            if (!bwd->tape->grads[i].occupied) {
+                slot = &bwd->tape->grads[i];
+                break;
+            }
+        }
     }
-    slot = &bwd->tape->grads[bwd->tape->n_grads];
+    if (slot == NULL) {
+        if (bwd->tape->n_grads >= bwd->tape->cap_grads) {
+            return gd_context_set_error(bwd->ctx, GD_ERR_OUT_OF_MEMORY, "autograd grad capacity exceeded");
+        }
+        slot = &bwd->tape->grads[bwd->tape->n_grads];
+        bwd->tape->n_grads += 1U;
+    }
     memset(slot, 0, sizeof(*slot));
     st = gd_tensor_zeros(bwd->ctx, GD_ARENA_SCRATCH, like->dtype, gd_shape_make(like->rank, like->shape), GD_AUTOGRAD_GRAD_ALIGNMENT, &slot->grad);
     if (st != GD_OK) {
@@ -301,7 +494,6 @@ static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
     slot->grad.is_leaf = false;
     slot->tensor_id = tensor_id;
     slot->occupied = true;
-    bwd->tape->n_grads += 1U;
     *out_slot = slot;
     return GD_OK;
 }
@@ -445,6 +637,70 @@ static bool gd_node_has_output_grad(gd_autograd_state *state, const gd_tape_node
     return false;
 }
 
+static gd_status gd_release_node_output_grads(gd_bwd_ctx *bwd, const gd_tape_node *node)
+{
+    uint16_t i;
+    gd_status st;
+    if (bwd == NULL || bwd->tape == NULL || node == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < node->n_outputs; ++i) {
+        const gd_tensor *out = gd_tape_output(bwd->tape, node, i);
+        if (out == NULL) {
+            return GD_ERR_INTERNAL;
+        }
+        st = gd_release_grad_slot(bwd, out->id);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_release_node_forward_refs(gd_context *ctx,
+                                              gd_autograd_state *state,
+                                              const gd_tape_node *node,
+                                              const gd_tensor *const *seed_outputs,
+                                              uint32_t n_seed_outputs)
+{
+    uint16_t i;
+    gd_status st;
+    if (ctx == NULL || state == NULL || node == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < node->n_inputs; ++i) {
+        const gd_tensor *tensor = gd_tape_input(state, node, i);
+        if (tensor == NULL) {
+            return GD_ERR_INTERNAL;
+        }
+        st = gd_live_span_release_ref(ctx, state, tensor, seed_outputs, n_seed_outputs);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    for (i = 0U; i < node->n_outputs; ++i) {
+        const gd_tensor *tensor = gd_tape_output(state, node, i);
+        if (tensor == NULL) {
+            return GD_ERR_INTERNAL;
+        }
+        st = gd_live_span_release_ref(ctx, state, tensor, seed_outputs, n_seed_outputs);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    for (i = 0U; i < node->n_saved; ++i) {
+        const gd_tensor *tensor = gd_tape_saved(state, node, i);
+        if (tensor == NULL) {
+            return GD_ERR_INTERNAL;
+        }
+        st = gd_live_span_release_ref(ctx, state, tensor, seed_outputs, n_seed_outputs);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
 bool gd_autograd_get_grad(gd_bwd_ctx *bwd, uint64_t tensor_id, gd_tensor *out_grad)
 {
     gd_grad_slot *slot;
@@ -481,7 +737,11 @@ gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
             return st;
         }
     }
-    return gd_backend_accumulate_tensor(bwd->ctx, &slot->grad, contrib);
+    st = gd_backend_accumulate_tensor(bwd->ctx, &slot->grad, contrib);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_autograd_release_temporary_contrib(bwd, contrib);
 }
 
 static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
@@ -557,6 +817,12 @@ static gd_status gd_backward_many_impl(gd_context *ctx,
     bwd.ctx = ctx;
     bwd.tape = state;
 
+    st = gd_autograd_build_live_spans(state);
+    if (st != GD_OK) {
+        st = gd_context_set_error(ctx, st, "failed to build autograd live span table");
+        goto done;
+    }
+
     for (i = 0U; i < n_outputs; ++i) {
         const gd_tensor *grad = grad_outputs != NULL ? grad_outputs[i] : NULL;
         st = gd_seed_output_grad(&bwd, outputs[i], grad, scale);
@@ -569,6 +835,10 @@ static gd_status gd_backward_many_impl(gd_context *ctx,
         const gd_tape_node *node = &state->nodes[i - 1U];
         const gd_autograd_rule *rule;
         if (!gd_node_has_output_grad(state, node)) {
+            st = gd_release_node_forward_refs(ctx, state, node, outputs, n_outputs);
+            if (st != GD_OK) {
+                goto done;
+            }
             continue;
         }
         rule = gd_autograd_rule_for(node->op);
@@ -577,6 +847,14 @@ static gd_status gd_backward_many_impl(gd_context *ctx,
             goto done;
         }
         st = rule->backward(&bwd, node);
+        if (st != GD_OK) {
+            goto done;
+        }
+        st = gd_release_node_output_grads(&bwd, node);
+        if (st != GD_OK) {
+            goto done;
+        }
+        st = gd_release_node_forward_refs(ctx, state, node, outputs, n_outputs);
         if (st != GD_OK) {
             goto done;
         }

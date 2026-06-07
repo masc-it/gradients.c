@@ -60,6 +60,8 @@ gd_status gd_context_alloc_span(gd_context *ctx,
                                 size_t alignment,
                                 gd_span *out);
 
+gd_status gd_context_free_span(gd_context *ctx, const gd_span *span);
+
 bool gd_context_span_is_live(const gd_context *ctx, const gd_span *span);
 
 gd_status gd_context_validate_span(gd_context *ctx,

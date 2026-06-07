@@ -6,8 +6,8 @@
 #include <string.h>
 
 #define GD_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
-#define GD_METAL_MPS_MATMUL_MIN_FLOPS 500000000ULL
-#define GD_METAL_MPS_MATMUL_NN_MIN_FLOPS 500000000ULL
+#define GD_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
+#define GD_METAL_MPS_MATMUL_NN_MIN_FLOPS 64000000ULL
 #define GD_METAL_MPS_BATCH_MATMUL_MIN_FLOPS 100000000ULL
 #define GD_METAL_MPS_BATCH_NN_MATMUL_MIN_FLOPS 100000000ULL
 
@@ -361,7 +361,7 @@ static id gd_metal_mps_batched_ndarray(const gd_backend_batched_matrix_view *vie
     }
     [desc setPreferPackedRows:YES];
     if (transpose) {
-        [desc transposeDimension:0 withDimension:1];
+        [desc transposeDimension:2 withDimension:3];
     }
     buffer = (__bridge id<MTLBuffer>)view->buffer->buffer;
     return [[array_class alloc] initWithBuffer:buffer offset:(NSUInteger)view->offset descriptor:desc];

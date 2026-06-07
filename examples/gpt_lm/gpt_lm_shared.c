@@ -82,18 +82,6 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
     const size_t token_field_bytes = checked_mul_size(tokens_per_batch,
                                                       gd_dtype_size(GD_DTYPE_I32),
                                                       "packed token field bytes");
-    const size_t hidden_bytes = checked_mul_size(tokens_per_batch,
-                                                 (size_t)GPT_D_MODEL * gd_dtype_size(GD_DTYPE_F16),
-                                                 "hidden activation bytes");
-    const size_t logits_bytes = checked_mul_size(tokens_per_batch,
-                                                 (size_t)GPT_VOCAB_SIZE * gd_dtype_size(GD_DTYPE_F16),
-                                                 "logit activation bytes");
-    const size_t activation_scratch = checked_mul_size(hidden_bytes,
-                                                       (size_t)(96 + 20 * config->n_layers),
-                                                       "activation scratch estimate");
-    const size_t logits_scratch = checked_mul_size(logits_bytes,
-                                                   8U,
-                                                   "logits scratch estimate");
     gd_memory_config mem = gd_memory_config_default();
     mem.params_bytes = size_max2((size_t)GPT_MIN_PARAMS_BYTES,
                                  checked_add_size(param_bytes,
@@ -103,13 +91,7 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
                                 checked_add_size(adam_bytes,
                                                  32U * 1024U * 1024U,
                                                  "state arena bytes"));
-    mem.scratch_slot_bytes = size_max2(
-        (size_t)GPT_MIN_SCRATCH_SLOT_BYTES,
-        checked_add_size(checked_add_size(activation_scratch,
-                                          logits_scratch,
-                                          "scratch arena bytes"),
-                         (size_t)GPT_SCRATCH_RESERVE_BYTES,
-                         "scratch arena bytes"));
+    mem.scratch_slot_bytes = (size_t)GPT_SCRATCH_SLOT_BYTES;
     mem.data_slot_bytes = size_max2(
         (size_t)GPT_MIN_DATA_SLOT_BYTES,
         checked_add_size(checked_mul_size(token_field_bytes,

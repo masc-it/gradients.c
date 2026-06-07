@@ -374,6 +374,92 @@ static void test_attention_backward_skinny(gd_context *ctx)
     CHECK_OK(gd_end_step(ctx));
 }
 
+static void test_attention_backward_mps_batch2(gd_context *ctx)
+{
+    enum { B = 4, H = 4, T = 224, D = 64 };
+    const int64_t x_shape[4] = {B, H, T, D};
+    const int64_t w_shape[4] = {B, H, D, T};
+    const int64_t g_shape[4] = {B, H, T, T};
+    const size_t x_count = (size_t)B * H * T * D;
+    const size_t w_count = (size_t)B * H * D * T;
+    const size_t g_count = (size_t)B * H * T * T;
+    uint16_t *x_data = (uint16_t *)malloc(x_count * sizeof(*x_data));
+    uint16_t *w_data = (uint16_t *)malloc(w_count * sizeof(*w_data));
+    uint16_t *g_data = (uint16_t *)malloc(g_count * sizeof(*g_data));
+    uint16_t *dx_got = (uint16_t *)malloc(x_count * sizeof(*dx_got));
+    uint16_t *dw_got = (uint16_t *)malloc(w_count * sizeof(*dw_got));
+    gd_tensor x;
+    gd_tensor w;
+    gd_tensor g;
+    gd_tensor dx;
+    gd_tensor dw;
+    uint32_t b;
+    uint32_t h;
+    uint32_t t;
+    uint32_t d;
+    uint32_t s;
+    CHECK(x_data != NULL && w_data != NULL && g_data != NULL && dx_got != NULL && dw_got != NULL,
+          "attention mps batch2 allocation");
+    fill_pattern(x_data, x_count, 0.0025f, -0.008f);
+    fill_pattern(w_data, w_count, -0.002f, 0.012f);
+    fill_pattern(g_data, g_count, 0.0015f, 0.004f);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(4U, x_shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(4U, w_shape), 256U, &w));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(4U, g_shape), 256U, &g));
+    CHECK_OK(gd_tensor_write(ctx, &x, x_data, x_count * sizeof(*x_data)));
+    CHECK_OK(gd_tensor_write(ctx, &w, w_data, w_count * sizeof(*w_data)));
+    CHECK_OK(gd_tensor_write(ctx, &g, g_data, g_count * sizeof(*g_data)));
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_matmul_backward(ctx, &x, &w, &g, &dx, &dw));
+    CHECK(dx.rank == 4U && dx.shape[0] == B && dx.shape[1] == H && dx.shape[2] == T && dx.shape[3] == D,
+          "attention mps batch2 dx shape");
+    CHECK(dw.rank == 4U && dw.shape[0] == B && dw.shape[1] == H && dw.shape[2] == D && dw.shape[3] == T,
+          "attention mps batch2 dw shape");
+    CHECK_OK(gd_tensor_read(ctx, &dx, dx_got, x_count * sizeof(*dx_got)));
+    CHECK_OK(gd_tensor_read(ctx, &dw, dw_got, w_count * sizeof(*dw_got)));
+    for (b = 0U; b < B; ++b) {
+        for (h = 0U; h < H; ++h) {
+            for (t = 0U; t < T; t += 37U) {
+                for (d = 0U; d < D; d += 11U) {
+                    float want = 0.0f;
+                    float have;
+                    for (s = 0U; s < T; ++s) {
+                        size_t gi = (((((size_t)b * H + h) * T + t) * T) + s);
+                        size_t wi = (((((size_t)b * H + h) * D + d) * T) + s);
+                        want += hval(g_data, gi) * hval(w_data, wi);
+                    }
+                    have = hval(dx_got, (((((size_t)b * H + h) * T + t) * D) + d));
+                    CHECK(abs_f32(want - have) <= 0.03f, "attention mps batch2 dx close");
+                }
+            }
+        }
+    }
+    for (b = 0U; b < B; ++b) {
+        for (h = 0U; h < H; ++h) {
+            for (d = 0U; d < D; d += 11U) {
+                for (s = 0U; s < T; s += 37U) {
+                    float want = 0.0f;
+                    float have;
+                    for (t = 0U; t < T; ++t) {
+                        size_t xi = (((((size_t)b * H + h) * T + t) * D) + d);
+                        size_t gi = (((((size_t)b * H + h) * T + t) * T) + s);
+                        want += hval(x_data, xi) * hval(g_data, gi);
+                    }
+                    have = hval(dw_got, (((((size_t)b * H + h) * D + d) * T) + s));
+                    CHECK(abs_f32(want - have) <= 0.03f, "attention mps batch2 dw close");
+                }
+            }
+        }
+    }
+    CHECK_OK(gd_end_step(ctx));
+    free(x_data);
+    free(w_data);
+    free(g_data);
+    free(dx_got);
+    free(dw_got);
+}
+
 int main(void)
 {
     gd_context *ctx = NULL;
@@ -388,6 +474,10 @@ int main(void)
     ctx = NULL;
     CHECK_OK(gd_context_create(&cfg, &ctx));
     test_attention_backward_skinny(ctx);
+    gd_context_destroy(ctx);
+    ctx = NULL;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    test_attention_backward_mps_batch2(ctx);
     gd_context_destroy(ctx);
     printf("test_matmul_batched: ok\n");
     return 0;

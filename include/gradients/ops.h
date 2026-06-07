@@ -37,6 +37,16 @@ gd_status gd_linear_transposed_weight(gd_context *ctx,
                                       const gd_tensor *bias,
                                       gd_tensor *out);
 
+/* Fused tied LM head + cross entropy:
+ * hidden [..., D], weight [V, D], targets [rows] -> scalar F32 mean loss.
+ * Uses the same F16 logits semantics as linear_transposed_weight followed by
+ * cross_entropy, but records one training op for the combined LM-head loss. */
+gd_status gd_lm_cross_entropy(gd_context *ctx,
+                              const gd_tensor *hidden,
+                              const gd_tensor *weight,
+                              const gd_tensor *targets,
+                              gd_tensor *loss);
+
 /* Direct matmul backward. Broadcasted batch dimensions are reduced back to
  * x/w's original shapes. Pass grad_x or grad_w as NULL to skip that gradient. */
 gd_status gd_matmul_backward(gd_context *ctx,

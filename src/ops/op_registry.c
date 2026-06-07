@@ -24,6 +24,7 @@ extern const gd_autograd_rule gd_bwd_rule_rope;
 extern const gd_autograd_rule gd_bwd_rule_embedding;
 extern const gd_autograd_rule gd_bwd_rule_linear_transposed_weight;
 extern const gd_autograd_rule gd_bwd_rule_powlu;
+extern const gd_autograd_rule gd_bwd_rule_lm_cross_entropy;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -49,6 +50,7 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_EMBEDDING] = &gd_bwd_rule_embedding,
     [GD_OP_LINEAR_TRANSPOSED_WEIGHT] = &gd_bwd_rule_linear_transposed_weight,
     [GD_OP_POWLU] = &gd_bwd_rule_powlu,
+    [GD_OP_LM_CROSS_ENTROPY] = &gd_bwd_rule_lm_cross_entropy,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

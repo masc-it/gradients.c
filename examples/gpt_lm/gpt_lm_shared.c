@@ -496,7 +496,6 @@ gd_status gpt_lm_forward(gd_context *ctx,
     gd_tensor dropped;
     gd_tensor block_out;
     gd_tensor final_norm;
-    gd_tensor logits;
     gd_status st;
     uint32_t i;
     uint64_t site_seed;
@@ -547,11 +546,7 @@ gd_status gpt_lm_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, &logits);
-    if (st != GD_OK) {
-        return st;
-    }
-    return gd_cross_entropy(ctx, &logits, target_ids, loss);
+    return gd_lm_cross_entropy(ctx, &final_norm, &model->token_embedding, target_ids, loss);
 }
 
 static gd_status gpt_block_prefill_cached(gd_context *ctx,

@@ -11,7 +11,7 @@ Model defaults:
 - `n_heads = 4`
 - `head_dim = 64`
 - local causal `sdpa_varlen` sliding window: 256 for training/prompt prefill
-- decode-time KV cache with `kv_cache_append_at` + `sdpa_decode_at`
+- batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
 - RMSNorm, RoPE, PoWLU gated MLP, and dropout
 
@@ -34,6 +34,14 @@ Generation-only smoke test with random/current in-memory weights:
 make -C examples/gpt_lm run ARGS="--epochs 0 --generate 'Don Abbondio' --max-new-tokens 64"
 ```
 
+Periodic batched generation during training:
+
+```sh
+make -C examples/gpt_lm run ARGS="--epochs 1 --batch-size 1 --overfit-num-samples 1 --generate-every-n-steps 1 --max-new-tokens 4"
+```
+
+The periodic path runs one batched generation over the five vowel prefixes `a/e/i/o/u`.
+
 Useful runtime options:
 
 ```text
@@ -47,6 +55,7 @@ Useful runtime options:
 --lr-min LR
 --warmup-steps N        # default -1 means total_steps / 10
 --generate TEXT
+--generate-every-n-steps N
 --max-new-tokens N
 --temperature T         # 0 means greedy
 --tokenizer-path PATH
@@ -61,4 +70,4 @@ cu_seqlens  i32 [B + 1]
 positions   i32 [B * 512]
 ```
 
-Generation uses full `sdpa_varlen` for prompt prefill, then appends one token of K/V per layer and calls `sdpa_decode_at` for each autoregressive step. Sampling is currently CPU-side, so very small generations are latency-bound by per-token logits readback.
+Generation uses packed `sdpa_varlen` for batched prompt prefill, `kv_cache_append_packed` to materialize variable-length prompt K/V, then appends one token per batch row with `kv_cache_append_positions` and calls `sdpa_decode_positions` for each autoregressive step. Sampling is currently CPU-side, so very small generations are latency-bound by per-step logits readback.

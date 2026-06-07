@@ -6,22 +6,29 @@
 #define GD_METAL_KV_CACHE_APPEND_DTYPE_F16 1U
 #define GD_METAL_KV_CACHE_APPEND_DTYPE_F32 3U
 
+#define GD_METAL_KV_CACHE_POS_SCALAR 0U
+#define GD_METAL_KV_CACHE_POS_VECTOR 2U
+
 typedef struct gd_metal_kv_cache_append_args {
     gd_metal_u64 k_cache_offset;
     gd_metal_u64 v_cache_offset;
     gd_metal_u64 k_new_offset;
     gd_metal_u64 v_new_offset;
+    gd_metal_u64 pos_offset;
+    gd_metal_u64 cu_offset;
     gd_metal_u64 total_units;
+    gd_metal_u32 batch;
     gd_metal_u32 tmax;
     gd_metal_u32 tnew;
     gd_metal_u32 row_bytes;
     gd_metal_u32 copy_unit;
+    gd_metal_u32 pos_mode;
     gd_metal_u32 cache_pos;
     gd_metal_u32 reserved0;
 } gd_metal_kv_cache_append_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_kv_cache_append_args) == 64U,
+_Static_assert(sizeof(gd_metal_kv_cache_append_args) == 88U,
                "gd_metal_kv_cache_append_args ABI mismatch");
 #endif
 

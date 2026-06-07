@@ -26,7 +26,7 @@ typedef struct gd_metal_sdpa_decode_args {
     gd_metal_u32 prefix_len;
     gd_metal_u32 dtype;
     float scale;
-    gd_metal_u32 use_pos_buffer;
+    gd_metal_u32 pos_mode; /* 0: scalar arg, 1: scalar buffer, 2: vector buffer [B]. */
     gd_metal_u32 cache_pos;
 } gd_metal_sdpa_decode_args;
 

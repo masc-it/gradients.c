@@ -138,6 +138,40 @@ static gd_status gd_sdpa_decode_validate_at(gd_context *ctx,
     return GD_OK;
 }
 
+static gd_status gd_sdpa_decode_validate_positions(gd_context *ctx,
+                                                   const gd_tensor *q,
+                                                   const gd_tensor *k_cache,
+                                                   const gd_tensor *v_cache,
+                                                   const gd_tensor *cache_pos,
+                                                   const gd_sdpa_decode_config *config,
+                                                   gd_backend_sdpa_decode_args *args)
+{
+    gd_status st;
+    if (ctx == NULL || cache_pos == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_sdpa_decode_validate_common(ctx, q, k_cache, v_cache, config, args);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_validate(ctx, cache_pos);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (cache_pos->dtype != GD_DTYPE_I32 || cache_pos->rank != 1U ||
+        cache_pos->shape[0] != q->shape[0]) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_UNSUPPORTED,
+                                    "sdpa_decode_positions cache_pos must be i32 [B]");
+    }
+    if (!gd_tensor_is_contiguous(cache_pos)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_UNSUPPORTED,
+                                    "sdpa_decode_positions requires contiguous cache_pos");
+    }
+    return GD_OK;
+}
+
 gd_status gd_sdpa_decode(gd_context *ctx,
                          const gd_tensor *q,
                          const gd_tensor *k_cache,
@@ -229,6 +263,58 @@ gd_status gd_sdpa_decode_at(gd_context *ctx,
     st = gd_backend_sdpa_decode_at(gd_context_backend(ctx), &qv, &kv, &vv, &yv, &args);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend sdpa_decode_at failed");
+    }
+    *out = y;
+    return GD_OK;
+}
+
+gd_status gd_sdpa_decode_positions(gd_context *ctx,
+                                   const gd_tensor *q,
+                                   const gd_tensor *k_cache,
+                                   const gd_tensor *v_cache,
+                                   const gd_tensor *cache_pos,
+                                   const gd_sdpa_decode_config *config,
+                                   gd_tensor *out)
+{
+    gd_status st;
+    gd_backend_sdpa_decode_args args;
+    gd_tensor y;
+    gd_backend_tensor_view qv;
+    gd_backend_tensor_view kv;
+    gd_backend_tensor_view vv;
+    gd_backend_tensor_view pv;
+    gd_backend_tensor_view yv;
+    int64_t shape[4];
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || q == NULL || k_cache == NULL || v_cache == NULL || cache_pos == NULL ||
+        out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_sdpa_decode_validate_positions(ctx, q, k_cache, v_cache, cache_pos, config, &args);
+    if (st != GD_OK) {
+        return st;
+    }
+    shape[0] = q->shape[0];
+    shape[1] = q->shape[1];
+    shape[2] = q->shape[2];
+    shape[3] = q->shape[3];
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, q->dtype, gd_shape_make(4U, shape), 256U, &y);
+    if (st != GD_OK) {
+        return st;
+    }
+    y.is_leaf = false;
+    if (!gd_op_tensor_view_from_tensor(q, &qv) || !gd_op_tensor_view_from_tensor(k_cache, &kv) ||
+        !gd_op_tensor_view_from_tensor(v_cache, &vv) || !gd_op_tensor_view_from_tensor(cache_pos, &pv) ||
+        !gd_op_tensor_view_from_tensor(&y, &yv)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "sdpa_decode_positions invalid tensor view");
+    }
+    st = gd_backend_sdpa_decode_positions(gd_context_backend(ctx), &qv, &kv, &vv, &pv, &yv, &args);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend sdpa_decode_positions failed");
     }
     *out = y;
     return GD_OK;

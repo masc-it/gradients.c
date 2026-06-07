@@ -114,6 +114,18 @@ static bool gd_sdpa_decode_shapes_valid(const gd_backend_tensor_view *q,
            pos->dtype == (uint32_t)GD_DTYPE_I32 && pos->rank == 0U && pos->count == 1U;
 }
 
+static bool gd_sdpa_decode_shapes_positions_valid(const gd_backend_tensor_view *q,
+                                                  const gd_backend_tensor_view *k,
+                                                  const gd_backend_tensor_view *v,
+                                                  const gd_backend_tensor_view *pos,
+                                                  const gd_backend_tensor_view *out)
+{
+    return gd_sdpa_decode_shapes_common_valid(q, k, v, out) &&
+           gd_sdpa_decode_view_range_valid(pos) && gd_sdpa_decode_contiguous_valid(pos) &&
+           pos->dtype == (uint32_t)GD_DTYPE_I32 && pos->rank == 1U &&
+           pos->shape[0] == q->shape[0] && pos->count == (size_t)q->shape[0];
+}
+
 static bool gd_sdpa_decode_shapes_at_valid(const gd_backend_tensor_view *q,
                                            const gd_backend_tensor_view *k,
                                            const gd_backend_tensor_view *v,
@@ -154,7 +166,7 @@ static void gd_sdpa_decode_fill_metal_args(gd_metal_sdpa_decode_args *p,
     p->prefix_len = args->prefix_len;
     p->dtype = q->dtype;
     p->scale = args->scale;
-    p->use_pos_buffer = pos != NULL ? 1U : 0U;
+    p->pos_mode = pos != NULL ? 1U : 0U;
     p->cache_pos = args->cache_pos >= 0 ? (uint32_t)args->cache_pos : 0U;
 }
 
@@ -205,12 +217,14 @@ gd_status gd_backend_sdpa_decode(gd_backend *backend,
     return gd_metal_finish_immediate(command_buffer, immediate);
 }
 
-gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
-                                    const gd_backend_tensor_view *q,
-                                    const gd_backend_tensor_view *k_cache,
-                                    const gd_backend_tensor_view *v_cache,
-                                    const gd_backend_tensor_view *out,
-                                    const gd_backend_sdpa_decode_args *args)
+static gd_status gd_backend_sdpa_decode_dispatch(gd_backend *backend,
+                                                 const gd_backend_tensor_view *q,
+                                                 const gd_backend_tensor_view *k_cache,
+                                                 const gd_backend_tensor_view *v_cache,
+                                                 const gd_backend_tensor_view *cache_pos,
+                                                 const gd_backend_tensor_view *out,
+                                                 const gd_backend_sdpa_decode_args *args,
+                                                 uint32_t pos_mode)
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
@@ -219,10 +233,6 @@ gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
     MTLSize threads;
     bool immediate;
     gd_status st;
-    if (backend == NULL || !gd_sdpa_decode_shapes_at_valid(q, k_cache, v_cache, out, args) ||
-        !gd_sdpa_decode_args_valid(args, k_cache)) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
     st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
     if (st != GD_OK) {
         return st;
@@ -231,13 +241,14 @@ gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    gd_sdpa_decode_fill_metal_args(&p, q, k_cache, NULL, out, args);
+    gd_sdpa_decode_fill_metal_args(&p, q, k_cache, cache_pos, out, args);
     p.v_offset = (uint64_t)v_cache->offset;
+    p.pos_mode = pos_mode;
     [encoder setComputePipelineState:gd_sdpa_decode_pso(backend)];
     [encoder setBuffer:gd_sdpa_decode_buffer(q->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_sdpa_decode_buffer(k_cache->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_sdpa_decode_buffer(v_cache->buffer) offset:0U atIndex:2U];
-    [encoder setBuffer:gd_sdpa_decode_buffer(q->buffer) offset:0U atIndex:3U];
+    [encoder setBuffer:gd_sdpa_decode_buffer(cache_pos != NULL ? cache_pos->buffer : q->buffer) offset:0U atIndex:3U];
     [encoder setBuffer:gd_sdpa_decode_buffer(out->buffer) offset:0U atIndex:4U];
     [encoder setBytes:&p length:sizeof(p) atIndex:5U];
     groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq *
@@ -249,4 +260,34 @@ gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
+                                    const gd_backend_tensor_view *q,
+                                    const gd_backend_tensor_view *k_cache,
+                                    const gd_backend_tensor_view *v_cache,
+                                    const gd_backend_tensor_view *out,
+                                    const gd_backend_sdpa_decode_args *args)
+{
+    if (backend == NULL || !gd_sdpa_decode_shapes_at_valid(q, k_cache, v_cache, out, args) ||
+        !gd_sdpa_decode_args_valid(args, k_cache)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_backend_sdpa_decode_dispatch(backend, q, k_cache, v_cache, NULL, out, args, 0U);
+}
+
+gd_status gd_backend_sdpa_decode_positions(gd_backend *backend,
+                                           const gd_backend_tensor_view *q,
+                                           const gd_backend_tensor_view *k_cache,
+                                           const gd_backend_tensor_view *v_cache,
+                                           const gd_backend_tensor_view *cache_pos,
+                                           const gd_backend_tensor_view *out,
+                                           const gd_backend_sdpa_decode_args *args)
+{
+    if (backend == NULL ||
+        !gd_sdpa_decode_shapes_positions_valid(q, k_cache, v_cache, cache_pos, out) ||
+        !gd_sdpa_decode_args_valid(args, k_cache)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_backend_sdpa_decode_dispatch(backend, q, k_cache, v_cache, cache_pos, out, args, 2U);
 }

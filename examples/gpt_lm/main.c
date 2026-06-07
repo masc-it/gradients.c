@@ -77,7 +77,7 @@ typedef struct gpt_kv_cache {
     int n_layers;
     int n_heads;
     int head_dim;
-    int32_t pos;
+    int32_t *pos;
     gd_tensor *k;
     gd_tensor *v;
 } gpt_kv_cache;
@@ -92,6 +92,7 @@ typedef struct gpt_config {
     int report_every;
     int lr_warmup_steps; /* -1 => auto. */
     int max_new_tokens;
+    int generate_every_n_steps;
     bool epochs_set;
     uint64_t overfit_num_samples; /* 0 => full shuffled dataset. */
     uint64_t seed;
@@ -211,7 +212,8 @@ static void print_usage(const char *argv0)
     printf("  --data-dir PATH             GDDS directory (default: examples/gpt_lm/data)\n");
     printf("  --tokenizer-path PATH       tokenizer JSON for generation (default: DATA/tokenizer-v2048.json)\n");
     printf("  --generate TEXT             run KV-cache generation from TEXT; skips training unless --epochs is set\n");
-    printf("  --max-new-tokens N          generated tokens for --generate (default: 64)\n");
+    printf("  --generate-every-n-steps N  during training, generate batched a/e/i/o/u samples every N steps (default: 0)\n");
+    printf("  --max-new-tokens N          generated tokens for --generate / periodic generation (default: 64)\n");
     printf("  --temperature T             sampling temperature; 0 means greedy (default: 0)\n");
     printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
     printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
@@ -242,6 +244,7 @@ static gpt_config gpt_config_default(void)
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = 64;
+    config.generate_every_n_steps = 0;
     config.epochs_set = false;
     config.overfit_num_samples = 0U;
     config.seed = GPT_DEFAULT_SEED;
@@ -279,6 +282,15 @@ static gpt_config parse_args(int argc, char **argv)
         value = arg_value(argc, argv, &i, "--generate");
         if (value != NULL) {
             config.generate_prompt = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--generate-every-n-steps");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 1000000000, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --generate-every-n-steps %s\n", value);
+                exit(2);
+            }
+            config.generate_every_n_steps = (int)parsed_i64;
             continue;
         }
         value = arg_value(argc, argv, &i, "--max-new-tokens");
@@ -661,9 +673,11 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
     memset(cache, 0, sizeof(*cache));
     cache->k = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->k[0]));
     cache->v = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->v[0]));
-    if (cache->k == NULL || cache->v == NULL) {
+    cache->pos = (int32_t *)calloc((size_t)batch_size, sizeof(cache->pos[0]));
+    if (cache->k == NULL || cache->v == NULL || cache->pos == NULL) {
         free(cache->k);
         free(cache->v);
+        free(cache->pos);
         memset(cache, 0, sizeof(*cache));
         return GD_ERR_OUT_OF_MEMORY;
     }
@@ -672,7 +686,6 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
     cache->n_layers = model->n_layers;
     cache->n_heads = model->n_heads;
     cache->head_dim = model->head_dim;
-    cache->pos = 0;
     shape[0] = batch_size;
     shape[1] = max_seq;
     shape[2] = model->n_heads;
@@ -687,6 +700,7 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
         if (st != GD_OK) {
             free(cache->k);
             free(cache->v);
+            free(cache->pos);
             memset(cache, 0, sizeof(*cache));
             return st;
         }
@@ -699,6 +713,7 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
         if (st != GD_OK) {
             free(cache->k);
             free(cache->v);
+            free(cache->pos);
             memset(cache, 0, sizeof(*cache));
             return st;
         }
@@ -715,6 +730,7 @@ static void gpt_kv_cache_deinit(gpt_kv_cache *cache)
     }
     free(cache->k);
     free(cache->v);
+    free(cache->pos);
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -942,7 +958,7 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
                                            const gd_tensor *x,
                                            const gd_tensor *positions,
                                            const gd_tensor *cu_seqlens,
-                                           int32_t cache_pos,
+                                           const gd_tensor *cache_positions,
                                            gd_tensor *out)
 {
     const gd_rope_config rope_cfg = {
@@ -968,8 +984,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     gd_tensor v_view;
     gd_tensor q_rot;
     gd_tensor k_rot;
-    gd_tensor k_cache_new;
-    gd_tensor v_cache_new;
     gd_tensor attn;
     gd_tensor attn_flat;
     gd_tensor attn_proj;
@@ -982,26 +996,23 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     gd_status st;
     int64_t n_tokens;
     int64_t q_shape[3];
-    int64_t cache_shape[4];
     int64_t flat_shape[2];
 
     if (ctx == NULL || model == NULL || cache == NULL || block == NULL || x == NULL ||
-        positions == NULL || cu_seqlens == NULL || out == NULL || x->rank != 2U ||
-        x->shape[1] != GPT_D_MODEL || cache_pos < 0) {
+        positions == NULL || cu_seqlens == NULL || cache_positions == NULL || out == NULL ||
+        x->rank != 2U || x->shape[1] != GPT_D_MODEL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     n_tokens = x->shape[0];
-    if (n_tokens <= 0 || n_tokens > cache->max_seq - (int64_t)cache_pos ||
-        cache->batch_size != 1 || block_index >= (uint32_t)cache->n_layers) {
+    if (n_tokens <= 0 || n_tokens > (int64_t)cache->batch_size * (int64_t)cache->max_seq ||
+        block_index >= (uint32_t)cache->n_layers || cache_positions->rank != 1U ||
+        cache_positions->shape[0] != cache->batch_size || cu_seqlens->rank != 1U ||
+        cu_seqlens->shape[0] != cache->batch_size + 1) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     q_shape[0] = n_tokens;
     q_shape[1] = GPT_N_HEADS;
     q_shape[2] = GPT_HEAD_DIM;
-    cache_shape[0] = 1;
-    cache_shape[1] = n_tokens;
-    cache_shape[2] = GPT_N_HEADS;
-    cache_shape[3] = GPT_HEAD_DIM;
     flat_shape[0] = n_tokens;
     flat_shape[1] = GPT_D_MODEL;
 
@@ -1022,16 +1033,13 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
     if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &k_rot, gd_shape_make(4U, cache_shape), &k_cache_new);
-    if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &v_view, gd_shape_make(4U, cache_shape), &v_cache_new);
-    if (st != GD_OK) { return st; }
-    st = gd_kv_cache_append_at(ctx,
-                               &cache->k[block_index],
-                               &cache->v[block_index],
-                               cache_pos,
-                               &k_cache_new,
-                               &v_cache_new);
+    st = gd_kv_cache_append_packed(ctx,
+                                    &cache->k[block_index],
+                                    &cache->v[block_index],
+                                    cache_positions,
+                                    cu_seqlens,
+                                    &k_rot,
+                                    &v_view);
     if (st != GD_OK) { return st; }
     st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
     if (st != GD_OK) { return st; }
@@ -1063,7 +1071,7 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
                                          uint32_t block_index,
                                          const gd_tensor *x,
                                          const gd_tensor *positions,
-                                         int32_t cache_pos,
+                                         const gd_tensor *cache_positions,
                                          gd_tensor *out)
 {
     const gd_rope_config rope_cfg = {
@@ -1101,8 +1109,11 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     int64_t flat_shape[2];
 
     if (ctx == NULL || model == NULL || cache == NULL || block == NULL || x == NULL ||
-        positions == NULL || out == NULL || x->rank != 2U || x->shape[1] != GPT_D_MODEL ||
-        cache_pos < 0 || cache_pos >= cache->max_seq || block_index >= (uint32_t)cache->n_layers) {
+        positions == NULL || cache_positions == NULL || out == NULL || x->rank != 2U ||
+        x->shape[1] != GPT_D_MODEL || x->shape[0] != cache->batch_size ||
+        positions->rank != 1U || positions->shape[0] != cache->batch_size ||
+        cache_positions->rank != 1U || cache_positions->shape[0] != cache->batch_size ||
+        block_index >= (uint32_t)cache->n_layers) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     q_shape[0] = x->shape[0];
@@ -1129,20 +1140,20 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
     if (st != GD_OK) { return st; }
-    st = gd_kv_cache_append_at(ctx,
-                               &cache->k[block_index],
-                               &cache->v[block_index],
-                               cache_pos,
-                               &k_rot,
-                               &v_view);
+    st = gd_kv_cache_append_positions(ctx,
+                                       &cache->k[block_index],
+                                       &cache->v[block_index],
+                                       cache_positions,
+                                       &k_rot,
+                                       &v_view);
     if (st != GD_OK) { return st; }
-    st = gd_sdpa_decode_at(ctx,
-                           &q_rot,
-                           &cache->k[block_index],
-                           &cache->v[block_index],
-                           cache_pos,
-                           &sdpa_cfg,
-                           &attn);
+    st = gd_sdpa_decode_positions(ctx,
+                                  &q_rot,
+                                  &cache->k[block_index],
+                                  &cache->v[block_index],
+                                  cache_positions,
+                                  &sdpa_cfg,
+                                  &attn);
     if (st != GD_OK) { return st; }
     st = gd_reshape(ctx, &attn, gd_shape_make(2U, flat_shape), &attn_flat);
     if (st != GD_OK) { return st; }
@@ -1171,6 +1182,7 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
                                        const gd_tensor *input_ids,
                                        const gd_tensor *positions,
                                        const gd_tensor *cu_seqlens,
+                                       const gd_tensor *cache_positions,
                                        gd_tensor *logits)
 {
     gd_tensor x;
@@ -1178,14 +1190,14 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
     gd_tensor final_norm;
     gd_status st;
     uint32_t i;
-    int32_t cache_pos;
     if (ctx == NULL || model == NULL || cache == NULL || input_ids == NULL || positions == NULL ||
-        cu_seqlens == NULL || logits == NULL || input_ids->rank != 1U || positions->rank != 1U ||
-        input_ids->shape[0] != positions->shape[0] || input_ids->shape[0] <= 0 ||
-        input_ids->shape[0] > cache->max_seq - cache->pos) {
+        cu_seqlens == NULL || cache_positions == NULL || logits == NULL || input_ids->rank != 1U ||
+        positions->rank != 1U || input_ids->shape[0] != positions->shape[0] ||
+        input_ids->shape[0] <= 0 || cache_positions->rank != 1U ||
+        cache_positions->shape[0] != cache->batch_size || cu_seqlens->rank != 1U ||
+        cu_seqlens->shape[0] != cache->batch_size + 1) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    cache_pos = cache->pos;
     st = gd_embedding(ctx, &model->token_embedding, input_ids, &x);
     if (st != GD_OK) { return st; }
     for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
@@ -1197,7 +1209,7 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
                                       &x,
                                       positions,
                                       cu_seqlens,
-                                      cache_pos,
+                                      cache_positions,
                                       &block_out);
         if (st != GD_OK) { return st; }
         x = block_out;
@@ -1206,7 +1218,6 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
     if (st != GD_OK) { return st; }
-    cache->pos = (int32_t)(cache_pos + (int32_t)input_ids->shape[0]);
     return GD_OK;
 }
 
@@ -1215,6 +1226,7 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
                                       gpt_kv_cache *cache,
                                       const gd_tensor *input_ids,
                                       const gd_tensor *positions,
+                                      const gd_tensor *cache_positions,
                                       gd_tensor *logits)
 {
     gd_tensor x;
@@ -1222,14 +1234,12 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
     gd_tensor final_norm;
     gd_status st;
     uint32_t i;
-    int32_t cache_pos;
     if (ctx == NULL || model == NULL || cache == NULL || input_ids == NULL || positions == NULL ||
-        logits == NULL || input_ids->rank != 1U || positions->rank != 1U ||
+        cache_positions == NULL || logits == NULL || input_ids->rank != 1U || positions->rank != 1U ||
         input_ids->shape[0] != positions->shape[0] || input_ids->shape[0] != cache->batch_size ||
-        cache->pos < 0 || cache->pos >= cache->max_seq) {
+        cache_positions->rank != 1U || cache_positions->shape[0] != cache->batch_size) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    cache_pos = cache->pos;
     st = gd_embedding(ctx, &model->token_embedding, input_ids, &x);
     if (st != GD_OK) { return st; }
     for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
@@ -1240,7 +1250,7 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
                                      i,
                                      &x,
                                      positions,
-                                     cache_pos,
+                                     cache_positions,
                                      &block_out);
         if (st != GD_OK) { return st; }
         x = block_out;
@@ -1249,7 +1259,9 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
     if (st != GD_OK) { return st; }
-    cache->pos = cache_pos + 1;
+    for (i = 0U; i < (uint32_t)cache->batch_size; ++i) {
+        cache->pos[i] += 1;
+    }
     return GD_OK;
 }
 
@@ -1413,6 +1425,11 @@ static size_t effective_steps_per_epoch(uint64_t dataset_samples,
     return (size_t)requested_batches;
 }
 
+static void gpt_generate_vowels(gd_context *ctx,
+                                gpt_lm *model,
+                                const gpt_config *config,
+                                size_t step);
+
 static void train_one_batch(gd_context *ctx,
                             gpt_lm *model,
                             gd_dataloader *loader,
@@ -1485,6 +1502,11 @@ static void train_one_batch(gd_context *ctx,
                gd_amp_scaler_last_found_inf(scaler) ? " found_inf" : "");
         *last_report_time = now;
         *last_report_step = current_step;
+    }
+
+    if (config->generate_every_n_steps > 0 &&
+        (current_step % (size_t)config->generate_every_n_steps) == 0U) {
+        gpt_generate_vowels(ctx, model, config, current_step);
     }
 }
 
@@ -1633,30 +1655,49 @@ static int gpt_sample_next_token(const float *logits,
     return best;
 }
 
-static void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
+static void gpt_generate_prompts(gd_context *ctx,
+                                 gpt_lm *model,
+                                 const gpt_config *config,
+                                 const char *const *prompts,
+                                 int n_prompts,
+                                 const char *tag,
+                                 size_t step,
+                                 bool restore_training)
 {
     gd_tokenizer *tok = NULL;
     gd_tokenizer_config tok_cfg;
     char *default_tok_path = NULL;
     const char *tokenizer_path;
-    int32_t *encoded = NULL;
-    int n_encoded = 0;
-    int prompt_offset = 0;
-    int prompt_len;
-    int max_new;
-    int32_t *all_ids = NULL;
-    int total_ids;
-    int generated = 0;
-    int next_id;
-    uint64_t rng;
-    float logits_host[GPT_VOCAB_SIZE];
+    int32_t **encoded = NULL;
+    int32_t **seq_ids = NULL;
+    int *n_encoded = NULL;
+    int *prompt_offset = NULL;
+    int *prompt_len = NULL;
+    int *seq_len = NULL;
+    int32_t *packed_ids = NULL;
+    int32_t *packed_positions = NULL;
+    int32_t *cu = NULL;
+    int32_t *cache_pos_values = NULL;
+    int32_t *decode_ids = NULL;
+    int32_t *decode_positions = NULL;
+    int *next_ids = NULL;
+    gd_tensor *last_logits = NULL;
+    float *logits_host = NULL;
     gpt_kv_cache cache;
+    int total_prompt_tokens = 0;
+    int max_new;
+    int room_for_prompt;
+    int generated = 0;
+    int b;
+    int i;
+    uint64_t rng;
     double start;
     double elapsed;
-    char *decoded = NULL;
-    char *decoded_new = NULL;
 
     memset(&cache, 0, sizeof(cache));
+    if (ctx == NULL || model == NULL || config == NULL || prompts == NULL || n_prompts <= 0) {
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "generation arguments", __LINE__);
+    }
     tok_cfg.split_digits = 1;
     tok_cfg.allow_special = 1;
     default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
@@ -1665,104 +1706,220 @@ static void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *confi
         fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "tokenizer path allocation", __LINE__);
     }
     TRY(ctx, gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &tok));
-    TRY(ctx, gd_tokenizer_encode(tok, config->generate_prompt, &encoded, &n_encoded));
-    if (n_encoded <= 0) {
-        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty generation prompt", __LINE__);
+
+    encoded = (int32_t **)calloc((size_t)n_prompts, sizeof(encoded[0]));
+    seq_ids = (int32_t **)calloc((size_t)n_prompts, sizeof(seq_ids[0]));
+    n_encoded = (int *)calloc((size_t)n_prompts, sizeof(n_encoded[0]));
+    prompt_offset = (int *)calloc((size_t)n_prompts, sizeof(prompt_offset[0]));
+    prompt_len = (int *)calloc((size_t)n_prompts, sizeof(prompt_len[0]));
+    seq_len = (int *)calloc((size_t)n_prompts, sizeof(seq_len[0]));
+    cu = (int32_t *)calloc((size_t)n_prompts + 1U, sizeof(cu[0]));
+    cache_pos_values = (int32_t *)calloc((size_t)n_prompts, sizeof(cache_pos_values[0]));
+    decode_ids = (int32_t *)calloc((size_t)n_prompts, sizeof(decode_ids[0]));
+    decode_positions = (int32_t *)calloc((size_t)n_prompts, sizeof(decode_positions[0]));
+    next_ids = (int *)calloc((size_t)n_prompts, sizeof(next_ids[0]));
+    last_logits = (gd_tensor *)calloc((size_t)n_prompts, sizeof(last_logits[0]));
+    logits_host = (float *)malloc((size_t)n_prompts * (size_t)GPT_VOCAB_SIZE * sizeof(logits_host[0]));
+    if (encoded == NULL || seq_ids == NULL || n_encoded == NULL || prompt_offset == NULL ||
+        prompt_len == NULL || seq_len == NULL || cu == NULL || cache_pos_values == NULL ||
+        decode_ids == NULL || decode_positions == NULL || next_ids == NULL || last_logits == NULL ||
+        logits_host == NULL) {
+        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation allocation", __LINE__);
     }
-    if (n_encoded >= GPT_CONTEXT_LENGTH) {
-        prompt_offset = n_encoded - (GPT_CONTEXT_LENGTH - 1);
-        printf("generate: prompt tokens=%d exceeds context; using last %d tokens\n",
-               n_encoded,
-               GPT_CONTEXT_LENGTH - 1);
-    }
-    prompt_len = n_encoded - prompt_offset;
+
     max_new = config->max_new_tokens;
-    if (max_new > GPT_CONTEXT_LENGTH - prompt_len) {
-        max_new = GPT_CONTEXT_LENGTH - prompt_len;
-    }
-    if (max_new <= 0) {
+    room_for_prompt = GPT_CONTEXT_LENGTH - max_new;
+    if (room_for_prompt <= 0) {
         fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "no context room for generation", __LINE__);
     }
-    all_ids = (int32_t *)calloc((size_t)(prompt_len + max_new), sizeof(all_ids[0]));
-    if (all_ids == NULL) {
-        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation token buffer", __LINE__);
+    for (b = 0; b < n_prompts; ++b) {
+        TRY(ctx, gd_tokenizer_encode(tok, prompts[b], &encoded[b], &n_encoded[b]));
+        if (n_encoded[b] <= 0) {
+            fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty generation prompt", __LINE__);
+        }
+        if (n_encoded[b] > room_for_prompt) {
+            prompt_offset[b] = n_encoded[b] - room_for_prompt;
+            printf("generate%s%s: prompt[%d] tokens=%d exceeds context budget; using last %d tokens\n",
+                   tag != NULL ? ":" : "",
+                   tag != NULL ? tag : "",
+                   b,
+                   n_encoded[b],
+                   room_for_prompt);
+        }
+        prompt_len[b] = n_encoded[b] - prompt_offset[b];
+        cu[b] = (int32_t)total_prompt_tokens;
+        total_prompt_tokens += prompt_len[b];
+        seq_ids[b] = (int32_t *)calloc((size_t)GPT_CONTEXT_LENGTH, sizeof(seq_ids[b][0]));
+        if (seq_ids[b] == NULL) {
+            fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation sequence allocation", __LINE__);
+        }
+        memcpy(seq_ids[b], encoded[b] + prompt_offset[b], (size_t)prompt_len[b] * sizeof(seq_ids[b][0]));
+        seq_len[b] = prompt_len[b];
     }
-    memcpy(all_ids, encoded + prompt_offset, (size_t)prompt_len * sizeof(all_ids[0]));
-    total_ids = prompt_len;
-    rng = splitmix64(config->seed ^ UINT64_C(0xdec0de1234567890));
+    cu[n_prompts] = (int32_t)total_prompt_tokens;
+    packed_ids = (int32_t *)calloc((size_t)total_prompt_tokens, sizeof(packed_ids[0]));
+    packed_positions = (int32_t *)calloc((size_t)total_prompt_tokens, sizeof(packed_positions[0]));
+    if (packed_ids == NULL || packed_positions == NULL) {
+        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation packed prompt allocation", __LINE__);
+    }
+    for (b = 0; b < n_prompts; ++b) {
+        for (i = 0; i < prompt_len[b]; ++i) {
+            const int dst = (int)cu[b] + i;
+            packed_ids[dst] = seq_ids[b][i];
+            packed_positions[dst] = cache_pos_values[b] + i;
+        }
+    }
 
-    TRY(ctx, gpt_kv_cache_init(ctx, model, 1, GPT_CONTEXT_LENGTH, &cache));
+    rng = splitmix64(config->seed ^ UINT64_C(0xdec0de1234567890) ^ (uint64_t)n_prompts ^ (uint64_t)step);
+    TRY(ctx, gpt_kv_cache_init(ctx, model, n_prompts, GPT_CONTEXT_LENGTH, &cache));
     gd_module_set_training(&model->mod, false);
     start = wall_seconds();
 
     {
-        int32_t positions[GPT_CONTEXT_LENGTH];
-        int32_t cu[2];
         gd_tensor ids_t;
         gd_tensor pos_t;
         gd_tensor cu_t;
+        gd_tensor cache_pos_t;
         gd_tensor logits;
-        gd_tensor last_logits;
-        int i;
-        for (i = 0; i < prompt_len; ++i) {
-            positions[i] = (int32_t)i;
-        }
-        cu[0] = 0;
-        cu[1] = (int32_t)prompt_len;
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
-        TRY(ctx, gpt_data_i32_tensor(ctx, all_ids, prompt_len, &ids_t));
-        TRY(ctx, gpt_data_i32_tensor(ctx, positions, prompt_len, &pos_t));
-        TRY(ctx, gpt_data_i32_tensor(ctx, cu, 2, &cu_t));
-        TRY(ctx, gpt_lm_prefill_logits(ctx, model, &cache, &ids_t, &pos_t, &cu_t, &logits));
-        TRY(ctx, gd_tensor_slice(ctx, &logits, 0U, (int64_t)prompt_len - 1, 1, &last_logits));
+        TRY(ctx, gpt_data_i32_tensor(ctx, packed_ids, total_prompt_tokens, &ids_t));
+        TRY(ctx, gpt_data_i32_tensor(ctx, packed_positions, total_prompt_tokens, &pos_t));
+        TRY(ctx, gpt_data_i32_tensor(ctx, cu, n_prompts + 1, &cu_t));
+        TRY(ctx, gpt_data_i32_tensor(ctx, cache_pos_values, n_prompts, &cache_pos_t));
+        TRY(ctx, gpt_lm_prefill_logits(ctx,
+                                       model,
+                                       &cache,
+                                       &ids_t,
+                                       &pos_t,
+                                       &cu_t,
+                                       &cache_pos_t,
+                                       &logits));
+        for (b = 0; b < n_prompts; ++b) {
+            TRY(ctx, gd_tensor_slice(ctx, &logits, 0U, (int64_t)cu[b + 1] - 1, 1, &last_logits[b]));
+        }
         TRY(ctx, gd_end_step(ctx));
-        TRY(ctx, gd_tensor_read_f32(ctx, &last_logits, logits_host, GPT_VOCAB_SIZE));
+        for (b = 0; b < n_prompts; ++b) {
+            TRY(ctx, gd_tensor_read_f32(ctx,
+                                        &last_logits[b],
+                                        logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
+                                        GPT_VOCAB_SIZE));
+            next_ids[b] = gpt_sample_next_token(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
+                                                GPT_VOCAB_SIZE,
+                                                config->temperature,
+                                                &rng);
+            cache.pos[b] = prompt_len[b];
+        }
     }
 
-    next_id = gpt_sample_next_token(logits_host, GPT_VOCAB_SIZE, config->temperature, &rng);
     while (generated < max_new) {
-        all_ids[total_ids] = (int32_t)next_id;
-        total_ids += 1;
+        for (b = 0; b < n_prompts; ++b) {
+            seq_ids[b][seq_len[b]] = (int32_t)next_ids[b];
+            seq_len[b] += 1;
+        }
         generated += 1;
         if (generated >= max_new) {
             break;
         }
+        for (b = 0; b < n_prompts; ++b) {
+            decode_ids[b] = (int32_t)next_ids[b];
+            decode_positions[b] = cache.pos[b];
+            cache_pos_values[b] = cache.pos[b];
+        }
         {
-            int32_t id_value = (int32_t)next_id;
-            int32_t pos_value = cache.pos;
             gd_tensor ids_t;
             gd_tensor pos_t;
+            gd_tensor cache_pos_t;
             gd_tensor logits;
             TRY(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
-            TRY(ctx, gpt_data_i32_tensor(ctx, &id_value, 1, &ids_t));
-            TRY(ctx, gpt_data_i32_tensor(ctx, &pos_value, 1, &pos_t));
-            TRY(ctx, gpt_lm_decode_logits(ctx, model, &cache, &ids_t, &pos_t, &logits));
+            TRY(ctx, gpt_data_i32_tensor(ctx, decode_ids, n_prompts, &ids_t));
+            TRY(ctx, gpt_data_i32_tensor(ctx, decode_positions, n_prompts, &pos_t));
+            TRY(ctx, gpt_data_i32_tensor(ctx, cache_pos_values, n_prompts, &cache_pos_t));
+            TRY(ctx, gpt_lm_decode_logits(ctx, model, &cache, &ids_t, &pos_t, &cache_pos_t, &logits));
             TRY(ctx, gd_end_step(ctx));
-            TRY(ctx, gd_tensor_read_f32(ctx, &logits, logits_host, GPT_VOCAB_SIZE));
+            TRY(ctx, gd_tensor_read_f32(ctx,
+                                        &logits,
+                                        logits_host,
+                                        (size_t)n_prompts * (size_t)GPT_VOCAB_SIZE));
         }
-        next_id = gpt_sample_next_token(logits_host, GPT_VOCAB_SIZE, config->temperature, &rng);
+        for (b = 0; b < n_prompts; ++b) {
+            next_ids[b] = gpt_sample_next_token(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
+                                                GPT_VOCAB_SIZE,
+                                                config->temperature,
+                                                &rng);
+        }
     }
 
     elapsed = wall_seconds() - start;
-    TRY(ctx, gd_tokenizer_decode(tok, all_ids, total_ids, &decoded));
-    TRY(ctx, gd_tokenizer_decode(tok, all_ids + prompt_len, generated, &decoded_new));
-    printf("generate: tokenizer=%s prompt_tokens=%d generated=%d temperature=%.3f elapsed=%.3fs tok/s=%.1f\n",
+    printf("generate%s%s: tokenizer=%s batch=%d generated=%d temperature=%.3f elapsed=%.3fs tok/s=%.1f",
+           tag != NULL ? ":" : "",
+           tag != NULL ? tag : "",
            tokenizer_path,
-           prompt_len,
+           n_prompts,
            generated,
            (double)config->temperature,
            elapsed,
-           elapsed > 0.0 ? (double)generated / elapsed : 0.0);
-    printf("generated_text:\n%s\n", decoded_new != NULL ? decoded_new : "");
-    printf("full_text:\n%s\n", decoded != NULL ? decoded : "");
+           elapsed > 0.0 ? (double)((size_t)n_prompts * (size_t)generated) / elapsed : 0.0);
+    if (step != 0U) {
+        printf(" step=%zu", step);
+    }
+    printf("\n");
+    for (b = 0; b < n_prompts; ++b) {
+        char *decoded = NULL;
+        char *decoded_new = NULL;
+        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b], seq_len[b], &decoded));
+        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b] + prompt_len[b], generated, &decoded_new));
+        printf("  prefix=\"%s\" prompt_tokens=%d generated_text=%s\n",
+               prompts[b],
+               prompt_len[b],
+               decoded_new != NULL ? decoded_new : "");
+        if (n_prompts == 1) {
+            printf("full_text:\n%s\n", decoded != NULL ? decoded : "");
+        }
+        gd_tokenizer_free(decoded_new);
+        gd_tokenizer_free(decoded);
+    }
 
-    gd_tokenizer_free(decoded_new);
-    gd_tokenizer_free(decoded);
+    if (restore_training) {
+        gd_module_set_training(&model->mod, true);
+    }
     gpt_kv_cache_deinit(&cache);
-    free(all_ids);
-    gd_tokenizer_free(encoded);
+    for (b = 0; b < n_prompts; ++b) {
+        gd_tokenizer_free(encoded[b]);
+        free(seq_ids[b]);
+    }
+    free(logits_host);
+    free(last_logits);
+    free(next_ids);
+    free(decode_positions);
+    free(decode_ids);
+    free(cache_pos_values);
+    free(cu);
+    free(packed_positions);
+    free(packed_ids);
+    free(seq_len);
+    free(prompt_len);
+    free(prompt_offset);
+    free(n_encoded);
+    free(seq_ids);
+    free(encoded);
     gd_tokenizer_destroy(tok);
     free(default_tok_path);
+}
+
+static void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
+{
+    const char *prompts[1];
+    prompts[0] = config->generate_prompt;
+    gpt_generate_prompts(ctx, model, config, prompts, 1, "user", 0U, false);
+}
+
+static void gpt_generate_vowels(gd_context *ctx,
+                                gpt_lm *model,
+                                const gpt_config *config,
+                                size_t step)
+{
+    static const char *const prompts[5] = {"a", "e", "i", "o", "u"};
+    gpt_generate_prompts(ctx, model, config, prompts, 5, "vowels", step, true);
 }
 
 int main(int argc, char **argv)
@@ -1870,6 +2027,13 @@ int main(int argc, char **argv)
            GPT_MLP_HIDDEN,
            GPT_SDPA_WINDOW,
            (double)config.dropout_p);
+    if (config.generate_prompt != NULL || config.generate_every_n_steps > 0) {
+        printf("generation: max_new_tokens=%d temperature=%.3f every_n_steps=%d batched_vowels=%s\n",
+               config.max_new_tokens,
+               (double)config.temperature,
+               config.generate_every_n_steps,
+               config.generate_every_n_steps > 0 ? "yes" : "no");
+    }
     if (config.epochs > 0) {
         printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.1f\n",
                (double)lr_config.max_lr,

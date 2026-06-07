@@ -265,6 +265,16 @@ gd_status gd_sdpa_decode_at(gd_context *ctx,
                             const gd_sdpa_decode_config *config,
                             gd_tensor *out);
 
+/* Batched decode variant: cache_pos is I32 [B], one absolute start position per
+ * batch row. */
+gd_status gd_sdpa_decode_positions(gd_context *ctx,
+                                   const gd_tensor *q,
+                                   const gd_tensor *k_cache,
+                                   const gd_tensor *v_cache,
+                                   const gd_tensor *cache_pos,
+                                   const gd_sdpa_decode_config *config,
+                                   gd_tensor *out);
+
 /* In-place append of new K/V rows into a fixed decode cache. Cache tensors are
  * [B,Tmax,Hkv,Dh], new tensors are [B,Tnew,Hkv,Dh], and writes target
  * cache[:, cache_pos:cache_pos+Tnew, :, :]. Inference/eval only. */
@@ -274,6 +284,24 @@ gd_status gd_kv_cache_append_at(gd_context *ctx,
                                 int32_t cache_pos,
                                 const gd_tensor *k_new,
                                 const gd_tensor *v_new);
+
+/* Batched append with one cache position per batch row. cache_pos is I32 [B]. */
+gd_status gd_kv_cache_append_positions(gd_context *ctx,
+                                       gd_tensor *k_cache,
+                                       gd_tensor *v_cache,
+                                       const gd_tensor *cache_pos,
+                                       const gd_tensor *k_new,
+                                       const gd_tensor *v_new);
+
+/* Packed prefill append for variable-length prompt batches. k_new/v_new are
+ * [N,Hkv,Dh], cu_seqlens is I32 [B+1], and cache_pos is I32 [B]. */
+gd_status gd_kv_cache_append_packed(gd_context *ctx,
+                                    gd_tensor *k_cache,
+                                    gd_tensor *v_cache,
+                                    const gd_tensor *cache_pos,
+                                    const gd_tensor *cu_seqlens,
+                                    const gd_tensor *k_new,
+                                    const gd_tensor *v_new);
 
 /* Reduces a single axis. Negative axes are accepted Python-style. */
 gd_status gd_reduce_sum_axis(gd_context *ctx,

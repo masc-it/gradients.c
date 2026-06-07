@@ -529,12 +529,34 @@ gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
                                     const gd_backend_tensor_view *v_cache,
                                     const gd_backend_tensor_view *out,
                                     const gd_backend_sdpa_decode_args *args);
+gd_status gd_backend_sdpa_decode_positions(gd_backend *backend,
+                                           const gd_backend_tensor_view *q,
+                                           const gd_backend_tensor_view *k_cache,
+                                           const gd_backend_tensor_view *v_cache,
+                                           const gd_backend_tensor_view *cache_pos,
+                                           const gd_backend_tensor_view *out,
+                                           const gd_backend_sdpa_decode_args *args);
 gd_status gd_backend_kv_cache_append_at(gd_backend *backend,
                                         const gd_backend_tensor_view *k_cache,
                                         const gd_backend_tensor_view *v_cache,
                                         const gd_backend_tensor_view *k_new,
                                         const gd_backend_tensor_view *v_new,
                                         const gd_backend_kv_cache_append_args *args);
+gd_status gd_backend_kv_cache_append_positions(gd_backend *backend,
+                                               const gd_backend_tensor_view *k_cache,
+                                               const gd_backend_tensor_view *v_cache,
+                                               const gd_backend_tensor_view *cache_pos,
+                                               const gd_backend_tensor_view *k_new,
+                                               const gd_backend_tensor_view *v_new,
+                                               const gd_backend_kv_cache_append_args *args);
+gd_status gd_backend_kv_cache_append_packed(gd_backend *backend,
+                                            const gd_backend_tensor_view *k_cache,
+                                            const gd_backend_tensor_view *v_cache,
+                                            const gd_backend_tensor_view *cache_pos,
+                                            const gd_backend_tensor_view *cu_seqlens,
+                                            const gd_backend_tensor_view *k_new,
+                                            const gd_backend_tensor_view *v_new,
+                                            const gd_backend_kv_cache_append_args *args);
 
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);

@@ -36,7 +36,7 @@ ifneq ($(GPT_LM_RETRAIN_TOKENIZER),)
 DATA_ARGS += --retrain-tokenizer
 endif
 
-.PHONY: all run build-lib tools data clean smoke overfit-smoke FORCE
+.PHONY: all run build-lib tools data clean smoke overfit-smoke generate-smoke FORCE
 
 all: $(BIN)
 
@@ -69,7 +69,10 @@ run: $(BIN)
 overfit-smoke: $(BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 $(ARGS)
 
-smoke: overfit-smoke
+generate-smoke: $(BIN)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 0 --generate "Don Abbondio" --max-new-tokens 16 $(ARGS)
+
+smoke: overfit-smoke generate-smoke
 
 clean:
 	rm -f $(BIN)

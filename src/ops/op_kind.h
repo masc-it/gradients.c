@@ -28,7 +28,8 @@ typedef enum gd_op_kind {
     GD_OP_EMBEDDING = 22,
     GD_OP_LINEAR_TRANSPOSED_WEIGHT = 23,
     GD_OP_POWLU = 24,
-    GD_OP_COUNT = 25,
+    GD_OP_KV_CACHE_APPEND = 25,
+    GD_OP_COUNT = 26,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

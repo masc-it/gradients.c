@@ -144,6 +144,7 @@ struct gd_backend {
     void *sdpa_varlen_bwd_dkv_split_dh64_f16_pso;
     void *sdpa_varlen_bwd_dkv_reduce_f16_pso;
     void *sdpa_decode_pso;
+    void *kv_cache_append_pso;
     void *adamw_pso;
     void *active_command_buffer;
     bool scope_active;

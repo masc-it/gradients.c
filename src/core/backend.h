@@ -491,7 +491,12 @@ typedef struct gd_backend_sdpa_decode_args {
     float scale;
     uint32_t sliding_window;
     uint32_t prefix_len;
+    int32_t cache_pos; /* Used by gd_backend_sdpa_decode_at. */
 } gd_backend_sdpa_decode_args;
+
+typedef struct gd_backend_kv_cache_append_args {
+    int32_t cache_pos;
+} gd_backend_kv_cache_append_args;
 
 gd_status gd_backend_sdpa_varlen(gd_backend *backend,
                                  const gd_backend_tensor_view *q,
@@ -518,6 +523,18 @@ gd_status gd_backend_sdpa_decode(gd_backend *backend,
                                  const gd_backend_tensor_view *cache_pos,
                                  const gd_backend_tensor_view *out,
                                  const gd_backend_sdpa_decode_args *args);
+gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
+                                    const gd_backend_tensor_view *q,
+                                    const gd_backend_tensor_view *k_cache,
+                                    const gd_backend_tensor_view *v_cache,
+                                    const gd_backend_tensor_view *out,
+                                    const gd_backend_sdpa_decode_args *args);
+gd_status gd_backend_kv_cache_append_at(gd_backend *backend,
+                                        const gd_backend_tensor_view *k_cache,
+                                        const gd_backend_tensor_view *v_cache,
+                                        const gd_backend_tensor_view *k_new,
+                                        const gd_backend_tensor_view *v_new,
+                                        const gd_backend_kv_cache_append_args *args);
 
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);

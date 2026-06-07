@@ -238,14 +238,15 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
                                   gd_tensor *grad_v);
 
 /* Decode-time attention over a fixed K/V cache. q is [B,Tq,Hq,Dh], k/v cache
- * are [B,Tmax,Hkv,Dh], cache_pos is an I32 scalar, and live keys are
- * [0, cache_pos + Tq). Attention is causal. */
+ * are [B,Tmax,Hkv,Dh], cache_pos is the starting absolute position for q,
+ * and live keys are [0, cache_pos + Tq). Attention is causal. */
 typedef struct gd_sdpa_decode_config {
     float scale;
     int32_t sliding_window;
     int32_t prefix_len;
 } gd_sdpa_decode_config;
 
+/* Compatibility variant: cache_pos is an I32 scalar tensor. */
 gd_status gd_sdpa_decode(gd_context *ctx,
                          const gd_tensor *q,
                          const gd_tensor *k_cache,
@@ -253,6 +254,26 @@ gd_status gd_sdpa_decode(gd_context *ctx,
                          const gd_tensor *cache_pos,
                          const gd_sdpa_decode_config *config,
                          gd_tensor *out);
+
+/* Fast decode variant: cache_pos is passed as a host scalar kernel argument,
+ * avoiding a per-step scalar tensor/upload in autoregressive generation. */
+gd_status gd_sdpa_decode_at(gd_context *ctx,
+                            const gd_tensor *q,
+                            const gd_tensor *k_cache,
+                            const gd_tensor *v_cache,
+                            int32_t cache_pos,
+                            const gd_sdpa_decode_config *config,
+                            gd_tensor *out);
+
+/* In-place append of new K/V rows into a fixed decode cache. Cache tensors are
+ * [B,Tmax,Hkv,Dh], new tensors are [B,Tnew,Hkv,Dh], and writes target
+ * cache[:, cache_pos:cache_pos+Tnew, :, :]. Inference/eval only. */
+gd_status gd_kv_cache_append_at(gd_context *ctx,
+                                gd_tensor *k_cache,
+                                gd_tensor *v_cache,
+                                int32_t cache_pos,
+                                const gd_tensor *k_new,
+                                const gd_tensor *v_new);
 
 /* Reduces a single axis. Negative axes are accepted Python-style. */
 gd_status gd_reduce_sum_axis(gd_context *ctx,

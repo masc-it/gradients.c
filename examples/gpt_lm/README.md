@@ -1,6 +1,6 @@
 # GPT language model example
 
-Training-only decoder LM example over the Promessi Sposi GDDS dataset.
+Decoder LM example over the Promessi Sposi GDDS dataset, with training and KV-cache generation paths.
 
 Model defaults:
 
@@ -10,7 +10,8 @@ Model defaults:
 - `n_layers = 7` by default, about 7.87M trainable parameters
 - `n_heads = 4`
 - `head_dim = 64`
-- local causal `sdpa_varlen` sliding window: 256
+- local causal `sdpa_varlen` sliding window: 256 for training/prompt prefill
+- decode-time KV cache with `kv_cache_append_at` + `sdpa_decode_at`
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
 - RMSNorm, RoPE, PoWLU gated MLP, and dropout
 
@@ -27,10 +28,16 @@ make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 1 --overfit-num-sample
 make -C examples/gpt_lm run ARGS="--epochs 1 --batch-size 32 --overfit-num-samples 32 --report-every 1"
 ```
 
+Generation-only smoke test with random/current in-memory weights:
+
+```sh
+make -C examples/gpt_lm run ARGS="--epochs 0 --generate 'Don Abbondio' --max-new-tokens 64"
+```
+
 Useful runtime options:
 
 ```text
---epochs N
+--epochs N              # 0 allowed with --generate
 --batch-size N
 --layers N
 --dropout P
@@ -38,7 +45,11 @@ Useful runtime options:
 --report-every N
 --lr-max LR
 --lr-min LR
---warmup-steps N    # default -1 means total_steps / 10
+--warmup-steps N        # default -1 means total_steps / 10
+--generate TEXT
+--max-new-tokens N
+--temperature T         # 0 means greedy
+--tokenizer-path PATH
 ```
 
 The GDDS dataloader provides packed fields directly:
@@ -50,4 +61,4 @@ cu_seqlens  i32 [B + 1]
 positions   i32 [B * 512]
 ```
 
-No generation path is implemented yet.
+Generation uses full `sdpa_varlen` for prompt prefill, then appends one token of K/V per layer and calls `sdpa_decode_at` for each autoregressive step. Sampling is currently CPU-side, so very small generations are latency-bound by per-token logits readback.

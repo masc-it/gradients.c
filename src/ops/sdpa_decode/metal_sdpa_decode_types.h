@@ -26,8 +26,8 @@ typedef struct gd_metal_sdpa_decode_args {
     gd_metal_u32 prefix_len;
     gd_metal_u32 dtype;
     float scale;
-    gd_metal_u32 reserved0;
-    gd_metal_u32 reserved1;
+    gd_metal_u32 use_pos_buffer;
+    gd_metal_u32 cache_pos;
 } gd_metal_sdpa_decode_args;
 
 #ifndef __METAL_VERSION__

@@ -110,7 +110,7 @@ kernel void gd_sdpa_decode_kernel(device const uchar *qbuf [[buffer(0)]],
     int hkv = hq / group;
     int i = qb * bq + int(tid);
     bool active = i < int(p.tq);
-    int pos = cache_pos[0];
+    int pos = p.use_pos_buffer != 0u ? cache_pos[0] : int(p.cache_pos);
     if (pos < 0) {
         return;
     }

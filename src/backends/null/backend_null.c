@@ -854,6 +854,38 @@ gd_status gd_backend_sdpa_decode(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_sdpa_decode_at(gd_backend *backend,
+                                    const gd_backend_tensor_view *q,
+                                    const gd_backend_tensor_view *k_cache,
+                                    const gd_backend_tensor_view *v_cache,
+                                    const gd_backend_tensor_view *out,
+                                    const gd_backend_sdpa_decode_args *args)
+{
+    (void)backend;
+    (void)q;
+    (void)k_cache;
+    (void)v_cache;
+    (void)out;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_kv_cache_append_at(gd_backend *backend,
+                                        const gd_backend_tensor_view *k_cache,
+                                        const gd_backend_tensor_view *v_cache,
+                                        const gd_backend_tensor_view *k_new,
+                                        const gd_backend_tensor_view *v_new,
+                                        const gd_backend_kv_cache_append_args *args)
+{
+    (void)backend;
+    (void)k_cache;
+    (void)v_cache;
+    (void)k_new;
+    (void)v_new;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
 {
     (void)backend;

@@ -71,19 +71,35 @@ typedef struct gpt_lm {
     gpt_block *block_items;
 } gpt_lm;
 
+typedef struct gpt_kv_cache {
+    int batch_size;
+    int max_seq;
+    int n_layers;
+    int n_heads;
+    int head_dim;
+    int32_t pos;
+    gd_tensor *k;
+    gd_tensor *v;
+} gpt_kv_cache;
+
 typedef struct gpt_config {
     const char *data_dir;
+    const char *tokenizer_path; /* NULL => data_dir/tokenizer-v2048.json. */
+    const char *generate_prompt; /* NULL => training only. */
     int epochs;
     int batch_size;
     int n_layers;
     int report_every;
     int lr_warmup_steps; /* -1 => auto. */
+    int max_new_tokens;
+    bool epochs_set;
     uint64_t overfit_num_samples; /* 0 => full shuffled dataset. */
     uint64_t seed;
     float dropout_p;
     float lr_max;
     float lr_min;
     float weight_decay;
+    float temperature; /* <= 0 => greedy. */
 } gpt_config;
 
 static void fail_status(gd_context *ctx, gd_status st, const char *expr, int line)
@@ -193,7 +209,11 @@ static void print_usage(const char *argv0)
     printf("\n");
     printf("Options:\n");
     printf("  --data-dir PATH             GDDS directory (default: examples/gpt_lm/data)\n");
-    printf("  --epochs N                  training epochs (default: %d)\n", GPT_DEFAULT_EPOCHS);
+    printf("  --tokenizer-path PATH       tokenizer JSON for generation (default: DATA/tokenizer-v2048.json)\n");
+    printf("  --generate TEXT             run KV-cache generation from TEXT; skips training unless --epochs is set\n");
+    printf("  --max-new-tokens N          generated tokens for --generate (default: 64)\n");
+    printf("  --temperature T             sampling temperature; 0 means greedy (default: 0)\n");
+    printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
     printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
     printf("  --layers N                  decoder blocks (default: %d)\n", GPT_DEFAULT_LAYERS);
     printf("  --dropout P                 dropout probability (default: %.2f)\n", (double)GPT_DEFAULT_DROPOUT_P);
@@ -214,17 +234,22 @@ static gpt_config gpt_config_default(void)
     gpt_config config;
     memset(&config, 0, sizeof(config));
     config.data_dir = "examples/gpt_lm/data";
+    config.tokenizer_path = NULL;
+    config.generate_prompt = NULL;
     config.epochs = GPT_DEFAULT_EPOCHS;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.lr_warmup_steps = -1;
+    config.max_new_tokens = 64;
+    config.epochs_set = false;
     config.overfit_num_samples = 0U;
     config.seed = GPT_DEFAULT_SEED;
     config.dropout_p = GPT_DEFAULT_DROPOUT_P;
     config.lr_max = GPT_DEFAULT_LR_MAX;
     config.lr_min = GPT_DEFAULT_LR_MIN;
     config.weight_decay = GPT_DEFAULT_WEIGHT_DECAY;
+    config.temperature = 0.0f;
     return config;
 }
 
@@ -246,13 +271,42 @@ static gpt_config parse_args(int argc, char **argv)
             config.data_dir = value;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--tokenizer-path");
+        if (value != NULL) {
+            config.tokenizer_path = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--generate");
+        if (value != NULL) {
+            config.generate_prompt = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--max-new-tokens");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 1, GPT_CONTEXT_LENGTH - 1, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --max-new-tokens %s\n", value);
+                exit(2);
+            }
+            config.max_new_tokens = (int)parsed_i64;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--temperature");
+        if (value != NULL) {
+            if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
+                fprintf(stderr, "gpt_lm: invalid --temperature %s\n", value);
+                exit(2);
+            }
+            config.temperature = parsed_f32;
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--epochs");
         if (value != NULL) {
-            if (!parse_i64_arg(value, 1, 1000000, &parsed_i64)) {
+            if (!parse_i64_arg(value, 0, 1000000, &parsed_i64)) {
                 fprintf(stderr, "gpt_lm: invalid --epochs %s\n", value);
                 exit(2);
             }
             config.epochs = (int)parsed_i64;
+            config.epochs_set = true;
             continue;
         }
         value = arg_value(argc, argv, &i, "--batch-size");
@@ -347,6 +401,13 @@ static gpt_config parse_args(int argc, char **argv)
         }
         fprintf(stderr, "gpt_lm: unknown argument %s\n", argv[i]);
         print_usage(argv[0]);
+        exit(2);
+    }
+    if (config.generate_prompt != NULL && !config.epochs_set) {
+        config.epochs = 0;
+    }
+    if (config.epochs == 0 && config.generate_prompt == NULL) {
+        fprintf(stderr, "gpt_lm: --epochs 0 requires --generate\n");
         exit(2);
     }
     if (config.lr_min > config.lr_max) {
@@ -586,6 +647,77 @@ static void gpt_lm_deinit(gpt_lm *model)
     memset(model, 0, sizeof(*model));
 }
 
+static gd_status gpt_kv_cache_init(gd_context *ctx,
+                                   const gpt_lm *model,
+                                   int batch_size,
+                                   int max_seq,
+                                   gpt_kv_cache *cache)
+{
+    int64_t shape[4];
+    uint32_t i;
+    if (ctx == NULL || model == NULL || cache == NULL || batch_size <= 0 || max_seq <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(cache, 0, sizeof(*cache));
+    cache->k = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->k[0]));
+    cache->v = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->v[0]));
+    if (cache->k == NULL || cache->v == NULL) {
+        free(cache->k);
+        free(cache->v);
+        memset(cache, 0, sizeof(*cache));
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    cache->batch_size = batch_size;
+    cache->max_seq = max_seq;
+    cache->n_layers = model->n_layers;
+    cache->n_heads = model->n_heads;
+    cache->head_dim = model->head_dim;
+    cache->pos = 0;
+    shape[0] = batch_size;
+    shape[1] = max_seq;
+    shape[2] = model->n_heads;
+    shape[3] = model->head_dim;
+    for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
+        gd_status st = gd_tensor_empty(ctx,
+                                       GD_ARENA_STATE,
+                                       GD_DTYPE_F16,
+                                       gd_shape_make(4U, shape),
+                                       GPT_ALIGNMENT,
+                                       &cache->k[i]);
+        if (st != GD_OK) {
+            free(cache->k);
+            free(cache->v);
+            memset(cache, 0, sizeof(*cache));
+            return st;
+        }
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_STATE,
+                             GD_DTYPE_F16,
+                             gd_shape_make(4U, shape),
+                             GPT_ALIGNMENT,
+                             &cache->v[i]);
+        if (st != GD_OK) {
+            free(cache->k);
+            free(cache->v);
+            memset(cache, 0, sizeof(*cache));
+            return st;
+        }
+        cache->k[i].is_leaf = false;
+        cache->v[i].is_leaf = false;
+    }
+    return GD_OK;
+}
+
+static void gpt_kv_cache_deinit(gpt_kv_cache *cache)
+{
+    if (cache == NULL) {
+        return;
+    }
+    free(cache->k);
+    free(cache->v);
+    memset(cache, 0, sizeof(*cache));
+}
+
 static gd_status gpt_block_forward(gd_context *ctx,
                                    gpt_lm *model,
                                    gpt_block *block,
@@ -800,6 +932,325 @@ static gd_status gpt_lm_forward(gd_context *ctx,
         return st;
     }
     return gd_cross_entropy(ctx, &logits, target_ids, loss);
+}
+
+static gd_status gpt_block_prefill_cached(gd_context *ctx,
+                                           gpt_lm *model,
+                                           gpt_kv_cache *cache,
+                                           gpt_block *block,
+                                           uint32_t block_index,
+                                           const gd_tensor *x,
+                                           const gd_tensor *positions,
+                                           const gd_tensor *cu_seqlens,
+                                           int32_t cache_pos,
+                                           gd_tensor *out)
+{
+    const gd_rope_config rope_cfg = {
+        .theta = 10000.0f,
+        .n_dims = GPT_HEAD_DIM,
+        .interleaved = false,
+    };
+    const gd_sdpa_varlen_config sdpa_cfg = {
+        .scale = 0.0f,
+        .causal = true,
+        .sliding_window = GPT_SDPA_WINDOW,
+        .prefix_len = 0,
+        .max_seqlen = GPT_CONTEXT_LENGTH,
+    };
+    int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
+    int64_t mlp_sizes[2] = {GPT_MLP_HIDDEN, GPT_MLP_HIDDEN};
+    gd_tensor residual;
+    gd_tensor normed;
+    gd_tensor qkv;
+    gd_tensor qkv_parts[3];
+    gd_tensor q_view;
+    gd_tensor k_view;
+    gd_tensor v_view;
+    gd_tensor q_rot;
+    gd_tensor k_rot;
+    gd_tensor k_cache_new;
+    gd_tensor v_cache_new;
+    gd_tensor attn;
+    gd_tensor attn_flat;
+    gd_tensor attn_proj;
+    gd_tensor attn_resid;
+    gd_tensor mlp_normed;
+    gd_tensor up_gate;
+    gd_tensor up_gate_parts[2];
+    gd_tensor powlu;
+    gd_tensor mlp_proj;
+    gd_status st;
+    int64_t n_tokens;
+    int64_t q_shape[3];
+    int64_t cache_shape[4];
+    int64_t flat_shape[2];
+
+    if (ctx == NULL || model == NULL || cache == NULL || block == NULL || x == NULL ||
+        positions == NULL || cu_seqlens == NULL || out == NULL || x->rank != 2U ||
+        x->shape[1] != GPT_D_MODEL || cache_pos < 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    n_tokens = x->shape[0];
+    if (n_tokens <= 0 || n_tokens > cache->max_seq - (int64_t)cache_pos ||
+        cache->batch_size != 1 || block_index >= (uint32_t)cache->n_layers) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    q_shape[0] = n_tokens;
+    q_shape[1] = GPT_N_HEADS;
+    q_shape[2] = GPT_HEAD_DIM;
+    cache_shape[0] = 1;
+    cache_shape[1] = n_tokens;
+    cache_shape[2] = GPT_N_HEADS;
+    cache_shape[3] = GPT_HEAD_DIM;
+    flat_shape[0] = n_tokens;
+    flat_shape[1] = GPT_D_MODEL;
+
+    residual = *x;
+    st = gd_rms_norm(ctx, x, &block->attn_norm_w, model->rms_eps, &normed);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->qkv_proj, &normed, &qkv);
+    if (st != GD_OK) { return st; }
+    st = gd_split(ctx, &qkv, qkv_sizes, 3U, -1, qkv_parts);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[0], gd_shape_make(3U, q_shape), &q_view);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[1], gd_shape_make(3U, q_shape), &k_view);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[2], gd_shape_make(3U, q_shape), &v_view);
+    if (st != GD_OK) { return st; }
+    st = gd_rope(ctx, &q_view, positions, &rope_cfg, &q_rot);
+    if (st != GD_OK) { return st; }
+    st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &k_rot, gd_shape_make(4U, cache_shape), &k_cache_new);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &v_view, gd_shape_make(4U, cache_shape), &v_cache_new);
+    if (st != GD_OK) { return st; }
+    st = gd_kv_cache_append_at(ctx,
+                               &cache->k[block_index],
+                               &cache->v[block_index],
+                               cache_pos,
+                               &k_cache_new,
+                               &v_cache_new);
+    if (st != GD_OK) { return st; }
+    st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &attn, gd_shape_make(2U, flat_shape), &attn_flat);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->attn_proj, &attn_flat, &attn_proj);
+    if (st != GD_OK) { return st; }
+    st = gd_add(ctx, &residual, &attn_proj, &attn_resid);
+    if (st != GD_OK) { return st; }
+
+    residual = attn_resid;
+    st = gd_rms_norm(ctx, &attn_resid, &block->mlp_norm_w, model->rms_eps, &mlp_normed);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
+    if (st != GD_OK) { return st; }
+    st = gd_split(ctx, &up_gate, mlp_sizes, 2U, -1, up_gate_parts);
+    if (st != GD_OK) { return st; }
+    st = gd_powlu(ctx, &up_gate_parts[0], &up_gate_parts[1], model->powlu_m, &powlu);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
+    if (st != GD_OK) { return st; }
+    return gd_add(ctx, &residual, &mlp_proj, out);
+}
+
+static gd_status gpt_block_decode_cached(gd_context *ctx,
+                                         gpt_lm *model,
+                                         gpt_kv_cache *cache,
+                                         gpt_block *block,
+                                         uint32_t block_index,
+                                         const gd_tensor *x,
+                                         const gd_tensor *positions,
+                                         int32_t cache_pos,
+                                         gd_tensor *out)
+{
+    const gd_rope_config rope_cfg = {
+        .theta = 10000.0f,
+        .n_dims = GPT_HEAD_DIM,
+        .interleaved = false,
+    };
+    const gd_sdpa_decode_config sdpa_cfg = {
+        .scale = 0.0f,
+        .sliding_window = GPT_SDPA_WINDOW,
+        .prefix_len = 0,
+    };
+    int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
+    int64_t mlp_sizes[2] = {GPT_MLP_HIDDEN, GPT_MLP_HIDDEN};
+    gd_tensor residual;
+    gd_tensor normed;
+    gd_tensor qkv;
+    gd_tensor qkv_parts[3];
+    gd_tensor q_view;
+    gd_tensor k_view;
+    gd_tensor v_view;
+    gd_tensor q_rot;
+    gd_tensor k_rot;
+    gd_tensor attn;
+    gd_tensor attn_flat;
+    gd_tensor attn_proj;
+    gd_tensor attn_resid;
+    gd_tensor mlp_normed;
+    gd_tensor up_gate;
+    gd_tensor up_gate_parts[2];
+    gd_tensor powlu;
+    gd_tensor mlp_proj;
+    gd_status st;
+    int64_t q_shape[4];
+    int64_t flat_shape[2];
+
+    if (ctx == NULL || model == NULL || cache == NULL || block == NULL || x == NULL ||
+        positions == NULL || out == NULL || x->rank != 2U || x->shape[1] != GPT_D_MODEL ||
+        cache_pos < 0 || cache_pos >= cache->max_seq || block_index >= (uint32_t)cache->n_layers) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    q_shape[0] = x->shape[0];
+    q_shape[1] = 1;
+    q_shape[2] = GPT_N_HEADS;
+    q_shape[3] = GPT_HEAD_DIM;
+    flat_shape[0] = x->shape[0];
+    flat_shape[1] = GPT_D_MODEL;
+
+    residual = *x;
+    st = gd_rms_norm(ctx, x, &block->attn_norm_w, model->rms_eps, &normed);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->qkv_proj, &normed, &qkv);
+    if (st != GD_OK) { return st; }
+    st = gd_split(ctx, &qkv, qkv_sizes, 3U, -1, qkv_parts);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[0], gd_shape_make(4U, q_shape), &q_view);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[1], gd_shape_make(4U, q_shape), &k_view);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &qkv_parts[2], gd_shape_make(4U, q_shape), &v_view);
+    if (st != GD_OK) { return st; }
+    st = gd_rope(ctx, &q_view, positions, &rope_cfg, &q_rot);
+    if (st != GD_OK) { return st; }
+    st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
+    if (st != GD_OK) { return st; }
+    st = gd_kv_cache_append_at(ctx,
+                               &cache->k[block_index],
+                               &cache->v[block_index],
+                               cache_pos,
+                               &k_rot,
+                               &v_view);
+    if (st != GD_OK) { return st; }
+    st = gd_sdpa_decode_at(ctx,
+                           &q_rot,
+                           &cache->k[block_index],
+                           &cache->v[block_index],
+                           cache_pos,
+                           &sdpa_cfg,
+                           &attn);
+    if (st != GD_OK) { return st; }
+    st = gd_reshape(ctx, &attn, gd_shape_make(2U, flat_shape), &attn_flat);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->attn_proj, &attn_flat, &attn_proj);
+    if (st != GD_OK) { return st; }
+    st = gd_add(ctx, &residual, &attn_proj, &attn_resid);
+    if (st != GD_OK) { return st; }
+
+    residual = attn_resid;
+    st = gd_rms_norm(ctx, &attn_resid, &block->mlp_norm_w, model->rms_eps, &mlp_normed);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
+    if (st != GD_OK) { return st; }
+    st = gd_split(ctx, &up_gate, mlp_sizes, 2U, -1, up_gate_parts);
+    if (st != GD_OK) { return st; }
+    st = gd_powlu(ctx, &up_gate_parts[0], &up_gate_parts[1], model->powlu_m, &powlu);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
+    if (st != GD_OK) { return st; }
+    return gd_add(ctx, &residual, &mlp_proj, out);
+}
+
+static gd_status gpt_lm_prefill_logits(gd_context *ctx,
+                                       gpt_lm *model,
+                                       gpt_kv_cache *cache,
+                                       const gd_tensor *input_ids,
+                                       const gd_tensor *positions,
+                                       const gd_tensor *cu_seqlens,
+                                       gd_tensor *logits)
+{
+    gd_tensor x;
+    gd_tensor block_out;
+    gd_tensor final_norm;
+    gd_status st;
+    uint32_t i;
+    int32_t cache_pos;
+    if (ctx == NULL || model == NULL || cache == NULL || input_ids == NULL || positions == NULL ||
+        cu_seqlens == NULL || logits == NULL || input_ids->rank != 1U || positions->rank != 1U ||
+        input_ids->shape[0] != positions->shape[0] || input_ids->shape[0] <= 0 ||
+        input_ids->shape[0] > cache->max_seq - cache->pos) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    cache_pos = cache->pos;
+    st = gd_embedding(ctx, &model->token_embedding, input_ids, &x);
+    if (st != GD_OK) { return st; }
+    for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
+        st = gpt_block_prefill_cached(ctx,
+                                      model,
+                                      cache,
+                                      &model->block_items[i],
+                                      i,
+                                      &x,
+                                      positions,
+                                      cu_seqlens,
+                                      cache_pos,
+                                      &block_out);
+        if (st != GD_OK) { return st; }
+        x = block_out;
+    }
+    st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
+    if (st != GD_OK) { return st; }
+    cache->pos = (int32_t)(cache_pos + (int32_t)input_ids->shape[0]);
+    return GD_OK;
+}
+
+static gd_status gpt_lm_decode_logits(gd_context *ctx,
+                                      gpt_lm *model,
+                                      gpt_kv_cache *cache,
+                                      const gd_tensor *input_ids,
+                                      const gd_tensor *positions,
+                                      gd_tensor *logits)
+{
+    gd_tensor x;
+    gd_tensor block_out;
+    gd_tensor final_norm;
+    gd_status st;
+    uint32_t i;
+    int32_t cache_pos;
+    if (ctx == NULL || model == NULL || cache == NULL || input_ids == NULL || positions == NULL ||
+        logits == NULL || input_ids->rank != 1U || positions->rank != 1U ||
+        input_ids->shape[0] != positions->shape[0] || input_ids->shape[0] != cache->batch_size ||
+        cache->pos < 0 || cache->pos >= cache->max_seq) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    cache_pos = cache->pos;
+    st = gd_embedding(ctx, &model->token_embedding, input_ids, &x);
+    if (st != GD_OK) { return st; }
+    for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
+        st = gpt_block_decode_cached(ctx,
+                                     model,
+                                     cache,
+                                     &model->block_items[i],
+                                     i,
+                                     &x,
+                                     positions,
+                                     cache_pos,
+                                     &block_out);
+        if (st != GD_OK) { return st; }
+        x = block_out;
+    }
+    st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
+    if (st != GD_OK) { return st; }
+    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
+    if (st != GD_OK) { return st; }
+    cache->pos = cache_pos + 1;
+    return GD_OK;
 }
 
 static gd_status param_set_stats(const gd_param_set *params,
@@ -1106,6 +1557,214 @@ static void train_gpt(gd_context *ctx,
     }
 }
 
+static char *gpt_default_tokenizer_path(const char *data_dir)
+{
+    const char *file = "tokenizer-v2048.json";
+    const size_t data_len = strlen(data_dir);
+    const bool need_sep = data_len == 0U || data_dir[data_len - 1U] != '/';
+    const size_t file_len = strlen(file);
+    char *path;
+    if (data_len > SIZE_MAX - file_len - (need_sep ? 2U : 1U)) {
+        return NULL;
+    }
+    path = (char *)malloc(data_len + file_len + (need_sep ? 2U : 1U));
+    if (path == NULL) {
+        return NULL;
+    }
+    (void)sprintf(path, "%s%s%s", data_dir, need_sep ? "/" : "", file);
+    return path;
+}
+
+static gd_status gpt_data_i32_tensor(gd_context *ctx,
+                                     const int32_t *values,
+                                     int64_t count,
+                                     gd_tensor *out)
+{
+    gd_status st;
+    if (ctx == NULL || values == NULL || out == NULL || count <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, GD_SHAPE(count), GPT_ALIGNMENT, out);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_tensor_write(ctx, out, values, (size_t)count * sizeof(values[0]));
+}
+
+static int gpt_sample_next_token(const float *logits,
+                                 int vocab_size,
+                                 float temperature,
+                                 uint64_t *rng)
+{
+    int best = 0;
+    float best_value = logits[0];
+    int i;
+    for (i = 1; i < vocab_size; ++i) {
+        if (logits[i] > best_value) {
+            best_value = logits[i];
+            best = i;
+        }
+    }
+    if (temperature <= 0.0f) {
+        return best;
+    }
+    {
+        double sum = 0.0;
+        double target;
+        uint64_t r;
+        for (i = 0; i < vocab_size; ++i) {
+            const double z = ((double)logits[i] - (double)best_value) / (double)temperature;
+            sum += exp(z);
+        }
+        if (!(sum > 0.0) || !isfinite(sum)) {
+            return best;
+        }
+        *rng = splitmix64(*rng);
+        r = *rng >> 11;
+        target = ((double)r * (1.0 / 9007199254740992.0)) * sum;
+        for (i = 0; i < vocab_size; ++i) {
+            const double z = ((double)logits[i] - (double)best_value) / (double)temperature;
+            target -= exp(z);
+            if (target <= 0.0) {
+                return i;
+            }
+        }
+    }
+    return best;
+}
+
+static void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
+{
+    gd_tokenizer *tok = NULL;
+    gd_tokenizer_config tok_cfg;
+    char *default_tok_path = NULL;
+    const char *tokenizer_path;
+    int32_t *encoded = NULL;
+    int n_encoded = 0;
+    int prompt_offset = 0;
+    int prompt_len;
+    int max_new;
+    int32_t *all_ids = NULL;
+    int total_ids;
+    int generated = 0;
+    int next_id;
+    uint64_t rng;
+    float logits_host[GPT_VOCAB_SIZE];
+    gpt_kv_cache cache;
+    double start;
+    double elapsed;
+    char *decoded = NULL;
+    char *decoded_new = NULL;
+
+    memset(&cache, 0, sizeof(cache));
+    tok_cfg.split_digits = 1;
+    tok_cfg.allow_special = 1;
+    default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
+    tokenizer_path = config->tokenizer_path != NULL ? config->tokenizer_path : default_tok_path;
+    if (tokenizer_path == NULL) {
+        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "tokenizer path allocation", __LINE__);
+    }
+    TRY(ctx, gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &tok));
+    TRY(ctx, gd_tokenizer_encode(tok, config->generate_prompt, &encoded, &n_encoded));
+    if (n_encoded <= 0) {
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty generation prompt", __LINE__);
+    }
+    if (n_encoded >= GPT_CONTEXT_LENGTH) {
+        prompt_offset = n_encoded - (GPT_CONTEXT_LENGTH - 1);
+        printf("generate: prompt tokens=%d exceeds context; using last %d tokens\n",
+               n_encoded,
+               GPT_CONTEXT_LENGTH - 1);
+    }
+    prompt_len = n_encoded - prompt_offset;
+    max_new = config->max_new_tokens;
+    if (max_new > GPT_CONTEXT_LENGTH - prompt_len) {
+        max_new = GPT_CONTEXT_LENGTH - prompt_len;
+    }
+    if (max_new <= 0) {
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "no context room for generation", __LINE__);
+    }
+    all_ids = (int32_t *)calloc((size_t)(prompt_len + max_new), sizeof(all_ids[0]));
+    if (all_ids == NULL) {
+        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation token buffer", __LINE__);
+    }
+    memcpy(all_ids, encoded + prompt_offset, (size_t)prompt_len * sizeof(all_ids[0]));
+    total_ids = prompt_len;
+    rng = splitmix64(config->seed ^ UINT64_C(0xdec0de1234567890));
+
+    TRY(ctx, gpt_kv_cache_init(ctx, model, 1, GPT_CONTEXT_LENGTH, &cache));
+    gd_module_set_training(&model->mod, false);
+    start = wall_seconds();
+
+    {
+        int32_t positions[GPT_CONTEXT_LENGTH];
+        int32_t cu[2];
+        gd_tensor ids_t;
+        gd_tensor pos_t;
+        gd_tensor cu_t;
+        gd_tensor logits;
+        gd_tensor last_logits;
+        int i;
+        for (i = 0; i < prompt_len; ++i) {
+            positions[i] = (int32_t)i;
+        }
+        cu[0] = 0;
+        cu[1] = (int32_t)prompt_len;
+        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
+        TRY(ctx, gpt_data_i32_tensor(ctx, all_ids, prompt_len, &ids_t));
+        TRY(ctx, gpt_data_i32_tensor(ctx, positions, prompt_len, &pos_t));
+        TRY(ctx, gpt_data_i32_tensor(ctx, cu, 2, &cu_t));
+        TRY(ctx, gpt_lm_prefill_logits(ctx, model, &cache, &ids_t, &pos_t, &cu_t, &logits));
+        TRY(ctx, gd_tensor_slice(ctx, &logits, 0U, (int64_t)prompt_len - 1, 1, &last_logits));
+        TRY(ctx, gd_end_step(ctx));
+        TRY(ctx, gd_tensor_read_f32(ctx, &last_logits, logits_host, GPT_VOCAB_SIZE));
+    }
+
+    next_id = gpt_sample_next_token(logits_host, GPT_VOCAB_SIZE, config->temperature, &rng);
+    while (generated < max_new) {
+        all_ids[total_ids] = (int32_t)next_id;
+        total_ids += 1;
+        generated += 1;
+        if (generated >= max_new) {
+            break;
+        }
+        {
+            int32_t id_value = (int32_t)next_id;
+            int32_t pos_value = cache.pos;
+            gd_tensor ids_t;
+            gd_tensor pos_t;
+            gd_tensor logits;
+            TRY(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, gd_batch_empty()));
+            TRY(ctx, gpt_data_i32_tensor(ctx, &id_value, 1, &ids_t));
+            TRY(ctx, gpt_data_i32_tensor(ctx, &pos_value, 1, &pos_t));
+            TRY(ctx, gpt_lm_decode_logits(ctx, model, &cache, &ids_t, &pos_t, &logits));
+            TRY(ctx, gd_end_step(ctx));
+            TRY(ctx, gd_tensor_read_f32(ctx, &logits, logits_host, GPT_VOCAB_SIZE));
+        }
+        next_id = gpt_sample_next_token(logits_host, GPT_VOCAB_SIZE, config->temperature, &rng);
+    }
+
+    elapsed = wall_seconds() - start;
+    TRY(ctx, gd_tokenizer_decode(tok, all_ids, total_ids, &decoded));
+    TRY(ctx, gd_tokenizer_decode(tok, all_ids + prompt_len, generated, &decoded_new));
+    printf("generate: tokenizer=%s prompt_tokens=%d generated=%d temperature=%.3f elapsed=%.3fs tok/s=%.1f\n",
+           tokenizer_path,
+           prompt_len,
+           generated,
+           (double)config->temperature,
+           elapsed,
+           elapsed > 0.0 ? (double)generated / elapsed : 0.0);
+    printf("generated_text:\n%s\n", decoded_new != NULL ? decoded_new : "");
+    printf("full_text:\n%s\n", decoded != NULL ? decoded : "");
+
+    gd_tokenizer_free(decoded_new);
+    gd_tokenizer_free(decoded);
+    gpt_kv_cache_deinit(&cache);
+    free(all_ids);
+    gd_tokenizer_free(encoded);
+    gd_tokenizer_destroy(tok);
+    free(default_tok_path);
+}
+
 int main(int argc, char **argv)
 {
     const gpt_config config = parse_args(argc, argv);
@@ -1118,7 +1777,7 @@ int main(int argc, char **argv)
     gd_optimizer *optimizer = NULL;
     gd_amp_scaler *scaler = NULL;
     gd_lr_scheduler_config lr_config;
-    size_t dataset_samples;
+    size_t dataset_samples = 0U;
     size_t samples_per_epoch = 0U;
     size_t steps_per_epoch = 0U;
     size_t total_steps = 0U;
@@ -1143,13 +1802,15 @@ int main(int argc, char **argv)
         fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
     }
 
-    TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &dataset));
-    dataset_samples = (size_t)gd_dataset_num_samples(dataset);
-    steps_per_epoch = effective_steps_per_epoch((uint64_t)dataset_samples, &config, &samples_per_epoch);
-    if (steps_per_epoch == 0U || (size_t)config.epochs > SIZE_MAX / steps_per_epoch) {
-        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
+    if (config.epochs > 0) {
+        TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &dataset));
+        dataset_samples = (size_t)gd_dataset_num_samples(dataset);
+        steps_per_epoch = effective_steps_per_epoch((uint64_t)dataset_samples, &config, &samples_per_epoch);
+        if (steps_per_epoch == 0U || (size_t)config.epochs > SIZE_MAX / steps_per_epoch) {
+            fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
+        }
+        total_steps = (size_t)config.epochs * steps_per_epoch;
     }
-    total_steps = (size_t)config.epochs * steps_per_epoch;
 
     gpt_lm_init(ctx, &model, &config);
     {
@@ -1167,7 +1828,7 @@ int main(int argc, char **argv)
            (double)trainable_params / 1000000.0,
            (double)param_bytes / (1024.0 * 1024.0));
     print_param_set(&params);
-    {
+    if (config.epochs > 0) {
         const gd_adamw_config adam = gpt_adamw_config(config.lr_max, config.weight_decay);
         const gd_amp_config amp = gpt_amp_config();
         TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
@@ -1209,21 +1870,30 @@ int main(int argc, char **argv)
            GPT_MLP_HIDDEN,
            GPT_SDPA_WINDOW,
            (double)config.dropout_p);
-    printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.1f\n",
-           (double)lr_config.max_lr,
-           (double)lr_config.min_lr,
-           (unsigned long long)lr_config.warmup_steps,
-           (unsigned long long)lr_config.total_steps,
-           (double)config.weight_decay,
-           (double)gd_amp_scaler_scale(scaler));
+    if (config.epochs > 0) {
+        printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.1f\n",
+               (double)lr_config.max_lr,
+               (double)lr_config.min_lr,
+               (unsigned long long)lr_config.warmup_steps,
+               (unsigned long long)lr_config.total_steps,
+               (double)config.weight_decay,
+               (double)gd_amp_scaler_scale(scaler));
+    } else {
+        printf("optim: skipped (generation-only run)\n");
+    }
     printf("memory: params=%zuMB state=%zuMB scratch_slot=%zuMB data_slot=%zuMB\n",
            mem.params_bytes / (1024U * 1024U),
            mem.state_bytes / (1024U * 1024U),
            mem.scratch_slot_bytes / (1024U * 1024U),
            mem.data_slot_bytes / (1024U * 1024U));
 
-    train_gpt(ctx, &model, dataset, optimizer, scaler, &lr_config, &config, steps_per_epoch, total_steps);
-    optimizer_steps = (size_t)gd_optimizer_step_count(optimizer);
+    if (config.epochs > 0) {
+        train_gpt(ctx, &model, dataset, optimizer, scaler, &lr_config, &config, steps_per_epoch, total_steps);
+        optimizer_steps = (size_t)gd_optimizer_step_count(optimizer);
+    }
+    if (config.generate_prompt != NULL) {
+        gpt_generate(ctx, &model, &config);
+    }
     {
         gd_memory_stats stats;
         TRY(ctx, gd_memory_stats_query(ctx, &stats));

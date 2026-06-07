@@ -1,6 +1,6 @@
 # GPT language model example
 
-Decoder LM example over the Promessi Sposi GDDS dataset, with training and KV-cache generation paths.
+Decoder LM example over the Promessi Sposi GDDS dataset, with training, validation checkpointing, standalone checkpoint inference, and KV-cache generation paths.
 
 Model defaults:
 
@@ -15,16 +15,18 @@ Model defaults:
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
 - RMSNorm, RoPE, PoWLU gated MLP, and dropout
 
-Build and run:
+Build and run training:
 
 ```sh
 make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 32"
 ```
 
+At the end of every epoch, training evaluates the `val` split and saves `checkpoints/gpt_lm_best.gdckpt` whenever validation loss improves.
+
 Overfit smoke tests:
 
 ```sh
-make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 1 --overfit-num-samples 1 --report-every 1"
+make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 1 --overfit-num-samples 1 --report-every 1 --no-save-best"
 make -C examples/gpt_lm run ARGS="--epochs 1 --batch-size 32 --overfit-num-samples 32 --report-every 1"
 ```
 
@@ -32,6 +34,12 @@ Generation-only smoke test with random/current in-memory weights:
 
 ```sh
 make -C examples/gpt_lm run ARGS="--epochs 0 --generate 'Don Abbondio' --max-new-tokens 64"
+```
+
+Checkpoint inference after training:
+
+```sh
+make -C examples/gpt_lm infer ARGS="--checkpoint checkpoints/gpt_lm_best.gdckpt --prompt 'Don Abbondio' --max-new-tokens 64"
 ```
 
 Periodic batched generation during training:
@@ -56,12 +64,16 @@ Useful runtime options:
 --warmup-steps N        # default -1 means total_steps / 10
 --generate TEXT
 --generate-every-n-steps N
+--checkpoint-path PATH
+--load-checkpoint PATH
+--val-split NAME
+--no-save-best
 --max-new-tokens N
 --temperature T         # 0 means greedy
 --tokenizer-path PATH
 ```
 
-The GDDS dataloader provides packed fields directly:
+The dataset builder writes `train` and `val` GDDS splits. The GDDS dataloader provides packed fields directly:
 
 ```text
 input_ids   i32 [B * 512]

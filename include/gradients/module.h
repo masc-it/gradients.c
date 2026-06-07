@@ -90,6 +90,34 @@ typedef struct gd_param_set {
     uint32_t capacity;
 } gd_param_set;
 
+typedef struct gd_module_save_options {
+    const char *metadata;
+    size_t metadata_len;
+    bool include_buffers;
+} gd_module_save_options;
+
+typedef struct gd_module_load_options {
+    bool strict;
+    bool load_buffers;
+} gd_module_load_options;
+
+static inline gd_module_save_options gd_module_save_options_default(void)
+{
+    gd_module_save_options options;
+    options.metadata = NULL;
+    options.metadata_len = 0U;
+    options.include_buffers = true;
+    return options;
+}
+
+static inline gd_module_load_options gd_module_load_options_default(void)
+{
+    gd_module_load_options options;
+    options.strict = true;
+    options.load_buffers = true;
+    return options;
+}
+
 typedef struct gd_module_list {
     gd_module mod;
     gd_module **items;
@@ -218,6 +246,23 @@ gd_status gd_module_collect_params(gd_context *ctx,
                                    const gd_param_group *groups,
                                    uint32_t group_count,
                                    gd_param_set *out);
+
+/* Save/load a backend-independent module state dictionary. The module must be
+ * constructed before loading; strict loads require exact path/dtype/shape
+ * matches. Metadata is an opaque UTF-8 blob owned by the caller. */
+gd_status gd_module_save_state(gd_context *ctx,
+                               const gd_module *module,
+                               const char *path,
+                               const gd_module_save_options *options);
+gd_status gd_module_load_state(gd_context *ctx,
+                               gd_module *module,
+                               const char *path,
+                               const gd_module_load_options *options);
+/* Reads the opaque metadata blob into a NUL-terminated malloc allocation;
+ * caller releases *metadata_out with free(). */
+gd_status gd_checkpoint_read_metadata(const char *path,
+                                      char **metadata_out,
+                                      size_t *metadata_len_out);
 
 gd_status gd_module_list_init_child(gd_context *ctx,
                                     gd_module *parent,

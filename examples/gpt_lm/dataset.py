@@ -45,7 +45,7 @@ IM_END = "<|im_end|>"
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_CONTEXT_LENGTH = 512
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
-DATA_FORMAT_VERSION = "gpt-lm-promessi-v1"
+DATA_FORMAT_VERSION = "gpt-lm-promessi-v2"
 
 
 @dataclass(frozen=True)
@@ -202,23 +202,41 @@ def write_gdds_dataset(
     out_dir: Path,
     corpus: TokenizedCorpus,
     max_shard_bytes: int,
-) -> list[Path]:
+    val_samples: int,
+) -> dict[str, list[Path]]:
     if corpus.sequence_length is None or corpus.sequence_length < 3:
         raise ValueError("packed tokenized corpus must have sequence_length >= 3")
+    if val_samples < 0:
+        raise ValueError("val_samples must be non-negative")
     context_length = corpus.sequence_length - 1
     fields = fields_for_context(context_length)
-    remove_split_shards(out_dir, "train")
-    writer = GddsSplitWriter(out_dir, "train", fields, max_shard_bytes=max_shard_bytes)
-    try:
-        for sample in iter_lm_samples(corpus):
-            writer.write_sample(sample)
-        paths = writer.finish()
-    except BaseException:
-        writer.abort()
-        raise
-    if not paths:
+    total_samples = corpus.num_sequences
+    if total_samples <= 0:
         raise ValueError("tokenizer produced no packed records")
-    return paths
+    if total_samples == 1 or val_samples == 0:
+        val_count = 0
+    else:
+        val_count = min(val_samples, max(1, total_samples // 10), total_samples - 1)
+    train_count = total_samples - val_count
+    remove_split_shards(out_dir, "train")
+    remove_split_shards(out_dir, "val")
+    train_writer = GddsSplitWriter(out_dir, "train", fields, max_shard_bytes=max_shard_bytes)
+    val_writer = GddsSplitWriter(out_dir, "val", fields, max_shard_bytes=max_shard_bytes)
+    try:
+        for sample_index, sample in enumerate(iter_lm_samples(corpus)):
+            if sample_index < train_count:
+                train_writer.write_sample(sample)
+            else:
+                val_writer.write_sample(sample)
+        train_paths = train_writer.finish()
+        val_paths = val_writer.finish() if val_count > 0 else []
+    except BaseException:
+        train_writer.abort()
+        val_writer.abort()
+        raise
+    if not train_paths:
+        raise ValueError("tokenizer produced no training records")
+    return {"train": train_paths, "val": val_paths}
 
 
 def read_gdds_header(path: Path) -> ShardHeader:
@@ -239,14 +257,17 @@ def write_manifest(
     source: Path,
     tokenizer_path: Path,
     tokenized_corpus: TokenizedCorpus,
-    gdds_paths: Sequence[Path],
+    gdds_paths: Mapping[str, Sequence[Path]],
     max_shard_bytes: int,
     vocab_size: int,
 ) -> None:
     assert tokenized_corpus.sequence_length is not None
     context_length = tokenized_corpus.sequence_length - 1
     fields = fields_for_context(context_length)
-    split_samples = sum(read_gdds_header(path).samples for path in gdds_paths)
+    split_samples = {
+        split: sum(read_gdds_header(path).samples for path in paths)
+        for split, paths in gdds_paths.items()
+    }
     manifest = {
         "format": "GDDS",
         "version": 1,
@@ -274,10 +295,11 @@ def write_manifest(
             "source_tokens": tokenized_corpus.num_tokens,
         },
         "splits": {
-            "train": {
-                "samples": split_samples,
-                "shards": [path.name for path in gdds_paths],
+            split: {
+                "samples": split_samples.get(split, 0),
+                "shards": [path.name for path in paths],
             }
+            for split, paths in gdds_paths.items()
         },
         "prep": {
             "format_version": DATA_FORMAT_VERSION,
@@ -373,6 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES)
     parser.add_argument("--retrain-tokenizer", action="store_true")
+    parser.add_argument("--val-samples", type=int, default=64)
     parser.add_argument("--preview-samples", type=int, default=10)
     parser.add_argument("--preview-seed", type=int, default=17)
     return parser.parse_args()
@@ -405,7 +428,12 @@ def main() -> int:
     if corpus.sequence_length != expected_record_length:
         raise ValueError(f"unexpected tokenized sequence length {corpus.sequence_length}")
 
-    paths = write_gdds_dataset(out_dir=out_dir, corpus=corpus, max_shard_bytes=args.max_shard_bytes)
+    paths = write_gdds_dataset(
+        out_dir=out_dir,
+        corpus=corpus,
+        max_shard_bytes=args.max_shard_bytes,
+        val_samples=args.val_samples,
+    )
     write_manifest(
         out_dir=out_dir,
         source=args.source,
@@ -416,15 +444,20 @@ def main() -> int:
         vocab_size=args.vocab_size,
     )
 
-    total_samples = sum(read_gdds_header(path).samples for path in paths)
-    print(f"Wrote {total_samples} GPT LM samples to {out_dir}")
-    for path in paths:
-        print(path)
+    total_samples = sum(
+        read_gdds_header(path).samples for split_paths in paths.values() for path in split_paths
+    )
+    train_samples = sum(read_gdds_header(path).samples for path in paths["train"])
+    val_samples = sum(read_gdds_header(path).samples for path in paths.get("val", []))
+    print(f"Wrote {total_samples} GPT LM samples to {out_dir} (train={train_samples}, val={val_samples})")
+    for split_paths in paths.values():
+        for path in split_paths:
+            print(path)
     print(out_dir / "manifest.json")
 
     if args.preview_samples > 0:
         show_random_samples(
-            shards=paths,
+            shards=paths["train"],
             tokenizer_path=tokenizer_path,
             total_samples=total_samples,
             count=args.preview_samples,

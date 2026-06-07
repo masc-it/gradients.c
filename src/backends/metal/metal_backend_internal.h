@@ -41,6 +41,8 @@ struct gd_backend {
     void *dropout_backward_mask_f32_pso;
     void *rope_f16_pso;
     void *rope_f32_pso;
+    void *rope_full_f16_pso;
+    void *rope_full_f32_pso;
     void *rope_backward_f16_pso;
     void *rope_backward_f32_pso;
     void *binary_pso[GD_OP_COUNT];

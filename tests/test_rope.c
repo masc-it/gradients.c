@@ -110,6 +110,14 @@ static void fill_sequence(float *dst, size_t count, float scale, float bias)
     }
 }
 
+static void fill_positions(int32_t *dst, size_t count)
+{
+    size_t i;
+    for (i = 0U; i < count; ++i) {
+        dst[i] = (int32_t)((i * 7U + 3U) & 0x7fU);
+    }
+}
+
 static void run_case(gd_dtype dtype,
                      const int64_t *shape,
                      uint32_t rank,
@@ -232,6 +240,28 @@ static void test_rope_f16_interleaved_tail(void)
     run_case(GD_DTYPE_F16, shape, 3U, pos, 2U, rope, 1.5e-3f, "f16 interleaved rope tail");
 }
 
+static void test_rope_f32_full_head_many_tokens(void)
+{
+    const int64_t shape[3] = {1024, 2, 6};
+    const gd_rope_config rope = {.theta = 10000.0f, .n_dims = 6, .interleaved = false};
+    int32_t *pos = (int32_t *)malloc((size_t)shape[0] * sizeof(pos[0]));
+    CHECK(pos != NULL, "position allocation");
+    fill_positions(pos, (size_t)shape[0]);
+    run_case(GD_DTYPE_F32, shape, 3U, pos, (size_t)shape[0], rope, 2.5e-5f, "f32 full-head rope");
+    free(pos);
+}
+
+static void test_rope_f16_full_head_many_tokens(void)
+{
+    const int64_t shape[3] = {1024, 4, 64};
+    const gd_rope_config rope = {.theta = 10000.0f, .n_dims = 64, .interleaved = false};
+    int32_t *pos = (int32_t *)malloc((size_t)shape[0] * sizeof(pos[0]));
+    CHECK(pos != NULL, "position allocation");
+    fill_positions(pos, (size_t)shape[0]);
+    run_case(GD_DTYPE_F16, shape, 3U, pos, (size_t)shape[0], rope, 1.5e-3f, "f16 full-head rope");
+    free(pos);
+}
+
 static void test_rope_rejects_bad_n_dims(void)
 {
     const int64_t shape[2] = {1, 6};
@@ -265,6 +295,8 @@ int main(void)
 {
     test_rope_f32_half_split();
     test_rope_f16_interleaved_tail();
+    test_rope_f32_full_head_many_tokens();
+    test_rope_f16_full_head_many_tokens();
     test_rope_rejects_bad_n_dims();
     printf("test_rope ok\n");
     return 0;

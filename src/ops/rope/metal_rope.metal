@@ -68,6 +68,54 @@ static inline void gd_rope_rotate_f32(device const float *x,
     }
 }
 
+static inline void gd_rope_rotate_full_f16(device const half *x,
+                                           device half *out,
+                                           device const int *pos,
+                                           constant gd_metal_rope_args &args,
+                                           uint gid)
+{
+    const uint half_dims = args.n_dims >> 1U;
+    const uint pair = gid % half_dims;
+    const uint token = gid / half_dims;
+    const uint a = args.interleaved != 0U ? (pair << 1U) : pair;
+    const uint b = args.interleaved != 0U ? ((pair << 1U) + 1U) : (pair + half_dims);
+    const int position = pos[token];
+    const float angle = gd_rope_pair_angle(args, pair, position);
+    const float c = cos(angle);
+    const float s = sin(angle) * args.sin_sign;
+    for (uint h = 0U; h < args.heads; ++h) {
+        const ulong base = (ulong(token) * ulong(args.heads) + ulong(h)) * ulong(args.head_dim);
+        const float x0 = float(x[base + ulong(a)]);
+        const float x1 = float(x[base + ulong(b)]);
+        out[base + ulong(a)] = half(x0 * c - x1 * s);
+        out[base + ulong(b)] = half(x0 * s + x1 * c);
+    }
+}
+
+static inline void gd_rope_rotate_full_f32(device const float *x,
+                                           device float *out,
+                                           device const int *pos,
+                                           constant gd_metal_rope_args &args,
+                                           uint gid)
+{
+    const uint half_dims = args.n_dims >> 1U;
+    const uint pair = gid % half_dims;
+    const uint token = gid / half_dims;
+    const uint a = args.interleaved != 0U ? (pair << 1U) : pair;
+    const uint b = args.interleaved != 0U ? ((pair << 1U) + 1U) : (pair + half_dims);
+    const int position = pos[token];
+    const float angle = gd_rope_pair_angle(args, pair, position);
+    const float c = cos(angle);
+    const float s = sin(angle) * args.sin_sign;
+    for (uint h = 0U; h < args.heads; ++h) {
+        const ulong base = (ulong(token) * ulong(args.heads) + ulong(h)) * ulong(args.head_dim);
+        const float x0 = x[base + ulong(a)];
+        const float x1 = x[base + ulong(b)];
+        out[base + ulong(a)] = x0 * c - x1 * s;
+        out[base + ulong(b)] = x0 * s + x1 * c;
+    }
+}
+
 kernel void gd_rope_f16_kernel(device const uchar *xbuf [[buffer(0)]],
                                device const uchar *posbuf [[buffer(1)]],
                                device uchar *outbuf [[buffer(2)]],
@@ -96,6 +144,40 @@ kernel void gd_rope_f32_kernel(device const uchar *xbuf [[buffer(0)]],
     device const int *pos = reinterpret_cast<device const int *>(posbuf + args.pos_offset);
     device float *out = reinterpret_cast<device float *>(outbuf + args.out_offset);
     gd_rope_rotate_f32(x, out, pos, args, gid);
+}
+
+kernel void gd_rope_full_f16_kernel(device const uchar *xbuf [[buffer(0)]],
+                                    device const uchar *posbuf [[buffer(1)]],
+                                    device uchar *outbuf [[buffer(2)]],
+                                    constant gd_metal_rope_args &args [[buffer(3)]],
+                                    uint gid [[thread_position_in_grid]])
+{
+    const uint leading_count = args.rows / args.heads;
+    const uint half_dims = args.n_dims >> 1U;
+    if (gid >= leading_count * half_dims) {
+        return;
+    }
+    device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
+    device const int *pos = reinterpret_cast<device const int *>(posbuf + args.pos_offset);
+    device half *out = reinterpret_cast<device half *>(outbuf + args.out_offset);
+    gd_rope_rotate_full_f16(x, out, pos, args, gid);
+}
+
+kernel void gd_rope_full_f32_kernel(device const uchar *xbuf [[buffer(0)]],
+                                    device const uchar *posbuf [[buffer(1)]],
+                                    device uchar *outbuf [[buffer(2)]],
+                                    constant gd_metal_rope_args &args [[buffer(3)]],
+                                    uint gid [[thread_position_in_grid]])
+{
+    const uint leading_count = args.rows / args.heads;
+    const uint half_dims = args.n_dims >> 1U;
+    if (gid >= leading_count * half_dims) {
+        return;
+    }
+    device const float *x = reinterpret_cast<device const float *>(xbuf + args.x_offset);
+    device const int *pos = reinterpret_cast<device const int *>(posbuf + args.pos_offset);
+    device float *out = reinterpret_cast<device float *>(outbuf + args.out_offset);
+    gd_rope_rotate_full_f32(x, out, pos, args, gid);
 }
 
 kernel void gd_rope_backward_f16_kernel(device const uchar *gbuf [[buffer(0)]],

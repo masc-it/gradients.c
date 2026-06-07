@@ -8,6 +8,8 @@
 #include <string.h>
 
 #define GD_METAL_ROPE_MAX_THREADS_PER_GROUP 256U
+/* Below this, extra per-thread head loops do not reliably beat the simpler pair-row kernel. */
+#define GD_METAL_ROPE_FULL_MIN_LEADING_COUNT 1024U
 
 static id<MTLComputePipelineState> gd_rope_forward_pso(gd_backend *backend, uint32_t dtype)
 {
@@ -27,6 +29,17 @@ static id<MTLComputePipelineState> gd_rope_backward_pso(gd_backend *backend, uin
     }
     if (dtype == (uint32_t)GD_DTYPE_F32) {
         return (__bridge id<MTLComputePipelineState>)backend->rope_backward_f32_pso;
+    }
+    return nil;
+}
+
+static id<MTLComputePipelineState> gd_rope_full_pso(gd_backend *backend, uint32_t dtype)
+{
+    if (dtype == (uint32_t)GD_DTYPE_F16) {
+        return (__bridge id<MTLComputePipelineState>)backend->rope_full_f16_pso;
+    }
+    if (dtype == (uint32_t)GD_DTYPE_F32) {
+        return (__bridge id<MTLComputePipelineState>)backend->rope_full_f32_pso;
     }
     return nil;
 }
@@ -180,18 +193,48 @@ static bool gd_rope_args_valid(const gd_backend_tensor_view *x,
     return true;
 }
 
+static bool gd_rope_use_full_kernel(const gd_metal_rope_args *args)
+{
+    NSUInteger leading_count;
+    if (args == NULL || args->n_dims != args->head_dim || args->heads == 0U ||
+        args->rows % args->heads != 0U) {
+        return false;
+    }
+    leading_count = (NSUInteger)args->rows / (NSUInteger)args->heads;
+    return leading_count >= (NSUInteger)GD_METAL_ROPE_FULL_MIN_LEADING_COUNT;
+}
+
 static MTLSize gd_rope_grid(const gd_metal_rope_args *args)
 {
     return MTLSizeMake((NSUInteger)args->rows * (NSUInteger)args->lanes_per_row, 1U, 1U);
 }
 
-static MTLSize gd_rope_threads(const gd_metal_rope_args *args)
+static MTLSize gd_rope_full_grid(const gd_metal_rope_args *args)
 {
-    NSUInteger threads = (NSUInteger)args->rows * (NSUInteger)args->lanes_per_row;
+    NSUInteger leading_count = (NSUInteger)args->rows / (NSUInteger)args->heads;
+    NSUInteger half_dims = (NSUInteger)args->n_dims >> 1U;
+    return MTLSizeMake(leading_count * half_dims, 1U, 1U);
+}
+
+static MTLSize gd_rope_threads_for_count(NSUInteger count)
+{
+    NSUInteger threads = count;
     if (threads > (NSUInteger)GD_METAL_ROPE_MAX_THREADS_PER_GROUP) {
         threads = (NSUInteger)GD_METAL_ROPE_MAX_THREADS_PER_GROUP;
     }
     return MTLSizeMake(threads, 1U, 1U);
+}
+
+static MTLSize gd_rope_threads(const gd_metal_rope_args *args)
+{
+    return gd_rope_threads_for_count((NSUInteger)args->rows * (NSUInteger)args->lanes_per_row);
+}
+
+static MTLSize gd_rope_full_threads(const gd_metal_rope_args *args)
+{
+    NSUInteger leading_count = (NSUInteger)args->rows / (NSUInteger)args->heads;
+    NSUInteger half_dims = (NSUInteger)args->n_dims >> 1U;
+    return gd_rope_threads_for_count(leading_count * half_dims);
 }
 
 static gd_status gd_backend_rope_encode(gd_backend *backend,
@@ -207,12 +250,18 @@ static gd_status gd_backend_rope_encode(gd_backend *backend,
     id<MTLComputePipelineState> pso;
     gd_metal_rope_args metal_args;
     bool immediate;
+    bool full_kernel;
     gd_status st;
     if (backend == NULL || !gd_rope_args_valid(x, pos_ids, out, args, &metal_args)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     metal_args.sin_sign = sin_sign;
-    pso = backward ? gd_rope_backward_pso(backend, x->dtype) : gd_rope_forward_pso(backend, x->dtype);
+    full_kernel = gd_rope_use_full_kernel(&metal_args);
+    if (full_kernel) {
+        pso = gd_rope_full_pso(backend, x->dtype);
+    } else {
+        pso = backward ? gd_rope_backward_pso(backend, x->dtype) : gd_rope_forward_pso(backend, x->dtype);
+    }
     if (pso == nil) {
         return GD_ERR_UNSUPPORTED;
     }
@@ -229,7 +278,12 @@ static gd_status gd_backend_rope_encode(gd_backend *backend,
     [encoder setBuffer:gd_rope_buffer(pos_ids->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_rope_buffer(out->buffer) offset:0U atIndex:2U];
     [encoder setBytes:&metal_args length:sizeof(metal_args) atIndex:3U];
-    [encoder dispatchThreads:gd_rope_grid(&metal_args) threadsPerThreadgroup:gd_rope_threads(&metal_args)];
+    if (full_kernel) {
+        [encoder dispatchThreads:gd_rope_full_grid(&metal_args)
+            threadsPerThreadgroup:gd_rope_full_threads(&metal_args)];
+    } else {
+        [encoder dispatchThreads:gd_rope_grid(&metal_args) threadsPerThreadgroup:gd_rope_threads(&metal_args)];
+    }
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);
 }

@@ -949,10 +949,30 @@ gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *des
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_adamw_batch(gd_backend *backend,
+                                  const gd_backend_adamw_desc *descs,
+                                  uint32_t desc_count)
+{
+    (void)backend;
+    (void)descs;
+    (void)desc_count;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc)
 {
     (void)backend;
     (void)desc;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_amp_unscale_batch(gd_backend *backend,
+                                        const gd_backend_amp_unscale_desc *descs,
+                                        uint32_t desc_count)
+{
+    (void)backend;
+    (void)descs;
+    (void)desc_count;
     return GD_ERR_UNSUPPORTED;
 }
 

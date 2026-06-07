@@ -559,7 +559,13 @@ gd_status gd_backend_kv_cache_append_packed(gd_backend *backend,
                                             const gd_backend_kv_cache_append_args *args);
 
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
+gd_status gd_backend_adamw_batch(gd_backend *backend,
+                                  const gd_backend_adamw_desc *descs,
+                                  uint32_t desc_count);
 gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unscale_desc *desc);
+gd_status gd_backend_amp_unscale_batch(gd_backend *backend,
+                                        const gd_backend_amp_unscale_desc *descs,
+                                        uint32_t desc_count);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

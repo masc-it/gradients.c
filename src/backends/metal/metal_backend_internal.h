@@ -27,6 +27,8 @@ struct gd_backend {
     void *accumulate_pso;
     void *scale_pso;
     void *amp_unscale_pso;
+    void *grad_norm_stage_pso;
+    void *grad_clip_finalize_pso;
     void *unary_pso[GD_OP_COUNT];
     void *unary_backward_pso[GD_OP_COUNT];
     void *sigmoid_f32_pso;

@@ -101,6 +101,8 @@ static void print_usage(const char *argv0)
     printf("  --warmup-steps N            LR warmup steps; -1 means 10%% of total steps (default: -1)\n");
     printf("  --weight-decay WD           AdamW weight decay for non-norm weights (default: %.3g)\n",
            (double)GPT_DEFAULT_WEIGHT_DECAY);
+    printf("  --grad-clip-norm N          global grad norm clip; 0 disables (default: %.3g)\n",
+           (double)GPT_DEFAULT_GRAD_CLIP_NORM);
     printf("  --report-every N            report every N steps; 0 disables periodic reports (default: %d)\n",
            GPT_DEFAULT_REPORT_EVERY);
     printf("  --overfit-num-samples N     repeatedly train on the first N samples; 0 disables (default: 0)\n");
@@ -133,6 +135,7 @@ static gpt_config gpt_config_default(void)
     config.lr_max = GPT_DEFAULT_LR_MAX;
     config.lr_min = GPT_DEFAULT_LR_MIN;
     config.weight_decay = GPT_DEFAULT_WEIGHT_DECAY;
+    config.grad_clip_norm = GPT_DEFAULT_GRAD_CLIP_NORM;
     config.temperature = 0.0f;
     return config;
 }
@@ -282,6 +285,15 @@ static gpt_config parse_args(int argc, char **argv)
                 exit(2);
             }
             config.weight_decay = parsed_f32;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--grad-clip-norm");
+        if (value != NULL) {
+            if (!parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
+                fprintf(stderr, "gpt_lm: invalid --grad-clip-norm %s\n", value);
+                exit(2);
+            }
+            config.grad_clip_norm = parsed_f32;
             continue;
         }
         value = arg_value(argc, argv, &i, "--report-every");
@@ -533,7 +545,11 @@ static void train_one_batch(gd_context *ctx,
                             (uint64_t)current_step,
                             &loss));
     TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
-    TRY(ctx, gd_optimizer_step_amp_lr(ctx, optimizer, scaler, lr));
+    if (config->grad_clip_norm > 0.0f) {
+        TRY(ctx, gd_optimizer_step_amp_clip_lr(ctx, optimizer, scaler, lr, config->grad_clip_norm));
+    } else {
+        TRY(ctx, gd_optimizer_step_amp_lr(ctx, optimizer, scaler, lr));
+    }
     TRY(ctx, gd_end_step(ctx));
     TRY(ctx, gd_dataloader_release(loader, batch));
     TRY(ctx, gd_dataloader_prefetch(loader));
@@ -624,6 +640,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "mlp_hidden=%d\n"
                  "sdpa_window=%d\n"
                  "dropout=%.9g\n"
+                 "grad_clip_norm=%.9g\n"
                  "epoch=%zu\n"
                  "global_step=%zu\n"
                  "val_loss=%.9g\n"
@@ -637,6 +654,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  GPT_MLP_HIDDEN,
                  GPT_SDPA_WINDOW,
                  (double)config->dropout_p,
+                 (double)config->grad_clip_norm,
                  epoch,
                  global_step,
                  (double)val_loss,
@@ -662,6 +680,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "mlp_hidden=%d\n"
                    "sdpa_window=%d\n"
                    "dropout=%.9g\n"
+                   "grad_clip_norm=%.9g\n"
                    "epoch=%zu\n"
                    "global_step=%zu\n"
                    "val_loss=%.9g\n"
@@ -675,6 +694,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    GPT_MLP_HIDDEN,
                    GPT_SDPA_WINDOW,
                    (double)config->dropout_p,
+                   (double)config->grad_clip_norm,
                    epoch,
                    global_step,
                    (double)val_loss,
@@ -968,12 +988,13 @@ int main(int argc, char **argv)
                config.save_best ? "yes" : "no",
                config.checkpoint_path,
                config.val_split);
-        printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.1f\n",
+        printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g grad_clip=%.4g amp_scale=%.1f\n",
                (double)lr_config.max_lr,
                (double)lr_config.min_lr,
                (unsigned long long)lr_config.warmup_steps,
                (unsigned long long)lr_config.total_steps,
                (double)config.weight_decay,
+               (double)config.grad_clip_norm,
                (double)gd_amp_scaler_scale(scaler));
     } else {
         printf("optim: skipped (generation-only run)\n");

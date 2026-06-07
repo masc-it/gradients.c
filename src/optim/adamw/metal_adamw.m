@@ -12,6 +12,16 @@ static id<MTLComputePipelineState> gd_metal_adamw_pso(gd_backend *backend)
     return (__bridge id<MTLComputePipelineState>)backend->adamw_pso;
 }
 
+static id<MTLComputePipelineState> gd_metal_grad_norm_stage_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->grad_norm_stage_pso;
+}
+
+static id<MTLComputePipelineState> gd_metal_grad_clip_finalize_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->grad_clip_finalize_pso;
+}
+
 static id<MTLBuffer> gd_metal_adamw_buffer(gd_backend_buffer *buffer)
 {
     return (__bridge id<MTLBuffer>)buffer->buffer;
@@ -85,7 +95,12 @@ static gd_status gd_metal_adamw_validate_desc(const gd_backend_adamw_desc *desc)
          (desc->master_buffer == NULL ||
           !gd_metal_adamw_byte_range_valid(desc->master_buffer,
                                            desc->master_offset,
-                                           moment_nbytes)))) {
+                                           moment_nbytes))) ||
+        (desc->has_grad_scale != 0U &&
+         (desc->grad_scale_buffer == NULL ||
+          !gd_metal_adamw_byte_range_valid(desc->grad_scale_buffer,
+                                           desc->grad_scale_offset,
+                                           sizeof(float))))) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     return GD_OK;
@@ -101,10 +116,12 @@ static void gd_metal_adamw_make_args(const gd_backend_adamw_desc *desc,
     args->grad_offset = (uint64_t)desc->grad_offset;
     args->m_offset = (uint64_t)desc->m_offset;
     args->v_offset = (uint64_t)desc->v_offset;
+    args->grad_scale_offset = (uint64_t)desc->grad_scale_offset;
     args->count = (uint64_t)desc->count;
     args->param_dtype = desc->param_dtype;
     args->grad_dtype = desc->grad_dtype;
     args->has_master = desc->has_master != 0U ? 1U : 0U;
+    args->has_grad_scale = desc->has_grad_scale != 0U ? 1U : 0U;
     args->lr = desc->lr;
     args->beta1 = desc->beta1;
     args->beta2 = desc->beta2;
@@ -134,6 +151,10 @@ static void gd_metal_adamw_encode(id<MTLComputeCommandEncoder> encoder,
                 offset:0U
                atIndex:4U];
     [encoder setBytes:&args length:sizeof(args) atIndex:5U];
+    [encoder setBuffer:gd_metal_adamw_buffer(desc->has_grad_scale != 0U ?
+                                             desc->grad_scale_buffer : desc->param_buffer)
+                offset:0U
+               atIndex:6U];
     grid = MTLSizeMake((NSUInteger)desc->count, 1U, 1U);
     threads = MTLSizeMake((NSUInteger)(desc->count < GD_METAL_ADAMW_MAX_THREADS_PER_GROUP ?
                                        desc->count : GD_METAL_ADAMW_MAX_THREADS_PER_GROUP),
@@ -185,4 +206,137 @@ gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *des
         return GD_ERR_INVALID_ARGUMENT;
     }
     return gd_backend_adamw_batch(backend, desc, 1U);
+}
+
+static size_t gd_metal_grad_norm_group_count(size_t count)
+{
+    const size_t block = (size_t)GD_METAL_GRAD_NORM_BLOCK_ELEMS;
+    return (count / block) + ((count % block) != 0U ? (size_t)1U : (size_t)0U);
+}
+
+static gd_status gd_metal_grad_norm_validate_desc(const gd_backend_grad_norm_desc *desc)
+{
+    size_t grad_elem_size;
+    size_t grad_nbytes;
+    size_t partial_nbytes;
+    size_t expected_partials;
+    gd_status st;
+    if (desc == NULL || desc->grad_buffer == NULL || desc->partial_buffer == NULL ||
+        desc->count == 0U || desc->count > UINT32_MAX || desc->partial_count == 0U ||
+        desc->partial_count > UINT32_MAX) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_metal_adamw_elem_size(desc->grad_dtype, &grad_elem_size);
+    if (st != GD_OK) {
+        return st;
+    }
+    expected_partials = gd_metal_grad_norm_group_count(desc->count);
+    if (desc->partial_count != expected_partials ||
+        !gd_metal_adamw_count_bytes(desc->count, grad_elem_size, &grad_nbytes) ||
+        !gd_metal_adamw_count_bytes(desc->partial_count, sizeof(float), &partial_nbytes) ||
+        !gd_metal_adamw_byte_range_valid(desc->grad_buffer, desc->grad_offset, grad_nbytes) ||
+        !gd_metal_adamw_byte_range_valid(desc->partial_buffer,
+                                         desc->partial_offset,
+                                         partial_nbytes)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+static void gd_metal_grad_norm_encode_stage(id<MTLComputeCommandEncoder> encoder,
+                                            const gd_backend_grad_norm_desc *desc)
+{
+    gd_metal_grad_norm_stage_args args;
+    MTLSize groups;
+    MTLSize threads;
+    memset(&args, 0, sizeof(args));
+    args.grad_offset = (uint64_t)desc->grad_offset;
+    args.partial_offset = (uint64_t)desc->partial_offset;
+    args.count = (uint64_t)desc->count;
+    args.grad_dtype = desc->grad_dtype;
+    [encoder setBuffer:gd_metal_adamw_buffer(desc->grad_buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_metal_adamw_buffer(desc->partial_buffer) offset:0U atIndex:1U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:2U];
+    groups = MTLSizeMake((NSUInteger)desc->partial_count, 1U, 1U);
+    threads = MTLSizeMake((NSUInteger)GD_METAL_GRAD_NORM_THREADS, 1U, 1U);
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+gd_status gd_backend_grad_clip_scale(gd_backend *backend,
+                                      const gd_backend_grad_norm_desc *descs,
+                                      uint32_t desc_count,
+                                      gd_backend_buffer *scale_buffer,
+                                      size_t scale_offset,
+                                      float max_norm,
+                                      float eps)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    gd_backend_buffer *partial_buffer;
+    gd_metal_grad_clip_finalize_args final_args;
+    MTLSize final_groups;
+    MTLSize final_threads;
+    bool immediate;
+    size_t partial_base_offset;
+    size_t running_partial_offset;
+    size_t total_partials = 0U;
+    uint32_t i;
+    gd_status st;
+    if (desc_count == 0U) {
+        return GD_OK;
+    }
+    if (backend == NULL || descs == NULL || scale_buffer == NULL ||
+        !(max_norm > 0.0f) || !isfinite(max_norm) || !(eps > 0.0f) || !isfinite(eps) ||
+        !gd_metal_adamw_byte_range_valid(scale_buffer, scale_offset, 2U * sizeof(float))) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    partial_buffer = descs[0].partial_buffer;
+    partial_base_offset = descs[0].partial_offset;
+    running_partial_offset = partial_base_offset;
+    for (i = 0U; i < desc_count; ++i) {
+        size_t partial_nbytes;
+        st = gd_metal_grad_norm_validate_desc(&descs[i]);
+        if (st != GD_OK) {
+            return st;
+        }
+        if (descs[i].partial_buffer != partial_buffer ||
+            descs[i].partial_offset != running_partial_offset ||
+            !gd_metal_adamw_count_bytes(descs[i].partial_count, sizeof(float), &partial_nbytes) ||
+            total_partials > SIZE_MAX - descs[i].partial_count ||
+            running_partial_offset > SIZE_MAX - partial_nbytes) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        total_partials += descs[i].partial_count;
+        running_partial_offset += partial_nbytes;
+    }
+    if (total_partials == 0U || total_partials > UINT32_MAX) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    [encoder setComputePipelineState:gd_metal_grad_norm_stage_pso(backend)];
+    for (i = 0U; i < desc_count; ++i) {
+        gd_metal_grad_norm_encode_stage(encoder, &descs[i]);
+    }
+    memset(&final_args, 0, sizeof(final_args));
+    final_args.partial_offset = (uint64_t)partial_base_offset;
+    final_args.scale_offset = (uint64_t)scale_offset;
+    final_args.partial_count = (uint64_t)total_partials;
+    final_args.max_norm = max_norm;
+    final_args.eps = eps;
+    [encoder setComputePipelineState:gd_metal_grad_clip_finalize_pso(backend)];
+    [encoder setBuffer:gd_metal_adamw_buffer(partial_buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_metal_adamw_buffer(scale_buffer) offset:0U atIndex:1U];
+    [encoder setBytes:&final_args length:sizeof(final_args) atIndex:2U];
+    final_groups = MTLSizeMake(1U, 1U, 1U);
+    final_threads = MTLSizeMake((NSUInteger)GD_METAL_GRAD_NORM_THREADS, 1U, 1U);
+    [encoder dispatchThreadgroups:final_groups threadsPerThreadgroup:final_threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
 }

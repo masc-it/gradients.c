@@ -1020,6 +1020,24 @@ gd_status gd_backend_amp_unscale_batch(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_grad_clip_scale(gd_backend *backend,
+                                      const gd_backend_grad_norm_desc *descs,
+                                      uint32_t desc_count,
+                                      gd_backend_buffer *scale_buffer,
+                                      size_t scale_offset,
+                                      float max_norm,
+                                      float eps)
+{
+    (void)backend;
+    (void)descs;
+    (void)desc_count;
+    (void)scale_buffer;
+    (void)scale_offset;
+    (void)max_norm;
+    (void)eps;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence)
 {
     (void)backend;

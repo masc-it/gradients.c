@@ -135,6 +135,14 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_grad_norm_stage_kernel", &backend->grad_norm_stage_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_grad_clip_finalize_kernel", &backend->grad_clip_finalize_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_binary_reduce_broadcast_kernel", &backend->binary_reduce_pso);
     if (st != GD_OK) {
         return st;
@@ -1126,6 +1134,12 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->binary_reduce_pso != NULL) {
         CFRelease(backend->binary_reduce_pso);
+    }
+    if (backend->grad_clip_finalize_pso != NULL) {
+        CFRelease(backend->grad_clip_finalize_pso);
+    }
+    if (backend->grad_norm_stage_pso != NULL) {
+        CFRelease(backend->grad_norm_stage_pso);
     }
     if (backend->amp_unscale_pso != NULL) {
         CFRelease(backend->amp_unscale_pso);

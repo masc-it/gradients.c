@@ -56,6 +56,8 @@ typedef struct gd_backend_adamw_desc {
     size_t master_offset;
     gd_backend_buffer *grad_buffer;
     size_t grad_offset;
+    gd_backend_buffer *grad_scale_buffer; /* Optional scalar F32 multiplier for clipped grads. */
+    size_t grad_scale_offset;
     gd_backend_buffer *m_buffer;
     size_t m_offset;
     gd_backend_buffer *v_buffer;
@@ -64,7 +66,7 @@ typedef struct gd_backend_adamw_desc {
     uint32_t param_dtype;
     uint32_t grad_dtype;
     uint32_t has_master;
-    uint32_t pad0;
+    uint32_t has_grad_scale;
     float lr;
     float beta1;
     float beta2;
@@ -83,6 +85,16 @@ typedef struct gd_backend_amp_unscale_desc {
     gd_backend_buffer *found_inf_buffer;
     size_t found_inf_offset;
 } gd_backend_amp_unscale_desc;
+
+typedef struct gd_backend_grad_norm_desc {
+    gd_backend_buffer *grad_buffer;
+    size_t grad_offset;
+    size_t count;
+    uint32_t grad_dtype;
+    gd_backend_buffer *partial_buffer;
+    size_t partial_offset;
+    size_t partial_count;
+} gd_backend_grad_norm_desc;
 
 typedef struct gd_backend_tensor_view {
     gd_backend_buffer *buffer;
@@ -584,6 +596,13 @@ gd_status gd_backend_amp_unscale(gd_backend *backend, const gd_backend_amp_unsca
 gd_status gd_backend_amp_unscale_batch(gd_backend *backend,
                                         const gd_backend_amp_unscale_desc *descs,
                                         uint32_t desc_count);
+gd_status gd_backend_grad_clip_scale(gd_backend *backend,
+                                      const gd_backend_grad_norm_desc *descs,
+                                      uint32_t desc_count,
+                                      gd_backend_buffer *scale_buffer,
+                                      size_t scale_offset,
+                                      float max_norm,
+                                      float eps);
 
 gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fence);
 void gd_backend_fence_destroy(gd_backend_fence *fence);

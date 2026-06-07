@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define GD_OPTIM_GRAD_CLIP_BLOCK_ELEMS 1024U
+#define GD_OPTIM_GRAD_CLIP_SCALE_EPS 1.0e-6f
+
 typedef struct gd_optimizer_param {
     char path[GD_MODULE_PATH_MAX];
     gd_tensor *param;
@@ -33,9 +36,13 @@ struct gd_optimizer {
     gd_tensor *step_grads;
     bool *step_has_grad;
     gd_backend_amp_unscale_desc *amp_descs;
+    gd_backend_grad_norm_desc *grad_norm_descs;
     gd_backend_adamw_desc *adamw_descs;
     uint32_t param_count;
+    size_t grad_clip_partial_capacity;
     gd_tensor found_inf;
+    gd_tensor grad_clip_partials;
+    gd_tensor grad_clip_scale;
     gd_adamw_config config;
     uint64_t step;
 };
@@ -50,6 +57,35 @@ struct gd_amp_scaler {
 static bool gd_adamw_lr_valid(float lr)
 {
     return lr == lr && lr >= 0.0f && lr <= FLT_MAX;
+}
+
+static bool gd_optimizer_grad_clip_norm_valid(float max_norm)
+{
+    return max_norm == max_norm && max_norm > 0.0f && max_norm <= FLT_MAX;
+}
+
+static size_t gd_optimizer_grad_clip_group_count(size_t count)
+{
+    const size_t block = (size_t)GD_OPTIM_GRAD_CLIP_BLOCK_ELEMS;
+    return (count / block) + ((count % block) != 0U ? (size_t)1U : (size_t)0U);
+}
+
+static bool gd_optimizer_size_add_overflow(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || a > SIZE_MAX - b) {
+        return true;
+    }
+    *out = a + b;
+    return false;
+}
+
+static bool gd_optimizer_size_mul_overflow(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || (a != 0U && b > SIZE_MAX / a)) {
+        return true;
+    }
+    *out = a * b;
+    return false;
 }
 
 static bool gd_adamw_config_valid(const gd_adamw_config *config)
@@ -304,6 +340,7 @@ static gd_status gd_adamw_init_slot(gd_context *ctx,
 static gd_status gd_optimizer_build_adamw_desc(gd_context *ctx,
                                                 gd_optimizer_param *slot,
                                                 const gd_tensor *grad,
+                                                const gd_tensor *grad_scale,
                                                 const gd_adamw_config *config,
                                                 float base_lr,
                                                 bool grad_already_validated,
@@ -342,6 +379,11 @@ static gd_status gd_optimizer_build_adamw_desc(gd_context *ctx,
     }
     out_desc->grad_buffer = (gd_backend_buffer *)grad->storage.buffer;
     out_desc->grad_offset = gd_tensor_storage_offset(grad);
+    if (grad_scale != NULL) {
+        out_desc->grad_scale_buffer = (gd_backend_buffer *)grad_scale->storage.buffer;
+        out_desc->grad_scale_offset = gd_tensor_storage_offset(grad_scale);
+        out_desc->has_grad_scale = 1U;
+    }
     out_desc->m_buffer = (gd_backend_buffer *)slot->m.storage.buffer;
     out_desc->m_offset = gd_tensor_storage_offset(&slot->m);
     out_desc->v_buffer = (gd_backend_buffer *)slot->v.storage.buffer;
@@ -516,10 +558,11 @@ gd_status gd_adamw_create(gd_context *ctx,
         optimizer->step_grads = (gd_tensor *)calloc(trainable_count, sizeof(optimizer->step_grads[0]));
         optimizer->step_has_grad = (bool *)calloc(trainable_count, sizeof(optimizer->step_has_grad[0]));
         optimizer->amp_descs = (gd_backend_amp_unscale_desc *)calloc(trainable_count, sizeof(optimizer->amp_descs[0]));
+        optimizer->grad_norm_descs = (gd_backend_grad_norm_desc *)calloc(trainable_count, sizeof(optimizer->grad_norm_descs[0]));
         optimizer->adamw_descs = (gd_backend_adamw_desc *)calloc(trainable_count, sizeof(optimizer->adamw_descs[0]));
         if (optimizer->params == NULL || optimizer->step_grads == NULL ||
             optimizer->step_has_grad == NULL || optimizer->amp_descs == NULL ||
-            optimizer->adamw_descs == NULL) {
+            optimizer->grad_norm_descs == NULL || optimizer->adamw_descs == NULL) {
             gd_optimizer_destroy(optimizer);
             return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "adamw param allocation failed");
         }
@@ -537,6 +580,53 @@ gd_status gd_adamw_create(gd_context *ctx,
         write_index += 1U;
     }
     optimizer->param_count = write_index;
+    {
+        size_t partial_capacity = 0U;
+        int64_t partial_shape[1];
+        const int64_t scale_shape[1] = {2};
+        for (i = 0U; i < optimizer->param_count; ++i) {
+            size_t groups = gd_optimizer_grad_clip_group_count(optimizer->params[i].count);
+            if (gd_optimizer_size_add_overflow(partial_capacity, groups, &partial_capacity)) {
+                gd_optimizer_destroy(optimizer);
+                return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY,
+                                            "adamw grad clip partial count overflow");
+            }
+        }
+        if (partial_capacity == 0U) {
+            partial_capacity = 1U;
+        }
+        if (partial_capacity > (size_t)INT64_MAX) {
+            gd_optimizer_destroy(optimizer);
+            return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY,
+                                        "adamw grad clip partial shape overflow");
+        }
+        partial_shape[0] = (int64_t)partial_capacity;
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_STATE,
+                             GD_DTYPE_F32,
+                             gd_shape_make(1U, partial_shape),
+                             256U,
+                             &optimizer->grad_clip_partials);
+        if (st != GD_OK) {
+            gd_optimizer_destroy(optimizer);
+            return st;
+        }
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_STATE,
+                             GD_DTYPE_F32,
+                             gd_shape_make(1U, scale_shape),
+                             256U,
+                             &optimizer->grad_clip_scale);
+        if (st != GD_OK) {
+            gd_optimizer_destroy(optimizer);
+            return st;
+        }
+        optimizer->grad_clip_partial_capacity = partial_capacity;
+        optimizer->grad_clip_partials.requires_grad = false;
+        optimizer->grad_clip_partials.is_leaf = false;
+        optimizer->grad_clip_scale.requires_grad = false;
+        optimizer->grad_clip_scale.is_leaf = false;
+    }
     {
         const int64_t flag_shape[1] = {1};
         st = gd_tensor_zeros(ctx, GD_ARENA_STATE, GD_DTYPE_I32, gd_shape_make(1U, flag_shape), 256U, &optimizer->found_inf);
@@ -560,6 +650,7 @@ void gd_optimizer_destroy(gd_optimizer *optimizer)
     free(optimizer->step_grads);
     free(optimizer->step_has_grad);
     free(optimizer->amp_descs);
+    free(optimizer->grad_norm_descs);
     free(optimizer->adamw_descs);
     memset(optimizer, 0, sizeof(*optimizer));
     free(optimizer);
@@ -611,6 +702,118 @@ static gd_status gd_optimizer_build_unscale_desc(gd_context *ctx,
     return GD_OK;
 }
 
+static gd_status gd_optimizer_build_grad_norm_desc(gd_context *ctx,
+                                                   const gd_optimizer_param *slot,
+                                                   const gd_tensor *grad,
+                                                   size_t partial_index,
+                                                   gd_backend_buffer *partial_buffer,
+                                                   size_t partial_base_offset,
+                                                   gd_backend_grad_norm_desc *out_desc,
+                                                   size_t *out_groups)
+{
+    size_t groups;
+    size_t partial_byte_delta;
+    gd_status st;
+    if (ctx == NULL || slot == NULL || grad == NULL || partial_buffer == NULL ||
+        out_desc == NULL || out_groups == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_optimizer_validate_grad(ctx, slot, grad);
+    if (st != GD_OK) {
+        return st;
+    }
+    groups = gd_optimizer_grad_clip_group_count(slot->count);
+    if (gd_optimizer_size_mul_overflow(partial_index, sizeof(float), &partial_byte_delta) ||
+        partial_base_offset > SIZE_MAX - partial_byte_delta) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY,
+                                    "adamw grad clip partial offset overflow");
+    }
+    memset(out_desc, 0, sizeof(*out_desc));
+    out_desc->grad_buffer = (gd_backend_buffer *)grad->storage.buffer;
+    out_desc->grad_offset = gd_tensor_storage_offset(grad);
+    out_desc->count = slot->count;
+    out_desc->grad_dtype = (uint32_t)grad->dtype;
+    out_desc->partial_buffer = partial_buffer;
+    out_desc->partial_offset = partial_base_offset + partial_byte_delta;
+    out_desc->partial_count = groups;
+    *out_groups = groups;
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_apply_grad_clip(gd_context *ctx,
+                                              gd_optimizer *optimizer,
+                                              float max_norm)
+{
+    gd_backend_buffer *partial_buffer;
+    gd_backend_buffer *scale_buffer;
+    size_t partial_base_offset;
+    size_t scale_offset;
+    size_t partial_index = 0U;
+    uint32_t desc_count = 0U;
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_optimizer_grad_clip_norm_valid(max_norm)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid grad clip norm");
+    }
+    if (optimizer->param_count == 0U) {
+        return GD_OK;
+    }
+    if (optimizer->step_grads == NULL || optimizer->step_has_grad == NULL ||
+        optimizer->grad_norm_descs == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "adamw grad clip cache missing");
+    }
+    partial_buffer = (gd_backend_buffer *)optimizer->grad_clip_partials.storage.buffer;
+    scale_buffer = (gd_backend_buffer *)optimizer->grad_clip_scale.storage.buffer;
+    partial_base_offset = gd_tensor_storage_offset(&optimizer->grad_clip_partials);
+    scale_offset = gd_tensor_storage_offset(&optimizer->grad_clip_scale);
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        size_t groups;
+        if (!optimizer->step_has_grad[i]) {
+            continue;
+        }
+        st = gd_optimizer_build_grad_norm_desc(ctx,
+                                               slot,
+                                               &optimizer->step_grads[i],
+                                               partial_index,
+                                               partial_buffer,
+                                               partial_base_offset,
+                                               &optimizer->grad_norm_descs[desc_count],
+                                               &groups);
+        if (st != GD_OK) {
+            return st;
+        }
+        if (partial_index > SIZE_MAX - groups ||
+            partial_index + groups > optimizer->grad_clip_partial_capacity) {
+            return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY,
+                                        "adamw grad clip partial capacity exceeded");
+        }
+        partial_index += groups;
+        desc_count += 1U;
+    }
+    if (desc_count == 0U) {
+        return GD_OK;
+    }
+    st = gd_backend_grad_clip_scale(gd_context_backend(ctx),
+                                    optimizer->grad_norm_descs,
+                                    desc_count,
+                                    scale_buffer,
+                                    scale_offset,
+                                    max_norm,
+                                    GD_OPTIM_GRAD_CLIP_SCALE_EPS);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend grad clip failed");
+    }
+    optimizer->grad_clip_scale.version += 1U;
+    if (optimizer->grad_clip_scale.version == 0U) {
+        optimizer->grad_clip_scale.version = 1U;
+    }
+    return GD_OK;
+}
+
 gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float lr)
 {
     bool updated = false;
@@ -653,6 +856,7 @@ gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float l
         st = gd_optimizer_build_adamw_desc(ctx,
                                            slot,
                                            &grad,
+                                           NULL,
                                            &optimizer->config,
                                            lr,
                                            false,
@@ -678,6 +882,108 @@ gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float l
         optimizer->step += 1U;
     }
     return GD_OK;
+}
+
+gd_status gd_optimizer_step_clip_lr(gd_context *ctx,
+                                    gd_optimizer *optimizer,
+                                    float lr,
+                                    float max_grad_norm)
+{
+    bool updated = false;
+    uint32_t adamw_desc_count = 0U;
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_adamw_lr_valid(lr)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid optimizer lr");
+    }
+    if (!gd_optimizer_grad_clip_norm_valid(max_grad_norm)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid grad clip norm");
+    }
+    st = gd_optimizer_require_train_scope(ctx);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (optimizer->param_count != 0U &&
+        (optimizer->step_grads == NULL || optimizer->step_has_grad == NULL ||
+         optimizer->grad_norm_descs == NULL || optimizer->adamw_descs == NULL)) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "adamw step cache missing");
+    }
+    if (optimizer->param_count != 0U) {
+        memset(optimizer->step_has_grad,
+               0,
+               (size_t)optimizer->param_count * sizeof(optimizer->step_has_grad[0]));
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        gd_tensor grad;
+        if (!slot->trainable || slot->param == NULL) {
+            continue;
+        }
+        st = gd_tensor_grad(ctx, slot->param, &grad);
+        if (st == GD_ERR_BAD_STATE) {
+            gd_context_clear_error(ctx);
+            continue;
+        }
+        if (st != GD_OK) {
+            return st;
+        }
+        st = gd_optimizer_validate_grad(ctx, slot, &grad);
+        if (st != GD_OK) {
+            return st;
+        }
+        optimizer->step_grads[i] = grad;
+        optimizer->step_has_grad[i] = true;
+    }
+    st = gd_optimizer_apply_grad_clip(ctx, optimizer, max_grad_norm);
+    if (st != GD_OK) {
+        return st;
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        if (!optimizer->step_has_grad[i]) {
+            continue;
+        }
+        st = gd_optimizer_build_adamw_desc(ctx,
+                                           slot,
+                                           &optimizer->step_grads[i],
+                                           &optimizer->grad_clip_scale,
+                                           &optimizer->config,
+                                           lr,
+                                           true,
+                                           &optimizer->adamw_descs[adamw_desc_count]);
+        if (st != GD_OK) {
+            return st;
+        }
+        adamw_desc_count += 1U;
+    }
+    st = gd_backend_adamw_batch(gd_context_backend(ctx), optimizer->adamw_descs, adamw_desc_count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend adamw failed");
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        if (!optimizer->step_has_grad[i]) {
+            continue;
+        }
+        gd_optimizer_commit_step_param(&optimizer->params[i], &optimizer->config);
+        updated = true;
+    }
+    if (updated) {
+        optimizer->step += 1U;
+    }
+    return GD_OK;
+}
+
+gd_status gd_optimizer_step_clip(gd_context *ctx,
+                                 gd_optimizer *optimizer,
+                                 float max_grad_norm)
+{
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_optimizer_step_clip_lr(ctx, optimizer, optimizer->config.lr, max_grad_norm);
 }
 
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer)
@@ -778,6 +1084,7 @@ gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
         st = gd_optimizer_build_adamw_desc(ctx,
                                            slot,
                                            &optimizer->step_grads[i],
+                                           NULL,
                                            &optimizer->config,
                                            lr,
                                            true,
@@ -803,6 +1110,148 @@ gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
         gd_amp_scaler_update(scaler, false);
     }
     return GD_OK;
+}
+
+gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
+                                        gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler,
+                                        float lr,
+                                        float max_grad_norm)
+{
+    bool updated = false;
+    int32_t found_inf = 0;
+    float inv_scale;
+    uint32_t amp_desc_count = 0U;
+    uint32_t adamw_desc_count = 0U;
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_adamw_lr_valid(lr)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid optimizer lr");
+    }
+    if (!gd_optimizer_grad_clip_norm_valid(max_grad_norm)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid grad clip norm");
+    }
+    if (scaler == NULL || !scaler->config.enabled) {
+        return gd_optimizer_step_clip_lr(ctx, optimizer, lr, max_grad_norm);
+    }
+    st = gd_optimizer_require_train_scope(ctx);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (!(scaler->scale > 0.0f)) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "invalid amp scale");
+    }
+    if (optimizer->param_count != 0U &&
+        (optimizer->step_grads == NULL || optimizer->step_has_grad == NULL ||
+         optimizer->amp_descs == NULL || optimizer->grad_norm_descs == NULL ||
+         optimizer->adamw_descs == NULL)) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "adamw step cache missing");
+    }
+    if (optimizer->param_count != 0U) {
+        memset(optimizer->step_has_grad,
+               0,
+               (size_t)optimizer->param_count * sizeof(optimizer->step_has_grad[0]));
+    }
+    inv_scale = 1.0f / scaler->scale;
+    st = gd_tensor_zero_(ctx, &optimizer->found_inf);
+    if (st != GD_OK) {
+        return st;
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        gd_tensor grad;
+        if (!slot->trainable || slot->param == NULL) {
+            continue;
+        }
+        st = gd_tensor_grad(ctx, slot->param, &grad);
+        if (st == GD_ERR_BAD_STATE) {
+            gd_context_clear_error(ctx);
+            continue;
+        }
+        if (st != GD_OK) {
+            return st;
+        }
+        st = gd_optimizer_build_unscale_desc(ctx,
+                                             optimizer,
+                                             slot,
+                                             &grad,
+                                             inv_scale,
+                                             &optimizer->amp_descs[amp_desc_count]);
+        if (st != GD_OK) {
+            return st;
+        }
+        optimizer->step_grads[i] = grad;
+        optimizer->step_has_grad[i] = true;
+        amp_desc_count += 1U;
+    }
+    st = gd_backend_amp_unscale_batch(gd_context_backend(ctx), optimizer->amp_descs, amp_desc_count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend amp unscale failed");
+    }
+    st = gd_tensor_read(ctx, &optimizer->found_inf, &found_inf, sizeof(found_inf));
+    if (st != GD_OK) {
+        return st;
+    }
+    if (found_inf != 0) {
+        gd_amp_scaler_update(scaler, true);
+        return GD_OK;
+    }
+    st = gd_optimizer_apply_grad_clip(ctx, optimizer, max_grad_norm);
+    if (st != GD_OK) {
+        return st;
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        if (!optimizer->step_has_grad[i]) {
+            continue;
+        }
+        st = gd_optimizer_build_adamw_desc(ctx,
+                                           slot,
+                                           &optimizer->step_grads[i],
+                                           &optimizer->grad_clip_scale,
+                                           &optimizer->config,
+                                           lr,
+                                           true,
+                                           &optimizer->adamw_descs[adamw_desc_count]);
+        if (st != GD_OK) {
+            return st;
+        }
+        adamw_desc_count += 1U;
+    }
+    st = gd_backend_adamw_batch(gd_context_backend(ctx), optimizer->adamw_descs, adamw_desc_count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend adamw failed");
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        if (!optimizer->step_has_grad[i]) {
+            continue;
+        }
+        gd_optimizer_commit_step_param(&optimizer->params[i], &optimizer->config);
+        updated = true;
+    }
+    if (updated) {
+        optimizer->step += 1U;
+        gd_amp_scaler_update(scaler, false);
+    }
+    return GD_OK;
+}
+
+gd_status gd_optimizer_step_amp_clip(gd_context *ctx,
+                                     gd_optimizer *optimizer,
+                                     gd_amp_scaler *scaler,
+                                     float max_grad_norm)
+{
+    if (ctx == NULL || optimizer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_optimizer_step_amp_clip_lr(ctx,
+                                         optimizer,
+                                         scaler,
+                                         optimizer->config.lr,
+                                         max_grad_norm);
 }
 
 gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp_scaler *scaler)

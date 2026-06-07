@@ -313,11 +313,97 @@ static void run_amp_adamw_test(void)
     gd_context_destroy(ctx);
 }
 
+static void run_amp_adamw_grad_clip_test(void)
+{
+    gd_context *ctx = NULL;
+    gd_optimizer *opt = NULL;
+    gd_amp_scaler *scaler = NULL;
+    gd_memory_config mem = optim_config();
+    gd_adamw_config adam = gd_adamw_config_default();
+    gd_adamw_config expected_adam;
+    gd_amp_config amp = gd_amp_config_default();
+    gd_tensor param;
+    gd_tensor grad_seed;
+    gd_tensor y;
+    gd_param_ref ref;
+    gd_param_set set;
+    int64_t shape[1] = {2};
+    const float p0_f32[2] = {1.0f, 2.0f};
+    const float g0_f32[2] = {3.0f, 4.0f};
+    float clipped_g[2];
+    uint16_t p0[2];
+    uint16_t grad_bits[2];
+    uint16_t got[2];
+    uint16_t want[2];
+    const float dynamic_lr = 1.0e-1f;
+    const float max_norm = 0.5f;
+    const float clip_scale = max_norm / (5.0f + 1.0e-6f);
+    uint32_t i;
+
+    adam.lr = 0.0f;
+    adam.beta1 = 0.0f;
+    adam.beta2 = 0.0f;
+    adam.eps = 1.0f;
+    adam.weight_decay = 0.0f;
+    adam.bias_correction = true;
+    expected_adam = adam;
+    expected_adam.lr = dynamic_lr;
+    amp.init_scale = 8.0f;
+    amp.growth_interval = 1000U;
+
+    CHECK_OK(gd_context_create(&mem, &ctx));
+    for (i = 0U; i < 2U; ++i) {
+        p0[i] = f32_to_f16_bits(p0_f32[i]);
+        grad_bits[i] = f32_to_f16_bits(g0_f32[i]);
+        clipped_g[i] = g0_f32[i] * clip_scale;
+    }
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &param));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &grad_seed));
+    CHECK_OK(gd_tensor_write(ctx, &param, p0, sizeof(p0)));
+    CHECK_OK(gd_tensor_write(ctx, &grad_seed, grad_bits, sizeof(grad_bits)));
+    param.requires_grad = true;
+
+    gd_param_set_init(&set);
+    memset(&ref, 0, sizeof(ref));
+    (void)snprintf(ref.path, sizeof(ref.path), "%s", "param");
+    ref.tensor = &param;
+    ref.group_index = -1;
+    ref.lr_mult = 1.0f;
+    ref.weight_decay = adam.weight_decay;
+    ref.trainable = true;
+    set.items = &ref;
+    set.count = 1U;
+    set.capacity = 1U;
+
+    CHECK_OK(gd_adamw_create(ctx, &set, &adam, &opt));
+    CHECK_OK(gd_amp_scaler_create(&amp, &scaler));
+    CHECK_OK(gd_context_seal_params(ctx));
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_relu(ctx, &param, &y));
+    CHECK_OK(gd_backward_scaled(ctx, &y, &grad_seed, gd_amp_scaler_scale(scaler)));
+    CHECK_OK(gd_optimizer_step_amp_clip_lr(ctx, opt, scaler, dynamic_lr, max_norm));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read(ctx, &param, got, sizeof(got)));
+    expect_adamw_first_step(want, p0_f32, clipped_g, 2U, &expected_adam);
+    for (i = 0U; i < 2U; ++i) {
+        CHECK(got[i] == want[i], "amp adamw grad clip scales global norm before update");
+    }
+    CHECK(gd_optimizer_step_count(opt) == 1U, "clipped amp adamw increments optimizer step");
+    CHECK(!gd_amp_scaler_last_found_inf(scaler), "clipped finite amp step reports no overflow");
+
+    gd_amp_scaler_destroy(scaler);
+    gd_optimizer_destroy(opt);
+    gd_context_destroy(ctx);
+}
+
 int main(void)
 {
     run_lr_scheduler_value_test();
     run_adamw_dynamic_lr_test();
     run_amp_adamw_test();
+    run_amp_adamw_grad_clip_test();
     printf("test_optim: ok\n");
     return 0;
 }

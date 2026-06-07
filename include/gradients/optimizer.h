@@ -64,11 +64,27 @@ void gd_optimizer_destroy(gd_optimizer *optimizer);
 gd_status gd_optimizer_zero_grad(gd_context *ctx, gd_optimizer *optimizer);
 gd_status gd_optimizer_step(gd_context *ctx, gd_optimizer *optimizer);
 gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float lr);
+gd_status gd_optimizer_step_clip(gd_context *ctx,
+                                 gd_optimizer *optimizer,
+                                 float max_grad_norm);
+gd_status gd_optimizer_step_clip_lr(gd_context *ctx,
+                                    gd_optimizer *optimizer,
+                                    float lr,
+                                    float max_grad_norm);
 gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp_scaler *scaler);
 gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
                                    gd_optimizer *optimizer,
                                    gd_amp_scaler *scaler,
                                    float lr);
+gd_status gd_optimizer_step_amp_clip(gd_context *ctx,
+                                     gd_optimizer *optimizer,
+                                     gd_amp_scaler *scaler,
+                                     float max_grad_norm);
+gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
+                                        gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler,
+                                        float lr,
+                                        float max_grad_norm);
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer);
 
 #ifdef __cplusplus

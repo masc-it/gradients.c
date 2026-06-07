@@ -23,6 +23,7 @@
 #define GPT_DEFAULT_LR_MAX 3.0e-4f
 #define GPT_DEFAULT_LR_MIN 3.0e-5f
 #define GPT_DEFAULT_WEIGHT_DECAY 3.0e-4f
+#define GPT_DEFAULT_GRAD_CLIP_NORM 1.0f
 #define GPT_DEFAULT_RMS_EPS 1.0e-5f
 #define GPT_DEFAULT_POWLU_M 2.0f
 #define GPT_DEFAULT_SEED UINT64_C(0x6750746c6d5eed00)
@@ -55,6 +56,18 @@ typedef struct gpt_block {
     gd_linear_layer down_proj;
 } gpt_block;
 
+typedef struct gpt_kv_cache {
+    int batch_size;
+    int batch_capacity;
+    int max_seq;
+    int n_layers;
+    int n_heads;
+    int head_dim;
+    int32_t *pos;
+    gd_tensor *k;
+    gd_tensor *v;
+} gpt_kv_cache;
+
 typedef struct gpt_lm {
     gd_module mod;
     int n_layers;
@@ -73,18 +86,8 @@ typedef struct gpt_lm {
     gd_tensor final_norm_w;
     gd_module_list blocks;
     gpt_block *block_items;
+    gpt_kv_cache generation_cache;
 } gpt_lm;
-
-typedef struct gpt_kv_cache {
-    int batch_size;
-    int max_seq;
-    int n_layers;
-    int n_heads;
-    int head_dim;
-    int32_t *pos;
-    gd_tensor *k;
-    gd_tensor *v;
-} gpt_kv_cache;
 
 typedef struct gpt_config {
     const char *data_dir;
@@ -108,6 +111,7 @@ typedef struct gpt_config {
     float lr_max;
     float lr_min;
     float weight_decay;
+    float grad_clip_norm;
     float temperature;
 } gpt_config;
 

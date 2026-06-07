@@ -24,14 +24,28 @@ double gpt_wall_seconds(void)
     return (double)tv.tv_sec + (double)tv.tv_usec * 1.0e-6;
 }
 
-static uint64_t splitmix64(uint64_t x)
+#define GPT_GENERATE_VOWEL_PROMPT_COUNT 5U
+
+static const float GPT_WEIGHT_INIT_STD = 0.02f;
+static const double GPT_TWO_PI = 6.283185307179586476925286766559;
+
+static uint64_t splitmix64_scramble(uint64_t x)
 {
-    x += UINT64_C(0x9e3779b97f4a7c15);
     x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
     x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
     return x ^ (x >> 31);
 }
 
+static uint64_t splitmix64(uint64_t x)
+{
+    return splitmix64_scramble(x + UINT64_C(0x9e3779b97f4a7c15));
+}
+
+static uint64_t splitmix64_next(uint64_t *state)
+{
+    *state += UINT64_C(0x9e3779b97f4a7c15);
+    return splitmix64_scramble(*state);
+}
 
 static size_t size_max2(size_t a, size_t b)
 {
@@ -56,6 +70,40 @@ static size_t checked_add_size(size_t a, size_t b, const char *what)
     return a + b;
 }
 
+static int int_max2(int a, int b)
+{
+    return a > b ? a : b;
+}
+
+static int gpt_generation_cache_batch_capacity(const gpt_config *config)
+{
+    int capacity = 0;
+    if (config == NULL) {
+        return 0;
+    }
+    if (config->generate_prompt != NULL) {
+        capacity = int_max2(capacity, 1);
+    }
+    if (config->generate_every_n_steps > 0) {
+        capacity = int_max2(capacity, (int)GPT_GENERATE_VOWEL_PROMPT_COUNT);
+    }
+    return capacity;
+}
+
+static size_t gpt_kv_cache_state_bytes(int n_layers, int batch_capacity, int max_seq)
+{
+    size_t count;
+    if (n_layers <= 0 || batch_capacity <= 0 || max_seq <= 0) {
+        return 0U;
+    }
+    count = checked_mul_size((size_t)n_layers, 2U, "KV cache K/V tensors");
+    count = checked_mul_size(count, (size_t)batch_capacity, "KV cache batch");
+    count = checked_mul_size(count, (size_t)max_seq, "KV cache sequence");
+    count = checked_mul_size(count, (size_t)GPT_N_HEADS, "KV cache heads");
+    count = checked_mul_size(count, (size_t)GPT_HEAD_DIM, "KV cache head dim");
+    return checked_mul_size(count, gd_dtype_size(GD_DTYPE_F16), "KV cache bytes");
+}
+
 size_t gpt_param_count_for_layers(int n_layers)
 {
     size_t per_block = 0U;
@@ -76,6 +124,10 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
     const size_t param_count = gpt_param_count_for_layers(config->n_layers);
     const size_t param_bytes = checked_mul_size(param_count, gd_dtype_size(GD_DTYPE_F16), "param bytes");
     const size_t adam_bytes = checked_mul_size(param_count, 3U * gd_dtype_size(GD_DTYPE_F32), "adam state bytes");
+    const int generation_batch_capacity = gpt_generation_cache_batch_capacity(config);
+    const size_t generation_cache_bytes = gpt_kv_cache_state_bytes(config->n_layers,
+                                                                    generation_batch_capacity,
+                                                                    GPT_CONTEXT_LENGTH);
     const size_t tokens_per_batch = checked_mul_size((size_t)config->batch_size,
                                                      (size_t)GPT_CONTEXT_LENGTH,
                                                      "batch tokens");
@@ -88,7 +140,9 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
                                                   32U * 1024U * 1024U,
                                                   "param arena bytes"));
     mem.state_bytes = size_max2((size_t)GPT_MIN_STATE_BYTES,
-                                checked_add_size(adam_bytes,
+                                checked_add_size(checked_add_size(adam_bytes,
+                                                                  generation_cache_bytes,
+                                                                  "state arena optimizer+KV bytes"),
                                                  32U * 1024U * 1024U,
                                                  "state arena bytes"));
     mem.scratch_slot_bytes = (size_t)GPT_SCRATCH_SLOT_BYTES;
@@ -120,21 +174,91 @@ static gd_tensor_spec tensor_spec_2d(gd_dtype dtype, int64_t dim0, int64_t dim1)
     return gd_tensor_spec_make(dtype, gd_shape_make(2U, shape), GPT_ALIGNMENT);
 }
 
-static gd_linear_layer_config linear_config(int64_t in_features,
-                                            int64_t out_features,
-                                            uint64_t seed,
-                                            float init_scale)
+static double gpt_rng_uniform_open_closed(uint64_t *state)
 {
-    gd_linear_layer_config cfg = gd_linear_layer_config_make(in_features,
-                                                             out_features,
-                                                             GD_DTYPE_F16,
-                                                             seed);
-    cfg.use_bias = false;
-    cfg.alignment = GPT_ALIGNMENT;
-    cfg.weight_low = -init_scale;
-    cfg.weight_high = init_scale;
-    return cfg;
+    const uint64_t bits = splitmix64_next(state) >> 11;
+    return ((double)bits + 1.0) * (1.0 / 9007199254740992.0);
 }
+
+static void gpt_fill_normal(float *values, size_t count, uint64_t seed, float stddev)
+{
+    uint64_t state = seed;
+    size_t i = 0U;
+    while (i < count) {
+        const double u1 = gpt_rng_uniform_open_closed(&state);
+        const double u2 = gpt_rng_uniform_open_closed(&state);
+        const double radius = sqrt(-2.0 * log(u1));
+        const double theta = GPT_TWO_PI * u2;
+        values[i] = (float)(radius * cos(theta) * (double)stddev);
+        i += 1U;
+        if (i < count) {
+            values[i] = (float)(radius * sin(theta) * (double)stddev);
+            i += 1U;
+        }
+    }
+}
+
+static void gpt_tensor_init_normal(gd_context *ctx, gd_tensor *tensor, uint64_t seed, float stddev)
+{
+    int64_t numel_i64;
+    size_t count;
+    float *values;
+    if (!(stddev >= 0.0f) || !isfinite(stddev)) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "invalid GPT normal init stddev", __LINE__);
+    }
+    TRY(ctx, gd_tensor_numel(tensor, &numel_i64));
+    if (numel_i64 <= 0 || (uint64_t)numel_i64 > (uint64_t)SIZE_MAX) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "invalid GPT init tensor shape", __LINE__);
+    }
+    count = (size_t)numel_i64;
+    if (count > SIZE_MAX / sizeof(values[0])) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "GPT init allocation overflow", __LINE__);
+    }
+    values = (float *)malloc(count * sizeof(values[0]));
+    if (values == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "malloc GPT init values", __LINE__);
+    }
+    gpt_fill_normal(values, count, seed, stddev);
+    {
+        const gd_status st = gd_tensor_write_f32(ctx, tensor, values, count);
+        free(values);
+        if (st != GD_OK) {
+            gpt_fail_status(ctx, st, "gd_tensor_write_f32 GPT normal init", __LINE__);
+        }
+    }
+}
+
+static void gpt_linear_layer_init_normal_child(gd_context *ctx,
+                                               gd_module *parent,
+                                               const char *name,
+                                               gd_linear_layer *layer,
+                                               int64_t in_features,
+                                               int64_t out_features,
+                                               uint64_t seed,
+                                               float stddev)
+{
+    int64_t weight_shape[2];
+    gd_tensor_spec weight_spec;
+    const gd_init_spec empty = gd_init_empty();
+    memset(layer, 0, sizeof(*layer));
+    weight_shape[0] = in_features;
+    weight_shape[1] = out_features;
+    weight_spec = gd_tensor_spec_make(GD_DTYPE_F16, gd_shape_make(2U, weight_shape), GPT_ALIGNMENT);
+    TRY(ctx, gd_module_init(ctx, &layer->mod, name));
+    layer->in_features = in_features;
+    layer->out_features = out_features;
+    layer->has_bias = false;
+    TRY(ctx, gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &empty, &layer->weight));
+    gpt_tensor_init_normal(ctx, &layer->weight, seed, stddev);
+    TRY(ctx, gd_module_add_child(parent, name, &layer->mod));
+}
+
+static gd_status gpt_kv_cache_init(gd_context *ctx,
+                                   const gpt_lm *model,
+                                   int batch_capacity,
+                                   int max_seq,
+                                   gpt_kv_cache *cache);
+static void gpt_kv_cache_deinit(gpt_kv_cache *cache);
 
 static void gpt_block_init(gd_context *ctx,
                            gpt_block *block,
@@ -142,46 +266,59 @@ static void gpt_block_init(gd_context *ctx,
                            int n_layers,
                            uint64_t seed)
 {
-    const float base_scale = 0.02f;
-    const float residual_scale = base_scale / sqrtf(2.0f * (float)n_layers);
+    const float residual_scale = GPT_WEIGHT_INIT_STD / sqrtf(2.0f * (float)n_layers);
     const gd_tensor_spec norm_spec = tensor_spec_1d(GD_DTYPE_F16, GPT_D_MODEL);
-    const gd_init_spec one = gd_init_one();
-    const gd_linear_layer_config qkv_cfg = linear_config(GPT_D_MODEL,
-                                                         3 * GPT_D_MODEL,
-                                                         splitmix64(seed ^ ((uint64_t)index << 8) ^ 1U),
-                                                         base_scale);
-    const gd_linear_layer_config attn_cfg = linear_config(GPT_D_MODEL,
-                                                          GPT_D_MODEL,
-                                                          splitmix64(seed ^ ((uint64_t)index << 8) ^ 2U),
-                                                          residual_scale);
-    const gd_linear_layer_config up_gate_cfg = linear_config(GPT_D_MODEL,
-                                                             2 * GPT_MLP_HIDDEN,
-                                                             splitmix64(seed ^ ((uint64_t)index << 8) ^ 3U),
-                                                             base_scale);
-    const gd_linear_layer_config down_cfg = linear_config(GPT_MLP_HIDDEN,
-                                                          GPT_D_MODEL,
-                                                          splitmix64(seed ^ ((uint64_t)index << 8) ^ 4U),
-                                                          residual_scale);
+    const gd_init_spec rms_norm_init = gd_init_one();
+    const uint64_t block_seed = seed ^ ((uint64_t)index << 8);
     char name[32];
     memset(block, 0, sizeof(*block));
     (void)snprintf(name, sizeof(name), "block_%u", (unsigned)index);
     TRY(ctx, gd_module_init(ctx, &block->mod, name));
-    TRY(ctx, gd_module_param(ctx, &block->mod, "attn_norm_w", &norm_spec, &one, &block->attn_norm_w));
-    TRY(ctx, gd_module_param(ctx, &block->mod, "mlp_norm_w", &norm_spec, &one, &block->mlp_norm_w));
-    TRY(ctx, gd_linear_layer_init_child(ctx, &block->mod, "qkv_proj", &block->qkv_proj, &qkv_cfg));
-    TRY(ctx, gd_linear_layer_init_child(ctx, &block->mod, "attn_proj", &block->attn_proj, &attn_cfg));
-    TRY(ctx, gd_linear_layer_init_child(ctx, &block->mod, "up_gate", &block->up_gate, &up_gate_cfg));
-    TRY(ctx, gd_linear_layer_init_child(ctx, &block->mod, "down_proj", &block->down_proj, &down_cfg));
+    /* GPT-2/NeoX/LLaMA-style pre-norm initialization: RMSNorm scale starts
+     * at one, QKV/MLP input projections use N(0, 0.02), and residual-branch
+     * output projections are scaled by 1/sqrt(2 * n_layers). */
+    TRY(ctx, gd_module_param(ctx, &block->mod, "attn_norm_w", &norm_spec, &rms_norm_init, &block->attn_norm_w));
+    TRY(ctx, gd_module_param(ctx, &block->mod, "mlp_norm_w", &norm_spec, &rms_norm_init, &block->mlp_norm_w));
+    gpt_linear_layer_init_normal_child(ctx,
+                                       &block->mod,
+                                       "qkv_proj",
+                                       &block->qkv_proj,
+                                       GPT_D_MODEL,
+                                       3 * GPT_D_MODEL,
+                                       splitmix64(block_seed ^ 1U),
+                                       GPT_WEIGHT_INIT_STD);
+    gpt_linear_layer_init_normal_child(ctx,
+                                       &block->mod,
+                                       "attn_proj",
+                                       &block->attn_proj,
+                                       GPT_D_MODEL,
+                                       GPT_D_MODEL,
+                                       splitmix64(block_seed ^ 2U),
+                                       residual_scale);
+    gpt_linear_layer_init_normal_child(ctx,
+                                       &block->mod,
+                                       "up_gate",
+                                       &block->up_gate,
+                                       GPT_D_MODEL,
+                                       2 * GPT_MLP_HIDDEN,
+                                       splitmix64(block_seed ^ 3U),
+                                       GPT_WEIGHT_INIT_STD);
+    gpt_linear_layer_init_normal_child(ctx,
+                                       &block->mod,
+                                       "down_proj",
+                                       &block->down_proj,
+                                       GPT_MLP_HIDDEN,
+                                       GPT_D_MODEL,
+                                       splitmix64(block_seed ^ 4U),
+                                       residual_scale);
 }
 
 void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
 {
     const gd_tensor_spec embed_spec = tensor_spec_2d(GD_DTYPE_F16, GPT_VOCAB_SIZE, GPT_D_MODEL);
     const gd_tensor_spec norm_spec = tensor_spec_1d(GD_DTYPE_F16, GPT_D_MODEL);
-    const gd_init_spec embed_init = gd_init_rand_uniform(splitmix64(config->seed ^ UINT64_C(0xabc001)),
-                                                         -0.02f,
-                                                         0.02f);
-    const gd_init_spec one = gd_init_one();
+    const gd_init_spec empty = gd_init_empty();
+    const gd_init_spec rms_norm_init = gd_init_one();
     uint32_t i;
     memset(model, 0, sizeof(*model));
     model->n_layers = config->n_layers;
@@ -202,9 +339,18 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
                              &model->mod,
                              "token_embedding",
                              &embed_spec,
-                             &embed_init,
+                             &empty,
                              &model->token_embedding));
-    TRY(ctx, gd_module_param(ctx, &model->mod, "final_norm_w", &norm_spec, &one, &model->final_norm_w));
+    gpt_tensor_init_normal(ctx,
+                           &model->token_embedding,
+                           splitmix64(config->seed ^ UINT64_C(0xabc001)),
+                           GPT_WEIGHT_INIT_STD);
+    TRY(ctx, gd_module_param(ctx,
+                             &model->mod,
+                             "final_norm_w",
+                             &norm_spec,
+                             &rms_norm_init,
+                             &model->final_norm_w));
     model->block_items = (gpt_block *)calloc((size_t)model->n_layers, sizeof(model->block_items[0]));
     if (model->block_items == NULL) {
         gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "calloc blocks", __LINE__);
@@ -213,6 +359,16 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
     for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
         gpt_block_init(ctx, &model->block_items[i], i, model->n_layers, config->seed);
         TRY(ctx, gd_module_list_set(&model->blocks, i, &model->block_items[i].mod));
+    }
+    {
+        const int generation_batch_capacity = gpt_generation_cache_batch_capacity(config);
+        if (generation_batch_capacity > 0) {
+            TRY(ctx, gpt_kv_cache_init(ctx,
+                                       model,
+                                       generation_batch_capacity,
+                                       GPT_CONTEXT_LENGTH,
+                                       &model->generation_cache));
+        }
     }
 }
 
@@ -239,27 +395,50 @@ void gpt_lm_deinit(gpt_lm *model)
             gpt_block_deinit(&model->block_items[i]);
         }
     }
+    gpt_kv_cache_deinit(&model->generation_cache);
     gd_module_list_deinit(&model->blocks);
     free(model->block_items);
     gd_module_deinit(&model->mod);
     memset(model, 0, sizeof(*model));
 }
 
+static gd_status gpt_kv_cache_set_active_batch(gpt_kv_cache *cache, int batch_size)
+{
+    uint32_t i;
+    if (cache == NULL || cache->k == NULL || cache->v == NULL || cache->pos == NULL ||
+        batch_size <= 0 || batch_size > cache->batch_capacity) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    cache->batch_size = batch_size;
+    memset(cache->pos, 0, (size_t)batch_size * sizeof(cache->pos[0]));
+    for (i = 0U; i < (uint32_t)cache->n_layers; ++i) {
+        if (cache->k[i].rank != 4U || cache->v[i].rank != 4U ||
+            cache->k[i].shape[1] != cache->max_seq || cache->v[i].shape[1] != cache->max_seq) {
+            return GD_ERR_BAD_STATE;
+        }
+        cache->k[i].shape[0] = batch_size;
+        cache->v[i].shape[0] = batch_size;
+    }
+    return GD_OK;
+}
+
 static gd_status gpt_kv_cache_init(gd_context *ctx,
                                    const gpt_lm *model,
-                                   int batch_size,
+                                   int batch_capacity,
                                    int max_seq,
                                    gpt_kv_cache *cache)
 {
     int64_t shape[4];
     uint32_t i;
-    if (ctx == NULL || model == NULL || cache == NULL || batch_size <= 0 || max_seq <= 0) {
+    gd_status st;
+    if (ctx == NULL || model == NULL || cache == NULL || batch_capacity <= 0 || max_seq <= 0 ||
+        model->n_layers <= 0 || model->n_heads <= 0 || model->head_dim <= 0) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     memset(cache, 0, sizeof(*cache));
     cache->k = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->k[0]));
     cache->v = (gd_tensor *)calloc((size_t)model->n_layers, sizeof(cache->v[0]));
-    cache->pos = (int32_t *)calloc((size_t)batch_size, sizeof(cache->pos[0]));
+    cache->pos = (int32_t *)calloc((size_t)batch_capacity, sizeof(cache->pos[0]));
     if (cache->k == NULL || cache->v == NULL || cache->pos == NULL) {
         free(cache->k);
         free(cache->v);
@@ -267,27 +446,24 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
         memset(cache, 0, sizeof(*cache));
         return GD_ERR_OUT_OF_MEMORY;
     }
-    cache->batch_size = batch_size;
+    cache->batch_capacity = batch_capacity;
     cache->max_seq = max_seq;
     cache->n_layers = model->n_layers;
     cache->n_heads = model->n_heads;
     cache->head_dim = model->head_dim;
-    shape[0] = batch_size;
+    shape[0] = batch_capacity;
     shape[1] = max_seq;
     shape[2] = model->n_heads;
     shape[3] = model->head_dim;
     for (i = 0U; i < (uint32_t)model->n_layers; ++i) {
-        gd_status st = gd_tensor_empty(ctx,
-                                       GD_ARENA_STATE,
-                                       GD_DTYPE_F16,
-                                       gd_shape_make(4U, shape),
-                                       GPT_ALIGNMENT,
-                                       &cache->k[i]);
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_STATE,
+                             GD_DTYPE_F16,
+                             gd_shape_make(4U, shape),
+                             GPT_ALIGNMENT,
+                             &cache->k[i]);
         if (st != GD_OK) {
-            free(cache->k);
-            free(cache->v);
-            free(cache->pos);
-            memset(cache, 0, sizeof(*cache));
+            gpt_kv_cache_deinit(cache);
             return st;
         }
         st = gd_tensor_empty(ctx,
@@ -297,16 +473,13 @@ static gd_status gpt_kv_cache_init(gd_context *ctx,
                              GPT_ALIGNMENT,
                              &cache->v[i]);
         if (st != GD_OK) {
-            free(cache->k);
-            free(cache->v);
-            free(cache->pos);
-            memset(cache, 0, sizeof(*cache));
+            gpt_kv_cache_deinit(cache);
             return st;
         }
         cache->k[i].is_leaf = false;
         cache->v[i].is_leaf = false;
     }
-    return GD_OK;
+    return gpt_kv_cache_set_active_batch(cache, batch_capacity);
 }
 
 static void gpt_kv_cache_deinit(gpt_kv_cache *cache)
@@ -318,6 +491,43 @@ static void gpt_kv_cache_deinit(gpt_kv_cache *cache)
     free(cache->v);
     free(cache->pos);
     memset(cache, 0, sizeof(*cache));
+}
+
+static gd_status gpt_lm_prepare_generation_cache(gd_context *ctx,
+                                                 gpt_lm *model,
+                                                 const gpt_config *config,
+                                                 int batch_size,
+                                                 int max_seq,
+                                                 gpt_kv_cache **out)
+{
+    gpt_kv_cache *cache;
+    int capacity;
+    gd_status st;
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (ctx == NULL || model == NULL || out == NULL || batch_size <= 0 || max_seq <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    cache = &model->generation_cache;
+    capacity = int_max2(batch_size, gpt_generation_cache_batch_capacity(config));
+    if (cache->batch_capacity == 0) {
+        st = gpt_kv_cache_init(ctx, model, capacity, max_seq, cache);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    if (cache->batch_capacity < batch_size || cache->max_seq != max_seq ||
+        cache->n_layers != model->n_layers || cache->n_heads != model->n_heads ||
+        cache->head_dim != model->head_dim) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    st = gpt_kv_cache_set_active_batch(cache, batch_size);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = cache;
+    return GD_OK;
 }
 
 static gd_status gpt_block_forward(gd_context *ctx,
@@ -927,7 +1137,7 @@ static void gpt_generate_prompts(gd_context *ctx,
     int *next_ids = NULL;
     gd_tensor *last_logits = NULL;
     float *logits_host = NULL;
-    gpt_kv_cache cache;
+    gpt_kv_cache *cache = NULL;
     int total_prompt_tokens = 0;
     int max_new;
     int room_for_prompt;
@@ -938,7 +1148,6 @@ static void gpt_generate_prompts(gd_context *ctx,
     double start;
     double elapsed;
 
-    memset(&cache, 0, sizeof(cache));
     if (ctx == NULL || model == NULL || config == NULL || prompts == NULL || n_prompts <= 0) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "generation arguments", __LINE__);
     }
@@ -1015,7 +1224,7 @@ static void gpt_generate_prompts(gd_context *ctx,
     }
 
     rng = splitmix64(config->seed ^ UINT64_C(0xdec0de1234567890) ^ (uint64_t)n_prompts ^ (uint64_t)step);
-    TRY(ctx, gpt_kv_cache_init(ctx, model, n_prompts, GPT_CONTEXT_LENGTH, &cache));
+    TRY(ctx, gpt_lm_prepare_generation_cache(ctx, model, config, n_prompts, GPT_CONTEXT_LENGTH, &cache));
     gd_module_set_training(&model->mod, false);
     start = gpt_wall_seconds();
 
@@ -1032,7 +1241,7 @@ static void gpt_generate_prompts(gd_context *ctx,
         TRY(ctx, gpt_data_i32_tensor(ctx, cache_pos_values, n_prompts, &cache_pos_t));
         TRY(ctx, gpt_lm_prefill_logits(ctx,
                                        model,
-                                       &cache,
+                                       cache,
                                        &ids_t,
                                        &pos_t,
                                        &cu_t,
@@ -1051,7 +1260,7 @@ static void gpt_generate_prompts(gd_context *ctx,
                                                 GPT_VOCAB_SIZE,
                                                 config->temperature,
                                                 &rng);
-            cache.pos[b] = prompt_len[b];
+            cache->pos[b] = prompt_len[b];
         }
     }
 
@@ -1066,8 +1275,8 @@ static void gpt_generate_prompts(gd_context *ctx,
         }
         for (b = 0; b < n_prompts; ++b) {
             decode_ids[b] = (int32_t)next_ids[b];
-            decode_positions[b] = cache.pos[b];
-            cache_pos_values[b] = cache.pos[b];
+            decode_positions[b] = cache->pos[b];
+            cache_pos_values[b] = cache->pos[b];
         }
         {
             gd_tensor ids_t;
@@ -1078,7 +1287,7 @@ static void gpt_generate_prompts(gd_context *ctx,
             TRY(ctx, gpt_data_i32_tensor(ctx, decode_ids, n_prompts, &ids_t));
             TRY(ctx, gpt_data_i32_tensor(ctx, decode_positions, n_prompts, &pos_t));
             TRY(ctx, gpt_data_i32_tensor(ctx, cache_pos_values, n_prompts, &cache_pos_t));
-            TRY(ctx, gpt_lm_decode_logits(ctx, model, &cache, &ids_t, &pos_t, &cache_pos_t, &logits));
+            TRY(ctx, gpt_lm_decode_logits(ctx, model, cache, &ids_t, &pos_t, &cache_pos_t, &logits));
             TRY(ctx, gd_end_step(ctx));
             TRY(ctx, gd_tensor_read_f32(ctx,
                                         &logits,
@@ -1126,7 +1335,6 @@ static void gpt_generate_prompts(gd_context *ctx,
     if (restore_training) {
         gd_module_set_training(&model->mod, true);
     }
-    gpt_kv_cache_deinit(&cache);
     for (b = 0; b < n_prompts; ++b) {
         gd_tokenizer_free(encoded[b]);
         free(seq_ids[b]);
@@ -1162,6 +1370,13 @@ void gpt_generate_vowels(gd_context *ctx,
                          const gpt_config *config,
                          size_t step)
 {
-    static const char *const prompts[5] = {"a", "e", "i", "o", "u"};
-    gpt_generate_prompts(ctx, model, config, prompts, 5, "vowels", step, true);
+    static const char *const prompts[GPT_GENERATE_VOWEL_PROMPT_COUNT] = {"a", "e", "i", "o", "u"};
+    gpt_generate_prompts(ctx,
+                         model,
+                         config,
+                         prompts,
+                         (int)GPT_GENERATE_VOWEL_PROMPT_COUNT,
+                         "vowels",
+                         step,
+                         true);
 }

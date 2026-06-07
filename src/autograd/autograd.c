@@ -498,6 +498,52 @@ static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
     return GD_OK;
 }
 
+static gd_status gd_adopt_grad_slot(gd_bwd_ctx *bwd,
+                                    uint64_t tensor_id,
+                                    const gd_tensor *contrib,
+                                    gd_grad_slot **out_slot)
+{
+    gd_grad_slot *slot = NULL;
+    uint32_t i;
+    if (bwd == NULL || bwd->ctx == NULL || bwd->tape == NULL || contrib == NULL || out_slot == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < bwd->tape->n_grads; ++i) {
+        if (!bwd->tape->grads[i].occupied) {
+            slot = &bwd->tape->grads[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        if (bwd->tape->n_grads >= bwd->tape->cap_grads) {
+            return gd_context_set_error(bwd->ctx, GD_ERR_OUT_OF_MEMORY, "autograd grad capacity exceeded");
+        }
+        slot = &bwd->tape->grads[bwd->tape->n_grads];
+        bwd->tape->n_grads += 1U;
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->grad = *contrib;
+    slot->grad.requires_grad = false;
+    slot->grad.is_leaf = false;
+    slot->tensor_id = tensor_id;
+    slot->occupied = true;
+    *out_slot = slot;
+    return GD_OK;
+}
+
+static bool gd_autograd_can_adopt_contrib(gd_bwd_ctx *bwd, const gd_tensor *contrib)
+{
+    /*
+     * First-use gradient slots can own a freshly produced scratch contribution
+     * directly.  Do not adopt forward-live tensors or existing grad storage:
+     * those may be read again by other backward edges or released separately.
+     */
+    return bwd != NULL && bwd->tape != NULL && contrib != NULL &&
+           gd_tensor_has_releasable_scratch_storage(contrib) &&
+           !gd_live_span_storage_active(bwd->tape, &contrib->storage) &&
+           !gd_grad_storage_active(bwd->tape, &contrib->storage);
+}
+
 static bool gd_tensors_same_shape(const gd_tensor *a, const gd_tensor *b)
 {
     uint32_t i;
@@ -732,6 +778,9 @@ gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
     }
     slot = gd_find_grad_slot(bwd->tape, tensor_id);
     if (slot == NULL) {
+        if (gd_autograd_can_adopt_contrib(bwd, contrib)) {
+            return gd_adopt_grad_slot(bwd, tensor_id, contrib, &slot);
+        }
         st = gd_create_grad_slot(bwd, tensor_id, contrib, &slot);
         if (st != GD_OK) {
             return st;

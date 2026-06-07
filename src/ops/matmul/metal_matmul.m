@@ -249,6 +249,37 @@ static uint64_t gd_metal_mps_batch_matmul_min_flops(gd_metal_matmul_layout layou
                                           GD_METAL_MPS_BATCH_MATMUL_MIN_FLOPS;
 }
 
+typedef struct gd_metal_mps_class_cache {
+    bool attempted;
+    bool available;
+    Class descriptor_class;
+    Class array_class;
+    Class matmul_class;
+} gd_metal_mps_class_cache;
+
+static const gd_metal_mps_class_cache *gd_metal_mps_classes(void)
+{
+    static gd_metal_mps_class_cache cache;
+    if (cache.attempted) {
+        return &cache;
+    }
+    cache.attempted = true;
+    cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+    cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
+    cache.array_class = NSClassFromString(@"MPSNDArray");
+    if (cache.matmul_class == Nil || cache.descriptor_class == Nil || cache.array_class == Nil) {
+        NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/MetalPerformanceShaders.framework"];
+        if (bundle != nil) {
+            (void)[bundle load];
+        }
+        cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+        cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
+        cache.array_class = NSClassFromString(@"MPSNDArray");
+    }
+    cache.available = cache.matmul_class != Nil && cache.descriptor_class != Nil && cache.array_class != Nil;
+    return &cache;
+}
+
 /*
  * PyTorch's MPS linear path uses MPSNDArrayMatrixMultiplication for large
  * contiguous 2D GEMMs.  Mirror that selectively for packed 2D workloads where
@@ -278,47 +309,26 @@ static bool gd_metal_mps_matmul_ok(const gd_backend_batched_matrix_view *x,
         gd_metal_u64_mul_overflow(flops, 2U, &flops)) {
         return false;
     }
-    if (layout == GD_METAL_MATMUL_NN && (uint64_t)y->cols >= (uint64_t)inner * 4ULL &&
-        flops < 2000000000ULL) {
-        return false;
-    }
     return flops >= gd_metal_mps_matmul_min_flops(layout);
 }
 
 static bool gd_metal_mps_framework_available(void)
 {
-    static bool attempted = false;
-    static bool available = false;
-    if (attempted) {
-        return available;
-    }
-    attempted = true;
-    if (NSClassFromString(@"MPSNDArrayMatrixMultiplication") == Nil) {
-        NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/MetalPerformanceShaders.framework"];
-        if (bundle != nil) {
-            (void)[bundle load];
-        }
-    }
-    available = NSClassFromString(@"MPSNDArrayMatrixMultiplication") != Nil &&
-                NSClassFromString(@"MPSNDArrayDescriptor") != Nil &&
-                NSClassFromString(@"MPSNDArray") != Nil;
-    return available;
+    return gd_metal_mps_classes()->available;
 }
 
 static id gd_metal_mps_matrix_array(const gd_backend_batched_matrix_view *view, bool transpose)
 {
+    const gd_metal_mps_class_cache *classes = gd_metal_mps_classes();
     Class desc_class;
     Class array_class;
     id desc;
     id<MTLBuffer> buffer;
-    if (view == NULL || view->buffer == NULL) {
+    if (view == NULL || view->buffer == NULL || !classes->available) {
         return nil;
     }
-    desc_class = NSClassFromString(@"MPSNDArrayDescriptor");
-    array_class = NSClassFromString(@"MPSNDArray");
-    if (desc_class == Nil || array_class == Nil) {
-        return nil;
-    }
+    desc_class = classes->descriptor_class;
+    array_class = classes->array_class;
     desc = [desc_class descriptorWithDataType:GD_METAL_MPS_DATA_TYPE_FLOAT16
                                         shape:@[ @((NSUInteger)view->rows), @((NSUInteger)view->cols) ]];
     if (desc == nil) {
@@ -334,13 +344,14 @@ static id gd_metal_mps_matrix_array(const gd_backend_batched_matrix_view *view, 
 
 static id gd_metal_mps_batched_ndarray(const gd_backend_batched_matrix_view *view, bool transpose)
 {
+    const gd_metal_mps_class_cache *classes = gd_metal_mps_classes();
     Class desc_class;
     Class array_class;
     id desc;
     id<MTLBuffer> buffer;
     NSUInteger b0 = 1U;
     NSUInteger b1 = 1U;
-    if (view == NULL || view->buffer == NULL || view->batch_rank > 2U) {
+    if (view == NULL || view->buffer == NULL || view->batch_rank > 2U || !classes->available) {
         return nil;
     }
     if (view->batch_rank == 1U) {
@@ -349,11 +360,8 @@ static id gd_metal_mps_batched_ndarray(const gd_backend_batched_matrix_view *vie
         b0 = (NSUInteger)view->batch_shape[0];
         b1 = (NSUInteger)view->batch_shape[1];
     }
-    desc_class = NSClassFromString(@"MPSNDArrayDescriptor");
-    array_class = NSClassFromString(@"MPSNDArray");
-    if (desc_class == Nil || array_class == Nil) {
-        return nil;
-    }
+    desc_class = classes->descriptor_class;
+    array_class = classes->array_class;
     desc = [desc_class descriptorWithDataType:GD_METAL_MPS_DATA_TYPE_FLOAT16
                                         shape:@[ @(b0), @(b1), @((NSUInteger)view->rows), @((NSUInteger)view->cols) ]];
     if (desc == nil) {
@@ -388,7 +396,7 @@ static gd_status gd_backend_batched_matmul_dispatch_mps(gd_backend *backend,
         return GD_ERR_UNSUPPORTED;
     }
     if (backend->mps_matmul_kernel == NULL) {
-        Class kernel_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+        Class kernel_class = gd_metal_mps_classes()->matmul_class;
         id new_kernel;
         if (kernel_class == Nil) {
             return GD_ERR_UNSUPPORTED;
@@ -443,7 +451,7 @@ static gd_status gd_backend_batched_matmul_dispatch_mps_ndarray(gd_backend *back
         return GD_ERR_UNSUPPORTED;
     }
     if (backend->mps_matmul_kernel == NULL) {
-        Class kernel_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+        Class kernel_class = gd_metal_mps_classes()->matmul_class;
         id new_kernel;
         if (kernel_class == Nil) {
             return GD_ERR_UNSUPPORTED;

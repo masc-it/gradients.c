@@ -43,13 +43,18 @@ static id<MTLComputePipelineState> gd_rms_norm_backward_pso(gd_backend *backend,
     return nil;
 }
 
-static id<MTLComputePipelineState> gd_rms_norm_wgrad_stage_pso(gd_backend *backend, uint32_t dtype)
+static id<MTLComputePipelineState> gd_rms_norm_wgrad_stage_pso(gd_backend *backend,
+                                                                 uint32_t dtype,
+                                                                 uint32_t row_block)
 {
+    bool large = row_block > GD_METAL_RMS_NORM_WGRAD_ROW_BLOCK;
     if (dtype == (uint32_t)GD_DTYPE_F16) {
-        return (__bridge id<MTLComputePipelineState>)backend->rms_norm_wgrad_stage_stats_f16_pso;
+        return (__bridge id<MTLComputePipelineState>)(large ? backend->rms_norm_wgrad_stage_stats_f16_rb128_pso
+                                                            : backend->rms_norm_wgrad_stage_stats_f16_pso);
     }
     if (dtype == (uint32_t)GD_DTYPE_F32) {
-        return (__bridge id<MTLComputePipelineState>)backend->rms_norm_wgrad_stage_stats_f32_pso;
+        return (__bridge id<MTLComputePipelineState>)(large ? backend->rms_norm_wgrad_stage_stats_f32_rb128_pso
+                                                            : backend->rms_norm_wgrad_stage_stats_f32_pso);
     }
     return nil;
 }
@@ -473,7 +478,7 @@ gd_status gd_backend_rms_norm_weight_backward_stats(gd_backend *backend,
     }
     if (x == NULL || grad_weight == NULL || args == NULL || args->rows == 0U ||
         args->cols == 0U || args->rows > UINT64_MAX / args->cols ||
-        args->wgrad_row_block == 0U || args->wgrad_row_block > GD_METAL_RMS_NORM_WGRAD_ROW_BLOCK ||
+        args->wgrad_row_block == 0U || args->wgrad_row_block > GD_METAL_RMS_NORM_WGRAD_ROW_BLOCK_LARGE ||
         args->wgrad_simdgroups == 0U || args->wgrad_simdgroups > GD_METAL_RMS_NORM_MAX_SIMDGROUPS ||
         !gd_rms_norm_view_range_valid(x) || !gd_rms_norm_contiguous_view(x) ||
         gd_rms_norm_dtype_size(x->dtype) == 0U ||
@@ -497,7 +502,7 @@ gd_status gd_backend_rms_norm_weight_backward_stats(gd_backend *backend,
     if (st != GD_OK) {
         return st;
     }
-    stage_pso = gd_rms_norm_wgrad_stage_pso(backend, x->dtype);
+    stage_pso = gd_rms_norm_wgrad_stage_pso(backend, x->dtype, args->wgrad_row_block);
     reduce_pso = gd_rms_norm_wgrad_reduce_pso(backend, x->dtype);
     if (stage_pso == nil || reduce_pso == nil) {
         return GD_ERR_UNSUPPORTED;

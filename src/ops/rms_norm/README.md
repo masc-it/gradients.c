@@ -32,6 +32,7 @@ out[row,c] = x[row,c] * weight[c] * inv_rms[row]
 - Weight gradient uses a coalesced two-stage reduction:
   1. row-block/channel-block partials in `f32 [row_blocks, last_dim]`,
   2. column-wise partial reduction to the requested output dtype.
+- Weight-gradient row blocks are adaptive: 64 rows for small batches, 128 rows for large row counts to cut partial traffic and row-block launch work.
 
 ## Metal kernels
 

@@ -6,7 +6,9 @@
 #include <stddef.h>
 #include <string.h>
 
-#define GD_RMS_NORM_WGRAD_ROW_BLOCK 64U
+#define GD_RMS_NORM_WGRAD_ROW_BLOCK_SMALL 64U
+#define GD_RMS_NORM_WGRAD_ROW_BLOCK_LARGE 128U
+#define GD_RMS_NORM_WGRAD_LARGE_ROWS_THRESHOLD 4096U
 
 static bool gd_rms_norm_dtype_supported(gd_dtype dtype)
 {
@@ -161,7 +163,9 @@ static gd_status gd_rms_norm_make_args(gd_context *ctx,
     }
     urows = (uint64_t)rows;
     ucols = (uint64_t)cols;
-    row_block = (uint64_t)GD_RMS_NORM_WGRAD_ROW_BLOCK;
+    row_block = urows >= (uint64_t)GD_RMS_NORM_WGRAD_LARGE_ROWS_THRESHOLD
+                    ? (uint64_t)GD_RMS_NORM_WGRAD_ROW_BLOCK_LARGE
+                    : (uint64_t)GD_RMS_NORM_WGRAD_ROW_BLOCK_SMALL;
     row_blocks = (urows + row_block - 1U) / row_block;
     if (urows > UINT64_MAX / ucols || row_blocks > (uint64_t)INT64_MAX) {
         return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "rms_norm shape overflow");
@@ -173,7 +177,7 @@ static gd_status gd_rms_norm_make_args(gd_context *ctx,
     out_args->eps = eps;
     out_args->simdgroups = gd_rms_norm_simdgroups(ucols);
     out_args->wgrad_simdgroups = gd_rms_norm_wgrad_simdgroups(row_blocks);
-    out_args->wgrad_row_block = GD_RMS_NORM_WGRAD_ROW_BLOCK;
+    out_args->wgrad_row_block = (uint32_t)row_block;
     return GD_OK;
 }
 

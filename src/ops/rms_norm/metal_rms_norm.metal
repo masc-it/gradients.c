@@ -481,6 +481,76 @@ kernel void gd_rms_norm_wgrad_stage_stats_f32_kernel(device const uchar *xbuf [[
     }
 }
 
+kernel void gd_rms_norm_wgrad_stage_stats_f16_rb128_kernel(device const uchar *xbuf [[buffer(0)]],
+                                                           device const uchar *invbuf [[buffer(1)]],
+                                                           device const uchar *gradbuf [[buffer(2)]],
+                                                           device uchar *partialbuf [[buffer(3)]],
+                                                           constant gd_metal_rms_norm_args &args [[buffer(4)]],
+                                                           uint3 tgpos [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup float inv_sh[GD_METAL_RMS_NORM_WGRAD_ROW_BLOCK_LARGE];
+    const ulong cb = ulong(tgpos.x);
+    const ulong rb = ulong(tgpos.y);
+    const ulong c = cb * ulong(GD_METAL_RMS_NORM_WGRAD_CHANNELS) + ulong(tid);
+    const ulong row0 = rb * ulong(args.wgrad_row_block);
+    ulong tile = args.rows > row0 ? args.rows - row0 : 0ul;
+    device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
+    device const float *inv = reinterpret_cast<device const float *>(invbuf + args.inv_rms_offset);
+    device const half *grad = reinterpret_cast<device const half *>(gradbuf + args.grad_out_offset);
+    device float *partial = reinterpret_cast<device float *>(partialbuf + args.partial_offset);
+    if (tile > ulong(args.wgrad_row_block)) {
+        tile = ulong(args.wgrad_row_block);
+    }
+    if (ulong(tid) < tile) {
+        inv_sh[tid] = inv[row0 + ulong(tid)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (c < args.cols && rb < args.row_blocks) {
+        float acc = 0.0f;
+        for (ulong i = 0ul; i < tile; ++i) {
+            const ulong idx = (row0 + i) * args.cols + c;
+            acc += float(grad[idx]) * float(x[idx]) * inv_sh[i];
+        }
+        partial[rb * args.cols + c] = acc;
+    }
+}
+
+kernel void gd_rms_norm_wgrad_stage_stats_f32_rb128_kernel(device const uchar *xbuf [[buffer(0)]],
+                                                           device const uchar *invbuf [[buffer(1)]],
+                                                           device const uchar *gradbuf [[buffer(2)]],
+                                                           device uchar *partialbuf [[buffer(3)]],
+                                                           constant gd_metal_rms_norm_args &args [[buffer(4)]],
+                                                           uint3 tgpos [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup float inv_sh[GD_METAL_RMS_NORM_WGRAD_ROW_BLOCK_LARGE];
+    const ulong cb = ulong(tgpos.x);
+    const ulong rb = ulong(tgpos.y);
+    const ulong c = cb * ulong(GD_METAL_RMS_NORM_WGRAD_CHANNELS) + ulong(tid);
+    const ulong row0 = rb * ulong(args.wgrad_row_block);
+    ulong tile = args.rows > row0 ? args.rows - row0 : 0ul;
+    device const float *x = reinterpret_cast<device const float *>(xbuf + args.x_offset);
+    device const float *inv = reinterpret_cast<device const float *>(invbuf + args.inv_rms_offset);
+    device const float *grad = reinterpret_cast<device const float *>(gradbuf + args.grad_out_offset);
+    device float *partial = reinterpret_cast<device float *>(partialbuf + args.partial_offset);
+    if (tile > ulong(args.wgrad_row_block)) {
+        tile = ulong(args.wgrad_row_block);
+    }
+    if (ulong(tid) < tile) {
+        inv_sh[tid] = inv[row0 + ulong(tid)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (c < args.cols && rb < args.row_blocks) {
+        float acc = 0.0f;
+        for (ulong i = 0ul; i < tile; ++i) {
+            const ulong idx = (row0 + i) * args.cols + c;
+            acc += grad[idx] * x[idx] * inv_sh[i];
+        }
+        partial[rb * args.cols + c] = acc;
+    }
+}
+
 kernel void gd_rms_norm_wgrad_reduce_f16_kernel(device const uchar *partialbuf [[buffer(0)]],
                                                 device uchar *dwbuf [[buffer(1)]],
                                                 constant gd_metal_rms_norm_args &args [[buffer(2)]],

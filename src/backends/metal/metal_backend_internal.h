@@ -102,6 +102,8 @@ struct gd_backend {
     void *rms_norm_backward_stats_f32_pso;
     void *rms_norm_wgrad_stage_stats_f16_pso;
     void *rms_norm_wgrad_stage_stats_f32_pso;
+    void *rms_norm_wgrad_stage_stats_f16_rb128_pso;
+    void *rms_norm_wgrad_stage_stats_f32_rb128_pso;
     void *rms_norm_wgrad_reduce_f16_pso;
     void *rms_norm_wgrad_reduce_f32_pso;
     void *concat_to_full_u8_pso;

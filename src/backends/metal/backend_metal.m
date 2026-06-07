@@ -359,6 +359,14 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f16_rb128_kernel", &backend->rms_norm_wgrad_stage_stats_f16_rb128_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f32_rb128_kernel", &backend->rms_norm_wgrad_stage_stats_f32_rb128_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_reduce_f16_kernel", &backend->rms_norm_wgrad_reduce_f16_pso);
     if (st != GD_OK) {
         return st;
@@ -957,6 +965,12 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->rms_norm_wgrad_reduce_f16_pso != NULL) {
         CFRelease(backend->rms_norm_wgrad_reduce_f16_pso);
+    }
+    if (backend->rms_norm_wgrad_stage_stats_f32_rb128_pso != NULL) {
+        CFRelease(backend->rms_norm_wgrad_stage_stats_f32_rb128_pso);
+    }
+    if (backend->rms_norm_wgrad_stage_stats_f16_rb128_pso != NULL) {
+        CFRelease(backend->rms_norm_wgrad_stage_stats_f16_rb128_pso);
     }
     if (backend->rms_norm_wgrad_stage_stats_f32_pso != NULL) {
         CFRelease(backend->rms_norm_wgrad_stage_stats_f32_pso);

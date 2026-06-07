@@ -175,6 +175,7 @@ static bool rms_perf_init(rms_perf_model *model, const rms_perf_case *pcase)
     size_t weight_bytes;
     size_t params_bytes;
     size_t scratch_bytes;
+    size_t row_block;
     size_t row_blocks;
     if (model == NULL || pcase == NULL) {
         return false;
@@ -192,7 +193,8 @@ static bool rms_perf_init(rms_perf_model *model, const rms_perf_case *pcase)
     }
     model->x_bytes = model->count * model->elem_size;
     weight_bytes = model->cols * model->elem_size;
-    row_blocks = (model->rows + 63U) / 64U;
+    row_block = model->rows >= 4096U ? 128U : 64U;
+    row_blocks = (model->rows + row_block - 1U) / row_block;
     if (row_blocks > SIZE_MAX / model->cols || row_blocks * model->cols > SIZE_MAX / sizeof(float)) {
         return false;
     }
@@ -351,6 +353,8 @@ int main(void)
 {
     const rms_perf_case cases[] = {
         {"small_hidden_8192x64_f16", GD_DTYPE_F16, 2U, {8192, 64, 0, 0, 0, 0, 0, 0}, 1.0e-5f},
+        {"gpt_lm_b1_512x256_f16", GD_DTYPE_F16, 2U, {512, 256, 0, 0, 0, 0, 0, 0}, 1.0e-5f},
+        {"gpt_lm_b32_16384x256_f16", GD_DTYPE_F16, 2U, {16384, 256, 0, 0, 0, 0, 0, 0}, 1.0e-5f},
         {"transformer_512x4096_f16", GD_DTYPE_F16, 2U, {512, 4096, 0, 0, 0, 0, 0, 0}, 1.0e-5f},
         {"qkv_tokens_4096x1024_f16", GD_DTYPE_F16, 2U, {4096, 1024, 0, 0, 0, 0, 0, 0}, 1.0e-5f},
         {"vision_tokens_1024x768_f16", GD_DTYPE_F16, 2U, {1024, 768, 0, 0, 0, 0, 0, 0}, 1.0e-5f},

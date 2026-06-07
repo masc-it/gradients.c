@@ -242,6 +242,32 @@ gd_status gd_rope_backward(gd_context *ctx,
                            const gd_rope_config *config,
                            gd_tensor *grad_x);
 
+/* Fused GPT-style QKV unpack + full-head RoPE for attention projections.
+ * qkv is contiguous F16 [N, 3 * H * Dh], pos_ids is contiguous I32 [N].
+ * Outputs are contiguous F16 q/k/v [N, H, Dh], with RoPE applied to q and k
+ * and v copied directly. This avoids materializing split Q/K/V tensors and
+ * computing identical Q/K rotary angles in separate kernels. */
+gd_status gd_qkv_split_rope(gd_context *ctx,
+                            const gd_tensor *qkv,
+                            const gd_tensor *pos_ids,
+                            int32_t n_heads,
+                            int32_t head_dim,
+                            const gd_rope_config *config,
+                            gd_tensor *q,
+                            gd_tensor *k,
+                            gd_tensor *v);
+
+gd_status gd_qkv_split_rope_backward(gd_context *ctx,
+                                      const gd_tensor *qkv,
+                                      const gd_tensor *pos_ids,
+                                      const gd_tensor *grad_q,
+                                      const gd_tensor *grad_k,
+                                      const gd_tensor *grad_v,
+                                      int32_t n_heads,
+                                      int32_t head_dim,
+                                      const gd_rope_config *config,
+                                      gd_tensor *grad_qkv);
+
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
  * Hq must be a multiple of Hkv. Output has q's shape and dtype.

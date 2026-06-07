@@ -552,16 +552,12 @@ static gd_status gpt_block_forward(gd_context *ctx,
         .prefix_len = 0,
         .max_seqlen = GPT_CONTEXT_LENGTH,
     };
-    int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
-    gd_tensor qkv_parts[3];
-    gd_tensor q_view;
-    gd_tensor k_view;
-    gd_tensor v_view;
     gd_tensor q_rot;
     gd_tensor k_rot;
+    gd_tensor v_view;
     gd_tensor attn;
     gd_tensor attn_flat;
     gd_tensor attn_proj;
@@ -572,7 +568,6 @@ static gd_status gpt_block_forward(gd_context *ctx,
     gd_tensor mlp_proj;
     gd_status st;
     int64_t n_tokens;
-    int64_t q_shape[3];
     int64_t flat_shape[2];
     uint64_t site_seed;
 
@@ -581,9 +576,6 @@ static gd_status gpt_block_forward(gd_context *ctx,
         return GD_ERR_INVALID_ARGUMENT;
     }
     n_tokens = x->shape[0];
-    q_shape[0] = n_tokens;
-    q_shape[1] = GPT_N_HEADS;
-    q_shape[2] = GPT_HEAD_DIM;
     flat_shape[0] = n_tokens;
     flat_shape[1] = GPT_D_MODEL;
 
@@ -596,27 +588,15 @@ static gd_status gpt_block_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_split(ctx, &qkv, qkv_sizes, 3U, -1, qkv_parts);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_reshape(ctx, &qkv_parts[0], gd_shape_make(3U, q_shape), &q_view);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_reshape(ctx, &qkv_parts[1], gd_shape_make(3U, q_shape), &k_view);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_reshape(ctx, &qkv_parts[2], gd_shape_make(3U, q_shape), &v_view);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_rope(ctx, &q_view, positions, &rope_cfg, &q_rot);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
+    st = gd_qkv_split_rope(ctx,
+                            &qkv,
+                            positions,
+                            GPT_N_HEADS,
+                            GPT_HEAD_DIM,
+                            &rope_cfg,
+                            &q_rot,
+                            &k_rot,
+                            &v_view);
     if (st != GD_OK) {
         return st;
     }

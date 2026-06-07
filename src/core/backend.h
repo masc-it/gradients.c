@@ -297,6 +297,27 @@ gd_status gd_backend_rope_backward(gd_backend *backend,
                                    const gd_backend_tensor_view *pos_ids,
                                    const gd_backend_tensor_view *grad_x,
                                    const gd_backend_rope_args *args);
+
+/* F16-only GPT attention helper: qkv [N, 3*H*Dh] -> q/k/v [N,H,Dh],
+ * applying full-head RoPE to q and k while copying v. */
+gd_status gd_backend_qkv_split_rope_forward(gd_backend *backend,
+                                            const gd_backend_tensor_view *qkv,
+                                            const gd_backend_tensor_view *pos_ids,
+                                            const gd_backend_tensor_view *q,
+                                            const gd_backend_tensor_view *k,
+                                            const gd_backend_tensor_view *v,
+                                            uint32_t n_heads,
+                                            uint32_t head_dim,
+                                            const gd_backend_rope_args *args);
+gd_status gd_backend_qkv_split_rope_backward(gd_backend *backend,
+                                             const gd_backend_tensor_view *grad_q,
+                                             const gd_backend_tensor_view *grad_k,
+                                             const gd_backend_tensor_view *grad_v,
+                                             const gd_backend_tensor_view *pos_ids,
+                                             const gd_backend_tensor_view *grad_qkv,
+                                             uint32_t n_heads,
+                                             uint32_t head_dim,
+                                             const gd_backend_rope_args *args);
 /* dst[i] = src[0] * scale for contiguous tensors; supports same dtype and f32 scalar to f16 dst. */
 gd_status gd_backend_broadcast_scalar(gd_backend *backend,
                                       const gd_backend_tensor_view *src,

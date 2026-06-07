@@ -668,6 +668,14 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_qkv_split_rope_forward_f16_kernel", &backend->qkv_split_rope_forward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_qkv_split_rope_backward_f16_kernel", &backend->qkv_split_rope_backward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     return GD_OK;
 }
 
@@ -897,6 +905,12 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->concat_to_full_u8_pso != NULL) {
         CFRelease(backend->concat_to_full_u8_pso);
+    }
+    if (backend->qkv_split_rope_backward_f16_pso != NULL) {
+        CFRelease(backend->qkv_split_rope_backward_f16_pso);
+    }
+    if (backend->qkv_split_rope_forward_f16_pso != NULL) {
+        CFRelease(backend->qkv_split_rope_forward_f16_pso);
     }
     if (backend->rope_backward_f32_pso != NULL) {
         CFRelease(backend->rope_backward_f32_pso);

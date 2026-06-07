@@ -1,0 +1,2 @@
+# Custom fused QKV split + full-head RoPE op; registers GD_OP_QKV_SPLIT_ROPE.
+# Public/backend signatures are declared manually in include/gradients/ops.h and src/core/backend.h.

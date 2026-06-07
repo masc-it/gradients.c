@@ -682,6 +682,50 @@ gd_status gd_backend_powlu_split_backward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_qkv_split_rope_forward(gd_backend *backend,
+                                            const gd_backend_tensor_view *qkv,
+                                            const gd_backend_tensor_view *pos_ids,
+                                            const gd_backend_tensor_view *q,
+                                            const gd_backend_tensor_view *k,
+                                            const gd_backend_tensor_view *v,
+                                            uint32_t n_heads,
+                                            uint32_t head_dim,
+                                            const gd_backend_rope_args *args)
+{
+    (void)backend;
+    (void)qkv;
+    (void)pos_ids;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)n_heads;
+    (void)head_dim;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_qkv_split_rope_backward(gd_backend *backend,
+                                             const gd_backend_tensor_view *grad_q,
+                                             const gd_backend_tensor_view *grad_k,
+                                             const gd_backend_tensor_view *grad_v,
+                                             const gd_backend_tensor_view *pos_ids,
+                                             const gd_backend_tensor_view *grad_qkv,
+                                             uint32_t n_heads,
+                                             uint32_t head_dim,
+                                             const gd_backend_rope_args *args)
+{
+    (void)backend;
+    (void)grad_q;
+    (void)grad_k;
+    (void)grad_v;
+    (void)pos_ids;
+    (void)grad_qkv;
+    (void)n_heads;
+    (void)head_dim;
+    (void)args;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_rms_norm_forward(gd_backend *backend,
                                       const gd_backend_tensor_view *x,
                                       const gd_backend_tensor_view *weight,

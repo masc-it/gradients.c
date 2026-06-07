@@ -187,6 +187,37 @@ static gd_status gd_dropout_dispatch_forward(gd_context *ctx,
     return GD_OK;
 }
 
+static gd_status gd_dropout_dispatch_add_forward(gd_context *ctx,
+                                                  const gd_tensor *residual,
+                                                  const gd_tensor *x,
+                                                  const gd_tensor *y,
+                                                  const gd_tensor *mask,
+                                                  float p,
+                                                  uint64_t seed)
+{
+    gd_backend_tensor_view rv;
+    gd_backend_tensor_view xv;
+    gd_backend_tensor_view yv;
+    gd_backend_tensor_view mv;
+    gd_status st;
+    if (ctx == NULL || residual == NULL || x == NULL || y == NULL || mask == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_op_tensor_view_from_tensor(residual, &rv) ||
+        !gd_op_tensor_view_from_tensor(x, &xv) ||
+        !gd_op_tensor_view_from_tensor(y, &yv) ||
+        !gd_op_tensor_view_from_tensor(mask, &mv)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "dropout_add forward invalid tensor view");
+    }
+    st = gd_backend_dropout_add_forward(gd_context_backend(ctx), &rv, &xv, &yv, &mv, p, seed);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend dropout_add forward failed");
+    }
+    return GD_OK;
+}
+
 static gd_status gd_dropout_dispatch_backward(gd_context *ctx,
                                               const gd_tensor *x,
                                               const gd_tensor *grad_out,
@@ -300,6 +331,92 @@ gd_status gd_dropout(gd_context *ctx,
                                 GD_OP_DROPOUT,
                                 inputs,
                                 1U,
+                                outputs,
+                                1U,
+                                &attrs,
+                                (uint32_t)sizeof(attrs),
+                                saved,
+                                1U);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    *out = y;
+    return GD_OK;
+}
+
+gd_status gd_dropout_add(gd_context *ctx,
+                         const gd_tensor *residual,
+                         const gd_tensor *x,
+                         float p,
+                         bool training,
+                         uint64_t seed,
+                         gd_tensor *out)
+{
+    gd_status st;
+    gd_tensor y;
+    gd_tensor mask;
+    gd_dropout_attrs attrs;
+    size_t count = 0U;
+    size_t residual_count = 0U;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || residual == NULL || x == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_dropout_probability_valid(p)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "dropout_add probability must satisfy 0 <= p < 1");
+    }
+    st = gd_dropout_validate_tensor(ctx, x, &count);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_dropout_validate_tensor(ctx, residual, &residual_count);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (x->dtype != GD_DTYPE_F16 || residual->dtype != GD_DTYPE_F16) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_UNSUPPORTED,
+                                    "dropout_add currently supports f16 tensors only");
+    }
+    if (count != residual_count || !gd_dropout_same_shape(residual, x)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "dropout_add inputs must have equal shape");
+    }
+    if (!training || p == 0.0f) {
+        return gd_add(ctx, residual, x, out);
+    }
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &y);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_U8, gd_shape_make(x->rank, x->shape), 256U, &mask);
+    if (st != GD_OK) {
+        return st;
+    }
+    y.is_leaf = false;
+    mask.requires_grad = false;
+    mask.is_leaf = false;
+    st = gd_dropout_dispatch_add_forward(ctx, residual, x, &y, &mask, p, seed);
+    if (st != GD_OK) {
+        return st;
+    }
+
+    attrs.p = p;
+    attrs.scale = 1.0f / (1.0f - p);
+    {
+        const gd_tensor *inputs[2] = {residual, x};
+        gd_tensor *outputs[1] = {&y};
+        const gd_tensor *saved[1] = {&mask};
+        st = gd_autograd_record(ctx,
+                                GD_OP_DROPOUT,
+                                inputs,
+                                2U,
                                 outputs,
                                 1U,
                                 &attrs,

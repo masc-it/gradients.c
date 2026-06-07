@@ -306,6 +306,84 @@ static void test_dropout_f16_training_forward_backward(void)
     gd_context_destroy(ctx);
 }
 
+static void test_dropout_add_f16_training_autograd(void)
+{
+    enum { N = 19 };
+    const int64_t shape[2] = {1, N};
+    const float residual_values[N] = {
+        0.25f, -0.25f, 0.50f, -0.50f, 0.75f, -0.75f, 1.00f, -1.00f, 1.25f, -1.25f,
+        1.50f, -1.50f, 1.75f, -1.75f, 2.00f, -2.00f, 0.125f, -0.125f, 0.0f,
+    };
+    const float x_values[N] = {
+        -2.0f, -1.5f, -1.0f, -0.5f, -0.25f, 0.0f, 0.25f, 0.5f, 1.0f, 1.5f,
+        2.0f, -3.0f, 3.0f, -4.0f, 4.0f, 0.125f, -0.125f, 0.75f, -0.75f,
+    };
+    const float g_values[N] = {
+        0.5f, -0.625f, 0.75f, -0.875f, 1.0f, -1.125f, 1.25f, -1.375f, 1.5f,
+        -1.625f, 1.75f, -1.875f, 2.0f, -2.125f, 2.25f, -2.375f, 2.5f, -2.625f, 2.75f,
+    };
+    const float p = 0.20f;
+    const float scale = 1.0f / (1.0f - p);
+    const uint64_t seed = UINT64_C(0xabcddcba98761234);
+    uint16_t residual_data[N];
+    uint16_t x_data[N];
+    uint16_t g_data[N];
+    uint16_t got[N];
+    gd_memory_config cfg = dropout_config((size_t)N * sizeof(uint16_t), (size_t)N);
+    gd_context *ctx = NULL;
+    gd_tensor residual;
+    gd_tensor x;
+    gd_tensor g;
+    gd_tensor y;
+    gd_tensor grad_residual;
+    gd_tensor grad_x;
+    uint32_t i;
+    for (i = 0U; i < (uint32_t)N; ++i) {
+        residual_data[i] = f32_to_f16_bits(residual_values[i]);
+        x_data[i] = f32_to_f16_bits(x_values[i]);
+        g_data[i] = f32_to_f16_bits(g_values[i]);
+    }
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &residual));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 256U, &g));
+    CHECK_OK(gd_tensor_write(ctx, &residual, residual_data, sizeof(residual_data)));
+    CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
+    CHECK_OK(gd_tensor_write(ctx, &g, g_data, sizeof(g_data)));
+    CHECK_OK(gd_context_seal_params(ctx));
+
+    residual.requires_grad = true;
+    x.requires_grad = true;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_dropout_add(ctx, &residual, &x, p, true, seed, &y));
+    CHECK_OK(gd_backward(ctx, &y, &g));
+    CHECK_OK(gd_tensor_grad(ctx, &residual, &grad_residual));
+    CHECK_OK(gd_tensor_grad(ctx, &x, &grad_x));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+
+    CHECK_OK(gd_tensor_read(ctx, &y, got, sizeof(got)));
+    for (i = 0U; i < (uint32_t)N; ++i) {
+        float residual_f = f16_bits_to_f32(residual_data[i]);
+        float x_f = f16_bits_to_f32(x_data[i]);
+        float drop_f = dropout_keep(seed, i, p) ? f16_bits_to_f32(f32_to_f16_bits(x_f * scale)) : 0.0f;
+        float want = f16_bits_to_f32(f32_to_f16_bits(residual_f + drop_f));
+        check_close(f16_bits_to_f32(got[i]), want, 1.0e-3f, "f16 dropout_add forward");
+    }
+    CHECK_OK(gd_tensor_read(ctx, &grad_residual, got, sizeof(got)));
+    for (i = 0U; i < (uint32_t)N; ++i) {
+        check_close(f16_bits_to_f32(got[i]), f16_bits_to_f32(g_data[i]), 1.0e-3f, "f16 dropout_add residual grad");
+    }
+    CHECK_OK(gd_tensor_read(ctx, &grad_x, got, sizeof(got)));
+    for (i = 0U; i < (uint32_t)N; ++i) {
+        float g_f = f16_bits_to_f32(g_data[i]);
+        float want = dropout_keep(seed, i, p) ? f16_bits_to_f32(f32_to_f16_bits(g_f * scale)) : 0.0f;
+        check_close(f16_bits_to_f32(got[i]), want, 1.0e-3f, "f16 dropout_add branch grad");
+    }
+
+    gd_context_destroy(ctx);
+}
+
 static void test_dropout_identity_paths(void)
 {
     enum { N = 5 };
@@ -365,6 +443,7 @@ int main(void)
 {
     test_dropout_f32_training_forward_backward();
     test_dropout_f16_training_forward_backward();
+    test_dropout_add_f16_training_autograd();
     test_dropout_identity_paths();
     test_dropout_rejects_invalid_inputs();
     printf("test_dropout_ops: ok\n");

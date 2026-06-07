@@ -227,6 +227,14 @@ gd_status gd_backend_dropout_forward(gd_backend *backend,
                                      const gd_backend_tensor_view *mask,
                                      float p,
                                      uint64_t seed);
+/* Fused residual add with inverted dropout on x: y = residual + dropout(x). */
+gd_status gd_backend_dropout_add_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *residual,
+                                         const gd_backend_tensor_view *x,
+                                         const gd_backend_tensor_view *y,
+                                         const gd_backend_tensor_view *mask,
+                                         float p,
+                                         uint64_t seed);
 /* Direct dropout backward recomputes the same stateless mask from p/seed. */
 gd_status gd_backend_dropout_backward(gd_backend *backend,
                                       const gd_backend_tensor_view *grad_out,
@@ -374,6 +382,16 @@ gd_status gd_backend_powlu_backward(gd_backend *backend,
                                     const gd_backend_tensor_view *grad_x1,
                                     const gd_backend_tensor_view *grad_x2,
                                     float m);
+/* Fused split+PoWLU over the last dimension: x12 [..., 2H] -> out [..., H]. */
+gd_status gd_backend_powlu_split_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *x12,
+                                         const gd_backend_tensor_view *out,
+                                         float m);
+gd_status gd_backend_powlu_split_backward(gd_backend *backend,
+                                          const gd_backend_tensor_view *x12,
+                                          const gd_backend_tensor_view *grad_out,
+                                          const gd_backend_tensor_view *grad_x12,
+                                          float m);
 
 typedef struct gd_backend_rms_norm_args {
     uint64_t rows;              /* Product of all dimensions except the last. */

@@ -21,6 +21,24 @@ static gd_status gd_dropout_autograd_backward(gd_bwd_ctx *bwd,
     if (!gd_autograd_get_grad(bwd, out->id, &grad_out)) {
         return GD_OK;
     }
+    if (node->n_inputs == 2U) {
+        const gd_tensor *residual = x;
+        x = gd_tape_input(bwd->tape, node, 1U);
+        if (x == NULL) {
+            return GD_ERR_INTERNAL;
+        }
+        if (residual->requires_grad) {
+            GD_TRY(gd_autograd_accumulate(bwd, residual->id, &grad_out));
+        }
+        if (x->requires_grad) {
+            GD_TRY(gd_dropout_backward_from_mask(bwd->ctx, mask, &grad_out, attrs->scale, &dx));
+            GD_TRY(gd_autograd_accumulate(bwd, x->id, &dx));
+        }
+        return GD_OK;
+    }
+    if (node->n_inputs != 1U) {
+        return GD_ERR_INTERNAL;
+    }
     if (!x->requires_grad) {
         return GD_OK;
     }

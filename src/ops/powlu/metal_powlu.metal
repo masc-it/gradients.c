@@ -90,3 +90,61 @@ kernel void gd_powlu_backward_f16_kernel(device const uchar *x1buf [[buffer(0)]]
         }
     }
 }
+
+kernel void gd_powlu_split_forward_f16_kernel(device const uchar *x12buf [[buffer(0)]],
+                                              device uchar *outbuf [[buffer(1)]],
+                                              constant gd_metal_powlu_split_fwd_args &args [[buffer(2)]],
+                                              uint2 gid [[thread_position_in_grid]])
+{
+    const ulong col_base = ulong(gid.x) * ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD);
+    if (col_base >= args.half_width) {
+        return;
+    }
+    const ulong row = ulong(gid.y);
+    const ulong out_row_base = row * args.half_width;
+    const ulong x_row_base = out_row_base * 2ul;
+    device const half *x12 = reinterpret_cast<device const half *>(x12buf + args.x12_offset);
+    device half *out = reinterpret_cast<device half *>(outbuf + args.out_offset);
+    for (ulong lane = 0ul; lane < ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD); ++lane) {
+        const ulong col = col_base + lane;
+        if (col >= args.half_width) {
+            break;
+        }
+        const ulong out_index = out_row_base + col;
+        const ulong x1_index = x_row_base + col;
+        const ulong x2_index = x1_index + args.half_width;
+        out[out_index] = half(float(x12[x1_index]) * gd_powlu_gate(float(x12[x2_index]), args.m));
+    }
+}
+
+kernel void gd_powlu_split_backward_f16_kernel(device const uchar *x12buf [[buffer(0)]],
+                                               device const uchar *gradbuf [[buffer(1)]],
+                                               device uchar *dx12buf [[buffer(2)]],
+                                               constant gd_metal_powlu_split_bwd_args &args [[buffer(3)]],
+                                               uint2 gid [[thread_position_in_grid]])
+{
+    const ulong col_base = ulong(gid.x) * ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD);
+    if (col_base >= args.half_width) {
+        return;
+    }
+    const ulong row = ulong(gid.y);
+    const ulong out_row_base = row * args.half_width;
+    const ulong x_row_base = out_row_base * 2ul;
+    device const half *x12 = reinterpret_cast<device const half *>(x12buf + args.x12_offset);
+    device const half *grad = reinterpret_cast<device const half *>(gradbuf + args.grad_offset);
+    device half *dx12 = reinterpret_cast<device half *>(dx12buf + args.dx12_offset);
+    for (ulong lane = 0ul; lane < ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD); ++lane) {
+        const ulong col = col_base + lane;
+        if (col >= args.half_width) {
+            break;
+        }
+        const ulong out_index = out_row_base + col;
+        const ulong x1_index = x_row_base + col;
+        const ulong x2_index = x1_index + args.half_width;
+        const float x1 = float(x12[x1_index]);
+        const float x2 = float(x12[x2_index]);
+        const float go = float(grad[out_index]);
+        dx12[x1_index] = half(go * gd_powlu_gate(x2, args.m));
+        dx12[x2_index] = half(go * x1 * gd_powlu_gate_grad(x2, args.m));
+    }
+}

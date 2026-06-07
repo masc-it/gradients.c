@@ -16,6 +16,16 @@ static id<MTLComputePipelineState> gd_powlu_backward_pso(gd_backend *backend)
     return backend != NULL ? (__bridge id<MTLComputePipelineState>)backend->powlu_backward_f16_pso : nil;
 }
 
+static id<MTLComputePipelineState> gd_powlu_split_forward_pso(gd_backend *backend)
+{
+    return backend != NULL ? (__bridge id<MTLComputePipelineState>)backend->powlu_split_forward_f16_pso : nil;
+}
+
+static id<MTLComputePipelineState> gd_powlu_split_backward_pso(gd_backend *backend)
+{
+    return backend != NULL ? (__bridge id<MTLComputePipelineState>)backend->powlu_split_backward_f16_pso : nil;
+}
+
 static id<MTLBuffer> gd_powlu_buffer(gd_backend_buffer *buffer)
 {
     return (__bridge id<MTLBuffer>)buffer->buffer;
@@ -67,6 +77,24 @@ static bool gd_powlu_same_shape(const gd_backend_tensor_view *x,
         }
     }
     return true;
+}
+
+static bool gd_powlu_split_shape(const gd_backend_tensor_view *x12,
+                                 const gd_backend_tensor_view *out)
+{
+    uint32_t axis;
+    if (x12 == NULL || out == NULL || x12->rank == 0U || x12->rank != out->rank ||
+        x12->rank > GD_MAX_DIMS || x12->shape[x12->rank - 1U] <= 0 ||
+        (x12->shape[x12->rank - 1U] & 1) != 0 ||
+        out->shape[out->rank - 1U] != x12->shape[x12->rank - 1U] / 2) {
+        return false;
+    }
+    for (axis = 0U; axis + 1U < x12->rank; ++axis) {
+        if (x12->shape[axis] != out->shape[axis]) {
+            return false;
+        }
+    }
+    return out->count <= SIZE_MAX / 2U && x12->count == out->count * 2U;
 }
 
 static bool gd_powlu_view_range_valid(const gd_backend_tensor_view *view)
@@ -241,6 +269,150 @@ gd_status gd_backend_powlu_backward(gd_backend *backend,
     [encoder setBuffer:gd_powlu_buffer(grad_x2 != NULL ? grad_x2->buffer : x2->buffer) offset:0U atIndex:4U];
     [encoder setBytes:&args length:sizeof(args) atIndex:5U];
     grid = MTLSizeMake((NSUInteger)thread_count, 1U, 1U);
+    threads = MTLSizeMake((NSUInteger)(thread_count < GD_METAL_POWLU_MAX_THREADS_PER_GROUP ?
+                                       thread_count : GD_METAL_POWLU_MAX_THREADS_PER_GROUP),
+                          1U,
+                          1U);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+static gd_status gd_powlu_split_forward_validate(const gd_backend_tensor_view *x12,
+                                                 const gd_backend_tensor_view *out,
+                                                 float m)
+{
+    if (!(m == m) || m <= 0.0f || m >= 10.0f || !gd_powlu_view_range_valid(x12) ||
+        !gd_powlu_view_range_valid(out) || !gd_powlu_contiguous_view(x12) ||
+        !gd_powlu_contiguous_view(out) || !gd_powlu_split_shape(x12, out)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+gd_status gd_backend_powlu_split_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *x12,
+                                         const gd_backend_tensor_view *out,
+                                         float m)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pso;
+    gd_metal_powlu_split_fwd_args args;
+    MTLSize grid;
+    MTLSize threads;
+    bool immediate;
+    size_t thread_count;
+    gd_status st;
+    if (backend == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_powlu_split_forward_validate(x12, out, m);
+    if (st != GD_OK) {
+        return st;
+    }
+    pso = gd_powlu_split_forward_pso(backend);
+    if (pso == nil) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    memset(&args, 0, sizeof(args));
+    args.x12_offset = (uint64_t)x12->offset;
+    args.out_offset = (uint64_t)out->offset;
+    args.count = (uint64_t)out->count;
+    args.half_width = (uint64_t)out->shape[out->rank - 1U];
+    args.m = m;
+    thread_count = ((size_t)out->shape[out->rank - 1U] + GD_METAL_POWLU_ELEMENTS_PER_THREAD - 1U) /
+                   GD_METAL_POWLU_ELEMENTS_PER_THREAD;
+    [encoder setComputePipelineState:pso];
+    [encoder setBuffer:gd_powlu_buffer(x12->buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_powlu_buffer(out->buffer) offset:0U atIndex:1U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:2U];
+    grid = MTLSizeMake((NSUInteger)thread_count,
+                       (NSUInteger)(out->count / (size_t)out->shape[out->rank - 1U]),
+                       1U);
+    threads = MTLSizeMake((NSUInteger)(thread_count < GD_METAL_POWLU_MAX_THREADS_PER_GROUP ?
+                                       thread_count : GD_METAL_POWLU_MAX_THREADS_PER_GROUP),
+                          1U,
+                          1U);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+static gd_status gd_powlu_split_backward_validate(const gd_backend_tensor_view *x12,
+                                                  const gd_backend_tensor_view *grad_out,
+                                                  const gd_backend_tensor_view *grad_x12,
+                                                  float m)
+{
+    if (!(m == m) || m <= 0.0f || m >= 10.0f || !gd_powlu_view_range_valid(x12) ||
+        !gd_powlu_view_range_valid(grad_out) || !gd_powlu_view_range_valid(grad_x12) ||
+        !gd_powlu_contiguous_view(x12) || !gd_powlu_contiguous_view(grad_out) ||
+        !gd_powlu_contiguous_view(grad_x12) || !gd_powlu_same_shape(x12, grad_x12) ||
+        !gd_powlu_split_shape(x12, grad_out)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+gd_status gd_backend_powlu_split_backward(gd_backend *backend,
+                                          const gd_backend_tensor_view *x12,
+                                          const gd_backend_tensor_view *grad_out,
+                                          const gd_backend_tensor_view *grad_x12,
+                                          float m)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pso;
+    gd_metal_powlu_split_bwd_args args;
+    MTLSize grid;
+    MTLSize threads;
+    bool immediate;
+    size_t thread_count;
+    gd_status st;
+    if (backend == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_powlu_split_backward_validate(x12, grad_out, grad_x12, m);
+    if (st != GD_OK) {
+        return st;
+    }
+    pso = gd_powlu_split_backward_pso(backend);
+    if (pso == nil) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    memset(&args, 0, sizeof(args));
+    args.x12_offset = (uint64_t)x12->offset;
+    args.grad_offset = (uint64_t)grad_out->offset;
+    args.dx12_offset = (uint64_t)grad_x12->offset;
+    args.count = (uint64_t)grad_out->count;
+    args.half_width = (uint64_t)grad_out->shape[grad_out->rank - 1U];
+    args.m = m;
+    thread_count = ((size_t)grad_out->shape[grad_out->rank - 1U] + GD_METAL_POWLU_ELEMENTS_PER_THREAD - 1U) /
+                   GD_METAL_POWLU_ELEMENTS_PER_THREAD;
+    [encoder setComputePipelineState:pso];
+    [encoder setBuffer:gd_powlu_buffer(x12->buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_powlu_buffer(grad_out->buffer) offset:0U atIndex:1U];
+    [encoder setBuffer:gd_powlu_buffer(grad_x12->buffer) offset:0U atIndex:2U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:3U];
+    grid = MTLSizeMake((NSUInteger)thread_count,
+                       (NSUInteger)(grad_out->count / (size_t)grad_out->shape[grad_out->rank - 1U]),
+                       1U);
     threads = MTLSizeMake((NSUInteger)(thread_count < GD_METAL_POWLU_MAX_THREADS_PER_GROUP ?
                                        thread_count : GD_METAL_POWLU_MAX_THREADS_PER_GROUP),
                           1U,

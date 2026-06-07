@@ -35,6 +35,7 @@ struct gd_backend {
     void *sigmoid_backward_saved_f32_pso;
     void *dropout_forward_f16_pso;
     void *dropout_forward_f32_pso;
+    void *dropout_add_forward_f16_pso;
     void *dropout_backward_recompute_f16_pso;
     void *dropout_backward_recompute_f32_pso;
     void *dropout_backward_mask_f16_pso;
@@ -84,6 +85,8 @@ struct gd_backend {
     void *huber_backward_f32_pso;
     void *powlu_forward_f16_pso;
     void *powlu_backward_f16_pso;
+    void *powlu_split_forward_f16_pso;
+    void *powlu_split_backward_f16_pso;
     void *embedding_forward_f16_pso;
     void *embedding_forward_f32_pso;
     void *embedding_forward_vec16_f16_pso;

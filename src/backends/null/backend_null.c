@@ -360,6 +360,24 @@ gd_status gd_backend_dropout_forward(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_dropout_add_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *residual,
+                                         const gd_backend_tensor_view *x,
+                                         const gd_backend_tensor_view *y,
+                                         const gd_backend_tensor_view *mask,
+                                         float p,
+                                         uint64_t seed)
+{
+    (void)backend;
+    (void)residual;
+    (void)x;
+    (void)y;
+    (void)mask;
+    (void)p;
+    (void)seed;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_dropout_backward(gd_backend *backend,
                                       const gd_backend_tensor_view *grad_out,
                                       const gd_backend_tensor_view *grad_x,
@@ -634,6 +652,32 @@ gd_status gd_backend_powlu_backward(gd_backend *backend,
     (void)grad_out;
     (void)grad_x1;
     (void)grad_x2;
+    (void)m;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_powlu_split_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *x12,
+                                         const gd_backend_tensor_view *out,
+                                         float m)
+{
+    (void)backend;
+    (void)x12;
+    (void)out;
+    (void)m;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_powlu_split_backward(gd_backend *backend,
+                                          const gd_backend_tensor_view *x12,
+                                          const gd_backend_tensor_view *grad_out,
+                                          const gd_backend_tensor_view *grad_x12,
+                                          float m)
+{
+    (void)backend;
+    (void)x12;
+    (void)grad_out;
+    (void)grad_x12;
     (void)m;
     return GD_ERR_UNSUPPORTED;
 }

@@ -127,6 +127,46 @@ kernel void gd_dropout_forward_f32_kernel(device const uchar *xbuf [[buffer(0)]]
     }
 }
 
+static inline void gd_dropout_add_forward_f16_one(device const half *residual,
+                                                  device const half *x,
+                                                  device half *y,
+                                                  device uchar *mask,
+                                                  constant gd_metal_dropout_add_args &args,
+                                                  ulong i)
+{
+    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const half dropped = keep ? half(float(x[i]) * args.scale) : half(0.0h);
+    mask[i] = keep ? uchar(1) : uchar(0);
+    y[i] = residual[i] + dropped;
+}
+
+kernel void gd_dropout_add_forward_f16_kernel(device const uchar *residualbuf [[buffer(0)]],
+                                              device const uchar *xbuf [[buffer(1)]],
+                                              device uchar *ybuf [[buffer(2)]],
+                                              device uchar *maskbuf [[buffer(3)]],
+                                              constant gd_metal_dropout_add_args &args [[buffer(4)]],
+                                              uint gid [[thread_position_in_grid]])
+{
+    const ulong base = ulong(gid) * ulong(GD_METAL_DROPOUT_ELEMENTS_PER_THREAD);
+    if (base >= args.count) {
+        return;
+    }
+    device const half *residual = reinterpret_cast<device const half *>(residualbuf + args.residual_offset);
+    device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
+    device half *y = reinterpret_cast<device half *>(ybuf + args.y_offset);
+    device uchar *mask = maskbuf + args.mask_offset;
+    if (base + 3ul < args.count) {
+        gd_dropout_add_forward_f16_one(residual, x, y, mask, args, base + 0ul);
+        gd_dropout_add_forward_f16_one(residual, x, y, mask, args, base + 1ul);
+        gd_dropout_add_forward_f16_one(residual, x, y, mask, args, base + 2ul);
+        gd_dropout_add_forward_f16_one(residual, x, y, mask, args, base + 3ul);
+        return;
+    }
+    for (ulong i = base; i < args.count; ++i) {
+        gd_dropout_add_forward_f16_one(residual, x, y, mask, args, i);
+    }
+}
+
 kernel void gd_dropout_backward_recompute_f16_kernel(device const uchar *gbuf [[buffer(0)]],
                                                      device uchar *dxbuf [[buffer(1)]],
                                                      constant gd_metal_dropout_args &args [[buffer(2)]],

@@ -47,6 +47,18 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                               const gd_tensor *targets,
                               gd_tensor *loss);
 
+/* Fused residual add with inverted dropout on the branch:
+ * out = residual + dropout(x, p, seed) in training, or residual + x otherwise.
+ * Training autograd records equivalent dropout and add nodes while using one
+ * fused forward kernel. Currently optimized for same-shape contiguous F16. */
+gd_status gd_dropout_add(gd_context *ctx,
+                         const gd_tensor *residual,
+                         const gd_tensor *x,
+                         float p,
+                         bool training,
+                         uint64_t seed,
+                         gd_tensor *out);
+
 /* Direct matmul backward. Broadcasted batch dimensions are reduced back to
  * x/w's original shapes. Pass grad_x or grad_w as NULL to skip that gradient. */
 gd_status gd_matmul_backward(gd_context *ctx,
@@ -92,6 +104,20 @@ gd_status gd_powlu_backward(gd_context *ctx,
                             float m,
                             gd_tensor *grad_x1,
                             gd_tensor *grad_x2);
+
+/* Fused split+PoWLU for gated MLP projections:
+ * x12 [..., 2H] -> out [..., H], where x1=x12[..., :H] and x2=x12[..., H:].
+ * Avoids materializing the two split halves and fuses the backward concat. */
+gd_status gd_powlu_split(gd_context *ctx,
+                         const gd_tensor *x12,
+                         float m,
+                         gd_tensor *out);
+
+gd_status gd_powlu_split_backward(gd_context *ctx,
+                                  const gd_tensor *x12,
+                                  const gd_tensor *grad_out,
+                                  float m,
+                                  gd_tensor *grad_x12);
 
 /* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
  * contiguous I32 tensor with rank >= 1. Output is contiguous with shape

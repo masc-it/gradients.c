@@ -35,6 +35,14 @@ static id<MTLComputePipelineState> gd_dropout_forward_pso(gd_backend *backend, u
     return nil;
 }
 
+static id<MTLComputePipelineState> gd_dropout_add_forward_pso(gd_backend *backend, uint32_t dtype)
+{
+    if (dtype == (uint32_t)GD_DTYPE_F16) {
+        return (__bridge id<MTLComputePipelineState>)backend->dropout_add_forward_f16_pso;
+    }
+    return nil;
+}
+
 static id<MTLComputePipelineState> gd_dropout_backward_recompute_pso(gd_backend *backend, uint32_t dtype)
 {
     if (dtype == (uint32_t)GD_DTYPE_F16) {
@@ -152,6 +160,27 @@ static void gd_dropout_fill_args(const gd_backend_tensor_view *src,
     args->dtype = src->dtype;
 }
 
+static void gd_dropout_add_fill_args(const gd_backend_tensor_view *residual,
+                                     const gd_backend_tensor_view *src,
+                                     const gd_backend_tensor_view *dst,
+                                     const gd_backend_tensor_view *mask,
+                                     float p,
+                                     float scale,
+                                     uint64_t seed,
+                                     gd_metal_dropout_add_args *args)
+{
+    memset(args, 0, sizeof(*args));
+    args->residual_offset = (uint64_t)residual->offset;
+    args->x_offset = (uint64_t)src->offset;
+    args->y_offset = (uint64_t)dst->offset;
+    args->mask_offset = (uint64_t)mask->offset;
+    args->count = (uint64_t)src->count;
+    args->seed = seed;
+    args->p = p;
+    args->scale = scale;
+    args->dtype = src->dtype;
+}
+
 static MTLSize gd_dropout_grid(size_t count)
 {
     const size_t thread_count = ((count - 1U) / GD_METAL_DROPOUT_ELEMENTS_PER_THREAD) + 1U;
@@ -215,6 +244,65 @@ gd_status gd_backend_dropout_forward(gd_backend *backend,
     [encoder setBuffer:gd_dropout_buffer(y->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_dropout_buffer(mask->buffer) offset:0U atIndex:2U];
     [encoder setBytes:&args length:sizeof(args) atIndex:3U];
+    [encoder dispatchThreads:gd_dropout_grid(x->count) threadsPerThreadgroup:gd_dropout_threads(x->count)];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+gd_status gd_backend_dropout_add_forward(gd_backend *backend,
+                                         const gd_backend_tensor_view *residual,
+                                         const gd_backend_tensor_view *x,
+                                         const gd_backend_tensor_view *y,
+                                         const gd_backend_tensor_view *mask,
+                                         float p,
+                                         uint64_t seed)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pso;
+    gd_metal_dropout_add_args args;
+    bool immediate;
+    size_t elem_size;
+    size_t nbytes;
+    float scale;
+    gd_status st;
+    if (backend == NULL || !gd_dropout_probability_valid(p) || p == 0.0f) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_dropout_validate_pair(x, y, &elem_size, &nbytes);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (residual == NULL || residual->dtype != x->dtype || residual->count != x->count ||
+        !gd_dropout_same_shape(residual, x) || residual->buffer == NULL ||
+        !gd_dropout_byte_range_valid(residual->buffer, residual->offset, nbytes)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    (void)elem_size;
+    st = gd_dropout_validate_mask(x, mask);
+    if (st != GD_OK) {
+        return st;
+    }
+    pso = gd_dropout_add_forward_pso(backend, x->dtype);
+    if (pso == nil) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    scale = 1.0f / (1.0f - p);
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    gd_dropout_add_fill_args(residual, x, y, mask, p, scale, seed, &args);
+    [encoder setComputePipelineState:pso];
+    [encoder setBuffer:gd_dropout_buffer(residual->buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_dropout_buffer(x->buffer) offset:0U atIndex:1U];
+    [encoder setBuffer:gd_dropout_buffer(y->buffer) offset:0U atIndex:2U];
+    [encoder setBuffer:gd_dropout_buffer(mask->buffer) offset:0U atIndex:3U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:4U];
     [encoder dispatchThreads:gd_dropout_grid(x->count) threadsPerThreadgroup:gd_dropout_threads(x->count)];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);

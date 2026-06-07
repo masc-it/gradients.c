@@ -279,6 +279,14 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_powlu_split_forward_f16_kernel", &backend->powlu_split_forward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_metal_make_pipeline(backend, library, "gd_powlu_split_backward_f16_kernel", &backend->powlu_split_backward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_f16_kernel", &backend->embedding_forward_f16_pso);
     if (st != GD_OK) {
         return st;
@@ -608,6 +616,10 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_dropout_add_forward_f16_kernel", &backend->dropout_add_forward_f16_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_dropout_backward_recompute_f16_kernel", &backend->dropout_backward_recompute_f16_pso);
     if (st != GD_OK) {
         return st;
@@ -908,6 +920,9 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend->dropout_backward_recompute_f16_pso != NULL) {
         CFRelease(backend->dropout_backward_recompute_f16_pso);
     }
+    if (backend->dropout_add_forward_f16_pso != NULL) {
+        CFRelease(backend->dropout_add_forward_f16_pso);
+    }
     if (backend->dropout_forward_f32_pso != NULL) {
         CFRelease(backend->dropout_forward_f32_pso);
     }
@@ -1033,6 +1048,12 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->huber_forward_f16_pso != NULL) {
         CFRelease(backend->huber_forward_f16_pso);
+    }
+    if (backend->powlu_split_backward_f16_pso != NULL) {
+        CFRelease(backend->powlu_split_backward_f16_pso);
+    }
+    if (backend->powlu_split_forward_f16_pso != NULL) {
+        CFRelease(backend->powlu_split_forward_f16_pso);
     }
     if (backend->powlu_backward_f16_pso != NULL) {
         CFRelease(backend->powlu_backward_f16_pso);

@@ -256,6 +256,90 @@ static void test_powlu_optional_grad_and_m2(void)
     gd_context_destroy(ctx);
 }
 
+static void test_powlu_split_f16_forward_backward_autograd(void)
+{
+    enum { ROWS = 3, H = 5, XN = ROWS * H * 2, YN = ROWS * H };
+    const int64_t x_shape[2] = {ROWS, H * 2};
+    const int64_t y_shape[2] = {ROWS, H};
+    const float x12_data[XN] = {
+        -1.50f, -0.75f, -0.25f, 0.00f, 0.25f, -4.00f, -2.00f, -1.00f, -0.50f, -0.125f,
+        0.50f, 0.75f, 1.00f, 1.25f, 1.50f, 0.00f, 0.125f, 0.25f, 0.50f, 1.00f,
+        -1.00f, 2.00f, -2.00f, 0.375f, -0.625f, 1.50f, 2.00f, 3.00f, 4.00f, 6.00f,
+    };
+    const float grad_data[YN] = {
+        0.25f, -0.375f, 0.50f, -0.625f, 0.75f,
+        -0.875f, 1.00f, -1.125f, 1.25f, -1.375f,
+        1.50f, -1.625f, 1.75f, -1.875f, 2.00f,
+    };
+    float x12q[XN];
+    float gradq[YN];
+    float want_y[YN];
+    float want_dx12[XN];
+    float got_x[XN];
+    float got_y[YN];
+    gd_memory_config cfg = powlu_config((size_t)XN * sizeof(unsigned short));
+    gd_context *ctx = NULL;
+    gd_tensor x12;
+    gd_tensor grad;
+    gd_tensor y;
+    gd_tensor dx12;
+    gd_tensor y_auto;
+    gd_tensor dx12_auto;
+    uint32_t row;
+    uint32_t col;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x12));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, y_shape), 256U, &grad));
+    CHECK_OK(gd_tensor_write_f32(ctx, &x12, x12_data, XN));
+    CHECK_OK(gd_tensor_write_f32(ctx, &grad, grad_data, YN));
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &x12, x12q, XN));
+    CHECK_OK(gd_tensor_read_f32(ctx, &grad, gradq, YN));
+    memset(want_dx12, 0, sizeof(want_dx12));
+    for (row = 0U; row < ROWS; ++row) {
+        for (col = 0U; col < H; ++col) {
+            const uint32_t yi = row * H + col;
+            const uint32_t x1i = row * H * 2U + col;
+            const uint32_t x2i = x1i + H;
+            const float gate = powlu_gate(x12q[x2i], 3.0f);
+            want_y[yi] = x12q[x1i] * gate;
+            want_dx12[x1i] = gradq[yi] * gate;
+            want_dx12[x2i] = gradq[yi] * x12q[x1i] * powlu_gate_grad(x12q[x2i], 3.0f);
+        }
+    }
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_powlu_split(ctx, &x12, 3.0f, &y));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &y, got_y, YN));
+    for (uint32_t i = 0U; i < YN; ++i) {
+        check_close(got_y[i], want_y[i], 8.0e-3f, "f16 powlu_split forward");
+    }
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_powlu_split_backward(ctx, &x12, &grad, 3.0f, &dx12));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &dx12, got_x, XN));
+    for (uint32_t i = 0U; i < XN; ++i) {
+        check_close(got_x[i], want_dx12[i], 1.2e-2f, "f16 powlu_split direct backward");
+    }
+
+    x12.requires_grad = true;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_powlu_split(ctx, &x12, 3.0f, &y_auto));
+    CHECK_OK(gd_backward(ctx, &y_auto, &grad));
+    CHECK_OK(gd_tensor_grad(ctx, &x12, &dx12_auto));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &dx12_auto, got_x, XN));
+    for (uint32_t i = 0U; i < XN; ++i) {
+        check_close(got_x[i], want_dx12[i], 1.2e-2f, "f16 powlu_split autograd backward");
+    }
+    gd_context_destroy(ctx);
+}
+
 static void test_powlu_validation(void)
 {
     const int64_t shape_a[1] = {4};
@@ -284,6 +368,7 @@ int main(void)
 {
     test_powlu_f16_forward_backward_autograd();
     test_powlu_optional_grad_and_m2();
+    test_powlu_split_f16_forward_backward_autograd();
     test_powlu_validation();
     printf("test_powlu: ok\n");
     return 0;

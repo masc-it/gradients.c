@@ -343,7 +343,6 @@ static gd_status gpt_block_forward(gd_context *ctx,
         .max_seqlen = GPT_CONTEXT_LENGTH,
     };
     int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
-    int64_t mlp_sizes[2] = {GPT_MLP_HIDDEN, GPT_MLP_HIDDEN};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
@@ -356,14 +355,11 @@ static gd_status gpt_block_forward(gd_context *ctx,
     gd_tensor attn;
     gd_tensor attn_flat;
     gd_tensor attn_proj;
-    gd_tensor attn_drop;
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor up_gate_parts[2];
     gd_tensor powlu;
     gd_tensor mlp_proj;
-    gd_tensor mlp_drop;
     gd_status st;
     int64_t n_tokens;
     int64_t q_shape[3];
@@ -427,11 +423,7 @@ static gd_status gpt_block_forward(gd_context *ctx,
         return st;
     }
     site_seed = splitmix64(model->dropout_seed ^ GPT_DROPOUT_ATTN ^ ((uint64_t)block_index << 32) ^ step);
-    st = gd_dropout(ctx, &attn_proj, model->dropout_p, model->mod.training, site_seed, &attn_drop);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_add(ctx, &residual, &attn_drop, &attn_resid);
+    st = gd_dropout_add(ctx, &residual, &attn_proj, model->dropout_p, model->mod.training, site_seed, &attn_resid);
     if (st != GD_OK) {
         return st;
     }
@@ -445,11 +437,7 @@ static gd_status gpt_block_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_split(ctx, &up_gate, mlp_sizes, 2U, -1, up_gate_parts);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_powlu(ctx, &up_gate_parts[0], &up_gate_parts[1], model->powlu_m, &powlu);
+    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
     if (st != GD_OK) {
         return st;
     }
@@ -458,11 +446,7 @@ static gd_status gpt_block_forward(gd_context *ctx,
         return st;
     }
     site_seed = splitmix64(model->dropout_seed ^ GPT_DROPOUT_MLP ^ ((uint64_t)block_index << 32) ^ step);
-    st = gd_dropout(ctx, &mlp_proj, model->dropout_p, model->mod.training, site_seed, &mlp_drop);
-    if (st != GD_OK) {
-        return st;
-    }
-    return gd_add(ctx, &residual, &mlp_drop, out);
+    return gd_dropout_add(ctx, &residual, &mlp_proj, model->dropout_p, model->mod.training, site_seed, out);
 }
 
 gd_status gpt_lm_forward(gd_context *ctx,
@@ -555,7 +539,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
         .max_seqlen = GPT_CONTEXT_LENGTH,
     };
     int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
-    int64_t mlp_sizes[2] = {GPT_MLP_HIDDEN, GPT_MLP_HIDDEN};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
@@ -571,7 +554,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor up_gate_parts[2];
     gd_tensor powlu;
     gd_tensor mlp_proj;
     gd_status st;
@@ -636,9 +618,7 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_split(ctx, &up_gate, mlp_sizes, 2U, -1, up_gate_parts);
-    if (st != GD_OK) { return st; }
-    st = gd_powlu(ctx, &up_gate_parts[0], &up_gate_parts[1], model->powlu_m, &powlu);
+    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
     if (st != GD_OK) { return st; }
@@ -666,7 +646,6 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
         .prefix_len = 0,
     };
     int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
-    int64_t mlp_sizes[2] = {GPT_MLP_HIDDEN, GPT_MLP_HIDDEN};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
@@ -682,7 +661,6 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor up_gate_parts[2];
     gd_tensor powlu;
     gd_tensor mlp_proj;
     gd_status st;
@@ -748,9 +726,7 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_split(ctx, &up_gate, mlp_sizes, 2U, -1, up_gate_parts);
-    if (st != GD_OK) { return st; }
-    st = gd_powlu(ctx, &up_gate_parts[0], &up_gate_parts[1], model->powlu_m, &powlu);
+    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
     if (st != GD_OK) { return st; }

@@ -341,6 +341,7 @@ static gd_status gd_optimizer_build_adamw_desc(gd_context *ctx,
                                                 gd_optimizer_param *slot,
                                                 const gd_tensor *grad,
                                                 const gd_tensor *grad_scale,
+                                                const gd_tensor *found_inf,
                                                 const gd_adamw_config *config,
                                                 float base_lr,
                                                 bool grad_already_validated,
@@ -383,6 +384,11 @@ static gd_status gd_optimizer_build_adamw_desc(gd_context *ctx,
         out_desc->grad_scale_buffer = (gd_backend_buffer *)grad_scale->storage.buffer;
         out_desc->grad_scale_offset = gd_tensor_storage_offset(grad_scale);
         out_desc->has_grad_scale = 1U;
+    }
+    if (found_inf != NULL) {
+        out_desc->found_inf_buffer = (gd_backend_buffer *)found_inf->storage.buffer;
+        out_desc->found_inf_offset = gd_tensor_storage_offset(found_inf);
+        out_desc->has_found_inf = 1U;
     }
     out_desc->m_buffer = (gd_backend_buffer *)slot->m.storage.buffer;
     out_desc->m_offset = gd_tensor_storage_offset(&slot->m);
@@ -438,6 +444,7 @@ gd_amp_config gd_amp_config_default(void)
 {
     gd_amp_config config;
     config.enabled = true;
+    config.defer_found_inf = false;
     config.init_scale = 32768.0f;
     config.growth_factor = 2.0f;
     config.backoff_factor = 0.5f;
@@ -705,6 +712,8 @@ static gd_status gd_optimizer_build_unscale_desc(gd_context *ctx,
 static gd_status gd_optimizer_build_grad_norm_desc(gd_context *ctx,
                                                    const gd_optimizer_param *slot,
                                                    const gd_tensor *grad,
+                                                   float grad_scale,
+                                                   const gd_tensor *found_inf,
                                                    size_t partial_index,
                                                    gd_backend_buffer *partial_buffer,
                                                    size_t partial_base_offset,
@@ -715,7 +724,8 @@ static gd_status gd_optimizer_build_grad_norm_desc(gd_context *ctx,
     size_t partial_byte_delta;
     gd_status st;
     if (ctx == NULL || slot == NULL || grad == NULL || partial_buffer == NULL ||
-        out_desc == NULL || out_groups == NULL) {
+        out_desc == NULL || out_groups == NULL || !(grad_scale > 0.0f) ||
+        grad_scale > FLT_MAX) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_optimizer_validate_grad(ctx, slot, grad);
@@ -736,13 +746,21 @@ static gd_status gd_optimizer_build_grad_norm_desc(gd_context *ctx,
     out_desc->partial_buffer = partial_buffer;
     out_desc->partial_offset = partial_base_offset + partial_byte_delta;
     out_desc->partial_count = groups;
+    out_desc->grad_scale = grad_scale;
+    if (found_inf != NULL) {
+        out_desc->found_inf_buffer = (gd_backend_buffer *)found_inf->storage.buffer;
+        out_desc->found_inf_offset = gd_tensor_storage_offset(found_inf);
+        out_desc->has_found_inf = 1U;
+    }
     *out_groups = groups;
     return GD_OK;
 }
 
-static gd_status gd_optimizer_apply_grad_clip(gd_context *ctx,
-                                              gd_optimizer *optimizer,
-                                              float max_norm)
+static gd_status gd_optimizer_apply_grad_clip_scaled(gd_context *ctx,
+                                                     gd_optimizer *optimizer,
+                                                     float max_norm,
+                                                     float grad_scale,
+                                                     const gd_tensor *found_inf)
 {
     gd_backend_buffer *partial_buffer;
     gd_backend_buffer *scale_buffer;
@@ -757,6 +775,9 @@ static gd_status gd_optimizer_apply_grad_clip(gd_context *ctx,
     }
     if (!gd_optimizer_grad_clip_norm_valid(max_norm)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid grad clip norm");
+    }
+    if (!(grad_scale > 0.0f) || grad_scale > FLT_MAX) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid grad clip scale");
     }
     if (optimizer->param_count == 0U) {
         return GD_OK;
@@ -778,6 +799,8 @@ static gd_status gd_optimizer_apply_grad_clip(gd_context *ctx,
         st = gd_optimizer_build_grad_norm_desc(ctx,
                                                slot,
                                                &optimizer->step_grads[i],
+                                               grad_scale,
+                                               found_inf,
                                                partial_index,
                                                partial_buffer,
                                                partial_base_offset,
@@ -856,6 +879,7 @@ gd_status gd_optimizer_step_lr(gd_context *ctx, gd_optimizer *optimizer, float l
         st = gd_optimizer_build_adamw_desc(ctx,
                                            slot,
                                            &grad,
+                                           NULL,
                                            NULL,
                                            &optimizer->config,
                                            lr,
@@ -937,7 +961,7 @@ gd_status gd_optimizer_step_clip_lr(gd_context *ctx,
         optimizer->step_grads[i] = grad;
         optimizer->step_has_grad[i] = true;
     }
-    st = gd_optimizer_apply_grad_clip(ctx, optimizer, max_grad_norm);
+    st = gd_optimizer_apply_grad_clip_scaled(ctx, optimizer, max_grad_norm, 1.0f, NULL);
     if (st != GD_OK) {
         return st;
     }
@@ -950,6 +974,7 @@ gd_status gd_optimizer_step_clip_lr(gd_context *ctx,
                                            slot,
                                            &optimizer->step_grads[i],
                                            &optimizer->grad_clip_scale,
+                                           NULL,
                                            &optimizer->config,
                                            lr,
                                            true,
@@ -1068,13 +1093,15 @@ gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend amp unscale failed");
     }
-    st = gd_tensor_read(ctx, &optimizer->found_inf, &found_inf, sizeof(found_inf));
-    if (st != GD_OK) {
-        return st;
-    }
-    if (found_inf != 0) {
-        gd_amp_scaler_update(scaler, true);
-        return GD_OK;
+    if (!scaler->config.defer_found_inf) {
+        st = gd_tensor_read(ctx, &optimizer->found_inf, &found_inf, sizeof(found_inf));
+        if (st != GD_OK) {
+            return st;
+        }
+        if (found_inf != 0) {
+            gd_amp_scaler_update(scaler, true);
+            return GD_OK;
+        }
     }
     for (i = 0U; i < optimizer->param_count; ++i) {
         gd_optimizer_param *slot = &optimizer->params[i];
@@ -1085,6 +1112,7 @@ gd_status gd_optimizer_step_amp_lr(gd_context *ctx,
                                            slot,
                                            &optimizer->step_grads[i],
                                            NULL,
+                                           scaler->config.defer_found_inf ? &optimizer->found_inf : NULL,
                                            &optimizer->config,
                                            lr,
                                            true,
@@ -1121,7 +1149,6 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
     bool updated = false;
     int32_t found_inf = 0;
     float inv_scale;
-    uint32_t amp_desc_count = 0U;
     uint32_t adamw_desc_count = 0U;
     uint32_t i;
     gd_status st;
@@ -1146,8 +1173,7 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
     }
     if (optimizer->param_count != 0U &&
         (optimizer->step_grads == NULL || optimizer->step_has_grad == NULL ||
-         optimizer->amp_descs == NULL || optimizer->grad_norm_descs == NULL ||
-         optimizer->adamw_descs == NULL)) {
+         optimizer->grad_norm_descs == NULL || optimizer->adamw_descs == NULL)) {
         return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "adamw step cache missing");
     }
     if (optimizer->param_count != 0U) {
@@ -1174,34 +1200,26 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
         if (st != GD_OK) {
             return st;
         }
-        st = gd_optimizer_build_unscale_desc(ctx,
-                                             optimizer,
-                                             slot,
-                                             &grad,
-                                             inv_scale,
-                                             &optimizer->amp_descs[amp_desc_count]);
+        st = gd_optimizer_validate_grad(ctx, slot, &grad);
         if (st != GD_OK) {
             return st;
         }
         optimizer->step_grads[i] = grad;
         optimizer->step_has_grad[i] = true;
-        amp_desc_count += 1U;
     }
-    st = gd_backend_amp_unscale_batch(gd_context_backend(ctx), optimizer->amp_descs, amp_desc_count);
-    if (st != GD_OK) {
-        return gd_context_set_error(ctx, st, "backend amp unscale failed");
-    }
-    st = gd_tensor_read(ctx, &optimizer->found_inf, &found_inf, sizeof(found_inf));
+    st = gd_optimizer_apply_grad_clip_scaled(ctx, optimizer, max_grad_norm, inv_scale, &optimizer->found_inf);
     if (st != GD_OK) {
         return st;
     }
-    if (found_inf != 0) {
-        gd_amp_scaler_update(scaler, true);
-        return GD_OK;
-    }
-    st = gd_optimizer_apply_grad_clip(ctx, optimizer, max_grad_norm);
-    if (st != GD_OK) {
-        return st;
+    if (!scaler->config.defer_found_inf) {
+        st = gd_tensor_read(ctx, &optimizer->found_inf, &found_inf, sizeof(found_inf));
+        if (st != GD_OK) {
+            return st;
+        }
+        if (found_inf != 0) {
+            gd_amp_scaler_update(scaler, true);
+            return GD_OK;
+        }
     }
     for (i = 0U; i < optimizer->param_count; ++i) {
         gd_optimizer_param *slot = &optimizer->params[i];
@@ -1212,6 +1230,7 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
                                            slot,
                                            &optimizer->step_grads[i],
                                            &optimizer->grad_clip_scale,
+                                           scaler->config.defer_found_inf ? &optimizer->found_inf : NULL,
                                            &optimizer->config,
                                            lr,
                                            true,

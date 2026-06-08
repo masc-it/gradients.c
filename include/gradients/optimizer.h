@@ -32,6 +32,11 @@ typedef struct gd_lr_scheduler_config {
 
 typedef struct gd_amp_config {
     bool enabled;
+    /* When true, optimizer steps keep found-inf skip logic on the backend and
+       optimistically update CPU-side scaler state without a mid-step readback.
+       This removes a per-step synchronization for workloads that expect finite
+       gradients, at the cost of delayed CPU visibility for rare overflows. */
+    bool defer_found_inf;
     float init_scale;
     float growth_factor;
     float backoff_factor;

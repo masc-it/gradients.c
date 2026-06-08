@@ -56,8 +56,10 @@ typedef struct gd_backend_adamw_desc {
     size_t master_offset;
     gd_backend_buffer *grad_buffer;
     size_t grad_offset;
-    gd_backend_buffer *grad_scale_buffer; /* Optional scalar F32 multiplier for clipped grads. */
+    gd_backend_buffer *grad_scale_buffer; /* Optional scalar F32 multiplier for clipped/scaled grads. */
     size_t grad_scale_offset;
+    gd_backend_buffer *found_inf_buffer;  /* Optional I32 flag; nonzero skips the update on backend. */
+    size_t found_inf_offset;
     gd_backend_buffer *m_buffer;
     size_t m_offset;
     gd_backend_buffer *v_buffer;
@@ -67,6 +69,7 @@ typedef struct gd_backend_adamw_desc {
     uint32_t grad_dtype;
     uint32_t has_master;
     uint32_t has_grad_scale;
+    uint32_t has_found_inf;
     float lr;
     float beta1;
     float beta2;
@@ -94,6 +97,10 @@ typedef struct gd_backend_grad_norm_desc {
     gd_backend_buffer *partial_buffer;
     size_t partial_offset;
     size_t partial_count;
+    float grad_scale;
+    gd_backend_buffer *found_inf_buffer;
+    size_t found_inf_offset;
+    uint32_t has_found_inf;
 } gd_backend_grad_norm_desc;
 
 typedef struct gd_backend_tensor_view {

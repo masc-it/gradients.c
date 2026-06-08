@@ -461,6 +461,7 @@ static gd_adamw_config gpt_adamw_config(float lr, float weight_decay)
 static gd_amp_config gpt_amp_config(void)
 {
     gd_amp_config config = gd_amp_config_default();
+    config.defer_found_inf = true;
     config.init_scale = 8192.0f;
     config.growth_interval = 1000U;
     return config;

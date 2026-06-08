@@ -100,7 +100,12 @@ static gd_status gd_metal_adamw_validate_desc(const gd_backend_adamw_desc *desc)
          (desc->grad_scale_buffer == NULL ||
           !gd_metal_adamw_byte_range_valid(desc->grad_scale_buffer,
                                            desc->grad_scale_offset,
-                                           sizeof(float))))) {
+                                           sizeof(float)))) ||
+        (desc->has_found_inf != 0U &&
+         (desc->found_inf_buffer == NULL ||
+          !gd_metal_adamw_byte_range_valid(desc->found_inf_buffer,
+                                           desc->found_inf_offset,
+                                           sizeof(uint32_t))))) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     return GD_OK;
@@ -117,11 +122,13 @@ static void gd_metal_adamw_make_args(const gd_backend_adamw_desc *desc,
     args->m_offset = (uint64_t)desc->m_offset;
     args->v_offset = (uint64_t)desc->v_offset;
     args->grad_scale_offset = (uint64_t)desc->grad_scale_offset;
+    args->found_inf_offset = (uint64_t)desc->found_inf_offset;
     args->count = (uint64_t)desc->count;
     args->param_dtype = desc->param_dtype;
     args->grad_dtype = desc->grad_dtype;
     args->has_master = desc->has_master != 0U ? 1U : 0U;
     args->has_grad_scale = desc->has_grad_scale != 0U ? 1U : 0U;
+    args->has_found_inf = desc->has_found_inf != 0U ? 1U : 0U;
     args->lr = desc->lr;
     args->beta1 = desc->beta1;
     args->beta2 = desc->beta2;
@@ -155,6 +162,10 @@ static void gd_metal_adamw_encode(id<MTLComputeCommandEncoder> encoder,
                                              desc->grad_scale_buffer : desc->param_buffer)
                 offset:0U
                atIndex:6U];
+    [encoder setBuffer:gd_metal_adamw_buffer(desc->has_found_inf != 0U ?
+                                             desc->found_inf_buffer : desc->param_buffer)
+                offset:0U
+               atIndex:7U];
     grid = MTLSizeMake((NSUInteger)desc->count, 1U, 1U);
     threads = MTLSizeMake((NSUInteger)(desc->count < GD_METAL_ADAMW_MAX_THREADS_PER_GROUP ?
                                        desc->count : GD_METAL_ADAMW_MAX_THREADS_PER_GROUP),
@@ -223,7 +234,8 @@ static gd_status gd_metal_grad_norm_validate_desc(const gd_backend_grad_norm_des
     gd_status st;
     if (desc == NULL || desc->grad_buffer == NULL || desc->partial_buffer == NULL ||
         desc->count == 0U || desc->count > UINT32_MAX || desc->partial_count == 0U ||
-        desc->partial_count > UINT32_MAX) {
+        desc->partial_count > UINT32_MAX || !(desc->grad_scale > 0.0f) ||
+        !isfinite(desc->grad_scale)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_metal_adamw_elem_size(desc->grad_dtype, &grad_elem_size);
@@ -237,7 +249,12 @@ static gd_status gd_metal_grad_norm_validate_desc(const gd_backend_grad_norm_des
         !gd_metal_adamw_byte_range_valid(desc->grad_buffer, desc->grad_offset, grad_nbytes) ||
         !gd_metal_adamw_byte_range_valid(desc->partial_buffer,
                                          desc->partial_offset,
-                                         partial_nbytes)) {
+                                         partial_nbytes) ||
+        (desc->has_found_inf != 0U &&
+         (desc->found_inf_buffer == NULL ||
+          !gd_metal_adamw_byte_range_valid(desc->found_inf_buffer,
+                                           desc->found_inf_offset,
+                                           sizeof(uint32_t))))) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     return GD_OK;
@@ -252,11 +269,18 @@ static void gd_metal_grad_norm_encode_stage(id<MTLComputeCommandEncoder> encoder
     memset(&args, 0, sizeof(args));
     args.grad_offset = (uint64_t)desc->grad_offset;
     args.partial_offset = (uint64_t)desc->partial_offset;
+    args.found_inf_offset = (uint64_t)desc->found_inf_offset;
     args.count = (uint64_t)desc->count;
     args.grad_dtype = desc->grad_dtype;
+    args.has_found_inf = desc->has_found_inf != 0U ? 1U : 0U;
+    args.grad_scale = desc->grad_scale;
     [encoder setBuffer:gd_metal_adamw_buffer(desc->grad_buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_metal_adamw_buffer(desc->partial_buffer) offset:0U atIndex:1U];
     [encoder setBytes:&args length:sizeof(args) atIndex:2U];
+    [encoder setBuffer:gd_metal_adamw_buffer(desc->has_found_inf != 0U ?
+                                             desc->found_inf_buffer : desc->partial_buffer)
+                offset:0U
+               atIndex:3U];
     groups = MTLSizeMake((NSUInteger)desc->partial_count, 1U, 1U);
     threads = MTLSizeMake((NSUInteger)GD_METAL_GRAD_NORM_THREADS, 1U, 1U);
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
@@ -301,6 +325,7 @@ gd_status gd_backend_grad_clip_scale(gd_backend *backend,
         }
         if (descs[i].partial_buffer != partial_buffer ||
             descs[i].partial_offset != running_partial_offset ||
+            descs[i].grad_scale != descs[0].grad_scale ||
             !gd_metal_adamw_count_bytes(descs[i].partial_count, sizeof(float), &partial_nbytes) ||
             total_partials > SIZE_MAX - descs[i].partial_count ||
             running_partial_offset > SIZE_MAX - partial_nbytes) {
@@ -330,6 +355,7 @@ gd_status gd_backend_grad_clip_scale(gd_backend *backend,
     final_args.partial_count = (uint64_t)total_partials;
     final_args.max_norm = max_norm;
     final_args.eps = eps;
+    final_args.grad_scale = descs[0].grad_scale;
     [encoder setComputePipelineState:gd_metal_grad_clip_finalize_pso(backend)];
     [encoder setBuffer:gd_metal_adamw_buffer(partial_buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_metal_adamw_buffer(scale_buffer) offset:0U atIndex:1U];

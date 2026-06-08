@@ -31,6 +31,21 @@ static inline float gd_adamw_grad_scale(device const uchar *grad_scale_buf,
     return *(reinterpret_cast<device const float *>(grad_scale_buf + args.grad_scale_offset));
 }
 
+static inline bool gd_adamw_found_inf(device const uchar *found_inf_buf,
+                                      constant gd_metal_adamw_args &args)
+{
+    if (args.has_found_inf == 0u) {
+        return false;
+    }
+    return *(reinterpret_cast<device const uint *>(found_inf_buf + args.found_inf_offset)) != 0u;
+}
+
+static inline void gd_grad_norm_mark_found_inf(device uchar *found_inf_buf, ulong found_inf_offset)
+{
+    device atomic_uint *flag = reinterpret_cast<device atomic_uint *>(found_inf_buf + found_inf_offset);
+    atomic_store_explicit(flag, 1u, memory_order_relaxed);
+}
+
 static inline float gd_adamw_scale_grad(float g, float scale)
 {
     return scale == 0.0f ? 0.0f : g * scale;
@@ -43,10 +58,11 @@ kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
                             device uchar *master_buf [[buffer(4)]],
                             constant gd_metal_adamw_args &args [[buffer(5)]],
                             device const uchar *grad_scale_buf [[buffer(6)]],
+                            device const uchar *found_inf_buf [[buffer(7)]],
                             uint gid [[thread_position_in_grid]])
 {
     const ulong i = ulong(gid);
-    if (i >= args.count) {
+    if (i >= args.count || gd_adamw_found_inf(found_inf_buf, args)) {
         return;
     }
 
@@ -94,19 +110,22 @@ static inline float gd_grad_norm_load(device const uchar *grad,
                                       ulong i,
                                       constant gd_metal_grad_norm_stage_args &args)
 {
+    float g;
     if (args.grad_dtype == 1u) {
-        return float(reinterpret_cast<device const half *>(grad + args.grad_offset)[i]);
+        g = float(reinterpret_cast<device const half *>(grad + args.grad_offset)[i]);
+    } else if (args.grad_dtype == 3u) {
+        g = reinterpret_cast<device const float *>(grad + args.grad_offset)[i];
+    } else {
+        const ulong byte = args.grad_offset + i * gd_dtype_elem_size(args.grad_dtype);
+        g = gd_load_float_dtype(grad, byte, args.grad_dtype);
     }
-    if (args.grad_dtype == 3u) {
-        return reinterpret_cast<device const float *>(grad + args.grad_offset)[i];
-    }
-    const ulong byte = args.grad_offset + i * gd_dtype_elem_size(args.grad_dtype);
-    return gd_load_float_dtype(grad, byte, args.grad_dtype);
+    return g * args.grad_scale;
 }
 
 kernel void gd_grad_norm_stage_kernel(device const uchar *grad [[buffer(0)]],
                                       device uchar *partial_buf [[buffer(1)]],
                                       constant gd_metal_grad_norm_stage_args &args [[buffer(2)]],
+                                      device uchar *found_inf_buf [[buffer(3)]],
                                       uint tid [[thread_index_in_threadgroup]],
                                       uint tg [[threadgroup_position_in_grid]])
 {
@@ -118,6 +137,9 @@ kernel void gd_grad_norm_stage_kernel(device const uchar *grad [[buffer(0)]],
         const ulong i = block_start + ulong(j);
         if (i < args.count) {
             const float g = gd_grad_norm_load(grad, i, args);
+            if (!isfinite(g) && args.has_found_inf != 0u) {
+                gd_grad_norm_mark_found_inf(found_inf_buf, args.found_inf_offset);
+            }
             sum = fma(g, g, sum);
         }
     }
@@ -166,7 +188,7 @@ kernel void gd_grad_clip_finalize_kernel(device const uchar *partial_buf [[buffe
             scale = 1.0f;
         }
         device float *out = reinterpret_cast<device float *>(scale_buf + args.scale_offset);
-        out[0] = scale;
+        out[0] = scale * args.grad_scale;
         out[1] = total_norm;
     }
 }

@@ -133,6 +133,10 @@ typedef struct gd_linear_layer_config {
     int64_t out_features;
     gd_dtype dtype;
     bool use_bias;
+    /* Store weight as [out_features, in_features] and dispatch x @ weight^T.
+       This is often faster on dense projection backends while preserving the
+       logical linear map and bias shape. */
+    bool transposed_weight;
     size_t alignment;
     uint64_t seed;
     float weight_low;
@@ -144,6 +148,7 @@ typedef struct gd_linear_layer {
     gd_tensor weight;
     gd_tensor bias;
     bool has_bias;
+    bool weight_transposed;
     int64_t in_features;
     int64_t out_features;
 } gd_linear_layer;

@@ -11,6 +11,7 @@
 #define GD_METAL_GEMM_REG_NBLK 4U
 #define GD_METAL_GEMM_REG_TILE (GD_METAL_GEMM_REG_NBLK * 8U)
 #define GD_METAL_GEMM_REG_SIMDGROUPS 4U
+#define GD_METAL_GEMM_TN_SPLIT8 8U
 #define GD_METAL_GEMM_MAX_BATCH_DIMS 6U
 
 typedef struct gd_metal_gemm_args {

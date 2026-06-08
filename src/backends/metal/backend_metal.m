@@ -614,6 +614,10 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (st != GD_OK) {
         return st;
     }
+    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_split8", &backend->matmul_tn_split8_pso);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_metal_make_pipeline(backend, library, "gd_reduce_rows_f16", &backend->reduce_rows_pso);
     if (st != GD_OK) {
         return st;
@@ -1217,6 +1221,9 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->mps_matmul_kernel != NULL) {
         CFRelease(backend->mps_matmul_kernel);
+    }
+    if (backend->matmul_tn_split8_pso != NULL) {
+        CFRelease(backend->matmul_tn_split8_pso);
     }
     if (backend->matmul_tn_reg_pso != NULL) {
         CFRelease(backend->matmul_tn_reg_pso);

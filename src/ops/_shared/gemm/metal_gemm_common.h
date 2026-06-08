@@ -571,4 +571,99 @@ static inline void gd_gemm_f16_tn_tile(device const uchar *xbuf,
     }
 }
 
+static inline void gd_gemm_f16_reg_tn_split8_tile(
+    device const uchar *xbuf,
+    device const uchar *wbuf,
+    device uchar *ybuf,
+    constant gd_metal_gemm_args &p,
+    threadgroup float partial[GD_METAL_GEMM_TN_SPLIT8][GD_METAL_GEMM_REG_TILE][GD_METAL_GEMM_REG_TILE],
+    uint3 tgpos,
+    uint simd_lane,
+    uint simdgroup_id)
+{
+    const uint row0 = tgpos.y * GD_METAL_GEMM_REG_TILE;
+    const uint col0 = tgpos.x * GD_METAL_GEMM_REG_TILE;
+    const ulong x_stride = p.x_row_bytes / 2ul;
+    const ulong w_stride = p.w_row_bytes / 2ul;
+    const ulong y_stride = p.y_row_bytes / 2ul;
+    const ulong x_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 0u);
+    const ulong w_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 1u);
+    const ulong y_batch_offset = gd_gemm_batch_offset(p, tgpos.z, 2u);
+    device const half *x = reinterpret_cast<device const half *>(xbuf + p.x_offset + x_batch_offset);
+    device const half *w = reinterpret_cast<device const half *>(wbuf + p.w_offset + w_batch_offset);
+    device half *y = reinterpret_cast<device half *>(ybuf + p.y_offset + y_batch_offset);
+
+    simdgroup_matrix<half, 8, 8> x_frag[GD_METAL_GEMM_REG_NBLK];
+    simdgroup_matrix<half, 8, 8> w_frag[GD_METAL_GEMM_REG_NBLK];
+    simdgroup_matrix<float, 8, 8> acc[GD_METAL_GEMM_REG_NBLK][GD_METAL_GEMM_REG_NBLK];
+
+    GD_METAL_UNROLL
+    for (uint mi = 0; mi < GD_METAL_GEMM_REG_NBLK; ++mi) {
+        GD_METAL_UNROLL
+        for (uint nj = 0; nj < GD_METAL_GEMM_REG_NBLK; ++nj) {
+            acc[mi][nj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const uint2 elem = gd_simdgroup_matrix_thread_coords(simd_lane);
+    const uint split_begin = (p.inner / GD_METAL_GEMM_TN_SPLIT8) * simdgroup_id;
+    const uint split_end = (p.inner / GD_METAL_GEMM_TN_SPLIT8) * (simdgroup_id + 1u);
+    for (uint k0 = split_begin; k0 < split_end; k0 += 8u) {
+        GD_METAL_UNROLL
+        for (uint mi = 0; mi < GD_METAL_GEMM_REG_NBLK; ++mi) {
+            gd_simdgroup_load_f16_transpose_a(x_frag[mi],
+                                              x,
+                                              x_stride,
+                                              row0 + mi * 8u,
+                                              k0,
+                                              elem);
+        }
+        GD_METAL_UNROLL
+        for (uint nj = 0; nj < GD_METAL_GEMM_REG_NBLK; ++nj) {
+            simdgroup_load(w_frag[nj],
+                           w + ulong(k0) * w_stride + ulong(col0 + nj * 8u),
+                           w_stride);
+        }
+
+        GD_METAL_UNROLL
+        for (uint mi = 0; mi < GD_METAL_GEMM_REG_NBLK; ++mi) {
+            GD_METAL_UNROLL
+            for (uint nj = 0; nj < GD_METAL_GEMM_REG_NBLK; ++nj) {
+                const uint ns = (mi & 1u) != 0u ? (GD_METAL_GEMM_REG_NBLK - 1u - nj) : nj;
+                simdgroup_multiply_accumulate(acc[mi][ns], x_frag[mi], w_frag[ns], acc[mi][ns]);
+            }
+        }
+    }
+
+    GD_METAL_UNROLL
+    for (uint mi = 0; mi < GD_METAL_GEMM_REG_NBLK; ++mi) {
+        const uint lr = mi * 8u + elem.x;
+        GD_METAL_UNROLL
+        for (uint nj = 0; nj < GD_METAL_GEMM_REG_NBLK; ++nj) {
+            const uint lc = nj * 8u + elem.y;
+            thread const auto &vals = acc[mi][nj].thread_elements();
+            partial[simdgroup_id][lr][lc] = vals[0];
+            partial[simdgroup_id][lr][lc + 1u] = vals[1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint tid = simdgroup_id * 32u + simd_lane;
+    for (uint e = tid; e < GD_METAL_GEMM_REG_TILE * GD_METAL_GEMM_REG_TILE;
+         e += 32u * GD_METAL_GEMM_TN_SPLIT8) {
+        const uint lr = e / GD_METAL_GEMM_REG_TILE;
+        const uint lc = e - lr * GD_METAL_GEMM_REG_TILE;
+        const uint gr = row0 + lr;
+        const uint gc = col0 + lc;
+        if (gr < p.rows && gc < p.cols) {
+            float sum = 0.0f;
+            GD_METAL_UNROLL
+            for (uint s = 0; s < GD_METAL_GEMM_TN_SPLIT8; ++s) {
+                sum += partial[s][lr][lc];
+            }
+            y[ulong(gr) * y_stride + ulong(gc)] = half(sum);
+        }
+    }
+}
+
 #endif /* GD_OPS_SHARED_GEMM_METAL_COMMON_H */

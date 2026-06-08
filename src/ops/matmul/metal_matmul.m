@@ -127,6 +127,29 @@ static bool gd_metal_batched_gemm_reg_ok(const gd_backend_batched_matrix_view *x
     return true;
 }
 
+static bool gd_metal_batched_gemm_tn_split8_ok(const gd_backend_batched_matrix_view *x,
+                                                const gd_backend_batched_matrix_view *w,
+                                                const gd_backend_batched_matrix_view *y,
+                                                uint32_t inner)
+{
+    uint32_t i;
+    if (x == NULL || w == NULL || y == NULL ||
+        (x->offset % 16U) != 0U || (w->offset % 16U) != 0U || (y->offset % 16U) != 0U ||
+        (x->row_bytes % 16U) != 0U || (w->row_bytes % 16U) != 0U || (y->row_bytes % 16U) != 0U ||
+        (y->rows % GD_METAL_GEMM_REG_TILE) != 0U ||
+        (y->cols % GD_METAL_GEMM_REG_TILE) != 0U ||
+        (inner % (8U * GD_METAL_GEMM_TN_SPLIT8)) != 0U || inner < 4096U) {
+        return false;
+    }
+    for (i = 0U; i < y->batch_rank; ++i) {
+        if ((x->batch_strides[i] % 16U) != 0U || (w->batch_strides[i] % 16U) != 0U ||
+            (y->batch_strides[i] % 16U) != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool gd_metal_batched_shapes_match(const gd_backend_batched_matrix_view *x,
                                           const gd_backend_batched_matrix_view *w,
                                           const gd_backend_batched_matrix_view *y)
@@ -592,6 +615,7 @@ static gd_status gd_backend_batched_matmul_dispatch(gd_backend *backend,
     MTLSize threads;
     bool immediate;
     bool use_reg;
+    bool use_tn_split8;
     uint32_t inner;
     gd_status st;
     void *tiled_pso;
@@ -646,8 +670,12 @@ static gd_status gd_backend_batched_matmul_dispatch(gd_backend *backend,
     default:
         return GD_ERR_INVALID_ARGUMENT;
     }
-    use_reg = gd_metal_batched_gemm_reg_ok(x, w, y, inner) && reg_pso != NULL;
-    pso = (__bridge id<MTLComputePipelineState>)(use_reg ? reg_pso : tiled_pso);
+    use_tn_split8 = layout == GD_METAL_MATMUL_TN &&
+                    gd_metal_batched_gemm_tn_split8_ok(x, w, y, inner) &&
+                    backend->matmul_tn_split8_pso != NULL;
+    use_reg = !use_tn_split8 && gd_metal_batched_gemm_reg_ok(x, w, y, inner) && reg_pso != NULL;
+    pso = (__bridge id<MTLComputePipelineState>)(use_tn_split8 ? backend->matmul_tn_split8_pso :
+                                                 (use_reg ? reg_pso : tiled_pso));
     if (pso == nil) {
         return GD_ERR_INTERNAL;
     }
@@ -666,7 +694,12 @@ static gd_status gd_backend_batched_matmul_dispatch(gd_backend *backend,
     [encoder setBuffer:(__bridge id<MTLBuffer>)x->buffer->buffer offset:0U atIndex:2U];
     [encoder setBuffer:(__bridge id<MTLBuffer>)y->buffer->buffer offset:0U atIndex:3U];
     [encoder setBytes:&args length:sizeof(args) atIndex:4U];
-    if (use_reg) {
+    if (use_tn_split8) {
+        groups = MTLSizeMake(gd_metal_div_up_u32(y->cols, GD_METAL_GEMM_REG_TILE),
+                             (NSUInteger)(y->rows / GD_METAL_GEMM_REG_TILE),
+                             (NSUInteger)y->batch_count);
+        threads = MTLSizeMake(32U * GD_METAL_GEMM_TN_SPLIT8, 1U, 1U);
+    } else if (use_reg) {
         groups = MTLSizeMake(gd_metal_div_up_u32(y->cols,
                                                  GD_METAL_GEMM_REG_TILE * GD_METAL_GEMM_REG_SIMDGROUPS),
                              (NSUInteger)(y->rows / GD_METAL_GEMM_REG_TILE),

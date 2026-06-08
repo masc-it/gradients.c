@@ -234,6 +234,7 @@ static void gpt_linear_layer_init_normal_child(gd_context *ctx,
                                                gd_linear_layer *layer,
                                                int64_t in_features,
                                                int64_t out_features,
+                                               bool transposed_weight,
                                                uint64_t seed,
                                                float stddev)
 {
@@ -241,13 +242,14 @@ static void gpt_linear_layer_init_normal_child(gd_context *ctx,
     gd_tensor_spec weight_spec;
     const gd_init_spec empty = gd_init_empty();
     memset(layer, 0, sizeof(*layer));
-    weight_shape[0] = in_features;
-    weight_shape[1] = out_features;
+    weight_shape[0] = transposed_weight ? out_features : in_features;
+    weight_shape[1] = transposed_weight ? in_features : out_features;
     weight_spec = gd_tensor_spec_make(GD_DTYPE_F16, gd_shape_make(2U, weight_shape), GPT_ALIGNMENT);
     TRY(ctx, gd_module_init(ctx, &layer->mod, name));
     layer->in_features = in_features;
     layer->out_features = out_features;
     layer->has_bias = false;
+    layer->weight_transposed = transposed_weight;
     TRY(ctx, gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &empty, &layer->weight));
     gpt_tensor_init_normal(ctx, &layer->weight, seed, stddev);
     TRY(ctx, gd_module_add_child(parent, name, &layer->mod));
@@ -285,6 +287,7 @@ static void gpt_block_init(gd_context *ctx,
                                        &block->qkv_proj,
                                        GPT_D_MODEL,
                                        3 * GPT_D_MODEL,
+                                       true,
                                        splitmix64(block_seed ^ 1U),
                                        GPT_WEIGHT_INIT_STD);
     gpt_linear_layer_init_normal_child(ctx,
@@ -293,6 +296,7 @@ static void gpt_block_init(gd_context *ctx,
                                        &block->attn_proj,
                                        GPT_D_MODEL,
                                        GPT_D_MODEL,
+                                       true,
                                        splitmix64(block_seed ^ 2U),
                                        residual_scale);
     gpt_linear_layer_init_normal_child(ctx,
@@ -301,6 +305,7 @@ static void gpt_block_init(gd_context *ctx,
                                        &block->up_gate,
                                        GPT_D_MODEL,
                                        2 * GPT_MLP_HIDDEN,
+                                       true,
                                        splitmix64(block_seed ^ 3U),
                                        GPT_WEIGHT_INIT_STD);
     gpt_linear_layer_init_normal_child(ctx,
@@ -309,6 +314,7 @@ static void gpt_block_init(gd_context *ctx,
                                        &block->down_proj,
                                        GPT_MLP_HIDDEN,
                                        GPT_D_MODEL,
+                                       false,
                                        splitmix64(block_seed ^ 4U),
                                        residual_scale);
 }

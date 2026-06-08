@@ -43,6 +43,20 @@ kernel void gd_matmul_f16_tn_reg(device const uchar *xbuf [[buffer(0)]],
     gd_gemm_f16_reg_tn_tile(xbuf, wbuf, ybuf, p, tgpos, simd_lane, simdgroup_id);
 }
 
+kernel void gd_matmul_f16_tn_split8(device const uchar *xbuf [[buffer(0)]],
+                                    device const uchar *wbuf [[buffer(1)]],
+                                    device const uchar *bbuf [[buffer(2)]],
+                                    device uchar *ybuf [[buffer(3)]],
+                                    constant gd_metal_gemm_args &p [[buffer(4)]],
+                                    uint3 tgpos [[threadgroup_position_in_grid]],
+                                    uint simd_lane [[thread_index_in_simdgroup]],
+                                    uint simdgroup_id [[simdgroup_index_in_threadgroup]])
+{
+    (void)bbuf;
+    threadgroup float partial[GD_METAL_GEMM_TN_SPLIT8][GD_METAL_GEMM_REG_TILE][GD_METAL_GEMM_REG_TILE];
+    gd_gemm_f16_reg_tn_split8_tile(xbuf, wbuf, ybuf, p, partial, tgpos, simd_lane, simdgroup_id);
+}
+
 kernel void gd_matmul_f16_tiled(device const uchar *xbuf [[buffer(0)]],
                                 device const uchar *wbuf [[buffer(1)]],
                                 device const uchar *bbuf [[buffer(2)]],

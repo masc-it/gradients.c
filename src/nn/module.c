@@ -450,6 +450,7 @@ gd_linear_layer_config gd_linear_layer_config_make(int64_t in_features,
     config.out_features = out_features;
     config.dtype = dtype;
     config.use_bias = true;
+    config.transposed_weight = false;
     config.alignment = 256U;
     config.seed = seed;
     config.weight_low = -0.02f;
@@ -954,8 +955,9 @@ gd_status gd_linear_layer_init(gd_context *ctx,
     layer->in_features = config->in_features;
     layer->out_features = config->out_features;
     layer->has_bias = config->use_bias;
-    weight_shape[0] = config->in_features;
-    weight_shape[1] = config->out_features;
+    layer->weight_transposed = config->transposed_weight;
+    weight_shape[0] = config->transposed_weight ? config->out_features : config->in_features;
+    weight_shape[1] = config->transposed_weight ? config->in_features : config->out_features;
     weight_spec = gd_tensor_spec_make(config->dtype, gd_shape_make(2U, weight_shape), config->alignment);
     weight_init = gd_init_rand_uniform(config->seed, config->weight_low, config->weight_high);
     st = gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &weight_init, &layer->weight);
@@ -1014,6 +1016,13 @@ gd_status gd_linear_layer_forward(gd_context *ctx,
 {
     if (layer == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (layer->weight_transposed) {
+        return gd_linear_transposed_weight(ctx,
+                                           x,
+                                           &layer->weight,
+                                           layer->has_bias ? &layer->bias : NULL,
+                                           out);
     }
     return gd_linear(ctx, x, &layer->weight, layer->has_bias ? &layer->bias : NULL, out);
 }

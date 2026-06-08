@@ -111,6 +111,51 @@ static void test_linear_child_module(gd_context *ctx)
     gd_module_deinit(&root);
 }
 
+static void test_transposed_linear_layer(gd_context *ctx)
+{
+    gd_linear_layer layer;
+    gd_linear_layer_config config;
+    gd_tensor x;
+    gd_tensor y;
+    int64_t x_shape[2] = {2, 3};
+    const float weight[6] = {
+        1.0f, 2.0f, 3.0f,
+        -1.0f, 0.5f, 4.0f,
+    };
+    const float input[6] = {
+        1.0f, 0.0f, 2.0f,
+        -1.0f, 3.0f, 0.5f,
+    };
+    const float expected[4] = {
+        7.0f, 7.0f,
+        6.5f, 4.5f,
+    };
+    float got[4];
+    uint32_t i;
+
+    config = gd_linear_layer_config_make(3, 2, GD_DTYPE_F16, 66U);
+    config.use_bias = false;
+    config.transposed_weight = true;
+    CHECK_OK(gd_linear_layer_init(ctx, &layer, "linear_t", &config));
+    CHECK(layer.weight_transposed, "linear layer stores transposed weight flag");
+    CHECK(layer.weight.rank == 2U && layer.weight.shape[0] == 2 && layer.weight.shape[1] == 3,
+          "linear layer transposed weight shape");
+    CHECK_OK(gd_tensor_write_f32(ctx, &layer.weight, weight, GD_ARRAY_LEN(weight)));
+
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, gd_batch_empty()));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    CHECK_OK(gd_tensor_write_f32(ctx, &x, input, GD_ARRAY_LEN(input)));
+    CHECK_OK(gd_linear_layer_forward(ctx, &layer, &x, &y));
+    CHECK_OK(gd_tensor_read_f32(ctx, &y, got, GD_ARRAY_LEN(got)));
+    CHECK_OK(gd_end_step(ctx));
+
+    for (i = 0U; i < GD_ARRAY_LEN(got); ++i) {
+        CHECK(abs_f32(got[i] - expected[i]) <= 5.0e-3f,
+              "transposed linear layer forward matches reference");
+    }
+    gd_linear_layer_deinit(&layer);
+}
+
 static void test_module_list_paths(gd_context *ctx)
 {
     gd_module root;
@@ -187,6 +232,7 @@ int main(void)
     CHECK_OK(st);
 
     test_linear_child_module(ctx);
+    test_transposed_linear_layer(ctx);
     test_module_list_paths(ctx);
     test_module_dict_paths(ctx);
 

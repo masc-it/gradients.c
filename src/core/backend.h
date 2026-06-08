@@ -368,6 +368,33 @@ gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
                                                   const gd_backend_tensor_view *grad_loss,
                                                   const gd_backend_tensor_view *grad_logits,
                                                   float scale);
+/* Fused tied LM-head CE helpers. logits_chunk is [rows, chunk_classes] for
+ * hidden @ weight[class_start:class_start+chunk_classes]^T. row_inv_sum is
+ * used as row_sum before finalize, then overwritten with reciprocal row_sum. */
+gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
+                                                    const gd_backend_tensor_view *logits_chunk,
+                                                    const gd_backend_tensor_view *targets,
+                                                    const gd_backend_tensor_view *row_loss,
+                                                    const gd_backend_tensor_view *row_max,
+                                                    const gd_backend_tensor_view *row_inv_sum,
+                                                    uint64_t class_start,
+                                                    uint64_t total_classes);
+gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
+                                               const gd_backend_tensor_view *targets,
+                                               const gd_backend_tensor_view *row_loss,
+                                               const gd_backend_tensor_view *row_max,
+                                               const gd_backend_tensor_view *row_inv_sum,
+                                               uint64_t total_classes);
+gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
+                                                     const gd_backend_tensor_view *logits_chunk,
+                                                     const gd_backend_tensor_view *targets,
+                                                     const gd_backend_tensor_view *row_max,
+                                                     const gd_backend_tensor_view *row_inv_sum,
+                                                     const gd_backend_tensor_view *grad_loss,
+                                                     const gd_backend_tensor_view *grad_logits_chunk,
+                                                     uint64_t class_start,
+                                                     uint64_t total_classes,
+                                                     float scale);
 /* MSE loss: out chunks contain scale * sum((x - y)^2) over each contiguous chunk. */
 gd_status gd_backend_mse_forward(gd_backend *backend,
                                  const gd_backend_tensor_view *x,

@@ -552,6 +552,66 @@ gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
+                                                    const gd_backend_tensor_view *logits_chunk,
+                                                    const gd_backend_tensor_view *targets,
+                                                    const gd_backend_tensor_view *row_loss,
+                                                    const gd_backend_tensor_view *row_max,
+                                                    const gd_backend_tensor_view *row_inv_sum,
+                                                    uint64_t class_start,
+                                                    uint64_t total_classes)
+{
+    (void)backend;
+    (void)logits_chunk;
+    (void)targets;
+    (void)row_loss;
+    (void)row_max;
+    (void)row_inv_sum;
+    (void)class_start;
+    (void)total_classes;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
+                                               const gd_backend_tensor_view *targets,
+                                               const gd_backend_tensor_view *row_loss,
+                                               const gd_backend_tensor_view *row_max,
+                                               const gd_backend_tensor_view *row_inv_sum,
+                                               uint64_t total_classes)
+{
+    (void)backend;
+    (void)targets;
+    (void)row_loss;
+    (void)row_max;
+    (void)row_inv_sum;
+    (void)total_classes;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
+                                                     const gd_backend_tensor_view *logits_chunk,
+                                                     const gd_backend_tensor_view *targets,
+                                                     const gd_backend_tensor_view *row_max,
+                                                     const gd_backend_tensor_view *row_inv_sum,
+                                                     const gd_backend_tensor_view *grad_loss,
+                                                     const gd_backend_tensor_view *grad_logits_chunk,
+                                                     uint64_t class_start,
+                                                     uint64_t total_classes,
+                                                     float scale)
+{
+    (void)backend;
+    (void)logits_chunk;
+    (void)targets;
+    (void)row_max;
+    (void)row_inv_sum;
+    (void)grad_loss;
+    (void)grad_logits_chunk;
+    (void)class_start;
+    (void)total_classes;
+    (void)scale;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_mse_forward(gd_backend *backend,
                                  const gd_backend_tensor_view *x,
                                  const gd_backend_tensor_view *y,

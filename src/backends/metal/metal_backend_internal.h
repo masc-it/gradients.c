@@ -79,6 +79,9 @@ struct gd_backend {
     void *cross_entropy_loss_stats_f16_pso;
     void *cross_entropy_backward_f16_pso;
     void *cross_entropy_backward_stats_f16_pso;
+    void *lm_cross_entropy_online_update_f16_pso;
+    void *lm_cross_entropy_finalize_f32_pso;
+    void *lm_cross_entropy_backward_chunk_f16_pso;
     void *mse_forward_f16_pso;
     void *mse_forward_f32_pso;
     void *mse_backward_f16_pso;

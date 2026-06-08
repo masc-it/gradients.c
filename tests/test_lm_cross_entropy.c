@@ -149,11 +149,11 @@ static void fill_weight(uint16_t *dst, size_t count)
 
 static void run_case(bool fused, float *loss_out, uint16_t *dh_out, uint16_t *dw_out)
 {
-    enum { ROWS = 6, DIM = 8, VOCAB = 11 };
+    enum { ROWS = 6, DIM = 8, VOCAB = 2048 };
     const int64_t hidden_shape[2] = {ROWS, DIM};
     const int64_t weight_shape[2] = {VOCAB, DIM};
     const int64_t target_shape[1] = {ROWS};
-    const int32_t targets_h[ROWS] = {0, 7, 3, 10, 4, 1};
+    const int32_t targets_h[ROWS] = {0, 1000, 3, 2047, 1024, 1};
     uint16_t hidden_h[ROWS * DIM];
     uint16_t weight_h[VOCAB * DIM];
     gd_context *ctx = NULL;
@@ -196,7 +196,7 @@ static void run_case(bool fused, float *loss_out, uint16_t *dh_out, uint16_t *dw
 
 static void test_fused_matches_materialized(void)
 {
-    enum { ROWS = 6, DIM = 8, VOCAB = 11, HCOUNT = ROWS * DIM, WCOUNT = VOCAB * DIM };
+    enum { ROWS = 6, DIM = 8, VOCAB = 2048, HCOUNT = ROWS * DIM, WCOUNT = VOCAB * DIM };
     float baseline_loss = 0.0f;
     float fused_loss = 0.0f;
     uint16_t baseline_dh[HCOUNT];

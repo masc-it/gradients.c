@@ -210,3 +210,43 @@ at the end provide a comparison table.
 
 dont worry about other files changing, since I am working in
 parallel on other things.
+
+
+--- OPTIMIZATIONS
+
+op 3 optimization opportunities:
+
+ 1. Enable the GPT-specific fast SDPA path
+     - GPT uses head_dim=64, causal local attention, sliding_window=256,
+       prefix_len=0 in examples/gpt_lm/gpt_lm_shared.c:548-553.
+     - But the optimized Metal SDPA kernel is only selected when
+       prefix_len > 0 in src/ops/sdpa_varlen/metal_sdpa_varlen.m:114-119.
+     - So training likely falls back to the generic scalar SDPA kernels
+       instead of the lane8 dh64 fast kernels.
+     - First thing I’d do: allow/test the existing fast kernel for
+       prefix_len=0, or add a no-prefix causal-window variant.
+ 2. Optimize the MLP/projection path: GEMM + PoWLU
+     - Each block does qkv, attn projection, up/gate, down projection in
+       gpt_block_forward.
+     - The MLP path is especially heavy: up_gate -> gd_powlu_split ->
+       down_proj at examples/gpt_lm/gpt_lm_shared.c:626-634.
+     - gd_powlu_split uses exp, log, sqrt, sigmoid per element in
+       src/ops/powlu/metal_powlu.metal:21-32, then recomputes in
+       backward.
+     - Opportunity: shape-specialized GEMMs for the fixed GPT sizes,
+       cache MPS descriptors/arrays, and/or specialize/approximate PoWLU
+       m=2. If model change is acceptable, SwiGLU would be much cheaper.
+ 3. Fuse tied LM head + cross entropy
+     - Final loss calls gd_lm_cross_entropy with tied embedding at
+       examples/gpt_lm/gpt_lm_shared.c:705.
+     - Current implementation materializes logits [32768, 2048] at batch
+       64: ~128 MiB f16, saves them for backward, then creates dlogits
+       and does two more matmuls
+       (src/ops/lm_cross_entropy/core_lm_cross_entropy.c:79-341).
+     - This drives scratch usage: baseline reports
+       scratch_max_slot=3243MB; batch 128 OOMs with current 5GB scratch
+       slot.
+     - Opportunity: tiled/fused vocab projection + softmax CE, avoiding
+       full logits/dlogits residency and possibly enabling batch 128.
+
+---

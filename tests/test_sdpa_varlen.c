@@ -436,7 +436,7 @@ static void test_varlen_fwd_bwd(gd_context *ctx)
 }
 
 
-static void test_varlen_dh64_prefix_window(gd_context *ctx)
+static void test_varlen_dh64_window_case(gd_context *ctx, int prefix_len)
 {
     enum { N = 160, Hq = 2, Hkv = 1, Dh = 64, B = 1 };
     const int64_t q_shape[3] = {N, Hq, Dh};
@@ -473,7 +473,7 @@ static void test_varlen_dh64_prefix_window(gd_context *ctx)
     cfg.scale = 0.125f;
     cfg.causal = true;
     cfg.sliding_window = 8;
-    cfg.prefix_len = 4;
+    cfg.prefix_len = prefix_len;
     cfg.max_seqlen = N;
 
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, q_shape), 256U, &q));
@@ -650,7 +650,8 @@ int main(void)
         CHECK_OK(st);
     }
     test_varlen_fwd_bwd(ctx);
-    test_varlen_dh64_prefix_window(ctx);
+    test_varlen_dh64_window_case(ctx, 4);
+    test_varlen_dh64_window_case(ctx, 0);
     test_decode(ctx);
     gd_context_destroy(ctx);
     printf("test_sdpa_varlen: ok\n");

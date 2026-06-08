@@ -114,9 +114,12 @@ static bool gd_sdpa_varlen_fast_enabled(void)
 static bool gd_sdpa_varlen_use_dh64_prefix_window(const gd_backend_tensor_view *q,
                                                    const gd_backend_sdpa_varlen_args *args)
 {
+    /* The lane8 DH=64 causal-window kernels handle both prefix-LM masks
+     * (prefix_len > 0) and plain causal local attention (prefix_len == 0).
+     * GPT training uses the latter, so do not require a positive prefix. */
     return gd_sdpa_varlen_fast_enabled() && q != NULL && args != NULL &&
            q->dtype == (uint32_t)GD_DTYPE_F16 && q->shape[2] == 64 &&
-           args->causal != 0U && args->prefix_len > 0U && args->sliding_window > 0U;
+           args->causal != 0U && args->sliding_window > 0U;
 }
 
 static bool gd_sdpa_varlen_byte_range_valid(const gd_backend_buffer *buffer,

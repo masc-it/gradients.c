@@ -1,23 +1,34 @@
 #ifndef GD_OP_POWLU_SPLIT_LINEAR_METAL_TYPES_H
 #define GD_OP_POWLU_SPLIT_LINEAR_METAL_TYPES_H
 
-/* Op-local Metal ABI types for powlu_split_linear. Keep host/Metal layouts in sync.
- * See docs/guides/metal_tips.md before implementing Metal hot paths.
- * Custom backend mode: generated backend stubs are omitted; add custom backend declarations/PSOs manually.
- */
 #include "../../backends/metal/metal_abi.h"
 
-typedef struct gd_metal_powlu_split_linear_args {
-    gd_metal_u64 x_offset;
-    gd_metal_u64 y_offset;
+#define GD_METAL_POWLU_SPLIT_LINEAR_MAX_THREADS_PER_GROUP 128U
+
+typedef struct gd_metal_powlu_split_linear_bwd_x12_args {
+    gd_metal_u64 x12_offset;
+    gd_metal_u64 w_offset;
     gd_metal_u64 grad_offset;
-    gd_metal_u64 count;
-    gd_metal_u32 dtype;
+    gd_metal_u64 dx12_offset;
+    gd_metal_u64 x12_row_bytes;
+    gd_metal_u64 w_row_bytes;
+    gd_metal_u64 grad_row_bytes;
+    gd_metal_u64 dx12_row_bytes;
+    gd_metal_u32 rows;
+    gd_metal_u32 hidden;
+    gd_metal_u32 out_cols;
     gd_metal_u32 pad0;
-} gd_metal_powlu_split_linear_args;
+    float m;
+    gd_metal_u32 pad1[3];
+} gd_metal_powlu_split_linear_bwd_x12_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_powlu_split_linear_args) == 40U, "gd_metal_powlu_split_linear_args ABI mismatch");
+_Static_assert(sizeof(gd_metal_powlu_split_linear_bwd_x12_args) == 96U,
+               "gd_metal_powlu_split_linear_bwd_x12_args ABI mismatch");
+_Static_assert(offsetof(gd_metal_powlu_split_linear_bwd_x12_args, rows) == 64U,
+               "gd_metal_powlu_split_linear_bwd_x12_args rows offset mismatch");
+_Static_assert(offsetof(gd_metal_powlu_split_linear_bwd_x12_args, m) == 80U,
+               "gd_metal_powlu_split_linear_bwd_x12_args m offset mismatch");
 #endif
 
 #endif /* GD_OP_POWLU_SPLIT_LINEAR_METAL_TYPES_H */

@@ -564,7 +564,6 @@ static gd_status gpt_block_forward(gd_context *ctx,
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor powlu;
     gd_tensor mlp_proj;
     gd_status st;
     int64_t n_tokens;
@@ -627,11 +626,12 @@ static gd_status gpt_block_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
+    st = gd_powlu_split_linear(ctx,
+                                &up_gate,
+                                &block->down_proj.weight,
+                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                model->powlu_m,
+                                &mlp_proj);
     if (st != GD_OK) {
         return st;
     }
@@ -744,7 +744,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor powlu;
     gd_tensor mlp_proj;
     gd_status st;
     int64_t n_tokens;
@@ -808,9 +807,12 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
-    if (st != GD_OK) { return st; }
-    st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
+    st = gd_powlu_split_linear(ctx,
+                                &up_gate,
+                                &block->down_proj.weight,
+                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                model->powlu_m,
+                                &mlp_proj);
     if (st != GD_OK) { return st; }
     return gd_add(ctx, &residual, &mlp_proj, out);
 }
@@ -851,7 +853,6 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     gd_tensor attn_resid;
     gd_tensor mlp_normed;
     gd_tensor up_gate;
-    gd_tensor powlu;
     gd_tensor mlp_proj;
     gd_status st;
     int64_t q_shape[4];
@@ -916,9 +917,12 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_powlu_split(ctx, &up_gate, model->powlu_m, &powlu);
-    if (st != GD_OK) { return st; }
-    st = gd_linear_layer_forward(ctx, &block->down_proj, &powlu, &mlp_proj);
+    st = gd_powlu_split_linear(ctx,
+                                &up_gate,
+                                &block->down_proj.weight,
+                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                model->powlu_m,
+                                &mlp_proj);
     if (st != GD_OK) { return st; }
     return gd_add(ctx, &residual, &mlp_proj, out);
 }

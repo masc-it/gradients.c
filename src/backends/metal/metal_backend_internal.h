@@ -94,6 +94,7 @@ struct gd_backend {
     void *powlu_backward_f16_pso;
     void *powlu_split_forward_f16_pso;
     void *powlu_split_backward_f16_pso;
+    void *powlu_split_linear_backward_x12_f16_reg_pso;
     void *embedding_forward_f16_pso;
     void *embedding_forward_f32_pso;
     void *embedding_forward_vec16_f16_pso;

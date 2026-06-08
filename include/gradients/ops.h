@@ -119,6 +119,27 @@ gd_status gd_powlu_split_backward(gd_context *ctx,
                                   float m,
                                   gd_tensor *grad_x12);
 
+/* Fused gated-MLP projection:
+ * y = linear(powlu_split(x12, m), w, bias), with x12 [..., 2H], w [H, N].
+ * Training autograd fuses the down-projection input-gradient GEMM with the
+ * PoWLU split backward epilogue to avoid materializing d_powlu. */
+gd_status gd_powlu_split_linear(gd_context *ctx,
+                                const gd_tensor *x12,
+                                const gd_tensor *w,
+                                const gd_tensor *bias,
+                                float m,
+                                gd_tensor *out);
+
+gd_status gd_powlu_split_linear_backward(gd_context *ctx,
+                                         const gd_tensor *x12,
+                                         const gd_tensor *w,
+                                         const gd_tensor *bias,
+                                         const gd_tensor *grad_out,
+                                         float m,
+                                         gd_tensor *grad_x12,
+                                         gd_tensor *grad_w,
+                                         gd_tensor *grad_bias);
+
 /* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
  * contiguous I32 tensor with rank >= 1. Output is contiguous with shape
  * ids.shape + [dim] and table dtype. Invalid ids produce NaN output values;

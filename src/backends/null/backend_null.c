@@ -344,6 +344,22 @@ gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_powlu_split_linear_backward_x12(gd_backend *backend,
+                                                     const gd_backend_tensor_view *x12,
+                                                     const gd_backend_matrix_view *w,
+                                                     const gd_backend_matrix_view *grad_out,
+                                                     const gd_backend_tensor_view *grad_x12,
+                                                     float m)
+{
+    (void)backend;
+    (void)x12;
+    (void)w;
+    (void)grad_out;
+    (void)grad_x12;
+    (void)m;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_dropout_forward(gd_backend *backend,
                                      const gd_backend_tensor_view *x,
                                      const gd_backend_tensor_view *y,

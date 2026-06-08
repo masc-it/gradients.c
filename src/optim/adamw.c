@@ -1281,6 +1281,23 @@ gd_status gd_optimizer_step_amp(gd_context *ctx, gd_optimizer *optimizer, gd_amp
     return gd_optimizer_step_amp_lr(ctx, optimizer, scaler, optimizer->config.lr);
 }
 
+gd_status gd_optimizer_last_grad_norm(gd_context *ctx,
+                                      const gd_optimizer *optimizer,
+                                      float *out)
+{
+    float clip_stats[2] = {0.0f, 0.0f};
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_read_f32(ctx, &optimizer->grad_clip_scale, clip_stats, 2U);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = clip_stats[1];
+    return GD_OK;
+}
+
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer)
 {
     return optimizer != NULL ? optimizer->step : 0U;

@@ -563,8 +563,20 @@ static void train_one_batch(gd_context *ctx,
         const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
         const double tokens_per_sec = elapsed > 0.0 ? (double)tokens / elapsed : 0.0;
         float loss_value = 0.0f;
+        float grad_norm = 0.0f;
+        char grad_norm_text[64];
         TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-        printf("epoch=%zu/%d batch=%zu/%zu step=%zu/%zu loss=%.6f lr=%.6g batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s\n",
+        if (config->grad_clip_norm > 0.0f) {
+            TRY(ctx, gd_optimizer_last_grad_norm(ctx, optimizer, &grad_norm));
+            (void)snprintf(grad_norm_text,
+                           sizeof(grad_norm_text),
+                           " grad_norm=%.4g clip=%.3g",
+                           (double)grad_norm,
+                           (double)config->grad_clip_norm);
+        } else {
+            (void)snprintf(grad_norm_text, sizeof(grad_norm_text), " grad_norm=off");
+        }
+        printf("epoch=%zu/%d batch=%zu/%zu step=%zu/%zu loss=%.6f lr=%.6g%s batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s\n",
                epoch,
                config->epochs,
                epoch_step,
@@ -573,6 +585,7 @@ static void train_one_batch(gd_context *ctx,
                total_steps,
                (double)loss_value,
                (double)lr,
+               grad_norm_text,
                batches_per_sec,
                tokens_per_sec,
                (double)gd_amp_scaler_scale(scaler),

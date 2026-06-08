@@ -90,6 +90,9 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
                                         gd_amp_scaler *scaler,
                                         float lr,
                                         float max_grad_norm);
+gd_status gd_optimizer_last_grad_norm(gd_context *ctx,
+                                      const gd_optimizer *optimizer,
+                                      float *out);
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer);
 
 #ifdef __cplusplus

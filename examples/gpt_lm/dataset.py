@@ -3,21 +3,24 @@
 
 The default source is ``~/projects/dnn.c/docs/promessi_sposi.txt``.  The script:
 
-1. trains a byte-level BPE tokenizer with a 2048 token vocabulary, unless a
-   compatible tokenizer already exists;
-2. uses the optimized C tokenizer to produce packed token records of
-   ``context_length + 1`` tokens with one-token overlap for next-token
-   prediction;
-3. writes a GDDS split under ``examples/gpt_lm/data`` with shifted
+1. splits raw text into deterministic block-random train/validation files;
+2. trains a byte-level BPE tokenizer with a 2048 token vocabulary on the raw
+   training text only;
+3. tokenizes train and validation text with that train-fitted tokenizer into
+   packed records of ``context_length + 1`` tokens with one-token overlap for
+   next-token prediction;
+4. writes GDDS train/val shards under ``examples/gpt_lm/data`` with shifted
    ``input_ids``/``target_ids`` tensors of length ``context_length``; and
-4. prints decoded random samples loaded back from the produced GDDS shard.
+5. prints decoded random samples loaded back from the produced GDDS shard.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
+import re
 import shutil
 import struct
 import sys
@@ -45,7 +48,10 @@ IM_END = "<|im_end|>"
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_CONTEXT_LENGTH = 512
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
-DATA_FORMAT_VERSION = "gpt-lm-promessi-v2"
+DATA_FORMAT_VERSION = "gpt-lm-promessi-v3"
+DEFAULT_SPLIT_BLOCK_CHARS = 16 * 1024
+DEFAULT_CHARS_PER_TOKEN_ESTIMATE = 3.0
+TOKENIZER_CACHE_FORMAT = "gpt-lm-tokenizer-cache-v1"
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,21 @@ class ShardHeader:
     samples: int
     index_offset: int
     schema_hash: int
+
+
+@dataclass(frozen=True)
+class RawTextSplit:
+    train_path: Path
+    val_path: Path
+    total_blocks: int
+    train_blocks: int
+    val_blocks: int
+    total_chars: int
+    train_chars: int
+    val_chars: int
+    target_val_chars: int
+    train_sha256: str
+    val_sha256: str
 
 
 class TokenDecoder:
@@ -127,6 +148,173 @@ def read_json(path: Path) -> Mapping[str, object]:
     return data
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tokenizer_cache_path(tokenizer_path: Path) -> Path:
+    return tokenizer_path.with_name(f"{tokenizer_path.name}.train-cache.json")
+
+
+def split_text_into_blocks(text: str, block_chars: int) -> list[str]:
+    """Split text into deterministic, roughly equal contiguous character blocks.
+
+    The split prefers paragraph boundaries near the target size, then line breaks,
+    then whitespace.  We choose validation blocks from these raw-text blocks
+    before tokenizer training, which avoids both tail-only validation and BPE
+    leakage from validation text.
+    """
+    if block_chars <= 0:
+        raise ValueError("block_chars must be positive")
+    n_chars = len(text)
+    blocks: list[str] = []
+    start = 0
+    while start < n_chars:
+        remaining = n_chars - start
+        if remaining <= int(block_chars * 1.25):
+            end = n_chars
+        else:
+            target = start + block_chars
+            lo = min(n_chars, start + max(1, block_chars // 2))
+            hi = min(n_chars, start + block_chars + max(1, block_chars // 2))
+            end = _best_text_boundary(text, lo, hi, target)
+            if end <= start:
+                end = min(n_chars, start + block_chars)
+        block = text[start:end]
+        if block.strip():
+            blocks.append(block)
+        start = end
+    if not blocks:
+        raise ValueError("source text produced no non-empty split blocks")
+    return blocks
+
+
+def _best_text_boundary(text: str, lo: int, hi: int, target: int) -> int:
+    boundary_patterns = [r"\n\s*\n+", r"\n", r"\s+"]
+    for pattern in boundary_patterns:
+        candidates = [lo + m.end() for m in re.finditer(pattern, text[lo:hi])]
+        if candidates:
+            return min(candidates, key=lambda pos: abs(pos - target))
+    return hi
+
+
+def choose_validation_blocks(
+    blocks: Sequence[str],
+    *,
+    val_samples: int,
+    context_length: int,
+    val_fraction: float | None,
+    split_seed: int,
+    chars_per_token_estimate: float,
+) -> tuple[set[int], int]:
+    if val_samples < 0:
+        raise ValueError("val_samples must be non-negative")
+    if context_length < 2:
+        raise ValueError("context_length must be >= 2")
+    if chars_per_token_estimate <= 0.0:
+        raise ValueError("chars_per_token_estimate must be positive")
+    total_chars = sum(len(block) for block in blocks)
+    if len(blocks) <= 1 or val_samples == 0:
+        return set(), 0
+    if val_fraction is not None:
+        if not (0.0 <= val_fraction < 1.0):
+            raise ValueError("val_fraction must satisfy 0 <= val_fraction < 1")
+        target_val_chars = int(round(total_chars * val_fraction))
+    else:
+        target_val_chars = int(round(val_samples * (context_length + 1) * chars_per_token_estimate))
+    if target_val_chars <= 0:
+        return set(), 0
+    # Keep at least one block for training.  This also prevents accidentally
+    # validating on most of a tiny source file when --val-samples is large.
+    max_val_chars = max(1, total_chars - min(len(block) for block in blocks))
+    target_val_chars = min(target_val_chars, max_val_chars)
+
+    order = list(range(len(blocks)))
+    random.Random(split_seed).shuffle(order)
+    selected: set[int] = set()
+    selected_chars = 0
+    for index in order:
+        if len(selected) >= len(blocks) - 1:
+            break
+        selected.add(index)
+        selected_chars += len(blocks[index])
+        if selected_chars >= target_val_chars:
+            break
+    return selected, target_val_chars
+
+
+def write_raw_text_split(
+    *,
+    source: Path,
+    data_dir: Path,
+    context_length: int,
+    val_samples: int,
+    val_fraction: float | None,
+    split_seed: int,
+    split_block_chars: int,
+    chars_per_token_estimate: float,
+) -> RawTextSplit:
+    text = source.read_text(encoding="utf-8")
+    blocks = split_text_into_blocks(text, split_block_chars)
+    val_indices, target_val_chars = choose_validation_blocks(
+        blocks,
+        val_samples=val_samples,
+        context_length=context_length,
+        val_fraction=val_fraction,
+        split_seed=split_seed,
+        chars_per_token_estimate=chars_per_token_estimate,
+    )
+    split_dir = data_dir / "raw_split"
+    ensure_clean_dir(split_dir)
+    train_path = split_dir / "train.txt"
+    val_path = split_dir / "val.txt"
+    train_blocks = [block for i, block in enumerate(blocks) if i not in val_indices]
+    val_blocks = [block for i, block in enumerate(blocks) if i in val_indices]
+    if not train_blocks:
+        raise ValueError("raw split produced no training blocks")
+    _write_text_blocks(train_path, train_blocks)
+    _write_text_blocks(val_path, val_blocks)
+    train_sha = file_sha256(train_path)
+    val_sha = file_sha256(val_path) if val_blocks else ""
+    train_chars = sum(len(block) for block in train_blocks)
+    val_chars = sum(len(block) for block in val_blocks)
+    print(
+        "Raw split: "
+        f"blocks={len(blocks)} train_blocks={len(train_blocks)} val_blocks={len(val_blocks)} "
+        f"train_chars={train_chars} val_chars={val_chars} target_val_chars={target_val_chars} "
+        f"seed={split_seed}"
+    )
+    return RawTextSplit(
+        train_path=train_path,
+        val_path=val_path,
+        total_blocks=len(blocks),
+        train_blocks=len(train_blocks),
+        val_blocks=len(val_blocks),
+        total_chars=len(text),
+        train_chars=train_chars,
+        val_chars=val_chars,
+        target_val_chars=target_val_chars,
+        train_sha256=train_sha,
+        val_sha256=val_sha,
+    )
+
+
+def _write_text_blocks(path: Path, blocks: Sequence[str]) -> None:
+    # Preserve source order within each split.  Separators avoid fusing words
+    # across held-out gaps in the training text.
+    text = "\n\n".join(block.strip("\n") for block in blocks if block.strip())
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
 def tokenizer_compatible(tokenizer_path: Path, *, vocab_size: int, specials: Sequence[str]) -> bool:
     try:
         spec = read_json(tokenizer_path)
@@ -142,41 +330,74 @@ def tokenizer_compatible(tokenizer_path: Path, *, vocab_size: int, specials: Seq
         return False
 
 
+def tokenizer_cache_compatible(
+    tokenizer_path: Path,
+    *,
+    train_sha256: str,
+    vocab_size: int,
+    specials: Sequence[str],
+) -> bool:
+    if not tokenizer_compatible(tokenizer_path, vocab_size=vocab_size, specials=specials):
+        return False
+    try:
+        cache = read_json(tokenizer_cache_path(tokenizer_path))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        cache.get("format") == TOKENIZER_CACHE_FORMAT
+        and cache.get("train_sha256") == train_sha256
+        and int(cache.get("vocab_size", -1)) == vocab_size
+        and list(cache.get("specials", [])) == list(specials)
+    )
+
+
+def write_tokenizer_cache(
+    tokenizer_path: Path,
+    *,
+    train_sha256: str,
+    vocab_size: int,
+    specials: Sequence[str],
+) -> None:
+    cache = {
+        "format": TOKENIZER_CACHE_FORMAT,
+        "train_sha256": train_sha256,
+        "vocab_size": vocab_size,
+        "specials": list(specials),
+        "note": "Tokenizer was trained only on raw_split/train.txt.",
+    }
+    tokenizer_cache_path(tokenizer_path).write_text(json.dumps(cache, indent=2) + "\n")
+
+
 def prepare_tokenized_corpus(
     *,
-    source: Path,
-    data_dir: Path,
+    split_name: str,
+    input_path: Path,
+    output_dir: Path,
     tokenizer_path: Path,
     context_length: int,
     vocab_size: int,
-    retrain_tokenizer: bool,
+    use_existing_tokenizer: bool,
 ) -> TokenizedCorpus:
-    tokenized_dir = data_dir / "tokenized"
-    ensure_clean_dir(tokenized_dir)
-    use_existing = tokenizer_path.exists() and not retrain_tokenizer and tokenizer_compatible(
-        tokenizer_path,
-        vocab_size=vocab_size,
-        specials=(IM_START, IM_END),
-    )
+    ensure_clean_dir(output_dir)
     summary = tokenize_file_packed(
         tokenizer=tokenizer_path,
-        input_path=source,
-        output_dir=tokenized_dir,
+        input_path=input_path,
+        output_dir=output_dir,
         im_start=IM_START,
         im_end=IM_END,
         num_tokens_per_sequence=context_length + 1,
-        use_tokenizer=use_existing,
+        use_tokenizer=use_existing_tokenizer,
         vocab_size=vocab_size,
         min_frequency=2,
         seed=17,
     )
-    action = "reused" if use_existing else "trained"
+    action = "tokenized with existing tokenizer" if use_existing_tokenizer else "trained tokenizer"
     print(
-        f"Tokenizer {action}: {summary['tokenizer']} "
+        f"{split_name}: {action}: {summary['tokenizer']} "
         f"(records={summary['sequences']}, record_tokens={context_length + 1}, "
         f"tokens={summary['tokens']})"
     )
-    return TokenizedCorpus.open(tokenized_dir)
+    return TokenizedCorpus.open(output_dir)
 
 
 def i32_tensor(array: np.ndarray) -> TensorData:
@@ -200,36 +421,30 @@ def iter_lm_samples(corpus: TokenizedCorpus):
 def write_gdds_dataset(
     *,
     out_dir: Path,
-    corpus: TokenizedCorpus,
+    train_corpus: TokenizedCorpus,
+    val_corpus: TokenizedCorpus | None,
     max_shard_bytes: int,
-    val_samples: int,
 ) -> dict[str, list[Path]]:
-    if corpus.sequence_length is None or corpus.sequence_length < 3:
-        raise ValueError("packed tokenized corpus must have sequence_length >= 3")
-    if val_samples < 0:
-        raise ValueError("val_samples must be non-negative")
-    context_length = corpus.sequence_length - 1
+    if train_corpus.sequence_length is None or train_corpus.sequence_length < 3:
+        raise ValueError("packed training corpus must have sequence_length >= 3")
+    if val_corpus is not None and val_corpus.sequence_length != train_corpus.sequence_length:
+        raise ValueError("train and validation corpora must use the same packed sequence length")
+    context_length = train_corpus.sequence_length - 1
     fields = fields_for_context(context_length)
-    total_samples = corpus.num_sequences
-    if total_samples <= 0:
-        raise ValueError("tokenizer produced no packed records")
-    if total_samples == 1 or val_samples == 0:
-        val_count = 0
-    else:
-        val_count = min(val_samples, max(1, total_samples // 10), total_samples - 1)
-    train_count = total_samples - val_count
+    if train_corpus.num_sequences <= 0:
+        raise ValueError("tokenizer produced no training records")
     remove_split_shards(out_dir, "train")
     remove_split_shards(out_dir, "val")
     train_writer = GddsSplitWriter(out_dir, "train", fields, max_shard_bytes=max_shard_bytes)
     val_writer = GddsSplitWriter(out_dir, "val", fields, max_shard_bytes=max_shard_bytes)
     try:
-        for sample_index, sample in enumerate(iter_lm_samples(corpus)):
-            if sample_index < train_count:
-                train_writer.write_sample(sample)
-            else:
+        for sample in iter_lm_samples(train_corpus):
+            train_writer.write_sample(sample)
+        if val_corpus is not None:
+            for sample in iter_lm_samples(val_corpus):
                 val_writer.write_sample(sample)
         train_paths = train_writer.finish()
-        val_paths = val_writer.finish() if val_count > 0 else []
+        val_paths = val_writer.finish()
     except BaseException:
         train_writer.abort()
         val_writer.abort()
@@ -256,18 +471,26 @@ def write_manifest(
     out_dir: Path,
     source: Path,
     tokenizer_path: Path,
-    tokenized_corpus: TokenizedCorpus,
+    raw_split: RawTextSplit,
+    train_corpus: TokenizedCorpus,
+    val_corpus: TokenizedCorpus | None,
     gdds_paths: Mapping[str, Sequence[Path]],
     max_shard_bytes: int,
     vocab_size: int,
+    split_seed: int,
+    split_block_chars: int,
+    val_samples_target: int,
+    val_fraction: float | None,
 ) -> None:
-    assert tokenized_corpus.sequence_length is not None
-    context_length = tokenized_corpus.sequence_length - 1
+    assert train_corpus.sequence_length is not None
+    context_length = train_corpus.sequence_length - 1
     fields = fields_for_context(context_length)
     split_samples = {
         split: sum(read_gdds_header(path).samples for path in paths)
         for split, paths in gdds_paths.items()
     }
+    val_records = 0 if val_corpus is None else val_corpus.num_sequences
+    val_tokens = 0 if val_corpus is None else val_corpus.num_tokens
     manifest = {
         "format": "GDDS",
         "version": 1,
@@ -281,18 +504,22 @@ def write_manifest(
         },
         "tokenizer": {
             "path": tokenizer_path.name,
-            "hash": tokenized_corpus.manifest["tokenizer_hash"],
+            "hash": train_corpus.manifest["tokenizer_hash"],
             "vocab_size": vocab_size,
-            "im_start_id": tokenized_corpus.im_start_id,
-            "im_end_id": tokenized_corpus.im_end_id,
+            "im_start_id": train_corpus.im_start_id,
+            "im_end_id": train_corpus.im_end_id,
             "digits": "always split before BPE merges",
+            "trained_on": "raw_split/train.txt",
+            "train_sha256": raw_split.train_sha256,
         },
         "packing": {
-            "record_length": tokenized_corpus.sequence_length,
+            "record_length": train_corpus.sequence_length,
             "context_length": context_length,
-            "stride": tokenized_corpus.stride,
-            "source_records": tokenized_corpus.num_sequences,
-            "source_tokens": tokenized_corpus.num_tokens,
+            "stride": train_corpus.stride,
+            "source_records": train_corpus.num_sequences + val_records,
+            "source_tokens": train_corpus.num_tokens + val_tokens,
+            "train_records": train_corpus.num_sequences,
+            "val_records": val_records,
         },
         "splits": {
             split: {
@@ -300,6 +527,24 @@ def write_manifest(
                 "shards": [path.name for path in paths],
             }
             for split, paths in gdds_paths.items()
+        },
+        "raw_split": {
+            "mode": "block_random_before_tokenizer_training",
+            "train_path": str(raw_split.train_path.relative_to(out_dir)),
+            "val_path": str(raw_split.val_path.relative_to(out_dir)),
+            "split_seed": split_seed,
+            "block_chars": split_block_chars,
+            "total_blocks": raw_split.total_blocks,
+            "train_blocks": raw_split.train_blocks,
+            "val_blocks": raw_split.val_blocks,
+            "total_chars": raw_split.total_chars,
+            "train_chars": raw_split.train_chars,
+            "val_chars": raw_split.val_chars,
+            "target_val_chars": raw_split.target_val_chars,
+            "target_val_samples": val_samples_target,
+            "val_fraction": val_fraction,
+            "train_sha256": raw_split.train_sha256,
+            "val_sha256": raw_split.val_sha256,
         },
         "prep": {
             "format_version": DATA_FORMAT_VERSION,
@@ -395,7 +640,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES)
     parser.add_argument("--retrain-tokenizer", action="store_true")
-    parser.add_argument("--val-samples", type=int, default=64)
+    parser.add_argument(
+        "--val-samples",
+        type=int,
+        default=64,
+        help="approximate validation budget in packed samples; converted to a raw-text char budget before tokenization",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=None,
+        help="override --val-samples and reserve this raw-text fraction for validation",
+    )
+    parser.add_argument("--split-seed", type=int, default=17)
+    parser.add_argument("--split-block-chars", type=int, default=DEFAULT_SPLIT_BLOCK_CHARS)
+    parser.add_argument("--chars-per-token-estimate", type=float, default=DEFAULT_CHARS_PER_TOKEN_ESTIMATE)
     parser.add_argument("--preview-samples", type=int, default=10)
     parser.add_argument("--preview-seed", type=int, default=17)
     return parser.parse_args()
@@ -411,37 +670,93 @@ def main() -> int:
         raise ValueError("--vocab-size must be at least 258 for byte tokens plus two specials")
     if args.max_shard_bytes <= 0:
         raise ValueError("--max-shard-bytes must be positive")
+    if args.val_samples < 0:
+        raise ValueError("--val-samples must be non-negative")
+    if args.val_fraction is not None and not (0.0 <= args.val_fraction < 1.0):
+        raise ValueError("--val-fraction must satisfy 0 <= val_fraction < 1")
+    if args.split_block_chars <= 0:
+        raise ValueError("--split-block-chars must be positive")
+    if args.chars_per_token_estimate <= 0.0:
+        raise ValueError("--chars-per-token-estimate must be positive")
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_path = out_dir / f"tokenizer-v{args.vocab_size}.json"
 
-    corpus = prepare_tokenized_corpus(
+    raw_split = write_raw_text_split(
         source=args.source,
         data_dir=out_dir,
+        context_length=args.context_length,
+        val_samples=args.val_samples,
+        val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
+        split_block_chars=args.split_block_chars,
+        chars_per_token_estimate=args.chars_per_token_estimate,
+    )
+    specials = (IM_START, IM_END)
+    reuse_train_tokenizer = (
+        not args.retrain_tokenizer
+        and tokenizer_cache_compatible(
+            tokenizer_path,
+            train_sha256=raw_split.train_sha256,
+            vocab_size=args.vocab_size,
+            specials=specials,
+        )
+    )
+    train_corpus = prepare_tokenized_corpus(
+        split_name="train",
+        input_path=raw_split.train_path,
+        output_dir=out_dir / "tokenized_train",
         tokenizer_path=tokenizer_path,
         context_length=args.context_length,
         vocab_size=args.vocab_size,
-        retrain_tokenizer=args.retrain_tokenizer,
+        use_existing_tokenizer=reuse_train_tokenizer,
     )
+    if not reuse_train_tokenizer:
+        write_tokenizer_cache(
+            tokenizer_path,
+            train_sha256=raw_split.train_sha256,
+            vocab_size=args.vocab_size,
+            specials=specials,
+        )
     expected_record_length = args.context_length + 1
-    if corpus.sequence_length != expected_record_length:
-        raise ValueError(f"unexpected tokenized sequence length {corpus.sequence_length}")
+    if train_corpus.sequence_length != expected_record_length:
+        raise ValueError(f"unexpected train tokenized sequence length {train_corpus.sequence_length}")
+
+    val_corpus = None
+    if raw_split.val_blocks > 0:
+        val_corpus = prepare_tokenized_corpus(
+            split_name="val",
+            input_path=raw_split.val_path,
+            output_dir=out_dir / "tokenized_val",
+            tokenizer_path=tokenizer_path,
+            context_length=args.context_length,
+            vocab_size=args.vocab_size,
+            use_existing_tokenizer=True,
+        )
+        if val_corpus.sequence_length != expected_record_length:
+            raise ValueError(f"unexpected val tokenized sequence length {val_corpus.sequence_length}")
 
     paths = write_gdds_dataset(
         out_dir=out_dir,
-        corpus=corpus,
+        train_corpus=train_corpus,
+        val_corpus=val_corpus,
         max_shard_bytes=args.max_shard_bytes,
-        val_samples=args.val_samples,
     )
     write_manifest(
         out_dir=out_dir,
         source=args.source,
         tokenizer_path=tokenizer_path,
-        tokenized_corpus=corpus,
+        raw_split=raw_split,
+        train_corpus=train_corpus,
+        val_corpus=val_corpus,
         gdds_paths=paths,
         max_shard_bytes=args.max_shard_bytes,
         vocab_size=args.vocab_size,
+        split_seed=args.split_seed,
+        split_block_chars=args.split_block_chars,
+        val_samples_target=args.val_samples,
+        val_fraction=args.val_fraction,
     )
 
     total_samples = sum(
@@ -459,7 +774,7 @@ def main() -> int:
         show_random_samples(
             shards=paths["train"],
             tokenizer_path=tokenizer_path,
-            total_samples=total_samples,
+            total_samples=train_samples,
             count=args.preview_samples,
             seed=args.preview_seed,
         )

@@ -9,7 +9,17 @@ SHARED_SRC := gpt_lm_shared.c
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.gpt_lm_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.gpt_lm_gdds.args
-DATA_FORMAT_VERSION := gpt-lm-promessi-v2
+GPT_LM_DATASET ?= promessi
+
+ifeq ($(GPT_LM_DATASET),ita_dict)
+DATA_SCRIPT := dataset_ita_dict.py
+DATA_FORMAT_VERSION := gpt-lm-ita-dict-v1
+else ifeq ($(GPT_LM_DATASET),promessi)
+DATA_SCRIPT := dataset.py
+DATA_FORMAT_VERSION := gpt-lm-promessi-v3
+else
+$(error unsupported GPT_LM_DATASET=$(GPT_LM_DATASET); expected promessi or ita_dict)
+endif
 
 CC ?= cc
 PYTHON ?= uv run --with numpy
@@ -23,9 +33,6 @@ LDLIBS += -framework Foundation -framework Metal
 endif
 
 DATA_ARGS := --out-dir $(DATA_DIR) --preview-samples 0
-ifneq ($(GPT_LM_SOURCE),)
-DATA_ARGS += --source $(GPT_LM_SOURCE)
-endif
 ifneq ($(GPT_LM_VOCAB_SIZE),)
 DATA_ARGS += --vocab-size $(GPT_LM_VOCAB_SIZE)
 endif
@@ -35,8 +42,42 @@ endif
 ifneq ($(GPT_LM_MAX_SHARD_BYTES),)
 DATA_ARGS += --max-shard-bytes $(GPT_LM_MAX_SHARD_BYTES)
 endif
+ifneq ($(GPT_LM_VAL_FRACTION),)
+DATA_ARGS += --val-fraction $(GPT_LM_VAL_FRACTION)
+endif
+ifneq ($(GPT_LM_SPLIT_SEED),)
+DATA_ARGS += --split-seed $(GPT_LM_SPLIT_SEED)
+endif
+
+ifeq ($(GPT_LM_DATASET),promessi)
+ifneq ($(GPT_LM_SOURCE),)
+DATA_ARGS += --source $(GPT_LM_SOURCE)
+endif
+ifneq ($(GPT_LM_VAL_SAMPLES),)
+DATA_ARGS += --val-samples $(GPT_LM_VAL_SAMPLES)
+endif
+ifneq ($(GPT_LM_SPLIT_BLOCK_CHARS),)
+DATA_ARGS += --split-block-chars $(GPT_LM_SPLIT_BLOCK_CHARS)
+endif
+ifneq ($(GPT_LM_CHARS_PER_TOKEN_ESTIMATE),)
+DATA_ARGS += --chars-per-token-estimate $(GPT_LM_CHARS_PER_TOKEN_ESTIMATE)
+endif
 ifneq ($(GPT_LM_RETRAIN_TOKENIZER),)
 DATA_ARGS += --retrain-tokenizer
+endif
+else ifeq ($(GPT_LM_DATASET),ita_dict)
+ifneq ($(GPT_LM_ITA_CLEAN_DIR),)
+DATA_ARGS += --clean-dir $(GPT_LM_ITA_CLEAN_DIR)
+endif
+ifneq ($(GPT_LM_ITA_ENRICHED_DIR),)
+DATA_ARGS += --enriched-dir $(GPT_LM_ITA_ENRICHED_DIR)
+endif
+ifneq ($(GPT_LM_MIN_FREQUENCY),)
+DATA_ARGS += --min-frequency $(GPT_LM_MIN_FREQUENCY)
+endif
+ifneq ($(GPT_LM_MAX_EXAMPLES_PER_DEFINITION),)
+DATA_ARGS += --max-examples-per-definition $(GPT_LM_MAX_EXAMPLES_PER_DEFINITION)
+endif
 endif
 
 .PHONY: all run infer build-lib tools data clean smoke overfit-smoke generate-smoke periodic-generate-smoke checkpoint-smoke FORCE
@@ -51,14 +92,17 @@ tools:
 
 data: $(DATA_STAMP)
 
-$(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/tok_utils.py tools
+$(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/tok_utils.py tools
 	@mkdir -p $(DATA_DIR)
 	@args='$(DATA_FORMAT_VERSION) $(DATA_ARGS)'; \
 	if [ -f '$(DATA_STAMP)' ] && [ -f '$(DATA_ARGS_FILE)' ] && \
-	   [ "$$(cat '$(DATA_ARGS_FILE)')" = "$$args" ]; then \
+	   [ "$$(cat '$(DATA_ARGS_FILE)')" = "$$args" ] && \
+	   [ '$(DATA_STAMP)' -nt '$(DATA_SCRIPT)' ] && \
+	   [ '$(DATA_STAMP)' -nt '$(ROOT)/tools/gdds_utils.py' ] && \
+	   [ '$(DATA_STAMP)' -nt '$(ROOT)/tools/tok_utils.py' ]; then \
 		echo "[data] up to date $(DATA_DIR)"; \
 	else \
-		$(PYTHON) dataset.py $(DATA_ARGS); \
+		$(PYTHON) $(DATA_SCRIPT) $(DATA_ARGS); \
 		printf '%s\n' "$$args" > '$(DATA_ARGS_FILE)'; \
 		touch '$(DATA_STAMP)'; \
 	fi

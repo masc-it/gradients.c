@@ -88,8 +88,10 @@ static void print_usage(const char *argv0)
     printf("  --generate-every-n-steps N  during training, generate batched a/e/i/o/u samples every N steps (default: 0)\n");
     printf("  --checkpoint-path PATH      best-val checkpoint path (default: checkpoints/gpt_lm_best.gdckpt)\n");
     printf("  --load-checkpoint PATH      load model weights before training/generation\n");
-    printf("  --val-split NAME            validation split name for best checkpointing (default: val)\n");
+    printf("  --val-split NAME            validation split name for validation/checkpointing (default: val)\n");
     printf("  --no-save-best              disable best validation checkpoint writes\n");
+    printf("  --early-stopping-patience N validation epochs without improvement before stopping; 0 disables (default: %d)\n",
+           GPT_DEFAULT_EARLY_STOPPING_PATIENCE);
     printf("  --max-new-tokens N          generated tokens for --generate / periodic generation (default: 64)\n");
     printf("  --temperature T             sampling temperature; 0 means greedy (default: 0)\n");
     printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
@@ -124,6 +126,7 @@ static gpt_config gpt_config_default(void)
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
+    config.early_stopping_patience = GPT_DEFAULT_EARLY_STOPPING_PATIENCE;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = 64;
     config.generate_every_n_steps = 0;
@@ -185,6 +188,15 @@ static gpt_config parse_args(int argc, char **argv)
         }
         if (strcmp(argv[i], "--no-save-best") == 0) {
             config.save_best = false;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--early-stopping-patience");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 1000000, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --early-stopping-patience %s\n", value);
+                exit(2);
+            }
+            config.early_stopping_patience = (int)parsed_i64;
             continue;
         }
         value = arg_value(argc, argv, &i, "--generate-every-n-steps");
@@ -655,6 +667,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "sdpa_window=%d\n"
                  "dropout=%.9g\n"
                  "grad_clip_norm=%.9g\n"
+                 "early_stopping_patience=%d\n"
                  "epoch=%zu\n"
                  "global_step=%zu\n"
                  "val_loss=%.9g\n"
@@ -669,6 +682,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  GPT_SDPA_WINDOW,
                  (double)config->dropout_p,
                  (double)config->grad_clip_norm,
+                 config->early_stopping_patience,
                  epoch,
                  global_step,
                  (double)val_loss,
@@ -695,6 +709,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "sdpa_window=%d\n"
                    "dropout=%.9g\n"
                    "grad_clip_norm=%.9g\n"
+                   "early_stopping_patience=%d\n"
                    "epoch=%zu\n"
                    "global_step=%zu\n"
                    "val_loss=%.9g\n"
@@ -709,6 +724,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    GPT_SDPA_WINDOW,
                    (double)config->dropout_p,
                    (double)config->grad_clip_norm,
+                   config->early_stopping_patience,
                    epoch,
                    global_step,
                    (double)val_loss,
@@ -773,23 +789,29 @@ static float evaluate_gpt_loss(gd_context *ctx,
     return (float)(total_loss / (double)steps);
 }
 
-static void validate_and_maybe_checkpoint(gd_context *ctx,
+static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                           gpt_lm *model,
                                           gd_dataset *val_dataset,
                                           const gpt_config *config,
                                           size_t epoch,
                                           size_t global_step,
-                                          float *best_val_loss)
+                                          float *best_val_loss,
+                                          bool *out_improved)
 {
+    bool improved = false;
     float val_loss;
+    if (out_improved != NULL) {
+        *out_improved = false;
+    }
     if (val_dataset == NULL) {
-        return;
+        return false;
     }
     val_loss = evaluate_gpt_loss(ctx, model, val_dataset, config);
     printf("validation: epoch=%zu step=%zu val_loss=%.6f", epoch, global_step, (double)val_loss);
     if (isfinite(val_loss) && best_val_loss != NULL && val_loss < *best_val_loss) {
         printf(" improved=%.6f", (double)*best_val_loss);
         *best_val_loss = val_loss;
+        improved = true;
         if (config->save_best) {
             char *metadata = gpt_checkpoint_metadata(config, epoch, global_step, val_loss);
             gd_module_save_options save_options;
@@ -805,7 +827,11 @@ static void validate_and_maybe_checkpoint(gd_context *ctx,
             free(metadata);
         }
     }
+    if (out_improved != NULL) {
+        *out_improved = improved;
+    }
     printf("\n");
+    return true;
 }
 
 static void train_gpt(gd_context *ctx,
@@ -822,6 +848,7 @@ static void train_gpt(gd_context *ctx,
     double last_report_time = gpt_wall_seconds();
     size_t last_report_step = 0U;
     size_t global_step = 0U;
+    size_t epochs_without_improvement = 0U;
     size_t epoch;
     float best_val_loss = INFINITY;
 
@@ -857,13 +884,33 @@ static void train_gpt(gd_context *ctx,
         }
         gd_dataloader_destroy(loader);
         gd_sampler_destroy(sampler);
-        validate_and_maybe_checkpoint(ctx,
-                                      model,
-                                      val_dataset,
-                                      config,
-                                      epoch,
-                                      global_step,
-                                      &best_val_loss);
+        {
+            bool validated;
+            bool val_improved = false;
+            validated = validate_and_maybe_checkpoint(ctx,
+                                                      model,
+                                                      val_dataset,
+                                                      config,
+                                                      epoch,
+                                                      global_step,
+                                                      &best_val_loss,
+                                                      &val_improved);
+            if (validated && config->early_stopping_patience > 0) {
+                if (val_improved) {
+                    epochs_without_improvement = 0U;
+                } else {
+                    epochs_without_improvement += 1U;
+                    if (epochs_without_improvement >= (size_t)config->early_stopping_patience) {
+                        printf("early_stopping: epoch=%zu step=%zu patience=%d best_val_loss=%.6f\n",
+                               epoch,
+                               global_step,
+                               config->early_stopping_patience,
+                               (double)best_val_loss);
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -915,7 +962,7 @@ int main(int argc, char **argv)
             gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
         }
         total_steps = (size_t)config.epochs * steps_per_epoch;
-        if (config.save_best) {
+        if (config.save_best || config.early_stopping_patience > 0) {
             TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, config.val_split, &val_dataset));
             val_samples = (size_t)gd_dataset_num_samples(val_dataset);
             if (val_samples == 0U) {
@@ -998,10 +1045,11 @@ int main(int argc, char **argv)
                config.generate_every_n_steps > 0 ? "yes" : "no");
     }
     if (config.epochs > 0) {
-        printf("checkpoint: save_best=%s path=%s val_split=%s\n",
+        printf("checkpoint: save_best=%s path=%s val_split=%s early_stopping_patience=%d\n",
                config.save_best ? "yes" : "no",
                config.checkpoint_path,
-               config.val_split);
+               config.val_split,
+               config.early_stopping_patience);
         printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g grad_clip=%.4g amp_scale=%.1f\n",
                (double)lr_config.max_lr,
                (double)lr_config.min_lr,

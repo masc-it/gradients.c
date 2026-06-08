@@ -21,7 +21,7 @@ Build and run training:
 make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 32"
 ```
 
-At the end of every epoch, training evaluates the `val` split and saves `checkpoints/gpt_lm_best.gdckpt` whenever validation loss improves.
+At the end of every epoch, training evaluates the `val` split, saves `checkpoints/gpt_lm_best.gdckpt` whenever validation loss improves, and stops early after 10 validation epochs without improvement by default.
 
 Overfit smoke tests:
 
@@ -68,12 +68,13 @@ Useful runtime options:
 --load-checkpoint PATH
 --val-split NAME
 --no-save-best
+--early-stopping-patience N # 0 disables; default 10
 --max-new-tokens N
 --temperature T         # 0 means greedy
 --tokenizer-path PATH
 ```
 
-The dataset builder writes `train` and `val` GDDS splits. The GDDS dataloader provides packed fields directly:
+The dataset builder first creates a deterministic block-random raw-text split, trains the BPE tokenizer on the training text only, then writes `train` and `val` GDDS splits. The GDDS dataloader provides packed fields directly:
 
 ```text
 input_ids   i32 [B * 512]

@@ -19,6 +19,7 @@
 #define GPT_DEFAULT_EPOCHS 2
 #define GPT_DEFAULT_BATCH_SIZE 2
 #define GPT_DEFAULT_REPORT_EVERY 10
+#define GPT_DEFAULT_EARLY_STOPPING_PATIENCE 10
 #define GPT_DEFAULT_DROPOUT_P 0.10f
 #define GPT_DEFAULT_LR_MAX 1.0e-4f
 #define GPT_DEFAULT_LR_MIN 1.0e-5f
@@ -100,6 +101,7 @@ typedef struct gpt_config {
     int batch_size;
     int n_layers;
     int report_every;
+    int early_stopping_patience;
     int lr_warmup_steps;
     int max_new_tokens;
     int generate_every_n_steps;

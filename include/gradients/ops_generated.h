@@ -132,6 +132,15 @@ gd_status gd_dropout_backward(gd_context *ctx,
                            uint64_t seed,
                            gd_tensor *grad_x);
 
+gd_status gd_powlu_split_linear(gd_context *ctx,
+                  const gd_tensor *x,
+                  gd_tensor *out);
+
+gd_status gd_powlu_split_linear_backward(gd_context *ctx,
+                           const gd_tensor *x,
+                           const gd_tensor *grad_out,
+                           gd_tensor *grad_x);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3,19 +3,34 @@
 
 using namespace metal;
 
+static inline float gd_powlu_exp(const float x)
+{
+    return fast::exp(x);
+}
+
+static inline float gd_powlu_log(const float x)
+{
+    return fast::log(x);
+}
+
+static inline float gd_powlu_sqrt(const float x)
+{
+    return fast::sqrt(x);
+}
+
 static inline float gd_powlu_sigmoid_stable(const float x)
 {
     if (x >= 0.0f) {
-        const float e = exp(-x);
+        const float e = gd_powlu_exp(-x);
         return 1.0f / (1.0f + e);
     }
-    const float e = exp(x);
+    const float e = gd_powlu_exp(x);
     return e / (1.0f + e);
 }
 
 static inline float gd_powlu_positive_pow(const float z, const float exponent)
 {
-    return exp(exponent * log(max(z, 0x1p-126f)));
+    return gd_powlu_exp(exponent * gd_powlu_log(max(z, 0x1p-126f)));
 }
 
 static inline float gd_powlu_gate(const float z, const float m)
@@ -24,7 +39,7 @@ static inline float gd_powlu_gate(const float z, const float m)
     if (z <= 0.0f) {
         return z * s;
     }
-    const float r = sqrt(z);
+    const float r = gd_powlu_sqrt(z);
     const float a = m / (r + 1.0f);
     return gd_powlu_positive_pow(z, a) * s;
 }
@@ -35,13 +50,29 @@ static inline float gd_powlu_gate_grad(const float z, const float m)
     if (z <= 0.0f) {
         return s * (1.0f + z * (1.0f - s));
     }
-    const float r = sqrt(z);
+    const float r = gd_powlu_sqrt(z);
     const float rp1 = r + 1.0f;
     const float a = m / rp1;
-    const float lz = log(max(z, 0x1p-126f));
-    const float g = exp(a * lz);
+    const float lz = gd_powlu_log(max(z, 0x1p-126f));
+    const float g = gd_powlu_exp(a * lz);
     const float da = -m / (2.0f * r * rp1 * rp1);
     return g * s * (a / z + da * lz + (1.0f - s));
+}
+
+static inline float2 gd_powlu_gate_and_grad(const float z, const float m)
+{
+    const float s = gd_powlu_sigmoid_stable(z);
+    if (z <= 0.0f) {
+        return float2(z * s, s * (1.0f + z * (1.0f - s)));
+    }
+    const float r = gd_powlu_sqrt(z);
+    const float rp1 = r + 1.0f;
+    const float a = m / rp1;
+    const float lz = gd_powlu_log(max(z, 0x1p-126f));
+    const float g = gd_powlu_exp(a * lz);
+    const float da = -m / (2.0f * r * rp1 * rp1);
+    const float gate = g * s;
+    return float2(gate, gate * (a / z + da * lz + (1.0f - s)));
 }
 
 kernel void gd_powlu_forward_f16_kernel(device const uchar *x1buf [[buffer(0)]],
@@ -82,10 +113,13 @@ kernel void gd_powlu_backward_f16_kernel(device const uchar *x1buf [[buffer(0)]]
     for (ulong i = base; i < args.count && i < base + ulong(GD_METAL_POWLU_ELEMENTS_PER_THREAD); ++i) {
         const float z = float(x2[i]);
         const float go = float(grad[i]);
-        if (args.write_x1 != 0u) {
+        if (args.write_x1 != 0u && args.write_x2 != 0u) {
+            const float2 gate_grad = gd_powlu_gate_and_grad(z, args.m);
+            dx1[i] = half(go * gate_grad.x);
+            dx2[i] = half(go * float(x1[i]) * gate_grad.y);
+        } else if (args.write_x1 != 0u) {
             dx1[i] = half(go * gd_powlu_gate(z, args.m));
-        }
-        if (args.write_x2 != 0u) {
+        } else if (args.write_x2 != 0u) {
             dx2[i] = half(go * float(x1[i]) * gd_powlu_gate_grad(z, args.m));
         }
     }
@@ -144,7 +178,8 @@ kernel void gd_powlu_split_backward_f16_kernel(device const uchar *x12buf [[buff
         const float x1 = float(x12[x1_index]);
         const float x2 = float(x12[x2_index]);
         const float go = float(grad[out_index]);
-        dx12[x1_index] = half(go * gd_powlu_gate(x2, args.m));
-        dx12[x2_index] = half(go * x1 * gd_powlu_gate_grad(x2, args.m));
+        const float2 gate_grad = gd_powlu_gate_and_grad(x2, args.m);
+        dx12[x1_index] = half(go * gate_grad.x);
+        dx12[x2_index] = half(go * x1 * gate_grad.y);
     }
 }

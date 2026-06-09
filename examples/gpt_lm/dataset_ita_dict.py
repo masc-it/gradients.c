@@ -41,11 +41,13 @@ from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_file_packed  # noqa
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 DEFAULT_CLEAN_DIR = Path("/Users/mascit/projects/DataFarmer/data/definizioni-clean")
-DEFAULT_ENRICHED_DIR = Path("/Users/mascit/projects/DataFarmer/data/definizioni-clean-enriched")
+DEFAULT_ENRICHED_DIR = Path(
+    "/Users/mascit/projects/DataFarmer/data/definizioni-clean-enriched"
+)
 DEFAULT_CONTEXT_LENGTH = 512
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_VAL_FRACTION = 0.05
-DEFAULT_MAX_EXAMPLES_PER_DEFINITION = 3
+DEFAULT_MAX_EXAMPLES_PER_DEFINITION = 0  # no limit
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
 DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v1"
 
@@ -162,7 +164,9 @@ def normalize_key(text: str) -> str:
 
 
 def iter_json_files(directory: Path) -> Iterable[Path]:
-    yield from sorted(path for path in directory.glob("*.json") if path.name != "status.json")
+    yield from sorted(
+        path for path in directory.glob("*.json") if path.name != "status.json"
+    )
 
 
 def parse_clean_file(path: Path) -> TermEntry | None:
@@ -176,13 +180,21 @@ def parse_clean_file(path: Path) -> TermEntry | None:
     if not term or not isinstance(raw_definitions, list):
         print(f"warning: skipping malformed clean entry {path}", file=sys.stderr)
         return None
-    definitions = [DefinitionEntry(definition=d) for d in map(normalize_space, raw_definitions) if d]
+    definitions = [
+        DefinitionEntry(definition=d)
+        for d in map(normalize_space, raw_definitions)
+        if d
+    ]
     if not definitions:
         return None
-    return TermEntry(term=term, definitions=definitions, source_ids={path.stem}, enriched=False)
+    return TermEntry(
+        term=term, definitions=definitions, source_ids={path.stem}, enriched=False
+    )
 
 
-def parse_enriched_file(path: Path, max_examples_per_definition: int) -> TermEntry | None:
+def parse_enriched_file(
+    path: Path, max_examples_per_definition: int
+) -> TermEntry | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -205,7 +217,9 @@ def parse_enriched_file(path: Path, max_examples_per_definition: int) -> TermEnt
             if isinstance(raw_examples, list):
                 for example in raw_examples:
                     normalized = normalize_space(example)
-                    if normalized and normalize_key(normalized) != normalize_key(definition):
+                    if normalized and normalize_key(normalized) != normalize_key(
+                        definition
+                    ):
                         examples.append(normalized)
         else:
             continue
@@ -219,7 +233,9 @@ def parse_enriched_file(path: Path, max_examples_per_definition: int) -> TermEnt
         )
     if not definitions:
         return None
-    return TermEntry(term=term, definitions=definitions, source_ids={path.stem}, enriched=True)
+    return TermEntry(
+        term=term, definitions=definitions, source_ids={path.stem}, enriched=True
+    )
 
 
 def dedupe_texts(texts: Iterable[str], *, max_items: int | None = None) -> list[str]:
@@ -239,16 +255,22 @@ def dedupe_texts(texts: Iterable[str], *, max_items: int | None = None) -> list[
     return out
 
 
-def merge_term_entry(target: TermEntry, source: TermEntry, max_examples_per_definition: int) -> None:
+def merge_term_entry(
+    target: TermEntry, source: TermEntry, max_examples_per_definition: int
+) -> None:
     target.source_ids.update(source.source_ids)
     target.enriched = target.enriched or source.enriched
-    by_definition = {normalize_key(defn.definition): defn for defn in target.definitions}
+    by_definition = {
+        normalize_key(defn.definition): defn for defn in target.definitions
+    }
     for defn in source.definitions:
         key = normalize_key(defn.definition)
         if key not in by_definition:
             copied = DefinitionEntry(
                 definition=defn.definition,
-                examples=dedupe_texts(defn.examples, max_items=max_examples_per_definition),
+                examples=dedupe_texts(
+                    defn.examples, max_items=max_examples_per_definition
+                ),
             )
             target.definitions.append(copied)
             by_definition[key] = copied
@@ -260,7 +282,9 @@ def merge_term_entry(target: TermEntry, source: TermEntry, max_examples_per_defi
         )
 
 
-def load_entries(clean_dir: Path, enriched_dir: Path, max_examples_per_definition: int) -> tuple[list[TermEntry], dict[str, int]]:
+def load_entries(
+    clean_dir: Path, enriched_dir: Path, max_examples_per_definition: int
+) -> tuple[list[TermEntry], dict[str, int]]:
     clean_by_id: dict[str, TermEntry] = {}
     enriched_by_id: dict[str, TermEntry] = {}
     for path in iter_json_files(clean_dir):
@@ -268,7 +292,9 @@ def load_entries(clean_dir: Path, enriched_dir: Path, max_examples_per_definitio
         if entry is not None:
             clean_by_id[path.stem] = entry
     for path in iter_json_files(enriched_dir):
-        entry = parse_enriched_file(path, max_examples_per_definition=max_examples_per_definition)
+        entry = parse_enriched_file(
+            path, max_examples_per_definition=max_examples_per_definition
+        )
         if entry is not None:
             enriched_by_id[path.stem] = entry
 
@@ -306,14 +332,13 @@ def load_entries(clean_dir: Path, enriched_dir: Path, max_examples_per_definitio
 
 
 def format_entry(entry: TermEntry) -> str:
-    lines = ["### Voce", f"Termine: {entry.term}", "Definizioni:"]
+    lines = [f"Termine: {entry.term}", "Definizioni:"]
     for i, definition in enumerate(entry.definitions, start=1):
         lines.append(f"{i}. {definition.definition}")
         if definition.examples:
             lines.append("   Esempi:")
             for example in definition.examples:
                 lines.append(f"   - {example}")
-    lines.append("### Fine voce")
     return "\n".join(lines)
 
 
@@ -321,7 +346,9 @@ def entry_chars(entry: TermEntry) -> int:
     return len(format_entry(entry))
 
 
-def split_entries(entries: Sequence[TermEntry], val_fraction: float, split_seed: int) -> tuple[list[TermEntry], list[TermEntry]]:
+def split_entries(
+    entries: Sequence[TermEntry], val_fraction: float, split_seed: int
+) -> tuple[list[TermEntry], list[TermEntry]]:
     if not entries:
         raise ValueError("no entries to split")
     if not (0.0 <= val_fraction < 1.0):
@@ -350,7 +377,9 @@ def split_entries(entries: Sequence[TermEntry], val_fraction: float, split_seed:
     return train, val
 
 
-def write_text_split(out_dir: Path, train_entries: Sequence[TermEntry], val_entries: Sequence[TermEntry]) -> CorpusSplit:
+def write_text_split(
+    out_dir: Path, train_entries: Sequence[TermEntry], val_entries: Sequence[TermEntry]
+) -> CorpusSplit:
     raw_dir = out_dir / "raw_ita_dict"
     ensure_clean_dir(raw_dir)
     train_path = raw_dir / "train.txt"
@@ -400,7 +429,11 @@ def prepare_tokenized_corpus(
         min_frequency=min_frequency,
         seed=17,
     )
-    action = "tokenized with existing tokenizer" if use_existing_tokenizer else "trained tokenizer"
+    action = (
+        "tokenized with existing tokenizer"
+        if use_existing_tokenizer
+        else "trained tokenizer"
+    )
     print(
         f"{split_name}: {action}: {summary['tokenizer']} "
         f"(records={summary['sequences']}, record_tokens={context_length + 1}, "
@@ -436,14 +469,23 @@ def write_gdds_dataset(
 ) -> dict[str, list[Path]]:
     if train_corpus.sequence_length is None or train_corpus.sequence_length < 3:
         raise ValueError("packed training corpus must have sequence_length >= 3")
-    if val_corpus is not None and val_corpus.sequence_length != train_corpus.sequence_length:
-        raise ValueError("train and validation corpora must use the same packed sequence length")
+    if (
+        val_corpus is not None
+        and val_corpus.sequence_length != train_corpus.sequence_length
+    ):
+        raise ValueError(
+            "train and validation corpora must use the same packed sequence length"
+        )
     context_length = train_corpus.sequence_length - 1
     fields = fields_for_context(context_length)
     remove_split_shards(out_dir, "train")
     remove_split_shards(out_dir, "val")
-    train_writer = GddsSplitWriter(out_dir, "train", fields, max_shard_bytes=max_shard_bytes)
-    val_writer = GddsSplitWriter(out_dir, "val", fields, max_shard_bytes=max_shard_bytes)
+    train_writer = GddsSplitWriter(
+        out_dir, "train", fields, max_shard_bytes=max_shard_bytes
+    )
+    val_writer = GddsSplitWriter(
+        out_dir, "val", fields, max_shard_bytes=max_shard_bytes
+    )
     try:
         for sample in iter_lm_samples(train_corpus):
             train_writer.write_sample(sample)
@@ -570,14 +612,23 @@ def write_manifest(
             "max_shard_bytes": max_shard_bytes,
         },
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+    )
     (out_dir / "split_terms.json").write_text(
-        json.dumps({"train": split.train_terms, "val": split.val_terms}, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(
+            {"train": split.train_terms, "val": split.val_terms},
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
 
-def read_gdds_lm_sample(shards: Sequence[Path], sample_index: int) -> tuple[np.ndarray, np.ndarray]:
+def read_gdds_lm_sample(
+    shards: Sequence[Path], sample_index: int
+) -> tuple[np.ndarray, np.ndarray]:
     remaining = sample_index
     for path in shards:
         header = read_gdds_header(path)
@@ -601,9 +652,17 @@ def read_gdds_lm_sample(shards: Sequence[Path], sample_index: int) -> tuple[np.n
             base = 20 + entry_index * 88
             field_id, rank, _flags = struct.unpack_from("<HHI", record, base)
             dims = struct.unpack_from("<8q", record, base + 8)[:rank]
-            payload_offset, payload_nbytes = struct.unpack_from("<QQ", record, base + 72)
-            data = record[header_nbytes + payload_offset : header_nbytes + payload_offset + payload_nbytes]
-            arrays[field_id] = np.frombuffer(data, dtype=TOKEN_DTYPE).reshape(dims).copy()
+            payload_offset, payload_nbytes = struct.unpack_from(
+                "<QQ", record, base + 72
+            )
+            data = record[
+                header_nbytes + payload_offset : header_nbytes
+                + payload_offset
+                + payload_nbytes
+            ]
+            arrays[field_id] = (
+                np.frombuffer(data, dtype=TOKEN_DTYPE).reshape(dims).copy()
+            )
         if 0 not in arrays:
             raise ValueError(f"missing input_ids in {path}")
         target_field_id = max(arrays)
@@ -613,7 +672,13 @@ def read_gdds_lm_sample(shards: Sequence[Path], sample_index: int) -> tuple[np.n
     raise IndexError(sample_index)
 
 
-def show_random_samples(shards: Sequence[Path], tokenizer_path: Path, total_samples: int, count: int, seed: int) -> None:
+def show_random_samples(
+    shards: Sequence[Path],
+    tokenizer_path: Path,
+    total_samples: int,
+    count: int,
+    seed: int,
+) -> None:
     if count <= 0 or total_samples <= 0:
         return
     decoder = TokenDecoder(tokenizer_path)
@@ -636,7 +701,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clean-dir", type=Path, default=DEFAULT_CLEAN_DIR)
     parser.add_argument("--enriched-dir", type=Path, default=DEFAULT_ENRICHED_DIR)
-    parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent / "data")
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path(__file__).resolve().parent / "data"
+    )
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--min-frequency", type=int, default=2)
@@ -663,7 +730,9 @@ def main() -> int:
     if args.context_length < 2:
         raise ValueError("--context-length must be >= 2")
     if args.vocab_size < 258:
-        raise ValueError("--vocab-size must be at least 258 for byte tokens plus two specials")
+        raise ValueError(
+            "--vocab-size must be at least 258 for byte tokens plus two specials"
+        )
     if args.min_frequency <= 0:
         raise ValueError("--min-frequency must be positive")
     if not (0.0 <= args.val_fraction < 1.0):
@@ -685,7 +754,9 @@ def main() -> int:
         f"clean_only_files={stats['clean_only_files']}"
     )
 
-    train_entries, val_entries = split_entries(entries, args.val_fraction, args.split_seed)
+    train_entries, val_entries = split_entries(
+        entries, args.val_fraction, args.split_seed
+    )
     ensure_clean_dir(args.out_dir)
     tokenizer_path = args.out_dir / f"tokenizer-v{args.vocab_size}.json"
     split = write_text_split(args.out_dir, train_entries, val_entries)
@@ -721,7 +792,9 @@ def main() -> int:
 
     expected_record_length = args.context_length + 1
     if train_corpus.sequence_length != expected_record_length:
-        raise ValueError(f"unexpected train sequence length {train_corpus.sequence_length}")
+        raise ValueError(
+            f"unexpected train sequence length {train_corpus.sequence_length}"
+        )
     if val_corpus is not None and val_corpus.sequence_length != expected_record_length:
         raise ValueError(f"unexpected val sequence length {val_corpus.sequence_length}")
 
@@ -749,10 +822,16 @@ def main() -> int:
         max_examples_per_definition=args.max_examples_per_definition,
     )
 
-    total_samples = sum(read_gdds_header(path).samples for split_paths in paths.values() for path in split_paths)
+    total_samples = sum(
+        read_gdds_header(path).samples
+        for split_paths in paths.values()
+        for path in split_paths
+    )
     train_samples = sum(read_gdds_header(path).samples for path in paths["train"])
     val_samples = sum(read_gdds_header(path).samples for path in paths.get("val", []))
-    print(f"Wrote {total_samples} GPT LM samples to {args.out_dir} (train={train_samples}, val={val_samples})")
+    print(
+        f"Wrote {total_samples} GPT LM samples to {args.out_dir} (train={train_samples}, val={val_samples})"
+    )
     for split_paths in paths.values():
         for path in split_paths:
             print(path)

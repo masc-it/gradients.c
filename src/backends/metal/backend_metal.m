@@ -4,6 +4,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,12 +99,183 @@ static gd_status gd_metal_make_pipeline(gd_backend *backend,
     return GD_OK;
 }
 
+typedef struct gd_metal_pipeline_spec {
+    const char *kernel_name;
+    size_t backend_field_offset;
+} gd_metal_pipeline_spec;
+
+#define GD_METAL_PIPELINE(kernel_, field_) \
+    { (kernel_), offsetof(gd_backend, field_) }
+#define GD_METAL_PIPELINE_INDEX(kernel_, array_, index_) \
+    { \
+        (kernel_), \
+        offsetof(gd_backend, array_) + \
+            ((size_t)(index_) * sizeof(((gd_backend *)0)->array_[0])) \
+    }
+
+static void **gd_metal_pipeline_slot(gd_backend *backend, size_t field_offset)
+{
+    if (backend == NULL) {
+        return NULL;
+    }
+    return (void **)((unsigned char *)backend + field_offset);
+}
+
+static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
+    GD_METAL_PIPELINE("gd_fill_kernel", fill_pso),
+    GD_METAL_PIPELINE("gd_rand_uniform_kernel", rand_uniform_pso),
+    GD_METAL_PIPELINE("gd_accumulate_kernel", accumulate_pso),
+    GD_METAL_PIPELINE("gd_scale_kernel", scale_pso),
+    GD_METAL_PIPELINE("gd_amp_unscale_kernel", amp_unscale_pso),
+    GD_METAL_PIPELINE("gd_grad_norm_stage_kernel", grad_norm_stage_pso),
+    GD_METAL_PIPELINE("gd_grad_clip_finalize_kernel", grad_clip_finalize_pso),
+    GD_METAL_PIPELINE("gd_binary_reduce_broadcast_kernel", binary_reduce_pso),
+    GD_METAL_PIPELINE("gd_binary_reduce_broadcast_suffix_kernel", binary_reduce_suffix_pso),
+    GD_METAL_PIPELINE("gd_mul_backward_direct_kernel", mul_backward_direct_pso),
+    GD_METAL_PIPELINE("gd_mul_reduce_suffix_kernel", mul_reduce_suffix_pso),
+    GD_METAL_PIPELINE("gd_mul_reduce_suffix_small_kernel", mul_reduce_suffix_small_pso),
+    GD_METAL_PIPELINE("gd_reduce_contiguous_f16_to_f16_kernel", reduce_contiguous_f16_to_f16_pso),
+    GD_METAL_PIPELINE("gd_reduce_contiguous_f16_to_f32_kernel", reduce_contiguous_f16_to_f32_pso),
+    GD_METAL_PIPELINE("gd_reduce_contiguous_f32_to_f32_kernel", reduce_contiguous_f32_to_f32_pso),
+    GD_METAL_PIPELINE("gd_reduce_contiguous_f32_to_f16_kernel", reduce_contiguous_f32_to_f16_pso),
+    GD_METAL_PIPELINE("gd_reduce_axis_f16_kernel", reduce_axis_f16_pso),
+    GD_METAL_PIPELINE("gd_reduce_axis_f32_kernel", reduce_axis_f32_pso),
+    GD_METAL_PIPELINE("gd_reduce_axis_last_f16_kernel", reduce_axis_last_f16_pso),
+    GD_METAL_PIPELINE("gd_reduce_axis_last_f32_kernel", reduce_axis_last_f32_pso),
+    GD_METAL_PIPELINE("gd_broadcast_axis_f16_kernel", broadcast_axis_f16_pso),
+    GD_METAL_PIPELINE("gd_broadcast_axis_f32_kernel", broadcast_axis_f32_pso),
+    GD_METAL_PIPELINE("gd_broadcast_axis_last_f16_kernel", broadcast_axis_last_f16_pso),
+    GD_METAL_PIPELINE("gd_broadcast_axis_last_f32_kernel", broadcast_axis_last_f32_pso),
+    GD_METAL_PIPELINE("gd_broadcast_to_f16_kernel", broadcast_to_f16_pso),
+    GD_METAL_PIPELINE("gd_broadcast_to_f32_kernel", broadcast_to_f32_pso),
+    GD_METAL_PIPELINE("gd_broadcast_scalar_f16_kernel", broadcast_scalar_f16_pso),
+    GD_METAL_PIPELINE("gd_broadcast_scalar_f32_kernel", broadcast_scalar_f32_pso),
+    GD_METAL_PIPELINE("gd_broadcast_scalar_f32_to_f16_kernel", broadcast_scalar_f32_to_f16_pso),
+    GD_METAL_PIPELINE("gd_cross_entropy_loss_f16_kernel", cross_entropy_loss_f16_pso),
+    GD_METAL_PIPELINE("gd_cross_entropy_loss_stats_f16_kernel", cross_entropy_loss_stats_f16_pso),
+    GD_METAL_PIPELINE("gd_cross_entropy_backward_f16_kernel", cross_entropy_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_cross_entropy_backward_stats_f16_kernel", cross_entropy_backward_stats_f16_pso),
+    GD_METAL_PIPELINE("gd_lm_cross_entropy_online_update_f16_kernel", lm_cross_entropy_online_update_f16_pso),
+    GD_METAL_PIPELINE("gd_lm_cross_entropy_finalize_f32_kernel", lm_cross_entropy_finalize_f32_pso),
+    GD_METAL_PIPELINE("gd_lm_cross_entropy_backward_chunk_f16_kernel", lm_cross_entropy_backward_chunk_f16_pso),
+    GD_METAL_PIPELINE("gd_mse_forward_f16_kernel", mse_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_mse_forward_f32_kernel", mse_forward_f32_pso),
+    GD_METAL_PIPELINE("gd_mse_backward_f16_kernel", mse_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_mse_backward_f32_kernel", mse_backward_f32_pso),
+    GD_METAL_PIPELINE("gd_huber_forward_f16_kernel", huber_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_huber_forward_f32_kernel", huber_forward_f32_pso),
+    GD_METAL_PIPELINE("gd_huber_backward_f16_kernel", huber_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_huber_backward_f32_kernel", huber_backward_f32_pso),
+    GD_METAL_PIPELINE("gd_powlu_forward_f16_kernel", powlu_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_powlu_backward_f16_kernel", powlu_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_powlu_split_forward_f16_kernel", powlu_split_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_powlu_split_backward_f16_kernel", powlu_split_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_powlu_split_linear_backward_x12_f16_reg_kernel", powlu_split_linear_backward_x12_f16_reg_pso),
+    GD_METAL_PIPELINE("gd_embedding_forward_f16_kernel", embedding_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_embedding_forward_f32_kernel", embedding_forward_f32_pso),
+    GD_METAL_PIPELINE("gd_embedding_forward_vec16_f16_kernel", embedding_forward_vec16_f16_pso),
+    GD_METAL_PIPELINE("gd_embedding_forward_vec16_f32_kernel", embedding_forward_vec16_f32_pso),
+    GD_METAL_PIPELINE("gd_embedding_zero_f32_kernel", embedding_zero_f32_pso),
+    GD_METAL_PIPELINE("gd_embedding_backward_scatter_f16_kernel", embedding_backward_scatter_f16_pso),
+    GD_METAL_PIPELINE("gd_embedding_backward_scatter_f32_kernel", embedding_backward_scatter_f32_pso),
+    GD_METAL_PIPELINE("gd_embedding_cast_f32_to_f16_kernel", embedding_cast_f32_to_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_forward_f16_kernel", rms_norm_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_forward_stats_f16_kernel", rms_norm_forward_stats_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_forward_f32_kernel", rms_norm_forward_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_forward_stats_f32_kernel", rms_norm_forward_stats_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_inv_f16_kernel", rms_norm_inv_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_inv_f32_kernel", rms_norm_inv_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_backward_f16_kernel", rms_norm_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_backward_stats_f16_kernel", rms_norm_backward_stats_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_backward_f32_kernel", rms_norm_backward_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_backward_stats_f32_kernel", rms_norm_backward_stats_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_stage_stats_f16_kernel", rms_norm_wgrad_stage_stats_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_stage_stats_f32_kernel", rms_norm_wgrad_stage_stats_f32_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_stage_stats_f16_rb128_kernel", rms_norm_wgrad_stage_stats_f16_rb128_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_stage_stats_f32_rb128_kernel", rms_norm_wgrad_stage_stats_f32_rb128_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_reduce_f16_kernel", rms_norm_wgrad_reduce_f16_pso),
+    GD_METAL_PIPELINE("gd_rms_norm_wgrad_reduce_f32_kernel", rms_norm_wgrad_reduce_f32_pso),
+    GD_METAL_PIPELINE("gd_concat_to_full_u8_kernel", concat_to_full_u8_pso),
+    GD_METAL_PIPELINE("gd_concat_to_full_u16_kernel", concat_to_full_u16_pso),
+    GD_METAL_PIPELINE("gd_concat_to_full_u32_kernel", concat_to_full_u32_pso),
+    GD_METAL_PIPELINE("gd_concat_from_full_u8_kernel", concat_from_full_u8_pso),
+    GD_METAL_PIPELINE("gd_concat_from_full_u16_kernel", concat_from_full_u16_pso),
+    GD_METAL_PIPELINE("gd_concat_from_full_u32_kernel", concat_from_full_u32_pso),
+    GD_METAL_PIPELINE("gd_split_from_full_u8_kernel", split_from_full_u8_pso),
+    GD_METAL_PIPELINE("gd_split_from_full_u16_kernel", split_from_full_u16_pso),
+    GD_METAL_PIPELINE("gd_split_from_full_u32_kernel", split_from_full_u32_pso),
+    GD_METAL_PIPELINE("gd_split_to_full_u8_kernel", split_to_full_u8_pso),
+    GD_METAL_PIPELINE("gd_split_to_full_u16_kernel", split_to_full_u16_pso),
+    GD_METAL_PIPELINE("gd_split_to_full_u32_kernel", split_to_full_u32_pso),
+    GD_METAL_PIPELINE("gd_split_from_full_vec16_kernel", split_from_full_vec16_pso),
+    GD_METAL_PIPELINE("gd_split_to_full_vec16_kernel", split_to_full_vec16_pso),
+    GD_METAL_PIPELINE("gd_permute_u8_kernel", permute_u8_pso),
+    GD_METAL_PIPELINE("gd_permute_u16_kernel", permute_u16_pso),
+    GD_METAL_PIPELINE("gd_permute_u32_kernel", permute_u32_pso),
+    GD_METAL_PIPELINE("gd_permute_block_u8_kernel", permute_block_u8_pso),
+    GD_METAL_PIPELINE("gd_permute_block_u16_kernel", permute_block_u16_pso),
+    GD_METAL_PIPELINE("gd_permute_block_u32_kernel", permute_block_u32_pso),
+    GD_METAL_PIPELINE("gd_permute_suffix16_kernel", permute_suffix16_pso),
+    GD_METAL_PIPELINE("gd_permute_hwc_to_chw_u8_kernel", permute_hwc_to_chw_u8_pso),
+    GD_METAL_PIPELINE("gd_permute_hwc_to_chw_u16_kernel", permute_hwc_to_chw_u16_pso),
+    GD_METAL_PIPELINE("gd_permute_hwc_to_chw_u32_kernel", permute_hwc_to_chw_u32_pso),
+    GD_METAL_PIPELINE("gd_permute_chw_to_hwc_u8_kernel", permute_chw_to_hwc_u8_pso),
+    GD_METAL_PIPELINE("gd_permute_chw_to_hwc_u16_kernel", permute_chw_to_hwc_u16_pso),
+    GD_METAL_PIPELINE("gd_permute_chw_to_hwc_u32_kernel", permute_chw_to_hwc_u32_pso),
+    GD_METAL_PIPELINE("gd_permute_transpose_u8_kernel", permute_transpose_u8_pso),
+    GD_METAL_PIPELINE("gd_permute_transpose_u16_kernel", permute_transpose_u16_pso),
+    GD_METAL_PIPELINE("gd_permute_transpose_u32_kernel", permute_transpose_u32_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_kernel", sdpa_varlen_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel", sdpa_varlen_prefix_window_dh64_f16_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_stats_kernel", sdpa_varlen_bwd_stats_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_kernel", sdpa_varlen_bwd_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_kernel", sdpa_varlen_bwd_dkv_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel", sdpa_varlen_bwd_stats_dq_dh64_f16_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel", sdpa_varlen_bwd_dkv_dh64_f16_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel", sdpa_varlen_bwd_dkv_split_dh64_f16_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_reduce_f16_kernel", sdpa_varlen_bwd_dkv_reduce_f16_pso),
+    GD_METAL_PIPELINE("gd_sdpa_decode_kernel", sdpa_decode_pso),
+    GD_METAL_PIPELINE("gd_kv_cache_append_kernel", kv_cache_append_pso),
+    GD_METAL_PIPELINE("gd_kv_cache_append_packed_kernel", kv_cache_append_packed_pso),
+    GD_METAL_PIPELINE("gd_adamw_kernel", adamw_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_tiled", matmul_pso),
+    GD_METAL_PIPELINE("gd_linear_f16_tiled", linear_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_reg", matmul_reg_pso),
+    GD_METAL_PIPELINE("gd_linear_f16_reg", linear_reg_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_nt_tiled", matmul_nt_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_tn_tiled", matmul_tn_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_nt_reg", matmul_nt_reg_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_tn_reg", matmul_tn_reg_pso),
+    GD_METAL_PIPELINE("gd_matmul_f16_tn_split8", matmul_tn_split8_pso),
+    GD_METAL_PIPELINE("gd_reduce_rows_f16", reduce_rows_pso),
+#include "metal_ops_generated.inc"
+    GD_METAL_PIPELINE("gd_sigmoid_f32_kernel", sigmoid_f32_pso),
+    GD_METAL_PIPELINE("gd_sigmoid_backward_f32_kernel", sigmoid_backward_f32_pso),
+    GD_METAL_PIPELINE("gd_sigmoid_backward_saved_f16_kernel", sigmoid_backward_saved_f16_pso),
+    GD_METAL_PIPELINE("gd_sigmoid_backward_saved_f32_kernel", sigmoid_backward_saved_f32_pso),
+    GD_METAL_PIPELINE("gd_dropout_forward_f16_kernel", dropout_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_dropout_forward_f32_kernel", dropout_forward_f32_pso),
+    GD_METAL_PIPELINE("gd_dropout_add_forward_f16_kernel", dropout_add_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_dropout_backward_recompute_f16_kernel", dropout_backward_recompute_f16_pso),
+    GD_METAL_PIPELINE("gd_dropout_backward_recompute_f32_kernel", dropout_backward_recompute_f32_pso),
+    GD_METAL_PIPELINE("gd_dropout_backward_mask_f16_kernel", dropout_backward_mask_f16_pso),
+    GD_METAL_PIPELINE("gd_dropout_backward_mask_f32_kernel", dropout_backward_mask_f32_pso),
+    GD_METAL_PIPELINE("gd_rope_f16_kernel", rope_f16_pso),
+    GD_METAL_PIPELINE("gd_rope_f32_kernel", rope_f32_pso),
+    GD_METAL_PIPELINE("gd_rope_full_f16_kernel", rope_full_f16_pso),
+    GD_METAL_PIPELINE("gd_rope_full_f32_kernel", rope_full_f32_pso),
+    GD_METAL_PIPELINE("gd_rope_backward_f16_kernel", rope_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_rope_backward_f32_kernel", rope_backward_f32_pso),
+    GD_METAL_PIPELINE("gd_qkv_split_rope_forward_f16_kernel", qkv_split_rope_forward_f16_pso),
+    GD_METAL_PIPELINE("gd_qkv_split_rope_backward_f16_kernel", qkv_split_rope_backward_f16_pso),
+};
+
 static gd_status gd_metal_make_pipelines(gd_backend *backend)
 {
     NSError *error = nil;
     NSURL *url;
     id<MTLLibrary> library;
-    gd_status st;
+    size_t i;
     if (backend == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -115,589 +287,15 @@ static gd_status gd_metal_make_pipelines(gd_backend *backend)
     if (library == nil) {
         return GD_ERR_UNSUPPORTED;
     }
-    st = gd_metal_make_pipeline(backend, library, "gd_fill_kernel", &backend->fill_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rand_uniform_kernel", &backend->rand_uniform_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_accumulate_kernel", &backend->accumulate_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_scale_kernel", &backend->scale_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_amp_unscale_kernel", &backend->amp_unscale_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_grad_norm_stage_kernel", &backend->grad_norm_stage_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_grad_clip_finalize_kernel", &backend->grad_clip_finalize_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_binary_reduce_broadcast_kernel", &backend->binary_reduce_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_binary_reduce_broadcast_suffix_kernel", &backend->binary_reduce_suffix_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mul_backward_direct_kernel", &backend->mul_backward_direct_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mul_reduce_suffix_kernel", &backend->mul_reduce_suffix_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mul_reduce_suffix_small_kernel", &backend->mul_reduce_suffix_small_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_contiguous_f16_to_f16_kernel", &backend->reduce_contiguous_f16_to_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_contiguous_f16_to_f32_kernel", &backend->reduce_contiguous_f16_to_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_contiguous_f32_to_f32_kernel", &backend->reduce_contiguous_f32_to_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_contiguous_f32_to_f16_kernel", &backend->reduce_contiguous_f32_to_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_axis_f16_kernel", &backend->reduce_axis_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_axis_f32_kernel", &backend->reduce_axis_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_axis_last_f16_kernel", &backend->reduce_axis_last_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_axis_last_f32_kernel", &backend->reduce_axis_last_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_axis_f16_kernel", &backend->broadcast_axis_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_axis_f32_kernel", &backend->broadcast_axis_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_axis_last_f16_kernel", &backend->broadcast_axis_last_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_axis_last_f32_kernel", &backend->broadcast_axis_last_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_to_f16_kernel", &backend->broadcast_to_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_to_f32_kernel", &backend->broadcast_to_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_scalar_f16_kernel", &backend->broadcast_scalar_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_scalar_f32_kernel", &backend->broadcast_scalar_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_broadcast_scalar_f32_to_f16_kernel", &backend->broadcast_scalar_f32_to_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_loss_f16_kernel", &backend->cross_entropy_loss_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_loss_stats_f16_kernel", &backend->cross_entropy_loss_stats_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_backward_f16_kernel", &backend->cross_entropy_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_cross_entropy_backward_stats_f16_kernel", &backend->cross_entropy_backward_stats_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_lm_cross_entropy_online_update_f16_kernel", &backend->lm_cross_entropy_online_update_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_lm_cross_entropy_finalize_f32_kernel", &backend->lm_cross_entropy_finalize_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_lm_cross_entropy_backward_chunk_f16_kernel", &backend->lm_cross_entropy_backward_chunk_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mse_forward_f16_kernel", &backend->mse_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mse_forward_f32_kernel", &backend->mse_forward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mse_backward_f16_kernel", &backend->mse_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_mse_backward_f32_kernel", &backend->mse_backward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_huber_forward_f16_kernel", &backend->huber_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_huber_forward_f32_kernel", &backend->huber_forward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_huber_backward_f16_kernel", &backend->huber_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_huber_backward_f32_kernel", &backend->huber_backward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_powlu_forward_f16_kernel", &backend->powlu_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_powlu_backward_f16_kernel", &backend->powlu_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_powlu_split_forward_f16_kernel", &backend->powlu_split_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_powlu_split_backward_f16_kernel", &backend->powlu_split_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend,
-                                library,
-                                "gd_powlu_split_linear_backward_x12_f16_reg_kernel",
-                                &backend->powlu_split_linear_backward_x12_f16_reg_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_f16_kernel", &backend->embedding_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_f32_kernel", &backend->embedding_forward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_vec16_f16_kernel", &backend->embedding_forward_vec16_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_forward_vec16_f32_kernel", &backend->embedding_forward_vec16_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_zero_f32_kernel", &backend->embedding_zero_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_backward_scatter_f16_kernel", &backend->embedding_backward_scatter_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_backward_scatter_f32_kernel", &backend->embedding_backward_scatter_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_embedding_cast_f32_to_f16_kernel", &backend->embedding_cast_f32_to_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_forward_f16_kernel", &backend->rms_norm_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_forward_stats_f16_kernel", &backend->rms_norm_forward_stats_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_forward_f32_kernel", &backend->rms_norm_forward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_forward_stats_f32_kernel", &backend->rms_norm_forward_stats_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_inv_f16_kernel", &backend->rms_norm_inv_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_inv_f32_kernel", &backend->rms_norm_inv_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_backward_f16_kernel", &backend->rms_norm_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_backward_stats_f16_kernel", &backend->rms_norm_backward_stats_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_backward_f32_kernel", &backend->rms_norm_backward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_backward_stats_f32_kernel", &backend->rms_norm_backward_stats_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f16_kernel", &backend->rms_norm_wgrad_stage_stats_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f32_kernel", &backend->rms_norm_wgrad_stage_stats_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f16_rb128_kernel", &backend->rms_norm_wgrad_stage_stats_f16_rb128_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_stage_stats_f32_rb128_kernel", &backend->rms_norm_wgrad_stage_stats_f32_rb128_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_reduce_f16_kernel", &backend->rms_norm_wgrad_reduce_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rms_norm_wgrad_reduce_f32_kernel", &backend->rms_norm_wgrad_reduce_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u8_kernel", &backend->concat_to_full_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u16_kernel", &backend->concat_to_full_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_to_full_u32_kernel", &backend->concat_to_full_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u8_kernel", &backend->concat_from_full_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u16_kernel", &backend->concat_from_full_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_concat_from_full_u32_kernel", &backend->concat_from_full_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u8_kernel", &backend->split_from_full_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u16_kernel", &backend->split_from_full_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_u32_kernel", &backend->split_from_full_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u8_kernel", &backend->split_to_full_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u16_kernel", &backend->split_to_full_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_u32_kernel", &backend->split_to_full_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_from_full_vec16_kernel", &backend->split_from_full_vec16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_split_to_full_vec16_kernel", &backend->split_to_full_vec16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_u8_kernel", &backend->permute_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_u16_kernel", &backend->permute_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_u32_kernel", &backend->permute_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u8_kernel", &backend->permute_block_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u16_kernel", &backend->permute_block_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_block_u32_kernel", &backend->permute_block_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_suffix16_kernel", &backend->permute_suffix16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u8_kernel", &backend->permute_hwc_to_chw_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u16_kernel", &backend->permute_hwc_to_chw_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_hwc_to_chw_u32_kernel", &backend->permute_hwc_to_chw_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u8_kernel", &backend->permute_chw_to_hwc_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u16_kernel", &backend->permute_chw_to_hwc_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_chw_to_hwc_u32_kernel", &backend->permute_chw_to_hwc_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u8_kernel", &backend->permute_transpose_u8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u16_kernel", &backend->permute_transpose_u16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_permute_transpose_u32_kernel", &backend->permute_transpose_u32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_kernel", &backend->sdpa_varlen_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel", &backend->sdpa_varlen_prefix_window_dh64_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_stats_kernel", &backend->sdpa_varlen_bwd_stats_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_kernel", &backend->sdpa_varlen_bwd_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_kernel", &backend->sdpa_varlen_bwd_dkv_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel", &backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel", &backend->sdpa_varlen_bwd_dkv_dh64_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel", &backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_varlen_bwd_dkv_reduce_f16_kernel", &backend->sdpa_varlen_bwd_dkv_reduce_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sdpa_decode_kernel", &backend->sdpa_decode_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_kv_cache_append_kernel", &backend->kv_cache_append_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_kv_cache_append_packed_kernel", &backend->kv_cache_append_packed_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_adamw_kernel", &backend->adamw_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tiled", &backend->matmul_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_linear_f16_tiled", &backend->linear_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_reg", &backend->matmul_reg_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_linear_f16_reg", &backend->linear_reg_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_nt_tiled", &backend->matmul_nt_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_tiled", &backend->matmul_tn_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_nt_reg", &backend->matmul_nt_reg_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_reg", &backend->matmul_tn_reg_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_matmul_f16_tn_split8", &backend->matmul_tn_split8_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_reduce_rows_f16", &backend->reduce_rows_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-#include "metal_ops_generated.inc"
-    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_f32_kernel", &backend->sigmoid_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_f32_kernel", &backend->sigmoid_backward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_saved_f16_kernel", &backend->sigmoid_backward_saved_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_sigmoid_backward_saved_f32_kernel", &backend->sigmoid_backward_saved_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_forward_f16_kernel", &backend->dropout_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_forward_f32_kernel", &backend->dropout_forward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_add_forward_f16_kernel", &backend->dropout_add_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_backward_recompute_f16_kernel", &backend->dropout_backward_recompute_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_backward_recompute_f32_kernel", &backend->dropout_backward_recompute_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_backward_mask_f16_kernel", &backend->dropout_backward_mask_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_dropout_backward_mask_f32_kernel", &backend->dropout_backward_mask_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_f16_kernel", &backend->rope_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_f32_kernel", &backend->rope_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_full_f16_kernel", &backend->rope_full_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_full_f32_kernel", &backend->rope_full_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_backward_f16_kernel", &backend->rope_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_rope_backward_f32_kernel", &backend->rope_backward_f32_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_qkv_split_rope_forward_f16_kernel", &backend->qkv_split_rope_forward_f16_pso);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_metal_make_pipeline(backend, library, "gd_qkv_split_rope_backward_f16_kernel", &backend->qkv_split_rope_backward_f16_pso);
-    if (st != GD_OK) {
-        return st;
+    for (i = 0U; i < sizeof(gd_metal_pipeline_specs) / sizeof(gd_metal_pipeline_specs[0]); ++i) {
+        gd_status st = gd_metal_make_pipeline(
+            backend,
+            library,
+            gd_metal_pipeline_specs[i].kernel_name,
+            gd_metal_pipeline_slot(backend, gd_metal_pipeline_specs[i].backend_field_offset));
+        if (st != GD_OK) {
+            return st;
+        }
     }
     return GD_OK;
 }
@@ -791,476 +389,36 @@ gd_status gd_backend_create_default(gd_backend **out_backend)
     return GD_OK;
 }
 
-void gd_backend_destroy(gd_backend *backend)
+static void gd_metal_release_retained(void **object)
 {
-    uint32_t i;
+    if (object != NULL && *object != NULL) {
+        CFRelease(*object);
+        *object = NULL;
+    }
+}
+
+static void gd_metal_release_pipelines(gd_backend *backend)
+{
+    size_t i;
     if (backend == NULL) {
         return;
     }
-    if (backend->active_command_buffer != NULL) {
-        CFRelease(backend->active_command_buffer);
-    }
-    if (backend->adamw_pso != NULL) {
-        CFRelease(backend->adamw_pso);
-    }
-    if (backend->sdpa_decode_pso != NULL) {
-        CFRelease(backend->sdpa_decode_pso);
-    }
-    if (backend->kv_cache_append_pso != NULL) {
-        CFRelease(backend->kv_cache_append_pso);
-    }
-    if (backend->kv_cache_append_packed_pso != NULL) {
-        CFRelease(backend->kv_cache_append_packed_pso);
-    }
-    if (backend->sdpa_varlen_bwd_dkv_reduce_f16_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_dkv_reduce_f16_pso);
-    }
-    if (backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_dkv_split_dh64_f16_pso);
-    }
-    if (backend->sdpa_varlen_bwd_dkv_dh64_f16_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_dkv_dh64_f16_pso);
-    }
-    if (backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso);
-    }
-    if (backend->sdpa_varlen_bwd_dkv_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_dkv_pso);
-    }
-    if (backend->sdpa_varlen_bwd_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_pso);
-    }
-    if (backend->sdpa_varlen_bwd_stats_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_bwd_stats_pso);
-    }
-    if (backend->sdpa_varlen_prefix_window_dh64_f16_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_prefix_window_dh64_f16_pso);
-    }
-    if (backend->sdpa_varlen_pso != NULL) {
-        CFRelease(backend->sdpa_varlen_pso);
-    }
-    if (backend->permute_transpose_u32_pso != NULL) {
-        CFRelease(backend->permute_transpose_u32_pso);
-    }
-    if (backend->permute_transpose_u16_pso != NULL) {
-        CFRelease(backend->permute_transpose_u16_pso);
-    }
-    if (backend->permute_transpose_u8_pso != NULL) {
-        CFRelease(backend->permute_transpose_u8_pso);
-    }
-    if (backend->permute_chw_to_hwc_u32_pso != NULL) {
-        CFRelease(backend->permute_chw_to_hwc_u32_pso);
-    }
-    if (backend->permute_chw_to_hwc_u16_pso != NULL) {
-        CFRelease(backend->permute_chw_to_hwc_u16_pso);
-    }
-    if (backend->permute_chw_to_hwc_u8_pso != NULL) {
-        CFRelease(backend->permute_chw_to_hwc_u8_pso);
-    }
-    if (backend->permute_hwc_to_chw_u32_pso != NULL) {
-        CFRelease(backend->permute_hwc_to_chw_u32_pso);
-    }
-    if (backend->permute_hwc_to_chw_u16_pso != NULL) {
-        CFRelease(backend->permute_hwc_to_chw_u16_pso);
-    }
-    if (backend->permute_hwc_to_chw_u8_pso != NULL) {
-        CFRelease(backend->permute_hwc_to_chw_u8_pso);
-    }
-    if (backend->permute_suffix16_pso != NULL) {
-        CFRelease(backend->permute_suffix16_pso);
-    }
-    if (backend->permute_block_u32_pso != NULL) {
-        CFRelease(backend->permute_block_u32_pso);
-    }
-    if (backend->permute_block_u16_pso != NULL) {
-        CFRelease(backend->permute_block_u16_pso);
-    }
-    if (backend->permute_block_u8_pso != NULL) {
-        CFRelease(backend->permute_block_u8_pso);
-    }
-    if (backend->permute_u32_pso != NULL) {
-        CFRelease(backend->permute_u32_pso);
-    }
-    if (backend->permute_u16_pso != NULL) {
-        CFRelease(backend->permute_u16_pso);
-    }
-    if (backend->permute_u8_pso != NULL) {
-        CFRelease(backend->permute_u8_pso);
-    }
-    if (backend->concat_from_full_u32_pso != NULL) {
-        CFRelease(backend->concat_from_full_u32_pso);
-    }
-    if (backend->concat_from_full_u16_pso != NULL) {
-        CFRelease(backend->concat_from_full_u16_pso);
-    }
-    if (backend->concat_from_full_u8_pso != NULL) {
-        CFRelease(backend->concat_from_full_u8_pso);
-    }
-    if (backend->split_to_full_vec16_pso != NULL) {
-        CFRelease(backend->split_to_full_vec16_pso);
-    }
-    if (backend->split_from_full_vec16_pso != NULL) {
-        CFRelease(backend->split_from_full_vec16_pso);
-    }
-    if (backend->split_to_full_u32_pso != NULL) {
-        CFRelease(backend->split_to_full_u32_pso);
-    }
-    if (backend->split_to_full_u16_pso != NULL) {
-        CFRelease(backend->split_to_full_u16_pso);
-    }
-    if (backend->split_to_full_u8_pso != NULL) {
-        CFRelease(backend->split_to_full_u8_pso);
-    }
-    if (backend->split_from_full_u32_pso != NULL) {
-        CFRelease(backend->split_from_full_u32_pso);
-    }
-    if (backend->split_from_full_u16_pso != NULL) {
-        CFRelease(backend->split_from_full_u16_pso);
-    }
-    if (backend->split_from_full_u8_pso != NULL) {
-        CFRelease(backend->split_from_full_u8_pso);
-    }
-    if (backend->concat_to_full_u32_pso != NULL) {
-        CFRelease(backend->concat_to_full_u32_pso);
-    }
-    if (backend->concat_to_full_u16_pso != NULL) {
-        CFRelease(backend->concat_to_full_u16_pso);
-    }
-    if (backend->concat_to_full_u8_pso != NULL) {
-        CFRelease(backend->concat_to_full_u8_pso);
-    }
-    if (backend->qkv_split_rope_backward_f16_pso != NULL) {
-        CFRelease(backend->qkv_split_rope_backward_f16_pso);
-    }
-    if (backend->qkv_split_rope_forward_f16_pso != NULL) {
-        CFRelease(backend->qkv_split_rope_forward_f16_pso);
-    }
-    if (backend->rope_backward_f32_pso != NULL) {
-        CFRelease(backend->rope_backward_f32_pso);
-    }
-    if (backend->rope_backward_f16_pso != NULL) {
-        CFRelease(backend->rope_backward_f16_pso);
-    }
-    if (backend->rope_full_f32_pso != NULL) {
-        CFRelease(backend->rope_full_f32_pso);
-    }
-    if (backend->rope_full_f16_pso != NULL) {
-        CFRelease(backend->rope_full_f16_pso);
-    }
-    if (backend->rope_f32_pso != NULL) {
-        CFRelease(backend->rope_f32_pso);
-    }
-    if (backend->rope_f16_pso != NULL) {
-        CFRelease(backend->rope_f16_pso);
-    }
-    if (backend->dropout_backward_mask_f32_pso != NULL) {
-        CFRelease(backend->dropout_backward_mask_f32_pso);
-    }
-    if (backend->dropout_backward_mask_f16_pso != NULL) {
-        CFRelease(backend->dropout_backward_mask_f16_pso);
-    }
-    if (backend->dropout_backward_recompute_f32_pso != NULL) {
-        CFRelease(backend->dropout_backward_recompute_f32_pso);
-    }
-    if (backend->dropout_backward_recompute_f16_pso != NULL) {
-        CFRelease(backend->dropout_backward_recompute_f16_pso);
-    }
-    if (backend->dropout_add_forward_f16_pso != NULL) {
-        CFRelease(backend->dropout_add_forward_f16_pso);
-    }
-    if (backend->dropout_forward_f32_pso != NULL) {
-        CFRelease(backend->dropout_forward_f32_pso);
-    }
-    if (backend->dropout_forward_f16_pso != NULL) {
-        CFRelease(backend->dropout_forward_f16_pso);
-    }
-    if (backend->sigmoid_backward_saved_f32_pso != NULL) {
-        CFRelease(backend->sigmoid_backward_saved_f32_pso);
-    }
-    if (backend->sigmoid_backward_saved_f16_pso != NULL) {
-        CFRelease(backend->sigmoid_backward_saved_f16_pso);
-    }
-    if (backend->sigmoid_backward_f32_pso != NULL) {
-        CFRelease(backend->sigmoid_backward_f32_pso);
-    }
-    if (backend->sigmoid_f32_pso != NULL) {
-        CFRelease(backend->sigmoid_f32_pso);
-    }
-    if (backend->lm_cross_entropy_backward_chunk_f16_pso != NULL) {
-        CFRelease(backend->lm_cross_entropy_backward_chunk_f16_pso);
-    }
-    if (backend->lm_cross_entropy_finalize_f32_pso != NULL) {
-        CFRelease(backend->lm_cross_entropy_finalize_f32_pso);
-    }
-    if (backend->lm_cross_entropy_online_update_f16_pso != NULL) {
-        CFRelease(backend->lm_cross_entropy_online_update_f16_pso);
-    }
-    if (backend->cross_entropy_backward_stats_f16_pso != NULL) {
-        CFRelease(backend->cross_entropy_backward_stats_f16_pso);
-    }
-    if (backend->cross_entropy_backward_f16_pso != NULL) {
-        CFRelease(backend->cross_entropy_backward_f16_pso);
-    }
-    if (backend->cross_entropy_loss_stats_f16_pso != NULL) {
-        CFRelease(backend->cross_entropy_loss_stats_f16_pso);
-    }
-    if (backend->cross_entropy_loss_f16_pso != NULL) {
-        CFRelease(backend->cross_entropy_loss_f16_pso);
-    }
-    if (backend->mse_backward_f32_pso != NULL) {
-        CFRelease(backend->mse_backward_f32_pso);
-    }
-    if (backend->mse_backward_f16_pso != NULL) {
-        CFRelease(backend->mse_backward_f16_pso);
-    }
-    if (backend->mse_forward_f32_pso != NULL) {
-        CFRelease(backend->mse_forward_f32_pso);
-    }
-    if (backend->mse_forward_f16_pso != NULL) {
-        CFRelease(backend->mse_forward_f16_pso);
-    }
-    if (backend->embedding_cast_f32_to_f16_pso != NULL) {
-        CFRelease(backend->embedding_cast_f32_to_f16_pso);
-    }
-    if (backend->embedding_backward_scatter_f32_pso != NULL) {
-        CFRelease(backend->embedding_backward_scatter_f32_pso);
-    }
-    if (backend->embedding_backward_scatter_f16_pso != NULL) {
-        CFRelease(backend->embedding_backward_scatter_f16_pso);
-    }
-    if (backend->embedding_zero_f32_pso != NULL) {
-        CFRelease(backend->embedding_zero_f32_pso);
-    }
-    if (backend->embedding_forward_vec16_f32_pso != NULL) {
-        CFRelease(backend->embedding_forward_vec16_f32_pso);
-    }
-    if (backend->embedding_forward_vec16_f16_pso != NULL) {
-        CFRelease(backend->embedding_forward_vec16_f16_pso);
-    }
-    if (backend->embedding_forward_f32_pso != NULL) {
-        CFRelease(backend->embedding_forward_f32_pso);
-    }
-    if (backend->embedding_forward_f16_pso != NULL) {
-        CFRelease(backend->embedding_forward_f16_pso);
-    }
-    if (backend->rms_norm_wgrad_reduce_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_reduce_f32_pso);
-    }
-    if (backend->rms_norm_wgrad_reduce_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_reduce_f16_pso);
-    }
-    if (backend->rms_norm_wgrad_stage_stats_f32_rb128_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_stage_stats_f32_rb128_pso);
-    }
-    if (backend->rms_norm_wgrad_stage_stats_f16_rb128_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_stage_stats_f16_rb128_pso);
-    }
-    if (backend->rms_norm_wgrad_stage_stats_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_stage_stats_f32_pso);
-    }
-    if (backend->rms_norm_wgrad_stage_stats_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_wgrad_stage_stats_f16_pso);
-    }
-    if (backend->rms_norm_backward_stats_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_backward_stats_f32_pso);
-    }
-    if (backend->rms_norm_backward_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_backward_f32_pso);
-    }
-    if (backend->rms_norm_backward_stats_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_backward_stats_f16_pso);
-    }
-    if (backend->rms_norm_backward_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_backward_f16_pso);
-    }
-    if (backend->rms_norm_inv_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_inv_f32_pso);
-    }
-    if (backend->rms_norm_inv_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_inv_f16_pso);
-    }
-    if (backend->rms_norm_forward_stats_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_forward_stats_f32_pso);
-    }
-    if (backend->rms_norm_forward_f32_pso != NULL) {
-        CFRelease(backend->rms_norm_forward_f32_pso);
-    }
-    if (backend->rms_norm_forward_stats_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_forward_stats_f16_pso);
-    }
-    if (backend->rms_norm_forward_f16_pso != NULL) {
-        CFRelease(backend->rms_norm_forward_f16_pso);
-    }
-    if (backend->huber_backward_f32_pso != NULL) {
-        CFRelease(backend->huber_backward_f32_pso);
-    }
-    if (backend->huber_backward_f16_pso != NULL) {
-        CFRelease(backend->huber_backward_f16_pso);
-    }
-    if (backend->huber_forward_f32_pso != NULL) {
-        CFRelease(backend->huber_forward_f32_pso);
-    }
-    if (backend->huber_forward_f16_pso != NULL) {
-        CFRelease(backend->huber_forward_f16_pso);
-    }
-    if (backend->powlu_split_linear_backward_x12_f16_reg_pso != NULL) {
-        CFRelease(backend->powlu_split_linear_backward_x12_f16_reg_pso);
-    }
-    if (backend->powlu_split_backward_f16_pso != NULL) {
-        CFRelease(backend->powlu_split_backward_f16_pso);
-    }
-    if (backend->powlu_split_forward_f16_pso != NULL) {
-        CFRelease(backend->powlu_split_forward_f16_pso);
-    }
-    if (backend->powlu_backward_f16_pso != NULL) {
-        CFRelease(backend->powlu_backward_f16_pso);
-    }
-    if (backend->powlu_forward_f16_pso != NULL) {
-        CFRelease(backend->powlu_forward_f16_pso);
-    }
-    if (backend->broadcast_scalar_f32_to_f16_pso != NULL) {
-        CFRelease(backend->broadcast_scalar_f32_to_f16_pso);
-    }
-    if (backend->broadcast_scalar_f32_pso != NULL) {
-        CFRelease(backend->broadcast_scalar_f32_pso);
-    }
-    if (backend->broadcast_scalar_f16_pso != NULL) {
-        CFRelease(backend->broadcast_scalar_f16_pso);
-    }
-    if (backend->broadcast_to_f32_pso != NULL) {
-        CFRelease(backend->broadcast_to_f32_pso);
-    }
-    if (backend->broadcast_to_f16_pso != NULL) {
-        CFRelease(backend->broadcast_to_f16_pso);
-    }
-    if (backend->broadcast_axis_last_f32_pso != NULL) {
-        CFRelease(backend->broadcast_axis_last_f32_pso);
-    }
-    if (backend->broadcast_axis_last_f16_pso != NULL) {
-        CFRelease(backend->broadcast_axis_last_f16_pso);
-    }
-    if (backend->broadcast_axis_f32_pso != NULL) {
-        CFRelease(backend->broadcast_axis_f32_pso);
-    }
-    if (backend->broadcast_axis_f16_pso != NULL) {
-        CFRelease(backend->broadcast_axis_f16_pso);
-    }
-    if (backend->reduce_axis_last_f32_pso != NULL) {
-        CFRelease(backend->reduce_axis_last_f32_pso);
-    }
-    if (backend->reduce_axis_last_f16_pso != NULL) {
-        CFRelease(backend->reduce_axis_last_f16_pso);
-    }
-    if (backend->reduce_axis_f32_pso != NULL) {
-        CFRelease(backend->reduce_axis_f32_pso);
-    }
-    if (backend->reduce_axis_f16_pso != NULL) {
-        CFRelease(backend->reduce_axis_f16_pso);
-    }
-    if (backend->reduce_contiguous_f32_to_f16_pso != NULL) {
-        CFRelease(backend->reduce_contiguous_f32_to_f16_pso);
-    }
-    if (backend->reduce_contiguous_f32_to_f32_pso != NULL) {
-        CFRelease(backend->reduce_contiguous_f32_to_f32_pso);
-    }
-    if (backend->reduce_contiguous_f16_to_f32_pso != NULL) {
-        CFRelease(backend->reduce_contiguous_f16_to_f32_pso);
-    }
-    if (backend->reduce_contiguous_f16_to_f16_pso != NULL) {
-        CFRelease(backend->reduce_contiguous_f16_to_f16_pso);
-    }
-    if (backend->mul_reduce_suffix_small_pso != NULL) {
-        CFRelease(backend->mul_reduce_suffix_small_pso);
-    }
-    if (backend->mul_reduce_suffix_pso != NULL) {
-        CFRelease(backend->mul_reduce_suffix_pso);
-    }
-    if (backend->mul_backward_direct_pso != NULL) {
-        CFRelease(backend->mul_backward_direct_pso);
-    }
-    if (backend->binary_reduce_suffix_pso != NULL) {
-        CFRelease(backend->binary_reduce_suffix_pso);
-    }
-    if (backend->binary_reduce_pso != NULL) {
-        CFRelease(backend->binary_reduce_pso);
-    }
-    if (backend->grad_clip_finalize_pso != NULL) {
-        CFRelease(backend->grad_clip_finalize_pso);
-    }
-    if (backend->grad_norm_stage_pso != NULL) {
-        CFRelease(backend->grad_norm_stage_pso);
-    }
-    if (backend->amp_unscale_pso != NULL) {
-        CFRelease(backend->amp_unscale_pso);
-    }
-    if (backend->scale_pso != NULL) {
-        CFRelease(backend->scale_pso);
-    }
-    if (backend->accumulate_pso != NULL) {
-        CFRelease(backend->accumulate_pso);
-    }
-    for (i = 0U; i < GD_OP_COUNT; ++i) {
-        if (backend->binary_row_bcast_pso[i] != NULL) {
-            CFRelease(backend->binary_row_bcast_pso[i]);
-        }
-        if (backend->binary_bcast_pso[i] != NULL) {
-            CFRelease(backend->binary_bcast_pso[i]);
-        }
-        if (backend->binary_pso[i] != NULL) {
-            CFRelease(backend->binary_pso[i]);
-        }
-        if (backend->unary_backward_pso[i] != NULL) {
-            CFRelease(backend->unary_backward_pso[i]);
-        }
-        if (backend->unary_pso[i] != NULL) {
-            CFRelease(backend->unary_pso[i]);
-        }
-    }
-    if (backend->reduce_rows_pso != NULL) {
-        CFRelease(backend->reduce_rows_pso);
-    }
-    if (backend->mps_matmul_kernel != NULL) {
-        CFRelease(backend->mps_matmul_kernel);
-    }
-    if (backend->matmul_tn_split8_pso != NULL) {
-        CFRelease(backend->matmul_tn_split8_pso);
-    }
-    if (backend->matmul_tn_reg_pso != NULL) {
-        CFRelease(backend->matmul_tn_reg_pso);
-    }
-    if (backend->matmul_nt_reg_pso != NULL) {
-        CFRelease(backend->matmul_nt_reg_pso);
-    }
-    if (backend->matmul_tn_pso != NULL) {
-        CFRelease(backend->matmul_tn_pso);
-    }
-    if (backend->matmul_nt_pso != NULL) {
-        CFRelease(backend->matmul_nt_pso);
-    }
-    if (backend->linear_reg_pso != NULL) {
-        CFRelease(backend->linear_reg_pso);
-    }
-    if (backend->matmul_reg_pso != NULL) {
-        CFRelease(backend->matmul_reg_pso);
-    }
-    if (backend->linear_pso != NULL) {
-        CFRelease(backend->linear_pso);
-    }
-    if (backend->matmul_pso != NULL) {
-        CFRelease(backend->matmul_pso);
-    }
-    if (backend->rand_uniform_pso != NULL) {
-        CFRelease(backend->rand_uniform_pso);
-    }
-    if (backend->fill_pso != NULL) {
-        CFRelease(backend->fill_pso);
-    }
-    if (backend->queue != NULL) {
-        CFRelease(backend->queue);
-    }
-    if (backend->device != NULL) {
-        CFRelease(backend->device);
-    }
+    for (i = 0U; i < sizeof(gd_metal_pipeline_specs) / sizeof(gd_metal_pipeline_specs[0]); ++i) {
+        gd_metal_release_retained(
+            gd_metal_pipeline_slot(backend, gd_metal_pipeline_specs[i].backend_field_offset));
+    }
+}
+
+void gd_backend_destroy(gd_backend *backend)
+{
+    if (backend == NULL) {
+        return;
+    }
+    gd_metal_release_retained(&backend->active_command_buffer);
+    gd_metal_release_pipelines(backend);
+    gd_metal_release_retained(&backend->mps_matmul_kernel);
+    gd_metal_release_retained(&backend->queue);
+    gd_metal_release_retained(&backend->device);
     free(backend);
 }
 

@@ -343,7 +343,7 @@ static bool gd_make_metal_content_custom(char *out,
                  "/* Custom Metal backend capsule for '%s'.\n"
                  "\n"
                  "   backend= is omitted in op_%s.def. Add custom backend declarations\n"
-                 "   to src/core/backend.h and PSO creation/release in\n"
+                 "   to src/core/backend.h and custom GD_METAL_PIPELINE entries in\n"
                  "   src/backends/metal/backend_metal.m when implementing this op.\n"
                  "\n"
                  "%s"

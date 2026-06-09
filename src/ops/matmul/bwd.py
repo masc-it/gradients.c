@@ -22,11 +22,17 @@ Knobs:
 from __future__ import annotations
 
 import os
-import platform
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.op_oracle import build_library, compile_runner, gradients_env
 
 import numpy as np
 import torch
@@ -43,86 +49,7 @@ class Case:
 RUNNER_SOURCE = r'''
 #include <gradients/gradients.h>
 
-#include <errno.h>
-#include <inttypes.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int read_file(const char *path, void *dst, size_t nbytes)
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        fprintf(stderr, "failed to open input %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    if (fread(dst, 1U, nbytes, f) != nbytes) {
-        fprintf(stderr, "failed to read %zu bytes from %s\n", nbytes, path);
-        fclose(f);
-        return 1;
-    }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int write_file(const char *path, const void *src, size_t nbytes)
-{
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) {
-        fprintf(stderr, "failed to open output %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    if (fwrite(src, 1U, nbytes, f) != nbytes) {
-        fprintf(stderr, "failed to write %zu bytes to %s\n", nbytes, path);
-        fclose(f);
-        return 1;
-    }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int parse_u32(const char *s, uint32_t *out)
-{
-    char *end = NULL;
-    unsigned long v;
-    if (s == NULL || out == NULL || s[0] == '\0') {
-        return 1;
-    }
-    v = strtoul(s, &end, 10);
-    if (end == s || *end != '\0' || v == 0UL || v > (unsigned long)UINT32_MAX) {
-        return 1;
-    }
-    *out = (uint32_t)v;
-    return 0;
-}
-
-static int mul_size(size_t a, size_t b, size_t *out)
-{
-    if (out == NULL || a > SIZE_MAX / b) {
-        return 1;
-    }
-    *out = a * b;
-    return 0;
-}
-
-static size_t align_up(size_t value, size_t alignment)
-{
-    return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
-static int check_status(gd_context *ctx, gd_status st, const char *expr)
-{
-    if (st == GD_OK) {
-        return 0;
-    }
-    fprintf(stderr, "%s failed: %s (%d), ctx=%s\n",
-            expr,
-            gd_status_string(st),
-            (int)st,
-            ctx != NULL ? gd_context_error(ctx) : "no context");
-    return 1;
-}
-
-#define CHECK(ctx, expr) do { if (check_status((ctx), (expr), #expr) != 0) { goto fail; } } while (0)
+#include "tools/oracle_runner_common.c"
 
 int main(int argc, char **argv)
 {
@@ -191,14 +118,11 @@ int main(int argc, char **argv)
         goto fail;
     }
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.params_bytes = align_up(x_bytes + w_bytes + g_bytes + 16U * 1024U * 1024U, 4096U);
-    cfg.state_bytes = 1024U * 1024U;
-    cfg.scratch_slot_bytes = align_up(dx_bytes + dw_bytes + 16U * 1024U * 1024U, 4096U);
-    cfg.data_slot_bytes = 1024U * 1024U;
-    cfg.scratch_slots = 2U;
-    cfg.data_slots = 2U;
-    cfg.default_alignment = 256U;
+    oracle_memory_config_slots(&cfg,
+                               align_up(x_bytes + w_bytes + g_bytes + 16U * 1024U * 1024U, 4096U),
+                               align_up(dx_bytes + dw_bytes + 16U * 1024U * 1024U, 4096U),
+                               2U,
+                               2U);
 
     st = gd_context_create(&cfg, &ctx);
     if (st == GD_ERR_UNSUPPORTED) {
@@ -249,36 +173,6 @@ done:
     return rc;
 }
 '''
-
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def build_library(root: Path) -> None:
-    subprocess.run(["make", "build"], cwd=root, check=True)
-
-
-def compile_runner(root: Path, tmp: Path) -> Path:
-    source = tmp / "gd_matmul_bwd_runner.c"
-    binary = tmp / "gd_matmul_bwd_runner"
-    source.write_text(RUNNER_SOURCE)
-    cmd = [
-        "cc",
-        f"-I{root / 'include'}",
-        "-std=c11",
-        "-O2",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        str(source),
-        str(root / "build" / "libgradients.a"),
-    ]
-    if platform.system() == "Darwin":
-        cmd.extend(["-framework", "Foundation", "-framework", "Metal"])
-    cmd.extend(["-o", str(binary)])
-    subprocess.run(cmd, cwd=root, check=True)
-    return binary
 
 
 def make_cases() -> list[Case]:
@@ -353,8 +247,7 @@ def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
     write_f16(w_path, w_f16)
     write_f16(g_path, g_f16)
 
-    env = os.environ.copy()
-    env["GRADIENTS_METALLIB"] = str(root / "build" / "gradients.metallib")
+    env = gradients_env(root)
     proc = subprocess.run(
         [
             str(runner),
@@ -394,11 +287,11 @@ def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
 
 
 def main() -> None:
-    root = repo_root()
+    root = _REPO_ROOT
     build_library(root)
     with tempfile.TemporaryDirectory(prefix="gd-matmul-bwd-") as tmp_str:
         tmp = Path(tmp_str)
-        runner = compile_runner(root, tmp)
+        runner = compile_runner(root, tmp, "gd_matmul_bwd_runner", RUNNER_SOURCE)
         failures = 0
         for case in make_cases():
             if not run_case(runner, root, tmp, case):

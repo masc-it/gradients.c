@@ -8,11 +8,17 @@
 from __future__ import annotations
 
 import os
-import platform
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.op_oracle import build_library, compile_runner, gradients_env
 
 import numpy as np
 import torch
@@ -29,64 +35,7 @@ class Case:
 RUNNER_SOURCE = r'''
 #include <gradients/gradients.h>
 
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int read_file(const char *path, void *dst, size_t nbytes)
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fread(dst, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int write_file(const char *path, const void *src, size_t nbytes)
-{
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fwrite(src, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int parse_u32(const char *s, uint32_t *out)
-{
-    char *end = NULL;
-    unsigned long v = strtoul(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v > UINT32_MAX) { return 1; }
-    *out = (uint32_t)v;
-    return 0;
-}
-
-static int parse_i64(const char *s, int64_t *out)
-{
-    char *end = NULL;
-    long long v = strtoll(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0') { return 1; }
-    *out = (int64_t)v;
-    return 0;
-}
-
-static int parse_dtype(const char *s, gd_dtype *dtype, size_t *elem_size)
-{
-    if (strcmp(s, "f16") == 0) { *dtype = GD_DTYPE_F16; *elem_size = 2U; return 0; }
-    if (strcmp(s, "f32") == 0) { *dtype = GD_DTYPE_F32; *elem_size = 4U; return 0; }
-    if (strcmp(s, "u8") == 0) { *dtype = GD_DTYPE_U8; *elem_size = 1U; return 0; }
-    return 1;
-}
-
-static int check_status(gd_context *ctx, gd_status st, const char *expr)
-{
-    if (st == GD_OK) { return 0; }
-    fprintf(stderr, "%s failed: %s (%d), ctx=%s\n", expr, gd_status_string(st), (int)st,
-            ctx != NULL ? gd_context_error(ctx) : "no context");
-    return 1;
-}
-
-static size_t align_up(size_t v, size_t a) { return (v + a - 1U) & ~(a - 1U); }
-#define CHECK(ctx, expr) do { if (check_status((ctx), (expr), #expr) != 0) { goto fail; } } while (0)
+#include "tools/oracle_runner_common.c"
 
 int main(int argc, char **argv)
 {
@@ -107,7 +56,7 @@ int main(int argc, char **argv)
     int arg;
     int rc = 1;
 
-    if (argc < 7 || parse_dtype(argv[2], &dtype, &elem_size) != 0 ||
+    if (argc < 7 || parse_dtype_with_size(argv[2], &dtype, &elem_size) != 0 ||
         parse_u32(argv[3], &input_rank) != 0 || parse_u32(argv[4], &target_rank) != 0 ||
         input_rank > GD_MAX_DIMS || target_rank > GD_MAX_DIMS ||
         argc != (int)(6U + input_rank + target_rank)) {
@@ -129,12 +78,9 @@ int main(int argc, char **argv)
     out_host = (unsigned char *)malloc(bytes);
     if (host == NULL || out_host == NULL || read_file(argv[arg], host, bytes) != 0) { goto fail; }
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.params_bytes = align_up(bytes + 1024U * 1024U, 4096U);
-    cfg.state_bytes = 1024U * 1024U;
-    cfg.scratch_slot_bytes = align_up(bytes * 2U + 1024U * 1024U, 4096U);
-    cfg.data_slot_bytes = 1024U * 1024U;
-    cfg.scratch_slots = 2U; cfg.data_slots = 2U; cfg.default_alignment = 256U;
+    oracle_memory_config(&cfg,
+                         align_up(bytes + 1024U * 1024U, 4096U),
+                         align_up(bytes * 2U + 1024U * 1024U, 4096U));
     if (check_status(NULL, gd_context_create(&cfg, &ctx), "gd_context_create") != 0) { goto fail; }
     CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, gd_shape_make(input_rank, input_shape), 256U, &x));
     CHECK(ctx, gd_tensor_write(ctx, &x, host, bytes));
@@ -156,27 +102,6 @@ done:
     return rc;
 }
 '''
-
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def build_library(root: Path) -> None:
-    subprocess.run(["make", "build"], cwd=root, check=True)
-
-
-def compile_runner(root: Path, tmp: Path) -> Path:
-    source = tmp / "gd_reshape_fwd_runner.c"
-    binary = tmp / "gd_reshape_fwd_runner"
-    source.write_text(RUNNER_SOURCE)
-    cmd = ["cc", f"-I{root / 'include'}", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-           str(source), str(root / "build" / "libgradients.a"), "-pthread", "-lm"]
-    if platform.system() == "Darwin":
-        cmd.extend(["-framework", "Foundation", "-framework", "Metal"])
-    cmd.extend(["-o", str(binary)])
-    subprocess.run(cmd, cwd=root, check=True)
-    return binary
 
 
 def cases() -> list[Case]:
@@ -221,8 +146,7 @@ def run_case(binary: Path, root: Path, tmp: Path, case: Case) -> None:
     x_path.write_bytes(np.ascontiguousarray(x).tobytes())
     cmd = [str(binary), str(out_path), case.dtype, str(len(case.input_shape)), str(len(case.target_shape)),
            *map(str, case.input_shape), *map(str, case.target_shape), str(x_path)]
-    env = os.environ.copy()
-    env.setdefault("GRADIENTS_METALLIB", str(root / "build" / "gradients.metallib"))
+    env = gradients_env(root)
     subprocess.run(cmd, check=True, env=env)
     got = np.frombuffer(out_path.read_bytes(), dtype=np_dtype(case.dtype)).reshape(tuple(ref.shape))
     np.testing.assert_array_equal(got, ref)
@@ -230,11 +154,11 @@ def run_case(binary: Path, root: Path, tmp: Path, case: Case) -> None:
 
 
 def main() -> None:
-    root = repo_root()
+    root = _REPO_ROOT
     build_library(root)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        binary = compile_runner(root, tmp)
+        binary = compile_runner(root, tmp, "gd_reshape_fwd_runner", RUNNER_SOURCE)
         for case in cases():
             run_case(binary, root, tmp, case)
 

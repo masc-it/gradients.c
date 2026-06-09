@@ -8,11 +8,17 @@
 from __future__ import annotations
 
 import os
-import platform
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.op_oracle import build_library, compile_runner, gradients_env
 
 import numpy as np
 import torch
@@ -29,74 +35,9 @@ class Case:
 RUNNER_SOURCE = r'''
 #include <gradients/gradients.h>
 
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #define MAX_INPUTS 8U
 
-static int read_file(const char *path, void *dst, size_t nbytes)
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fread(dst, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int write_file(const char *path, const void *src, size_t nbytes)
-{
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fwrite(src, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int parse_i32(const char *s, int32_t *out)
-{
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v < INT32_MIN || v > INT32_MAX) { return 1; }
-    *out = (int32_t)v;
-    return 0;
-}
-
-static int parse_u32(const char *s, uint32_t *out)
-{
-    char *end = NULL;
-    unsigned long v = strtoul(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v > UINT32_MAX) { return 1; }
-    *out = (uint32_t)v;
-    return 0;
-}
-
-static int parse_i64_dim(const char *s, int64_t *out)
-{
-    char *end = NULL;
-    long long v = strtoll(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v <= 0) { return 1; }
-    *out = (int64_t)v;
-    return 0;
-}
-
-static int parse_dtype(const char *s, gd_dtype *dtype, size_t *elem_size)
-{
-    if (strcmp(s, "f16") == 0) { *dtype = GD_DTYPE_F16; *elem_size = 2U; return 0; }
-    if (strcmp(s, "f32") == 0) { *dtype = GD_DTYPE_F32; *elem_size = 4U; return 0; }
-    return 1;
-}
-
-static int check_status(gd_context *ctx, gd_status st, const char *expr)
-{
-    if (st == GD_OK) { return 0; }
-    fprintf(stderr, "%s failed: %s (%d), ctx=%s\n", expr, gd_status_string(st), (int)st,
-            ctx != NULL ? gd_context_error(ctx) : "no context");
-    return 1;
-}
-
-static size_t align_up(size_t v, size_t a) { return (v + a - 1U) & ~(a - 1U); }
-#define CHECK(ctx, expr) do { if (check_status((ctx), (expr), #expr) != 0) { goto fail; } } while (0)
+#include "tools/oracle_runner_common.c"
 
 int main(int argc, char **argv)
 {
@@ -123,7 +64,7 @@ int main(int argc, char **argv)
     int arg;
     int rc = 1;
 
-    if (argc < 7 || parse_dtype(argv[2], &dtype, &elem_size) != 0 ||
+    if (argc < 7 || parse_dtype_with_size(argv[2], &dtype, &elem_size) != 0 ||
         parse_i32(argv[3], &axis) != 0 || parse_u32(argv[4], &rank) != 0 ||
         parse_u32(argv[5], &n_inputs) != 0 || rank == 0U || rank > GD_MAX_DIMS ||
         n_inputs == 0U || n_inputs > MAX_INPUTS || argc != (int)(6U + n_inputs * rank + n_inputs)) {
@@ -164,12 +105,9 @@ int main(int argc, char **argv)
     out_host = (unsigned char *)malloc(out_bytes);
     if (out_host == NULL) { goto fail; }
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.params_bytes = align_up(out_bytes + 1024U * 1024U, 4096U);
-    cfg.state_bytes = 1024U * 1024U;
-    cfg.scratch_slot_bytes = align_up(out_bytes * 2U + 1024U * 1024U, 4096U);
-    cfg.data_slot_bytes = 1024U * 1024U;
-    cfg.scratch_slots = 2U; cfg.data_slots = 2U; cfg.default_alignment = 256U;
+    oracle_memory_config(&cfg,
+                         align_up(out_bytes + 1024U * 1024U, 4096U),
+                         align_up(out_bytes * 2U + 1024U * 1024U, 4096U));
     if (check_status(NULL, gd_context_create(&cfg, &ctx), "gd_context_create") != 0) { goto fail; }
     for (i = 0U; i < n_inputs; ++i) {
         CHECK(ctx, gd_tensor_empty(ctx, GD_ARENA_PARAMS, dtype, gd_shape_make(rank, shapes[i]), 256U, &tensors[i]));
@@ -196,27 +134,6 @@ done:
 '''
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def build_library(root: Path) -> None:
-    subprocess.run(["make", "build"], cwd=root, check=True)
-
-
-def compile_runner(root: Path, tmp: Path) -> Path:
-    source = tmp / "gd_concat_fwd_runner.c"
-    binary = tmp / "gd_concat_fwd_runner"
-    source.write_text(RUNNER_SOURCE)
-    cmd = ["cc", f"-I{root / 'include'}", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-           str(source), str(root / "build" / "libgradients.a"), "-pthread", "-lm"]
-    if platform.system() == "Darwin":
-        cmd.extend(["-framework", "Foundation", "-framework", "Metal"])
-    cmd.extend(["-o", str(binary)])
-    subprocess.run(cmd, cwd=root, check=True)
-    return binary
-
-
 def cases() -> list[Case]:
     all_cases = [
         Case("axis0_f16", "f16", 0, ((3, 5), (2, 5))),
@@ -239,7 +156,7 @@ def np_dtype(dtype: str) -> np.dtype:
     return np.float16 if dtype == "f16" else np.float32
 
 
-def run_case(binary: Path, tmp: Path, case: Case) -> None:
+def run_case(binary: Path, root: Path, tmp: Path, case: Case) -> None:
     seed = sum((i + 1) * ord(ch) for i, ch in enumerate(case.name)) & 0xFFFF_FFFF
     rng = np.random.default_rng(seed)
     arrays = [rng.normal(0.0, 0.2, shape).astype(np_dtype(case.dtype)) for shape in case.shapes]
@@ -252,8 +169,7 @@ def run_case(binary: Path, tmp: Path, case: Case) -> None:
     dims = [str(dim) for shape in case.shapes for dim in shape]
     cmd = [str(binary), str(out_path), case.dtype, str(case.axis), str(len(case.shapes[0])),
            str(len(case.shapes)), *dims, *map(str, paths)]
-    env = os.environ.copy()
-    env.setdefault("GRADIENTS_METALLIB", str(repo_root() / "build" / "gradients.metallib"))
+    env = gradients_env(root)
     subprocess.run(cmd, check=True, env=env)
     got = np.frombuffer(out_path.read_bytes(), dtype=np_dtype(case.dtype)).reshape(
         torch.cat([torch.from_numpy(a) for a in arrays], dim=case.axis).shape
@@ -264,13 +180,13 @@ def run_case(binary: Path, tmp: Path, case: Case) -> None:
 
 
 def main() -> None:
-    root = repo_root()
+    root = _REPO_ROOT
     build_library(root)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        binary = compile_runner(root, tmp)
+        binary = compile_runner(root, tmp, "gd_concat_fwd_runner", RUNNER_SOURCE)
         for case in cases():
-            run_case(binary, tmp, case)
+            run_case(binary, root, tmp, case)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,17 @@
 from __future__ import annotations
 
 import os
-import platform
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.op_oracle import build_library, compile_runner, gradients_env
 
 import numpy as np
 import torch
@@ -31,70 +37,9 @@ class Case:
 RUNNER_SOURCE = r'''
 #include <gradients/gradients.h>
 
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #define AXIS_ALL (-999)
 
-static int read_file(const char *path, void *dst, size_t nbytes)
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fread(dst, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int write_file(const char *path, const void *src, size_t nbytes)
-{
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
-    if (fwrite(src, 1U, nbytes, f) != nbytes) { fclose(f); return 1; }
-    return fclose(f) != 0 ? 1 : 0;
-}
-
-static int parse_i32(const char *s, int32_t *out)
-{
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v < INT32_MIN || v > INT32_MAX) { return 1; }
-    *out = (int32_t)v;
-    return 0;
-}
-
-static int parse_i64(const char *s, int64_t *out)
-{
-    char *end = NULL;
-    long long v = strtoll(s, &end, 10);
-    if (s == NULL || *s == '\0' || end == s || *end != '\0' || v <= 0) { return 1; }
-    *out = (int64_t)v;
-    return 0;
-}
-
-static int check_status(gd_context *ctx, gd_status st, const char *expr)
-{
-    if (st == GD_OK) { return 0; }
-    fprintf(stderr, "%s failed: %s (%d), ctx=%s\n", expr, gd_status_string(st), (int)st,
-            ctx != NULL ? gd_context_error(ctx) : "no context");
-    return 1;
-}
-
-static size_t align_up(size_t v, size_t a) { return (v + a - 1U) & ~(a - 1U); }
-#define CHECK(ctx, expr) do { if (check_status((ctx), (expr), #expr) != 0) { goto fail; } } while (0)
-
-static int tensor_count(uint32_t rank, const int64_t *shape, size_t *out)
-{
-    uint32_t i;
-    size_t count = 1U;
-    for (i = 0U; i < rank; ++i) {
-        if (shape[i] <= 0 || (uint64_t)shape[i] > (uint64_t)(SIZE_MAX / count)) { return 1; }
-        count *= (size_t)shape[i];
-    }
-    *out = count;
-    return 0;
-}
+#include "tools/oracle_runner_common.c"
 
 int main(int argc, char **argv)
 {
@@ -129,12 +74,9 @@ int main(int argc, char **argv)
     out_data = calloc(x_count, elem_size);
     if (x_data == NULL || out_data == NULL || read_file(argv[1], x_data, x_bytes) != 0) { goto fail; }
 
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.params_bytes = align_up(x_bytes + 1024U * 1024U, 4096U);
-    cfg.state_bytes = 1024U * 1024U;
-    cfg.scratch_slot_bytes = align_up(x_bytes * 4U + 32U * 1024U * 1024U, 4096U);
-    cfg.data_slot_bytes = 1024U * 1024U;
-    cfg.scratch_slots = 2U; cfg.data_slots = 2U; cfg.default_alignment = 256U;
+    oracle_memory_config(&cfg,
+                         align_up(x_bytes + 1024U * 1024U, 4096U),
+                         align_up(x_bytes * 4U + 32U * 1024U * 1024U, 4096U));
     st = gd_context_create(&cfg, &ctx);
     if (st == GD_ERR_UNSUPPORTED) { printf("SKIP unsupported backend\n"); rc = 77; goto done; }
     if (check_status(ctx, st, "gd_context_create") != 0 || ctx == NULL) { goto fail; }
@@ -162,27 +104,6 @@ done:
     return rc;
 }
 '''
-
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def build_library(root: Path) -> None:
-    subprocess.run(["make", "build"], cwd=root, check=True)
-
-
-def compile_runner(root: Path, tmp: Path) -> Path:
-    source = tmp / "gd_reduce_sum_fwd_runner.c"
-    binary = tmp / "gd_reduce_sum_fwd_runner"
-    source.write_text(RUNNER_SOURCE)
-    cmd = ["cc", f"-I{root / 'include'}", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-           str(source), str(root / "build" / "libgradients.a")]
-    if platform.system() == "Darwin":
-        cmd.extend(["-framework", "Foundation", "-framework", "Metal"])
-    cmd.extend(["-o", str(binary)])
-    subprocess.run(cmd, cwd=root, check=True)
-    return binary
 
 
 def make_cases() -> list[Case]:
@@ -246,8 +167,7 @@ def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
     x_path = tmp / f"{case.name}.x.bin"
     out_path = tmp / f"{case.name}.out.bin"
     tensor_to_file(x, x_path, np_dtype)
-    env = os.environ.copy()
-    env["GRADIENTS_METALLIB"] = str(root / "build" / "gradients.metallib")
+    env = gradients_env(root)
     proc = subprocess.run([str(runner), str(x_path), str(out_path), str(gd_dtype), str(len(case.shape)),
                            str(case.axis), *[str(dim) for dim in case.shape]],
                           cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -270,11 +190,11 @@ def run_case(runner: Path, root: Path, tmp: Path, case: Case) -> bool:
 
 
 def main() -> None:
-    root = repo_root()
+    root = _REPO_ROOT
     build_library(root)
     with tempfile.TemporaryDirectory(prefix="gd-reduce-sum-fwd-") as tmp_str:
         tmp = Path(tmp_str)
-        runner = compile_runner(root, tmp)
+        runner = compile_runner(root, tmp, "gd_reduce_sum_fwd_runner", RUNNER_SOURCE)
         failures = sum(0 if run_case(runner, root, tmp, case) else 1 for case in make_cases())
         if failures:
             raise SystemExit(f"reduce_sum fwd check failed cases={failures}")

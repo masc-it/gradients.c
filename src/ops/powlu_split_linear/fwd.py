@@ -13,23 +13,21 @@ against a PyTorch reference. Run from the repository root with:
 
 from __future__ import annotations
 
-import subprocess
+import sys
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.op_oracle import build_library
 
 import numpy as np
 import torch
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def build_library(root: Path) -> None:
-    subprocess.run(["make", "build"], cwd=root, check=True)
-
-
 def main() -> None:
-    root = repo_root()
+    root = _REPO_ROOT
     build_library(root)
     _ = (np, torch)
     print("TODO: implement gd_powlu_split_linear forward PyTorch comparison")

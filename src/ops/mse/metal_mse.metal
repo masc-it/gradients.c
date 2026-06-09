@@ -3,32 +3,7 @@
 
 using namespace metal;
 
-static inline uint gd_mse_sg_count(const uint requested)
-{
-    if (requested == 0u) {
-        return 1u;
-    }
-    return requested > uint(GD_METAL_MSE_MAX_SIMDGROUPS) ?
-           uint(GD_METAL_MSE_MAX_SIMDGROUPS) : requested;
-}
-
-static inline float gd_mse_finish(float simd_acc,
-                                  threadgroup float *partials,
-                                  uint simd_lane,
-                                  uint simdgroup_id,
-                                  uint simdgroups)
-{
-    if (simd_lane == 0u) {
-        partials[simdgroup_id] = simd_acc;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    if (simdgroup_id == 0u) {
-        total = simd_lane < simdgroups ? partials[simd_lane] : 0.0f;
-        total = simd_sum(total);
-    }
-    return total;
-}
+#include "../_shared/loss/metal_pairwise_loss_kernels.h"
 
 kernel void gd_mse_forward_f16_kernel(device const uchar *xbuf [[buffer(0)]],
                                       device const uchar *ybuf [[buffer(1)]],
@@ -40,7 +15,8 @@ kernel void gd_mse_forward_f16_kernel(device const uchar *xbuf [[buffer(0)]],
 {
     threadgroup float partials[GD_METAL_MSE_MAX_SIMDGROUPS];
     const ulong chunk_id = ulong(tgpos.x);
-    const uint simdgroups = gd_mse_sg_count(args.simdgroups);
+    const uint simdgroups = gd_pairwise_loss_sg_count(args.simdgroups,
+                                                      uint(GD_METAL_MSE_MAX_SIMDGROUPS));
     const ulong begin = chunk_id * args.chunk_size;
     const ulong end = min(begin + args.chunk_size, args.count);
     device const half *x = reinterpret_cast<device const half *>(xbuf + args.x_offset);
@@ -53,7 +29,7 @@ kernel void gd_mse_forward_f16_kernel(device const uchar *xbuf [[buffer(0)]],
         acc += d * d;
     }
     acc = simd_sum(acc);
-    acc = gd_mse_finish(acc, partials, simd_lane, simdgroup_id, simdgroups);
+    acc = gd_pairwise_loss_finish(acc, partials, simd_lane, simdgroup_id, simdgroups);
     if (simdgroup_id == 0u && simd_lane == 0u) {
         out[chunk_id] = acc * args.scale;
     }
@@ -69,7 +45,8 @@ kernel void gd_mse_forward_f32_kernel(device const uchar *xbuf [[buffer(0)]],
 {
     threadgroup float partials[GD_METAL_MSE_MAX_SIMDGROUPS];
     const ulong chunk_id = ulong(tgpos.x);
-    const uint simdgroups = gd_mse_sg_count(args.simdgroups);
+    const uint simdgroups = gd_pairwise_loss_sg_count(args.simdgroups,
+                                                      uint(GD_METAL_MSE_MAX_SIMDGROUPS));
     const ulong begin = chunk_id * args.chunk_size;
     const ulong end = min(begin + args.chunk_size, args.count);
     device const float *x = reinterpret_cast<device const float *>(xbuf + args.x_offset);
@@ -82,7 +59,7 @@ kernel void gd_mse_forward_f32_kernel(device const uchar *xbuf [[buffer(0)]],
         acc += d * d;
     }
     acc = simd_sum(acc);
-    acc = gd_mse_finish(acc, partials, simd_lane, simdgroup_id, simdgroups);
+    acc = gd_pairwise_loss_finish(acc, partials, simd_lane, simdgroup_id, simdgroups);
     if (simdgroup_id == 0u && simd_lane == 0u) {
         out[chunk_id] = acc * args.scale;
     }

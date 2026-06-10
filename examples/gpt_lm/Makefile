@@ -13,7 +13,7 @@ GPT_LM_DATASET ?= promessi
 
 ifeq ($(GPT_LM_DATASET),ita_dict)
 DATA_SCRIPT := dataset_ita_dict.py
-DATA_FORMAT_VERSION := gpt-lm-ita-dict-v1
+DATA_FORMAT_VERSION := gpt-lm-ita-dict-v2
 else ifeq ($(GPT_LM_DATASET),promessi)
 DATA_SCRIPT := dataset.py
 DATA_FORMAT_VERSION := gpt-lm-promessi-v3

@@ -6,8 +6,9 @@ The source directories contain one JSON file per generated dictionary entry.  Th
 ``definizioni-clean-enriched`` files contain the same subset of terms with
 examples attached to each definition.  This builder merges both directories,
 prefers enriched entries when present, splits by *term* before tokenizer
-training, trains the byte-level BPE tokenizer on the training text only, then
-writes train/val GDDS shards compatible with ``examples/gpt_lm``.
+training, writes one JSONL row per dictionary entry, tokenizes those rows with
+``<|im_start|>``/``<|im_end|>`` delimiters, then repacks the delimited token
+stream into fixed 512-token GPT LM samples compatible with ``examples/gpt_lm``.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from gdds_utils import (  # noqa: E402
     field_metadata,
     schema_hash,
 )
-from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_file_packed  # noqa: E402
+from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_jsonl  # noqa: E402
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -47,9 +48,9 @@ DEFAULT_ENRICHED_DIR = Path(
 DEFAULT_CONTEXT_LENGTH = 512
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_VAL_FRACTION = 0.05
-DEFAULT_MAX_EXAMPLES_PER_DEFINITION = 0  # no limit
+DEFAULT_MAX_EXAMPLES_PER_DEFINITION = -1  # no limit
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
-DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v1"
+DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v2"
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,8 @@ class CorpusSplit:
     val_chars: int
     train_sha256: str
     val_sha256: str
+    train_jsonl_sha256: str
+    val_jsonl_sha256: str
 
 
 class TokenDecoder:
@@ -377,6 +380,13 @@ def split_entries(
     return train, val
 
 
+def write_jsonl_entries(path: Path, entries: Sequence[TermEntry]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps({"text": format_entry(entry)}, ensure_ascii=False))
+            f.write("\n")
+
+
 def write_text_split(
     out_dir: Path, train_entries: Sequence[TermEntry], val_entries: Sequence[TermEntry]
 ) -> CorpusSplit:
@@ -384,10 +394,14 @@ def write_text_split(
     ensure_clean_dir(raw_dir)
     train_path = raw_dir / "train.txt"
     val_path = raw_dir / "val.txt"
+    train_jsonl_path = raw_dir / "train.jsonl"
+    val_jsonl_path = raw_dir / "val.jsonl"
     train_text = format_entries(train_entries)
     val_text = format_entries(val_entries)
     train_path.write_text(train_text, encoding="utf-8")
     val_path.write_text(val_text, encoding="utf-8")
+    write_jsonl_entries(train_jsonl_path, train_entries)
+    write_jsonl_entries(val_jsonl_path, val_entries)
     return CorpusSplit(
         train_terms=[entry.term for entry in train_entries],
         val_terms=[entry.term for entry in val_entries],
@@ -395,6 +409,8 @@ def write_text_split(
         val_chars=len(val_text),
         train_sha256=file_sha256(train_path),
         val_sha256=file_sha256(val_path) if val_text else "",
+        train_jsonl_sha256=file_sha256(train_jsonl_path),
+        val_jsonl_sha256=file_sha256(val_jsonl_path) if val_entries else "",
     )
 
 
@@ -411,19 +427,19 @@ def prepare_tokenized_corpus(
     input_path: Path,
     output_dir: Path,
     tokenizer_path: Path,
-    context_length: int,
     vocab_size: int,
     min_frequency: int,
     use_existing_tokenizer: bool,
 ) -> TokenizedCorpus:
     ensure_clean_dir(output_dir)
-    summary = tokenize_file_packed(
+    summary = tokenize_jsonl(
         tokenizer=tokenizer_path,
-        input_path=input_path,
+        input_jsonl=input_path,
         output_dir=output_dir,
         im_start=IM_START,
         im_end=IM_END,
-        num_tokens_per_sequence=context_length + 1,
+        max_length=2_147_483_647,
+        jsonl_text_field="text",
         use_tokenizer=use_existing_tokenizer,
         vocab_size=vocab_size,
         min_frequency=min_frequency,
@@ -436,8 +452,7 @@ def prepare_tokenized_corpus(
     )
     print(
         f"{split_name}: {action}: {summary['tokenizer']} "
-        f"(records={summary['sequences']}, record_tokens={context_length + 1}, "
-        f"tokens={summary['tokens']})"
+        f"(source_entries={summary['sequences']}, tokens_with_delimiters={summary['tokens']})"
     )
     return TokenizedCorpus.open(output_dir)
 
@@ -449,15 +464,25 @@ def i32_tensor(array: np.ndarray) -> TensorData:
     return TensorData(dtype="i32", shape=(int(arr.size),), data=arr.tobytes(order="C"))
 
 
-def iter_lm_samples(corpus: TokenizedCorpus):
-    for packed in corpus.iter_packed_arrays():
-        if packed.shape[1] != corpus.sequence_length:
-            raise ValueError(f"unexpected packed shard width {packed.shape[1]}")
-        for row in packed:
-            yield {
-                "input_ids": i32_tensor(row[:-1]),
-                "target_ids": i32_tensor(row[1:]),
-            }
+def iter_lm_samples(corpus: TokenizedCorpus, context_length: int):
+    """Yield fixed-length LM samples from a stream of delimited source entries."""
+
+    record_length = context_length + 1
+    if corpus.mode != "jsonl":
+        raise ValueError(f"expected jsonl tokenized corpus, got {corpus.mode!r}")
+    if record_length < 3:
+        raise ValueError("record_length must be >= 3")
+
+    parts = [np.asarray(seq, dtype=TOKEN_DTYPE) for seq in corpus.iter_sequences()]
+    if not parts:
+        return
+    stream = np.concatenate(parts)
+    for start in range(0, stream.size - record_length + 1, context_length):
+        row = stream[start : start + record_length]
+        yield {
+            "input_ids": i32_tensor(row[:-1]),
+            "target_ids": i32_tensor(row[1:]),
+        }
 
 
 def write_gdds_dataset(
@@ -465,18 +490,13 @@ def write_gdds_dataset(
     out_dir: Path,
     train_corpus: TokenizedCorpus,
     val_corpus: TokenizedCorpus | None,
+    context_length: int,
     max_shard_bytes: int,
 ) -> dict[str, list[Path]]:
-    if train_corpus.sequence_length is None or train_corpus.sequence_length < 3:
-        raise ValueError("packed training corpus must have sequence_length >= 3")
-    if (
-        val_corpus is not None
-        and val_corpus.sequence_length != train_corpus.sequence_length
-    ):
-        raise ValueError(
-            "train and validation corpora must use the same packed sequence length"
-        )
-    context_length = train_corpus.sequence_length - 1
+    if train_corpus.mode != "jsonl":
+        raise ValueError(f"expected jsonl training corpus, got {train_corpus.mode!r}")
+    if val_corpus is not None and val_corpus.mode != "jsonl":
+        raise ValueError(f"expected jsonl validation corpus, got {val_corpus.mode!r}")
     fields = fields_for_context(context_length)
     remove_split_shards(out_dir, "train")
     remove_split_shards(out_dir, "val")
@@ -487,10 +507,10 @@ def write_gdds_dataset(
         out_dir, "val", fields, max_shard_bytes=max_shard_bytes
     )
     try:
-        for sample in iter_lm_samples(train_corpus):
+        for sample in iter_lm_samples(train_corpus, context_length):
             train_writer.write_sample(sample)
         if val_corpus is not None:
-            for sample in iter_lm_samples(val_corpus):
+            for sample in iter_lm_samples(val_corpus, context_length):
                 val_writer.write_sample(sample)
         train_paths = train_writer.finish()
         val_paths = val_writer.finish()
@@ -533,7 +553,6 @@ def write_manifest(
     split_seed: int,
     max_examples_per_definition: int,
 ) -> None:
-    assert train_corpus.sequence_length is not None
     fields = fields_for_context(context_length)
     split_samples = {
         split_name: sum(read_gdds_header(path).samples for path in paths)
@@ -559,17 +578,20 @@ def write_manifest(
             "im_start_id": train_corpus.im_start_id,
             "im_end_id": train_corpus.im_end_id,
             "digits": "always split before BPE merges",
-            "trained_on": "raw_ita_dict/train.txt",
-            "train_sha256": split.train_sha256,
+            "trained_on": "raw_ita_dict/train.jsonl",
+            "train_sha256": split.train_jsonl_sha256,
         },
         "packing": {
-            "record_length": train_corpus.sequence_length,
+            "record_length": context_length + 1,
             "context_length": context_length,
-            "stride": train_corpus.stride,
+            "stride": context_length,
+            "source_mode": "jsonl_per_entry_with_im_delimiters",
             "source_records": train_corpus.num_sequences + val_records,
             "source_tokens": train_corpus.num_tokens + val_tokens,
-            "train_records": train_corpus.num_sequences,
-            "val_records": val_records,
+            "train_records": split_samples.get("train", 0),
+            "val_records": split_samples.get("val", 0),
+            "train_source_records": train_corpus.num_sequences,
+            "val_source_records": val_records,
         },
         "splits": {
             split_name: {
@@ -590,16 +612,22 @@ def write_manifest(
             "val_sha256": split.val_sha256,
             "train_path": "raw_ita_dict/train.txt",
             "val_path": "raw_ita_dict/val.txt",
+            "train_jsonl_sha256": split.train_jsonl_sha256,
+            "val_jsonl_sha256": split.val_jsonl_sha256,
+            "train_jsonl_path": "raw_ita_dict/train.jsonl",
+            "val_jsonl_path": "raw_ita_dict/val.jsonl",
         },
         "dictionary_format": {
-            "entry_separator": "blank line",
-            "entry_header": "### Voce",
+            "source_record": "one JSONL row per dictionary entry with a `text` field",
+            "raw_text_entry_separator": "blank line in raw_ita_dict/*.txt only",
+            "entry_header": None,
             "term_line": "Termine: <lemma>",
             "definitions_header": "Definizioni:",
             "definition_line": "<n>. <definition>",
             "examples_header": "   Esempi:",
             "example_line": "   - <example>",
-            "entry_footer": "### Fine voce",
+            "entry_footer": None,
+            "sequence_delimiters": "tokenizer inserts <|im_start|>/<|im_end|> around every JSONL row before stream packing",
             "max_examples_per_definition": max_examples_per_definition,
         },
         "source": {
@@ -769,10 +797,9 @@ def main() -> int:
 
     train_corpus = prepare_tokenized_corpus(
         split_name="train",
-        input_path=args.out_dir / "raw_ita_dict" / "train.txt",
+        input_path=args.out_dir / "raw_ita_dict" / "train.jsonl",
         output_dir=args.out_dir / "tokenized_train",
         tokenizer_path=tokenizer_path,
-        context_length=args.context_length,
         vocab_size=args.vocab_size,
         min_frequency=args.min_frequency,
         use_existing_tokenizer=False,
@@ -781,27 +808,24 @@ def main() -> int:
     if val_entries:
         val_corpus = prepare_tokenized_corpus(
             split_name="val",
-            input_path=args.out_dir / "raw_ita_dict" / "val.txt",
+            input_path=args.out_dir / "raw_ita_dict" / "val.jsonl",
             output_dir=args.out_dir / "tokenized_val",
             tokenizer_path=tokenizer_path,
-            context_length=args.context_length,
             vocab_size=args.vocab_size,
             min_frequency=args.min_frequency,
             use_existing_tokenizer=True,
         )
 
-    expected_record_length = args.context_length + 1
-    if train_corpus.sequence_length != expected_record_length:
-        raise ValueError(
-            f"unexpected train sequence length {train_corpus.sequence_length}"
-        )
-    if val_corpus is not None and val_corpus.sequence_length != expected_record_length:
-        raise ValueError(f"unexpected val sequence length {val_corpus.sequence_length}")
+    if train_corpus.mode != "jsonl":
+        raise ValueError(f"unexpected train tokenized mode {train_corpus.mode!r}")
+    if val_corpus is not None and val_corpus.mode != "jsonl":
+        raise ValueError(f"unexpected val tokenized mode {val_corpus.mode!r}")
 
     paths = write_gdds_dataset(
         out_dir=args.out_dir,
         train_corpus=train_corpus,
         val_corpus=val_corpus,
+        context_length=args.context_length,
         max_shard_bytes=args.max_shard_bytes,
     )
     write_manifest(

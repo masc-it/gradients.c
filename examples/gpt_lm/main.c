@@ -932,6 +932,8 @@ int main(int argc, char **argv)
     gd_lr_scheduler_config lr_config;
     size_t dataset_samples = 0U;
     size_t val_samples = 0U;
+    size_t dataset_tokens = 0U;
+    size_t val_tokens = 0U;
     size_t samples_per_epoch = 0U;
     size_t steps_per_epoch = 0U;
     size_t total_steps = 0U;
@@ -959,6 +961,10 @@ int main(int argc, char **argv)
     if (config.epochs > 0) {
         TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &dataset));
         dataset_samples = (size_t)gd_dataset_num_samples(dataset);
+        if (dataset_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
+            gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "dataset token count overflow", __LINE__);
+        }
+        dataset_tokens = dataset_samples * (size_t)GPT_CONTEXT_LENGTH;
         steps_per_epoch = effective_steps_per_epoch((uint64_t)dataset_samples, &config, &samples_per_epoch);
         if (steps_per_epoch == 0U || (size_t)config.epochs > SIZE_MAX / steps_per_epoch) {
             gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
@@ -967,6 +973,10 @@ int main(int argc, char **argv)
         if (config.save_best || config.early_stopping_patience > 0) {
             TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, config.val_split, &val_dataset));
             val_samples = (size_t)gd_dataset_num_samples(val_dataset);
+            if (val_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
+                gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "validation token count overflow", __LINE__);
+            }
+            val_tokens = val_samples * (size_t)GPT_CONTEXT_LENGTH;
             if (val_samples == 0U) {
                 gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty validation split", __LINE__);
             }
@@ -1014,10 +1024,12 @@ int main(int argc, char **argv)
         lr_config.warmup_steps = (uint64_t)(total_steps / 10U);
     }
 
-    printf("dataset: dir=%s samples=%zu val_samples=%zu batch=%d context=%d steps_per_epoch=%zu samples_per_epoch=%zu epochs=%d total_steps=%zu%s\n",
+    printf("dataset: dir=%s samples=%zu train_tokens=%zu val_samples=%zu val_tokens=%zu batch=%d context=%d steps_per_epoch=%zu samples_per_epoch=%zu epochs=%d total_steps=%zu%s\n",
            config.data_dir,
            dataset_samples,
+           dataset_tokens,
            val_samples,
+           val_tokens,
            config.batch_size,
            GPT_CONTEXT_LENGTH,
            steps_per_epoch,

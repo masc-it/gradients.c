@@ -18,11 +18,13 @@ typedef struct gd_metal_lm_cross_entropy_args {
     gd_metal_u64 total_classes;
     gd_metal_u64 class_start;
     float scale;
+    float logits_softcap;
+    float inv_logits_softcap;
     gd_metal_u32 simdgroups;
 } gd_metal_lm_cross_entropy_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 96U,
+_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 104U,
                "gd_metal_lm_cross_entropy_args ABI mismatch");
 #endif
 

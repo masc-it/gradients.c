@@ -42,6 +42,12 @@ Checkpoint inference after training:
 make -C examples/gpt_lm infer ARGS="--checkpoint checkpoints/gpt_lm_best.gdckpt --prompt 'Don Abbondio' --max-new-tokens 64"
 ```
 
+Interactive checkpoint generation after training:
+
+```sh
+make -C examples/gpt_lm interactive ARGS="--checkpoint checkpoints/gpt_lm_best.gdckpt --temperature 0.8 --min-p 0.05 --repetition-penalty 1.1"
+```
+
 Full training resume:
 
 ```sh
@@ -80,6 +86,9 @@ Useful runtime options:
 --early-stopping-patience N # 0 disables; default 10
 --max-new-tokens N
 --temperature T         # 0 means greedy
+--min-p P               # filter tokens below P * top probability; 0 disables
+--repetition-penalty P  # 1 disables
+--logits-softcap C      # final logits softcap; 0 disables
 --tokenizer-path PATH
 ```
 

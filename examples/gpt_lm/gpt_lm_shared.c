@@ -338,6 +338,7 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
     model->dropout_p = config->dropout_p;
     model->rms_eps = GPT_DEFAULT_RMS_EPS;
     model->powlu_m = GPT_DEFAULT_POWLU_M;
+    model->logits_softcap = config->logits_softcap;
     model->dropout_seed = splitmix64(config->seed ^ UINT64_C(0xd00d1234));
 
     TRY(ctx, gd_module_init(ctx, &model->mod, "gpt_lm"));
@@ -708,7 +709,12 @@ gd_status gpt_lm_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    return gd_lm_cross_entropy(ctx, &final_norm, &model->token_embedding, target_ids, loss);
+    return gd_lm_cross_entropy_softcapped(ctx,
+                                          &final_norm,
+                                          &model->token_embedding,
+                                          target_ids,
+                                          model->logits_softcap,
+                                          loss);
 }
 
 static gd_status gpt_block_prefill_cached(gd_context *ctx,
@@ -1057,30 +1063,102 @@ static gd_status gpt_data_i32_tensor(gd_context *ctx,
     return gd_tensor_write(ctx, out, values, (size_t)count * sizeof(values[0]));
 }
 
-static int gpt_sample_next_token(const float *logits,
+static void gpt_apply_logits_softcap(float *logits, int vocab_size, float logits_softcap)
+{
+    int i;
+    if (logits == NULL || vocab_size <= 0 || logits_softcap <= 0.0f) {
+        return;
+    }
+    for (i = 0; i < vocab_size; ++i) {
+        logits[i] = logits_softcap * tanhf(logits[i] / logits_softcap);
+    }
+}
+
+static bool gpt_history_contains_token(const int32_t *history, int start, int end, int token)
+{
+    int i;
+    if (history == NULL || start < 0 || end < start) {
+        return false;
+    }
+    for (i = start; i < end; ++i) {
+        if (history[i] == token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gpt_apply_repetition_penalty(float *logits,
+                                         int vocab_size,
+                                         const int32_t *history,
+                                         int history_len,
+                                         float repetition_penalty)
+{
+    int i;
+    if (logits == NULL || history == NULL || vocab_size <= 0 || history_len <= 0 ||
+        !isfinite(repetition_penalty) || repetition_penalty <= 1.0f) {
+        return;
+    }
+    for (i = 0; i < history_len; ++i) {
+        const int token = (int)history[i];
+        if (token < 0 || token >= vocab_size || gpt_history_contains_token(history, 0, i, token)) {
+            continue;
+        }
+        if (logits[token] > 0.0f) {
+            logits[token] /= repetition_penalty;
+        } else {
+            logits[token] *= repetition_penalty;
+        }
+    }
+}
+
+static int gpt_sample_next_token(float *logits,
                                  int vocab_size,
+                                 const int32_t *history,
+                                 int history_len,
                                  float temperature,
+                                 float min_p,
+                                 float repetition_penalty,
                                  uint64_t *rng)
 {
     int best = 0;
-    float best_value = logits[0];
+    double best_value = -HUGE_VAL;
+    bool have_best = false;
     int i;
-    for (i = 1; i < vocab_size; ++i) {
-        if (logits[i] > best_value) {
-            best_value = logits[i];
+    if (logits == NULL || vocab_size <= 0 || rng == NULL) {
+        return 0;
+    }
+    gpt_apply_repetition_penalty(logits, vocab_size, history, history_len, repetition_penalty);
+    for (i = 0; i < vocab_size; ++i) {
+        const double value = (double)logits[i];
+        if (!isfinite(value)) {
+            continue;
+        }
+        if (!have_best || value > best_value) {
+            best_value = value;
             best = i;
+            have_best = true;
         }
     }
-    if (temperature <= 0.0f) {
+    if (!have_best || !isfinite(temperature) || temperature <= 0.0f) {
         return best;
     }
     {
+        const double temp = (double)temperature;
+        const double threshold = min_p > 0.0f ? best_value + temp * log((double)min_p) : -HUGE_VAL;
         double sum = 0.0;
         double target;
         uint64_t r;
         for (i = 0; i < vocab_size; ++i) {
-            const double z = ((double)logits[i] - (double)best_value) / (double)temperature;
-            sum += exp(z);
+            const double value = (double)logits[i];
+            double p;
+            if (!isfinite(value) || value < threshold) {
+                continue;
+            }
+            p = exp((value - best_value) / temp);
+            if (isfinite(p)) {
+                sum += p;
+            }
         }
         if (!(sum > 0.0) || !isfinite(sum)) {
             return best;
@@ -1089,8 +1167,16 @@ static int gpt_sample_next_token(const float *logits,
         r = *rng >> 11;
         target = ((double)r * (1.0 / 9007199254740992.0)) * sum;
         for (i = 0; i < vocab_size; ++i) {
-            const double z = ((double)logits[i] - (double)best_value) / (double)temperature;
-            target -= exp(z);
+            const double value = (double)logits[i];
+            double p;
+            if (!isfinite(value) || value < threshold) {
+                continue;
+            }
+            p = exp((value - best_value) / temp);
+            if (!isfinite(p)) {
+                continue;
+            }
+            target -= p;
             if (target <= 0.0) {
                 return i;
             }
@@ -1125,6 +1211,7 @@ static void gpt_generate_prompts(gd_context *ctx,
     int32_t *decode_ids = NULL;
     int32_t *decode_positions = NULL;
     int *next_ids = NULL;
+    bool *finished = NULL;
     gd_tensor *last_logits = NULL;
     float *logits_host = NULL;
     gpt_kv_cache *cache = NULL;
@@ -1132,6 +1219,8 @@ static void gpt_generate_prompts(gd_context *ctx,
     int max_new;
     int room_for_prompt;
     int generated = 0;
+    int finished_count = 0;
+    int32_t stop_token = -1;
     int b;
     int i;
     uint64_t rng;
@@ -1149,6 +1238,9 @@ static void gpt_generate_prompts(gd_context *ctx,
         gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "tokenizer path allocation", __LINE__);
     }
     TRY(ctx, gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &tok));
+    if (gd_tokenizer_id(tok, "<|im_end|>", &stop_token) != GD_OK) {
+        stop_token = -1;
+    }
 
     encoded = (int32_t **)calloc((size_t)n_prompts, sizeof(encoded[0]));
     seq_ids = (int32_t **)calloc((size_t)n_prompts, sizeof(seq_ids[0]));
@@ -1161,17 +1253,18 @@ static void gpt_generate_prompts(gd_context *ctx,
     decode_ids = (int32_t *)calloc((size_t)n_prompts, sizeof(decode_ids[0]));
     decode_positions = (int32_t *)calloc((size_t)n_prompts, sizeof(decode_positions[0]));
     next_ids = (int *)calloc((size_t)n_prompts, sizeof(next_ids[0]));
+    finished = (bool *)calloc((size_t)n_prompts, sizeof(finished[0]));
     last_logits = (gd_tensor *)calloc((size_t)n_prompts, sizeof(last_logits[0]));
     logits_host = (float *)malloc((size_t)n_prompts * (size_t)GPT_VOCAB_SIZE * sizeof(logits_host[0]));
     if (encoded == NULL || seq_ids == NULL || n_encoded == NULL || prompt_offset == NULL ||
         prompt_len == NULL || seq_len == NULL || cu == NULL || cache_pos_values == NULL ||
-        decode_ids == NULL || decode_positions == NULL || next_ids == NULL || last_logits == NULL ||
-        logits_host == NULL) {
+        decode_ids == NULL || decode_positions == NULL || next_ids == NULL || finished == NULL ||
+        last_logits == NULL || logits_host == NULL) {
         gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation allocation", __LINE__);
     }
 
     max_new = config->max_new_tokens;
-    room_for_prompt = GPT_CONTEXT_LENGTH - max_new;
+    room_for_prompt = max_new >= GPT_CONTEXT_LENGTH ? GPT_CONTEXT_LENGTH - 1 : GPT_CONTEXT_LENGTH - max_new;
     if (room_for_prompt <= 0) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "no context room for generation", __LINE__);
     }
@@ -1246,25 +1339,50 @@ static void gpt_generate_prompts(gd_context *ctx,
                                         &last_logits[b],
                                         logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
                                         GPT_VOCAB_SIZE));
+            gpt_apply_logits_softcap(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
+                                     GPT_VOCAB_SIZE,
+                                     model->logits_softcap);
             next_ids[b] = gpt_sample_next_token(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
                                                 GPT_VOCAB_SIZE,
+                                                seq_ids[b],
+                                                prompt_len[b],
                                                 config->temperature,
+                                                config->min_p,
+                                                config->repetition_penalty,
                                                 &rng);
             cache->pos[b] = prompt_len[b];
         }
     }
 
-    while (generated < max_new) {
+    while (generated < max_new && finished_count < n_prompts) {
+        bool appended_any = false;
         for (b = 0; b < n_prompts; ++b) {
+            if (finished[b]) {
+                continue;
+            }
+            if (stop_token >= 0 && next_ids[b] == stop_token) {
+                finished[b] = true;
+                finished_count += 1;
+                continue;
+            }
+            if (seq_len[b] >= GPT_CONTEXT_LENGTH) {
+                finished[b] = true;
+                finished_count += 1;
+                continue;
+            }
             seq_ids[b][seq_len[b]] = (int32_t)next_ids[b];
             seq_len[b] += 1;
+            appended_any = true;
+        }
+        if (!appended_any) {
+            break;
         }
         generated += 1;
-        if (generated >= max_new) {
+        if (generated >= max_new || finished_count >= n_prompts) {
             break;
         }
         for (b = 0; b < n_prompts; ++b) {
-            decode_ids[b] = (int32_t)next_ids[b];
+            decode_ids[b] = finished[b] ? (stop_token >= 0 ? stop_token : 0) : (int32_t)next_ids[b];
             decode_positions[b] = cache->pos[b];
             cache_pos_values[b] = cache->pos[b];
         }
@@ -1285,21 +1403,34 @@ static void gpt_generate_prompts(gd_context *ctx,
                                         (size_t)n_prompts * (size_t)GPT_VOCAB_SIZE));
         }
         for (b = 0; b < n_prompts; ++b) {
+            if (finished[b]) {
+                continue;
+            }
+            gpt_apply_logits_softcap(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
+                                     GPT_VOCAB_SIZE,
+                                     model->logits_softcap);
             next_ids[b] = gpt_sample_next_token(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
                                                 GPT_VOCAB_SIZE,
+                                                seq_ids[b],
+                                                seq_len[b],
                                                 config->temperature,
+                                                config->min_p,
+                                                config->repetition_penalty,
                                                 &rng);
         }
     }
 
     elapsed = gpt_wall_seconds() - start;
-    printf("generate%s%s: tokenizer=%s batch=%d generated=%d temperature=%.3f elapsed=%.3fs tok/s=%.1f",
+    printf("generate%s%s: tokenizer=%s batch=%d generated=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f elapsed=%.3fs tok/s=%.1f",
            tag != NULL ? ":" : "",
            tag != NULL ? tag : "",
            tokenizer_path,
            n_prompts,
            generated,
            (double)config->temperature,
+           (double)config->min_p,
+           (double)config->repetition_penalty,
+           (double)model->logits_softcap,
            elapsed,
            elapsed > 0.0 ? (double)((size_t)n_prompts * (size_t)generated) / elapsed : 0.0);
     if (step != 0U) {
@@ -1309,8 +1440,9 @@ static void gpt_generate_prompts(gd_context *ctx,
     for (b = 0; b < n_prompts; ++b) {
         char *decoded = NULL;
         char *decoded_new = NULL;
+        const int generated_len = seq_len[b] - prompt_len[b];
         TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b], seq_len[b], &decoded));
-        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b] + prompt_len[b], generated, &decoded_new));
+        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b] + prompt_len[b], generated_len, &decoded_new));
         printf("  prefix=\"%s\" prompt_tokens=%d generated_text=%s\n",
                prompts[b],
                prompt_len[b],
@@ -1331,6 +1463,7 @@ static void gpt_generate_prompts(gd_context *ctx,
     }
     free(logits_host);
     free(last_logits);
+    free(finished);
     free(next_ids);
     free(decode_positions);
     free(decode_ids);

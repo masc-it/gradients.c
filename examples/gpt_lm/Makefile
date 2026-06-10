@@ -3,7 +3,8 @@ BUILD_DIR := $(ROOT)/build
 LIB := $(BUILD_DIR)/libgradients.a
 METALLIB := $(BUILD_DIR)/gradients.metallib
 TRAIN_BIN := gd_main_gpt_lm
-INFER_BIN := gd_infer_gpt_lm
+INFER_BIN := gd_main_infer_gpt_lm
+GENERATE_BIN := gd_main_generate_gpt_lm
 BIN := $(TRAIN_BIN)
 SHARED_SRC := gpt_lm_shared.c
 DATA_DIR ?= data
@@ -80,9 +81,9 @@ DATA_ARGS += --max-examples-per-definition $(GPT_LM_MAX_EXAMPLES_PER_DEFINITION)
 endif
 endif
 
-.PHONY: all run infer build-lib tools data clean smoke overfit-smoke generate-smoke periodic-generate-smoke checkpoint-smoke FORCE
+.PHONY: all run infer interactive build-lib tools data clean smoke overfit-smoke generate-smoke periodic-generate-smoke checkpoint-smoke FORCE
 
-all: $(TRAIN_BIN) $(INFER_BIN)
+all: $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN)
 
 build-lib:
 	$(MAKE) -C $(ROOT) build
@@ -113,11 +114,17 @@ $(TRAIN_BIN): main.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
 $(INFER_BIN): infer.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
 	$(CC) $(CPPFLAGS) $(CFLAGS) infer.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
+$(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
+	$(CC) $(CPPFLAGS) $(CFLAGS) main_generate.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
+
 run: $(TRAIN_BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) $(ARGS)
 
 infer: $(INFER_BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(INFER_BIN) --data-dir $(DATA_DIR) $(ARGS)
+
+interactive: $(GENERATE_BIN)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(GENERATE_BIN) --data-dir $(DATA_DIR) $(ARGS)
 
 overfit-smoke: $(BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --no-save-best $(ARGS)
@@ -135,5 +142,5 @@ checkpoint-smoke: $(TRAIN_BIN) $(INFER_BIN)
 smoke: overfit-smoke generate-smoke periodic-generate-smoke
 
 clean:
-	rm -f $(TRAIN_BIN) $(INFER_BIN)
+	rm -f $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN)
 	rm -rf $(DATA_DIR) checkpoints

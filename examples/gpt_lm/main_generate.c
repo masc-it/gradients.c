@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define GPT_GENERATE_LINE_MAX 8192U
+#define GPT_GENERATE_IM_START "<|im_start|>"
+
 static int parse_i64_arg(const char *text, int64_t min_value, int64_t max_value, int64_t *out)
 {
     char *end = NULL;
@@ -66,7 +69,7 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
     }
     if (strcmp(arg, name) == 0) {
         if (*index + 1 >= argc) {
-            fprintf(stderr, "gpt_lm_infer: missing value for %s\n", name);
+            fprintf(stderr, "gpt_lm_generate: missing value for %s\n", name);
             exit(2);
         }
         *index += 1;
@@ -77,30 +80,33 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
 
 static void print_usage(const char *argv0)
 {
-    printf("usage: %s --checkpoint PATH --prompt TEXT [options]\n", argv0);
+    printf("usage: %s [options]\n", argv0);
+    printf("\n");
+    printf("Interactive GPT LM generation. Type a prefix and press enter; :q, :quit, exit, or quit ends the session.\n");
+    printf("Each prefix is encoded as <|im_start|> + your text.\n");
+    printf("Generation stops early when the tokenizer emits <|im_end|>.\n");
     printf("\n");
     printf("Options:\n");
-    printf("  --checkpoint PATH      checkpoint from gd_module_save_state (default: checkpoints/gpt_lm_best.gdckpt)\n");
-    printf("  --prompt TEXT          prompt text (alias: --generate)\n");
+    printf("  --checkpoint PATH      checkpoint to load (default: checkpoints/gpt_lm_best.gdckpt)\n");
     printf("  --data-dir PATH        data directory for default tokenizer (default: examples/gpt_lm/data)\n");
     printf("  --tokenizer-path PATH  tokenizer JSON; metadata value is used when available\n");
-    printf("  --max-new-tokens N     generated tokens (default: 64)\n");
+    printf("  --max-new-tokens N     generated token budget per prefix; capped by 512-token context (default: 512)\n");
     printf("  --temperature T        sampling temperature; 0 means greedy (default: 0)\n");
     printf("  --min-p P              min-p sampling cutoff relative to top token; 0 disables (default: 0)\n");
     printf("  --repetition-penalty P repetition penalty; 1 disables (default: 1)\n");
-    printf("  --logits-softcap C     final logits softcap; 0 disables; metadata value is used when available\n");
+    printf("  --logits-softcap C     final logits softcap; metadata value is used when available\n");
     printf("  --layers N             model layers; metadata value is used when available\n");
-    printf("  --seed N               sampling/init seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
+    printf("  --seed N               sampling seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
     printf("  --help                 show this help\n");
 }
 
-static gpt_config infer_config_default(void)
+static gpt_config generate_config_default(void)
 {
     gpt_config config;
     memset(&config, 0, sizeof(config));
     config.data_dir = "examples/gpt_lm/data";
     config.tokenizer_path = NULL;
-    config.generate_prompt = NULL;
+    config.generate_prompt = "";
     config.checkpoint_path = "checkpoints/gpt_lm_best.gdckpt";
     config.load_checkpoint_path = NULL;
     config.val_split = "val";
@@ -109,16 +115,18 @@ static gpt_config infer_config_default(void)
     config.n_layers = GPT_DEFAULT_LAYERS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.lr_warmup_steps = -1;
-    config.max_new_tokens = 64;
+    config.max_new_tokens = GPT_CONTEXT_LENGTH;
     config.generate_every_n_steps = 0;
     config.epochs_set = true;
     config.save_best = false;
+    config.save_latest = false;
     config.overfit_num_samples = 0U;
     config.seed = GPT_DEFAULT_SEED;
     config.dropout_p = GPT_DEFAULT_DROPOUT_P;
     config.lr_max = GPT_DEFAULT_LR_MAX;
     config.lr_min = GPT_DEFAULT_LR_MIN;
     config.weight_decay = GPT_DEFAULT_WEIGHT_DECAY;
+    config.grad_clip_norm = GPT_DEFAULT_GRAD_CLIP_NORM;
     config.temperature = 0.0f;
     config.min_p = GPT_DEFAULT_MIN_P;
     config.repetition_penalty = GPT_DEFAULT_REPETITION_PENALTY;
@@ -130,14 +138,12 @@ static gpt_config parse_args(int argc,
                              char **argv,
                              bool *layers_set,
                              bool *tokenizer_set,
-                             bool *dropout_set,
                              bool *softcap_set)
 {
-    gpt_config config = infer_config_default();
+    gpt_config config = generate_config_default();
     int i;
     *layers_set = false;
     *tokenizer_set = false;
-    *dropout_set = false;
     *softcap_set = false;
     for (i = 1; i < argc; ++i) {
         const char *value;
@@ -153,6 +159,11 @@ static gpt_config parse_args(int argc,
             config.checkpoint_path = value;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--checkpoint-path");
+        if (value != NULL) {
+            config.checkpoint_path = value;
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--data-dir");
         if (value != NULL) {
             config.data_dir = value;
@@ -164,20 +175,10 @@ static gpt_config parse_args(int argc,
             *tokenizer_set = true;
             continue;
         }
-        value = arg_value(argc, argv, &i, "--prompt");
-        if (value != NULL) {
-            config.generate_prompt = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--generate");
-        if (value != NULL) {
-            config.generate_prompt = value;
-            continue;
-        }
         value = arg_value(argc, argv, &i, "--max-new-tokens");
         if (value != NULL) {
             if (!parse_i64_arg(value, 1, GPT_CONTEXT_LENGTH, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --max-new-tokens %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --max-new-tokens %s\n", value);
                 exit(2);
             }
             config.max_new_tokens = (int)parsed_i64;
@@ -186,7 +187,7 @@ static gpt_config parse_args(int argc,
         value = arg_value(argc, argv, &i, "--temperature");
         if (value != NULL) {
             if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --temperature %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --temperature %s\n", value);
                 exit(2);
             }
             config.temperature = parsed_f32;
@@ -195,7 +196,7 @@ static gpt_config parse_args(int argc,
         value = arg_value(argc, argv, &i, "--min-p");
         if (value != NULL) {
             if (!parse_float_arg(value, 0.0f, 1.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --min-p %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --min-p %s\n", value);
                 exit(2);
             }
             config.min_p = parsed_f32;
@@ -204,7 +205,7 @@ static gpt_config parse_args(int argc,
         value = arg_value(argc, argv, &i, "--repetition-penalty");
         if (value != NULL) {
             if (!parse_float_arg(value, 1.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --repetition-penalty %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --repetition-penalty %s\n", value);
                 exit(2);
             }
             config.repetition_penalty = parsed_f32;
@@ -213,7 +214,7 @@ static gpt_config parse_args(int argc,
         value = arg_value(argc, argv, &i, "--logits-softcap");
         if (value != NULL) {
             if (!parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --logits-softcap %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --logits-softcap %s\n", value);
                 exit(2);
             }
             config.logits_softcap = parsed_f32;
@@ -223,38 +224,24 @@ static gpt_config parse_args(int argc,
         value = arg_value(argc, argv, &i, "--layers");
         if (value != NULL) {
             if (!parse_i64_arg(value, 1, 96, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --layers %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --layers %s\n", value);
                 exit(2);
             }
             config.n_layers = (int)parsed_i64;
             *layers_set = true;
             continue;
         }
-        value = arg_value(argc, argv, &i, "--dropout");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 0.95f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --dropout %s\n", value);
-                exit(2);
-            }
-            config.dropout_p = parsed_f32;
-            *dropout_set = true;
-            continue;
-        }
         value = arg_value(argc, argv, &i, "--seed");
         if (value != NULL) {
             if (!parse_u64_arg(value, UINT64_MAX, &parsed_u64)) {
-                fprintf(stderr, "gpt_lm_infer: invalid --seed %s\n", value);
+                fprintf(stderr, "gpt_lm_generate: invalid --seed %s\n", value);
                 exit(2);
             }
             config.seed = parsed_u64;
             continue;
         }
-        fprintf(stderr, "gpt_lm_infer: unknown argument %s\n", argv[i]);
+        fprintf(stderr, "gpt_lm_generate: unknown argument %s\n", argv[i]);
         print_usage(argv[0]);
-        exit(2);
-    }
-    if (config.generate_prompt == NULL) {
-        fprintf(stderr, "gpt_lm_infer: --prompt is required\n");
         exit(2);
     }
     return config;
@@ -277,8 +264,7 @@ static bool metadata_value(const char *metadata,
         while (line_end < metadata_len && metadata[line_end] != '\n') {
             line_end += 1U;
         }
-        if (line_end > line_start + key_len &&
-            strncmp(metadata + line_start, key, key_len) == 0 &&
+        if (line_end > line_start + key_len && strncmp(metadata + line_start, key, key_len) == 0 &&
             metadata[line_start + key_len] == '=') {
             const size_t value_start = line_start + key_len + 1U;
             const size_t value_len = line_end - value_start;
@@ -299,7 +285,6 @@ static void apply_checkpoint_metadata(gpt_config *config,
                                       size_t metadata_len,
                                       bool layers_set,
                                       bool tokenizer_set,
-                                      bool dropout_set,
                                       bool softcap_set,
                                       char *tokenizer_storage,
                                       size_t tokenizer_storage_size)
@@ -314,10 +299,6 @@ static void apply_checkpoint_metadata(gpt_config *config,
         parse_i64_arg(value, 1, 96, &parsed_i64)) {
         config->n_layers = (int)parsed_i64;
     }
-    if (!dropout_set && metadata_value(metadata, metadata_len, "dropout", value, sizeof(value)) &&
-        parse_float_arg(value, 0.0f, 0.95f, &parsed_f32)) {
-        config->dropout_p = parsed_f32;
-    }
     if (!softcap_set && metadata_value(metadata, metadata_len, "logits_softcap", value, sizeof(value)) &&
         parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
         config->logits_softcap = parsed_f32;
@@ -331,13 +312,32 @@ static void apply_checkpoint_metadata(gpt_config *config,
     }
 }
 
+static void trim_line(char *line)
+{
+    size_t len;
+    if (line == NULL) {
+        return;
+    }
+    len = strlen(line);
+    while (len > 0U && (line[len - 1U] == '\n' || line[len - 1U] == '\r')) {
+        line[len - 1U] = '\0';
+        len -= 1U;
+    }
+}
+
+static bool should_quit(const char *line)
+{
+    return line != NULL &&
+           (strcmp(line, ":q") == 0 || strcmp(line, ":quit") == 0 ||
+            strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0);
+}
+
 int main(int argc, char **argv)
 {
     bool layers_set;
     bool tokenizer_set;
-    bool dropout_set;
     bool softcap_set;
-    gpt_config config = parse_args(argc, argv, &layers_set, &tokenizer_set, &dropout_set, &softcap_set);
+    gpt_config config = parse_args(argc, argv, &layers_set, &tokenizer_set, &softcap_set);
     char *metadata = NULL;
     size_t metadata_len = 0U;
     char tokenizer_from_metadata[1024];
@@ -346,6 +346,8 @@ int main(int argc, char **argv)
     gd_status st;
     gpt_lm model;
     gd_module_load_options load_options;
+    char line[GPT_GENERATE_LINE_MAX];
+    char prompt[GPT_GENERATE_LINE_MAX + sizeof(GPT_GENERATE_IM_START)];
     int exit_code = 1;
 
     memset(&model, 0, sizeof(model));
@@ -357,19 +359,18 @@ int main(int argc, char **argv)
                                   metadata_len,
                                   layers_set,
                                   tokenizer_set,
-                                  dropout_set,
                                   softcap_set,
                                   tokenizer_from_metadata,
                                   sizeof(tokenizer_from_metadata));
     } else {
-        fprintf(stderr, "gpt_lm_infer: warning: could not read checkpoint metadata (%s)\n",
+        fprintf(stderr, "gpt_lm_generate: warning: could not read checkpoint metadata (%s)\n",
                 gd_status_string(st));
     }
 
     mem = gpt_memory_config(&config);
     st = gd_context_create(&mem, &ctx);
     if (st == GD_ERR_UNSUPPORTED) {
-        printf("gpt_lm_infer: skipped (no supported gradients.c backend)\n");
+        printf("gpt_lm_generate: skipped (no supported gradients.c backend)\n");
         free(metadata);
         return 0;
     }
@@ -380,21 +381,54 @@ int main(int argc, char **argv)
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
     }
 
-    printf("inference: checkpoint=%s prompt=\"%s\" layers=%d max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
+    printf("interactive_generation: checkpoint=%s layers=%d max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
            config.checkpoint_path,
-           config.generate_prompt,
            config.n_layers,
            config.max_new_tokens,
            (double)config.temperature,
            (double)config.min_p,
            (double)config.repetition_penalty,
            (double)config.logits_softcap);
+    printf("prompt template: <|im_start|>{input}\n");
+    printf("stop: <|im_end|> when present in tokenizer; commands: :q, :quit, quit, exit\n");
+
     gpt_lm_init(ctx, &model, &config);
     load_options.strict = true;
     load_options.load_buffers = true;
     TRY(ctx, gd_module_load_state(ctx, &model.mod, config.checkpoint_path, &load_options));
     TRY(ctx, gd_context_seal_params(ctx));
-    gpt_generate(ctx, &model, &config);
+    gd_module_set_training(&model.mod, false);
+
+    for (;;) {
+        printf("prefix> ");
+        fflush(stdout);
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\n");
+            break;
+        }
+        if (strchr(line, '\n') == NULL && strlen(line) == sizeof(line) - 1U) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+                /* discard overlong line tail */
+            }
+            fprintf(stderr, "gpt_lm_generate: prefix too long; max is %u bytes\n", GPT_GENERATE_LINE_MAX - 2U);
+            continue;
+        }
+        trim_line(line);
+        if (should_quit(line)) {
+            break;
+        }
+        if (line[0] == '\0') {
+            continue;
+        }
+        const int n = snprintf(prompt, sizeof(prompt), "%s%s", GPT_GENERATE_IM_START, line);
+        if (n < 0 || (size_t)n >= sizeof(prompt)) {
+            fprintf(stderr, "gpt_lm_generate: formatted prompt too long\n");
+            continue;
+        }
+        config.generate_prompt = prompt;
+        gpt_generate(ctx, &model, &config);
+    }
     exit_code = 0;
 
     gpt_lm_deinit(&model);

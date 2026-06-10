@@ -587,7 +587,8 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                                     const gd_backend_tensor_view *row_max,
                                                     const gd_backend_tensor_view *row_inv_sum,
                                                     uint64_t class_start,
-                                                    uint64_t total_classes)
+                                                    uint64_t total_classes,
+                                                    float logits_softcap)
 {
     (void)backend;
     (void)logits_chunk;
@@ -597,6 +598,7 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
     (void)row_inv_sum;
     (void)class_start;
     (void)total_classes;
+    (void)logits_softcap;
     return GD_ERR_UNSUPPORTED;
 }
 
@@ -625,7 +627,8 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *grad_logits_chunk,
                                                      uint64_t class_start,
                                                      uint64_t total_classes,
-                                                     float scale)
+                                                     float scale,
+                                                     float logits_softcap)
 {
     (void)backend;
     (void)logits_chunk;
@@ -637,6 +640,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
     (void)class_start;
     (void)total_classes;
     (void)scale;
+    (void)logits_softcap;
     return GD_ERR_UNSUPPORTED;
 }
 

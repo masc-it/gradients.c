@@ -97,6 +97,9 @@ static void print_usage(const char *argv0)
            GPT_DEFAULT_EARLY_STOPPING_PATIENCE);
     printf("  --max-new-tokens N          generated tokens for --generate / periodic generation (default: 64)\n");
     printf("  --temperature T             sampling temperature; 0 means greedy (default: 0)\n");
+    printf("  --min-p P                   min-p sampling cutoff relative to top token; 0 disables (default: 0)\n");
+    printf("  --repetition-penalty P      repetition penalty; 1 disables (default: 1)\n");
+    printf("  --logits-softcap C          final logits softcap; 0 disables (default: 30)\n");
     printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
     printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
     printf("  --layers N                  decoder blocks (default: %d)\n", GPT_DEFAULT_LAYERS);
@@ -146,6 +149,9 @@ static gpt_config gpt_config_default(void)
     config.weight_decay = GPT_DEFAULT_WEIGHT_DECAY;
     config.grad_clip_norm = GPT_DEFAULT_GRAD_CLIP_NORM;
     config.temperature = 0.0f;
+    config.min_p = GPT_DEFAULT_MIN_P;
+    config.repetition_penalty = GPT_DEFAULT_REPETITION_PENALTY;
+    config.logits_softcap = 30.0f;
     return config;
 }
 
@@ -230,7 +236,7 @@ static gpt_config parse_args(int argc, char **argv)
         }
         value = arg_value(argc, argv, &i, "--max-new-tokens");
         if (value != NULL) {
-            if (!parse_i64_arg(value, 1, GPT_CONTEXT_LENGTH - 1, &parsed_i64)) {
+            if (!parse_i64_arg(value, 1, GPT_CONTEXT_LENGTH, &parsed_i64)) {
                 fprintf(stderr, "gpt_lm: invalid --max-new-tokens %s\n", value);
                 exit(2);
             }
@@ -244,6 +250,33 @@ static gpt_config parse_args(int argc, char **argv)
                 exit(2);
             }
             config.temperature = parsed_f32;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--min-p");
+        if (value != NULL) {
+            if (!parse_float_arg(value, 0.0f, 1.0f, &parsed_f32)) {
+                fprintf(stderr, "gpt_lm: invalid --min-p %s\n", value);
+                exit(2);
+            }
+            config.min_p = parsed_f32;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--repetition-penalty");
+        if (value != NULL) {
+            if (!parse_float_arg(value, 1.0f, 10.0f, &parsed_f32)) {
+                fprintf(stderr, "gpt_lm: invalid --repetition-penalty %s\n", value);
+                exit(2);
+            }
+            config.repetition_penalty = parsed_f32;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--logits-softcap");
+        if (value != NULL) {
+            if (!parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
+                fprintf(stderr, "gpt_lm: invalid --logits-softcap %s\n", value);
+                exit(2);
+            }
+            config.logits_softcap = parsed_f32;
             continue;
         }
         value = arg_value(argc, argv, &i, "--epochs");
@@ -737,6 +770,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "mlp_hidden=%d\n"
                  "sdpa_window=%d\n"
                  "dropout=%.9g\n"
+                 "logits_softcap=%.9g\n"
                  "grad_clip_norm=%.9g\n"
                  "early_stopping_patience=%d\n"
                  "epoch=%zu\n"
@@ -755,6 +789,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  GPT_MLP_HIDDEN,
                  GPT_SDPA_WINDOW,
                  (double)config->dropout_p,
+                 (double)config->logits_softcap,
                  (double)config->grad_clip_norm,
                  config->early_stopping_patience,
                  epoch,
@@ -785,6 +820,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "mlp_hidden=%d\n"
                    "sdpa_window=%d\n"
                    "dropout=%.9g\n"
+                   "logits_softcap=%.9g\n"
                    "grad_clip_norm=%.9g\n"
                    "early_stopping_patience=%d\n"
                    "epoch=%zu\n"
@@ -803,6 +839,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    GPT_MLP_HIDDEN,
                    GPT_SDPA_WINDOW,
                    (double)config->dropout_p,
+                   (double)config->logits_softcap,
                    (double)config->grad_clip_norm,
                    config->early_stopping_patience,
                    epoch,
@@ -1514,7 +1551,7 @@ int main(int argc, char **argv)
                (unsigned long long)config.overfit_num_samples,
                samples_per_epoch);
     }
-    printf("model: vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d sdpa_window=%d dropout=%.3f\n",
+    printf("model: vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d sdpa_window=%d dropout=%.3f logits_softcap=%.3f\n",
            GPT_VOCAB_SIZE,
            GPT_D_MODEL,
            config.n_layers,
@@ -1522,11 +1559,15 @@ int main(int argc, char **argv)
            GPT_HEAD_DIM,
            GPT_MLP_HIDDEN,
            GPT_SDPA_WINDOW,
-           (double)config.dropout_p);
+           (double)config.dropout_p,
+           (double)config.logits_softcap);
     if (config.generate_prompt != NULL || config.generate_every_n_steps > 0) {
-        printf("generation: max_new_tokens=%d temperature=%.3f every_n_steps=%d batched_vowels=%s\n",
+        printf("generation: max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f every_n_steps=%d batched_vowels=%s\n",
                config.max_new_tokens,
                (double)config.temperature,
+               (double)config.min_p,
+               (double)config.repetition_penalty,
+               (double)config.logits_softcap,
                config.generate_every_n_steps,
                config.generate_every_n_steps > 0 ? "yes" : "no");
     }

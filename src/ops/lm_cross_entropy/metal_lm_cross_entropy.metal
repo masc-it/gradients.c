@@ -10,6 +10,36 @@ static inline float gd_lm_ce_nan(void)
     return as_type<float>(0x7fc00000u);
 }
 
+static inline float gd_lm_ce_softcap_tanh(float x)
+{
+    const float ax = fabs(x);
+    if (ax < 0.000244140625f) {
+        return x;
+    }
+    const float e = fast::exp(-2.0f * ax);
+    const float y = (1.0f - e) / (1.0f + e);
+    return x < 0.0f ? -y : y;
+}
+
+static inline float gd_lm_ce_apply_softcap(float logit,
+                                           constant gd_metal_lm_cross_entropy_args &args)
+{
+    if (args.logits_softcap <= 0.0f) {
+        return logit;
+    }
+    return args.logits_softcap * gd_lm_ce_softcap_tanh(logit * args.inv_logits_softcap);
+}
+
+static inline float gd_lm_ce_softcap_grad(float soft_logit,
+                                          constant gd_metal_lm_cross_entropy_args &args)
+{
+    if (args.logits_softcap <= 0.0f) {
+        return 1.0f;
+    }
+    const float y = soft_logit * args.inv_logits_softcap;
+    return max(0.0f, 1.0f - y * y);
+}
+
 static inline float gd_lm_ce_threadgroup_max(float local,
                                              threadgroup float *partial,
                                              threadgroup float *shared,
@@ -85,7 +115,8 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
     const ulong base = row * classes;
     float local_max = GD_LM_CE_NEG_INF;
     for (ulong c = thread_i; c < classes; c += thread_stride) {
-        local_max = max(local_max, float(logits[base + c]));
+        const float logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        local_max = max(local_max, logit);
     }
     const float chunk_max = gd_lm_ce_threadgroup_max(local_max,
                                                      partial,
@@ -95,7 +126,8 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
                                                      simdgroups);
     float local_sum = 0.0f;
     for (ulong c = thread_i; c < classes; c += thread_stride) {
-        local_sum += exp(float(logits[base + c]) - chunk_max);
+        const float logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        local_sum += exp(logit - chunk_max);
     }
     const float chunk_sum = gd_lm_ce_threadgroup_sum(local_sum,
                                                      partial,
@@ -110,7 +142,7 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
             const ulong chunk_start = ulong(args.class_start);
             if (target_u >= chunk_start && target_u < chunk_start + classes &&
                 target_u < ulong(args.total_classes)) {
-                target_logit[row] = float(logits[base + (target_u - chunk_start)]);
+                target_logit[row] = gd_lm_ce_apply_softcap(float(logits[base + (target_u - chunk_start)]), args);
             }
         }
         const float old_max = row_max[row];
@@ -192,10 +224,12 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     const ulong chunk_start = ulong(args.class_start);
     for (ulong c = thread_i; c < classes; c += thread_stride) {
         const ulong global_c = chunk_start + c;
-        float p = exp(float(logits[base + c]) - rm) * inv_sum;
+        const float soft_logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        float p = exp(soft_logit - rm) * inv_sum;
         if (global_c == target_u) {
             p -= 1.0f;
         }
+        p *= gd_lm_ce_softcap_grad(soft_logit, args);
         grad_logits[base + c] = half(p * seed);
     }
 }

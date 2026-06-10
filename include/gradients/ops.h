@@ -47,6 +47,16 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                               const gd_tensor *targets,
                               gd_tensor *loss);
 
+/* Fused tied LM head + cross entropy with optional final-logits softcap:
+ * soft_logit = logits_softcap * tanh(logit / logits_softcap).
+ * Pass logits_softcap=0 to disable softcapping and use the exact gd_lm_cross_entropy path. */
+gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
+                                         const gd_tensor *hidden,
+                                         const gd_tensor *weight,
+                                         const gd_tensor *targets,
+                                         float logits_softcap,
+                                         gd_tensor *loss);
+
 /* Fused residual add with inverted dropout on the branch:
  * out = residual + dropout(x, p, seed) in training, or residual + x otherwise.
  * Training autograd records equivalent dropout and add nodes while using one

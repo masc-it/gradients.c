@@ -460,7 +460,12 @@ static gd_status gd_optimizer_metadata_get_f32(gd_context *ctx,
     }
     errno = 0;
     parsed = strtof(buffer, &end);
-    if (errno != 0 || end == buffer || *end != '\0' || parsed != parsed) {
+    /* strtof may set ERANGE for a finite subnormal result.  Adam beta powers
+     * legitimately underflow into the subnormal range in long runs, so accept
+     * ERANGE here and let the field-specific validation below reject invalid
+     * ranges/overflows. */
+    if ((errno != 0 && errno != ERANGE) || end == buffer || *end != '\0' || parsed != parsed ||
+        parsed > FLT_MAX || parsed < -FLT_MAX) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "optimizer checkpoint metadata float parse failed");
     }

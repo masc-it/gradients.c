@@ -5,6 +5,7 @@
 #include "../op_common.h"
 #include "../../core/memory_internal.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -30,6 +31,19 @@ static gd_status gd_lm_cross_entropy_validate_targets(gd_context *ctx,
         return gd_context_set_error(ctx,
                                     GD_ERR_INVALID_ARGUMENT,
                                     "lm_cross_entropy expects contiguous i32 targets [rows]");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_lm_cross_entropy_validate_softcap(gd_context *ctx, float logits_softcap)
+{
+    if (logits_softcap == 0.0f) {
+        return GD_OK;
+    }
+    if (!isfinite(logits_softcap) || logits_softcap < 0.0f || !isfinite(1.0f / logits_softcap)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "lm_cross_entropy logits_softcap must be zero or finite positive with finite reciprocal");
     }
     return GD_OK;
 }
@@ -189,7 +203,8 @@ static gd_status gd_lm_cross_entropy_dispatch_online_update(gd_context *ctx,
                                                             const gd_tensor *row_max,
                                                             const gd_tensor *row_inv_sum,
                                                             uint64_t class_start,
-                                                            uint64_t total_classes)
+                                                            uint64_t total_classes,
+                                                            float logits_softcap)
 {
     gd_backend_tensor_view lv;
     gd_backend_tensor_view tv;
@@ -209,7 +224,8 @@ static gd_status gd_lm_cross_entropy_dispatch_online_update(gd_context *ctx,
                                                    &mv,
                                                    &iv,
                                                    class_start,
-                                                   total_classes);
+                                                   total_classes,
+                                                   logits_softcap);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend lm_cross_entropy online update failed");
     }
@@ -253,7 +269,8 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
                                                              const gd_tensor *grad_logits_chunk,
                                                              uint64_t class_start,
                                                              uint64_t total_classes,
-                                                             float scale)
+                                                             float scale,
+                                                             float logits_softcap)
 {
     gd_backend_tensor_view lv;
     gd_backend_tensor_view tv;
@@ -277,7 +294,8 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
                                                     &dgv,
                                                     class_start,
                                                     total_classes,
-                                                    scale);
+                                                    scale,
+                                                    logits_softcap);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend lm_cross_entropy backward chunk failed");
     }
@@ -289,6 +307,16 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                               const gd_tensor *weight,
                               const gd_tensor *targets,
                               gd_tensor *loss)
+{
+    return gd_lm_cross_entropy_softcapped(ctx, hidden, weight, targets, 0.0f, loss);
+}
+
+gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
+                                         const gd_tensor *hidden,
+                                         const gd_tensor *weight,
+                                         const gd_tensor *targets,
+                                         float logits_softcap,
+                                         gd_tensor *loss)
 {
     gd_status st;
     gd_linear_shape_info info;
@@ -315,6 +343,10 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
         return st;
     }
     st = gd_lm_cross_entropy_validate_targets(ctx, targets, info.rows);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_validate_softcap(ctx, logits_softcap);
     if (st != GD_OK) {
         return st;
     }
@@ -372,7 +404,8 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                                                         &row_max,
                                                         &row_inv_sum,
                                                         class_start,
-                                                        (uint64_t)info.n);
+                                                        (uint64_t)info.n,
+                                                        logits_softcap);
         if (st != GD_OK) {
             return st;
         }
@@ -399,6 +432,9 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
         const gd_tensor *inputs[3];
         gd_tensor *outputs[1];
         const gd_tensor *saved[2];
+        const gd_lm_cross_entropy_attrs attrs = {
+            .logits_softcap = logits_softcap,
+        };
         inputs[0] = hidden;
         inputs[1] = weight;
         inputs[2] = targets;
@@ -411,8 +447,8 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                                 3U,
                                 outputs,
                                 1U,
-                                NULL,
-                                0U,
+                                &attrs,
+                                (uint32_t)sizeof(attrs),
                                 saved,
                                 2U);
         if (st != GD_OK) {
@@ -437,6 +473,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   const gd_tensor *targets,
                                                   const gd_tensor *row_max,
                                                   const gd_tensor *row_inv_sum,
+                                                  float logits_softcap,
                                                   const gd_tensor *grad_out,
                                                   gd_tensor *grad_hidden,
                                                   gd_tensor *grad_weight)
@@ -474,6 +511,10 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         return st;
     }
     st = gd_lm_cross_entropy_validate_targets(ctx, targets, info.rows);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_validate_softcap(ctx, logits_softcap);
     if (st != GD_OK) {
         return st;
     }
@@ -567,7 +608,8 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                          &logits_chunk,
                                                          class_start,
                                                          (uint64_t)info.n,
-                                                         1.0f / (float)info.rows);
+                                                         1.0f / (float)info.rows,
+                                                         logits_softcap);
         if (st != GD_OK) {
             return st;
         }

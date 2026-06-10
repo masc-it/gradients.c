@@ -27,6 +27,8 @@
 #define GPT_DEFAULT_GRAD_CLIP_NORM 1.0f
 #define GPT_DEFAULT_RMS_EPS 1.0e-5f
 #define GPT_DEFAULT_POWLU_M 2.0f
+#define GPT_DEFAULT_MIN_P 0.0f
+#define GPT_DEFAULT_REPETITION_PENALTY 1.0f
 #define GPT_DEFAULT_SEED UINT64_C(0x6750746c6d5eed00)
 
 #define GPT_ALIGNMENT 256U
@@ -82,6 +84,7 @@ typedef struct gpt_lm {
     float dropout_p;
     float rms_eps;
     float powlu_m;
+    float logits_softcap;
     uint64_t dropout_seed;
     gd_tensor token_embedding;
     gd_tensor final_norm_w;
@@ -118,6 +121,9 @@ typedef struct gpt_config {
     float weight_decay;
     float grad_clip_norm;
     float temperature;
+    float min_p;
+    float repetition_penalty;
+    float logits_softcap;
 } gpt_config;
 
 void gpt_fail_status(gd_context *ctx, gd_status st, const char *expr, int line);

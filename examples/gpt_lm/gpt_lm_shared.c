@@ -1214,15 +1214,15 @@ static int gpt_sample_next_token(float *logits,
     return best;
 }
 
-static void gpt_generate_prompts_loaded(gd_context *ctx,
-                                        gpt_lm *model,
-                                        const gpt_config *config,
-                                        const char *const *prompts,
-                                        int n_prompts,
-                                        const char *tag,
-                                        size_t step,
-                                        bool restore_training,
-                                        const gpt_generation_tokenizer *tokenizer)
+static int gpt_generate_prompts_loaded(gd_context *ctx,
+                                       gpt_lm *model,
+                                       const gpt_config *config,
+                                       const char *const *prompts,
+                                       int n_prompts,
+                                       const char *tag,
+                                       size_t step,
+                                       bool restore_training,
+                                       const gpt_generation_tokenizer *tokenizer)
 {
     gd_tokenizer *tok;
     const char *tokenizer_path;
@@ -1498,51 +1498,56 @@ static void gpt_generate_prompts_loaded(gd_context *ctx,
     free(n_encoded);
     free(seq_ids);
     free(encoded);
+    return generated;
 }
 
-void gpt_generate_with_tokenizer(gd_context *ctx,
-                                 gpt_lm *model,
-                                 const gpt_config *config,
-                                 const gpt_generation_tokenizer *tokenizer)
+int gpt_generate_with_tokenizer(gd_context *ctx,
+                                gpt_lm *model,
+                                const gpt_config *config,
+                                const gpt_generation_tokenizer *tokenizer)
 {
     const char *prompts[1];
     prompts[0] = config->generate_prompt;
-    gpt_generate_prompts_loaded(ctx, model, config, prompts, 1, "user", 0U, false, tokenizer);
+    return gpt_generate_prompts_loaded(ctx, model, config, prompts, 1, "user", 0U, false, tokenizer);
 }
 
-void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
+int gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
 {
+    int generated;
     gpt_generation_tokenizer tokenizer;
     gpt_generation_tokenizer_init(ctx, config, &tokenizer);
-    gpt_generate_with_tokenizer(ctx, model, config, &tokenizer);
+    generated = gpt_generate_with_tokenizer(ctx, model, config, &tokenizer);
     gpt_generation_tokenizer_deinit(&tokenizer);
+    return generated;
 }
 
-void gpt_generate_vowels_with_tokenizer(gd_context *ctx,
-                                        gpt_lm *model,
-                                        const gpt_config *config,
-                                        size_t step,
-                                        const gpt_generation_tokenizer *tokenizer)
+int gpt_generate_vowels_with_tokenizer(gd_context *ctx,
+                                       gpt_lm *model,
+                                       const gpt_config *config,
+                                       size_t step,
+                                       const gpt_generation_tokenizer *tokenizer)
 {
     static const char *const prompts[GPT_GENERATE_VOWEL_PROMPT_COUNT] = {"a", "e", "i", "o", "u"};
-    gpt_generate_prompts_loaded(ctx,
-                                model,
-                                config,
-                                prompts,
-                                (int)GPT_GENERATE_VOWEL_PROMPT_COUNT,
-                                "vowels",
-                                step,
-                                true,
-                                tokenizer);
+    return gpt_generate_prompts_loaded(ctx,
+                                       model,
+                                       config,
+                                       prompts,
+                                       (int)GPT_GENERATE_VOWEL_PROMPT_COUNT,
+                                       "vowels",
+                                       step,
+                                       true,
+                                       tokenizer);
 }
 
-void gpt_generate_vowels(gd_context *ctx,
-                         gpt_lm *model,
-                         const gpt_config *config,
-                         size_t step)
+int gpt_generate_vowels(gd_context *ctx,
+                        gpt_lm *model,
+                        const gpt_config *config,
+                        size_t step)
 {
+    int generated;
     gpt_generation_tokenizer tokenizer;
     gpt_generation_tokenizer_init(ctx, config, &tokenizer);
-    gpt_generate_vowels_with_tokenizer(ctx, model, config, step, &tokenizer);
+    generated = gpt_generate_vowels_with_tokenizer(ctx, model, config, step, &tokenizer);
     gpt_generation_tokenizer_deinit(&tokenizer);
+    return generated;
 }

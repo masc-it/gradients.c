@@ -432,7 +432,15 @@ int main(int argc, char **argv)
             continue;
         }
         config.generate_prompt = prompt;
-        gpt_generate_with_tokenizer(ctx, &model, &config, &generation_tokenizer);
+        {
+            const double prompt_start = gpt_wall_seconds();
+            const int generated = gpt_generate_with_tokenizer(ctx, &model, &config, &generation_tokenizer);
+            const double prompt_elapsed = gpt_wall_seconds() - prompt_start;
+            printf("interactive:user: generated=%d wall_elapsed=%.3fs wall_tok/s=%.1f\n",
+                   generated,
+                   prompt_elapsed,
+                   prompt_elapsed > 0.0 ? (double)generated / prompt_elapsed : 0.0);
+        }
     }
     exit_code = 0;
 

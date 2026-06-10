@@ -152,19 +152,19 @@ void gpt_generation_tokenizer_init(gd_context *ctx,
                                    const gpt_config *config,
                                    gpt_generation_tokenizer *out);
 void gpt_generation_tokenizer_deinit(gpt_generation_tokenizer *tokenizer);
-void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config);
-void gpt_generate_with_tokenizer(gd_context *ctx,
-                                 gpt_lm *model,
-                                 const gpt_config *config,
-                                 const gpt_generation_tokenizer *tokenizer);
-void gpt_generate_vowels(gd_context *ctx,
-                         gpt_lm *model,
-                         const gpt_config *config,
-                         size_t step);
-void gpt_generate_vowels_with_tokenizer(gd_context *ctx,
-                                        gpt_lm *model,
-                                        const gpt_config *config,
-                                        size_t step,
-                                        const gpt_generation_tokenizer *tokenizer);
+int gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config);
+int gpt_generate_with_tokenizer(gd_context *ctx,
+                                gpt_lm *model,
+                                const gpt_config *config,
+                                const gpt_generation_tokenizer *tokenizer);
+int gpt_generate_vowels(gd_context *ctx,
+                        gpt_lm *model,
+                        const gpt_config *config,
+                        size_t step);
+int gpt_generate_vowels_with_tokenizer(gd_context *ctx,
+                                       gpt_lm *model,
+                                       const gpt_config *config,
+                                       size_t step,
+                                       const gpt_generation_tokenizer *tokenizer);
 
 #endif /* GPT_LM_SHARED_H */

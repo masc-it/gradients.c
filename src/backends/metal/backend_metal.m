@@ -235,6 +235,7 @@ static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
     GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel", sdpa_varlen_bwd_dkv_split_dh64_f16_pso),
     GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_dkv_reduce_f16_kernel", sdpa_varlen_bwd_dkv_reduce_f16_pso),
     GD_METAL_PIPELINE("gd_sdpa_decode_kernel", sdpa_decode_pso),
+    GD_METAL_PIPELINE("gd_sdpa_decode_tq1_dh64_f16_kernel", sdpa_decode_tq1_dh64_f16_pso),
     GD_METAL_PIPELINE("gd_kv_cache_append_kernel", kv_cache_append_pso),
     GD_METAL_PIPELINE("gd_kv_cache_append_packed_kernel", kv_cache_append_packed_pso),
     GD_METAL_PIPELINE("gd_adamw_kernel", adamw_pso),

@@ -11,6 +11,11 @@ static id<MTLComputePipelineState> gd_sdpa_decode_pso(gd_backend *backend)
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_decode_pso;
 }
 
+static id<MTLComputePipelineState> gd_sdpa_decode_tq1_dh64_f16_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->sdpa_decode_tq1_dh64_f16_pso;
+}
+
 static id<MTLBuffer> gd_sdpa_decode_buffer(gd_backend_buffer *buffer)
 {
     return (__bridge id<MTLBuffer>)buffer->buffer;
@@ -144,6 +149,16 @@ static bool gd_sdpa_decode_args_valid(const gd_backend_sdpa_decode_args *args,
            args->prefix_len <= (uint32_t)k->shape[1];
 }
 
+static bool gd_sdpa_decode_tq1_dh64_f16_ok(const gd_metal_sdpa_decode_args *p,
+                                           gd_backend *backend)
+{
+    return p != NULL && backend != NULL && backend->sdpa_decode_tq1_dh64_f16_pso != NULL &&
+           p->dtype == (uint32_t)GD_DTYPE_F16 && p->tq == 1U &&
+           p->dh == GD_METAL_SDPA_DECODE_DHT && p->prefix_len == 0U &&
+           p->window > 0U && p->window <= GD_METAL_SDPA_DECODE_TQ1_KEYS &&
+           p->hkv > 0U && p->hq > 0U && (p->hq % p->hkv) == 0U;
+}
+
 static void gd_sdpa_decode_fill_metal_args(gd_metal_sdpa_decode_args *p,
                                            const gd_backend_tensor_view *q,
                                            const gd_backend_tensor_view *k,
@@ -180,6 +195,7 @@ gd_status gd_backend_sdpa_decode(gd_backend *backend,
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pso;
     gd_metal_sdpa_decode_args p;
     MTLSize groups;
     MTLSize threads;
@@ -199,19 +215,26 @@ gd_status gd_backend_sdpa_decode(gd_backend *backend,
     }
     gd_sdpa_decode_fill_metal_args(&p, q, k_cache, cache_pos, out, args);
     p.v_offset = (uint64_t)v_cache->offset;
-    [encoder setComputePipelineState:gd_sdpa_decode_pso(backend)];
+    pso = gd_sdpa_decode_tq1_dh64_f16_ok(&p, backend) ? gd_sdpa_decode_tq1_dh64_f16_pso(backend) :
+                                                         gd_sdpa_decode_pso(backend);
+    [encoder setComputePipelineState:pso];
     [encoder setBuffer:gd_sdpa_decode_buffer(q->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_sdpa_decode_buffer(k_cache->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_sdpa_decode_buffer(v_cache->buffer) offset:0U atIndex:2U];
     [encoder setBuffer:gd_sdpa_decode_buffer(cache_pos->buffer) offset:0U atIndex:3U];
     [encoder setBuffer:gd_sdpa_decode_buffer(out->buffer) offset:0U atIndex:4U];
     [encoder setBytes:&p length:sizeof(p) atIndex:5U];
-    groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq *
-                             ((NSUInteger)(p.tq + GD_METAL_SDPA_DECODE_BQ - 1U) /
-                              (NSUInteger)GD_METAL_SDPA_DECODE_BQ),
-                         1U,
-                         1U);
-    threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_BQ, 1U, 1U);
+    if (pso == gd_sdpa_decode_tq1_dh64_f16_pso(backend)) {
+        groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq, 1U, 1U);
+        threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_TQ1_KEYS, 1U, 1U);
+    } else {
+        groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq *
+                                 ((NSUInteger)(p.tq + GD_METAL_SDPA_DECODE_BQ - 1U) /
+                                  (NSUInteger)GD_METAL_SDPA_DECODE_BQ),
+                             1U,
+                             1U);
+        threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_BQ, 1U, 1U);
+    }
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);
@@ -228,6 +251,7 @@ static gd_status gd_backend_sdpa_decode_dispatch(gd_backend *backend,
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pso;
     gd_metal_sdpa_decode_args p;
     MTLSize groups;
     MTLSize threads;
@@ -244,19 +268,26 @@ static gd_status gd_backend_sdpa_decode_dispatch(gd_backend *backend,
     gd_sdpa_decode_fill_metal_args(&p, q, k_cache, cache_pos, out, args);
     p.v_offset = (uint64_t)v_cache->offset;
     p.pos_mode = pos_mode;
-    [encoder setComputePipelineState:gd_sdpa_decode_pso(backend)];
+    pso = gd_sdpa_decode_tq1_dh64_f16_ok(&p, backend) ? gd_sdpa_decode_tq1_dh64_f16_pso(backend) :
+                                                         gd_sdpa_decode_pso(backend);
+    [encoder setComputePipelineState:pso];
     [encoder setBuffer:gd_sdpa_decode_buffer(q->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_sdpa_decode_buffer(k_cache->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_sdpa_decode_buffer(v_cache->buffer) offset:0U atIndex:2U];
     [encoder setBuffer:gd_sdpa_decode_buffer(cache_pos != NULL ? cache_pos->buffer : q->buffer) offset:0U atIndex:3U];
     [encoder setBuffer:gd_sdpa_decode_buffer(out->buffer) offset:0U atIndex:4U];
     [encoder setBytes:&p length:sizeof(p) atIndex:5U];
-    groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq *
-                             ((NSUInteger)(p.tq + GD_METAL_SDPA_DECODE_BQ - 1U) /
-                              (NSUInteger)GD_METAL_SDPA_DECODE_BQ),
-                         1U,
-                         1U);
-    threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_BQ, 1U, 1U);
+    if (pso == gd_sdpa_decode_tq1_dh64_f16_pso(backend)) {
+        groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq, 1U, 1U);
+        threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_TQ1_KEYS, 1U, 1U);
+    } else {
+        groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq *
+                                 ((NSUInteger)(p.tq + GD_METAL_SDPA_DECODE_BQ - 1U) /
+                                  (NSUInteger)GD_METAL_SDPA_DECODE_BQ),
+                             1U,
+                             1U);
+        threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_DECODE_BQ, 1U, 1U);
+    }
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);

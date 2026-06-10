@@ -5,7 +5,9 @@
 #include "../core/backend.h"
 #include "../core/memory_internal.h"
 
+#include <errno.h>
 #include <float.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +16,8 @@
 
 #define GD_OPTIM_GRAD_CLIP_BLOCK_ELEMS 1024U
 #define GD_OPTIM_GRAD_CLIP_SCALE_EPS 1.0e-6f
+#define GD_OPTIM_STATE_FORMAT "gd_optimizer_adamw_state_v1"
+#define GD_OPTIM_STATE_MODULE_NAME "gd_optimizer"
 
 typedef struct gd_optimizer_param {
     char path[GD_MODULE_PATH_MAX];
@@ -53,6 +57,29 @@ struct gd_amp_scaler {
     uint32_t growth_tracker;
     bool last_found_inf;
 };
+
+typedef struct gd_optim_string_builder {
+    char *data;
+    size_t len;
+    size_t capacity;
+} gd_optim_string_builder;
+
+typedef struct gd_optimizer_saved_param_state {
+    uint64_t step;
+    float beta1_power;
+    float beta2_power;
+    float lr_mult;
+    float weight_decay;
+    bool trainable;
+    bool has_master;
+} gd_optimizer_saved_param_state;
+
+typedef struct gd_optimizer_saved_state {
+    gd_adamw_config config;
+    uint64_t step;
+    uint32_t param_count;
+    gd_optimizer_saved_param_state *params;
+} gd_optimizer_saved_state;
 
 static bool gd_adamw_lr_valid(float lr)
 {
@@ -108,6 +135,495 @@ static bool gd_amp_config_valid(const gd_amp_config *config)
            gd_amp_float_finite_positive(config->min_scale) &&
            gd_amp_float_finite_positive(config->max_scale) && config->max_scale >= config->min_scale &&
            config->growth_interval > 0U;
+}
+
+static void gd_optim_string_builder_free(gd_optim_string_builder *builder)
+{
+    if (builder == NULL) {
+        return;
+    }
+    free(builder->data);
+    memset(builder, 0, sizeof(*builder));
+}
+
+static gd_status gd_optim_string_builder_reserve(gd_optim_string_builder *builder,
+                                                 size_t required)
+{
+    char *grown;
+    size_t new_capacity;
+    if (builder == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (required <= builder->capacity) {
+        return GD_OK;
+    }
+    new_capacity = builder->capacity != 0U ? builder->capacity : 1024U;
+    while (new_capacity < required) {
+        if (new_capacity > SIZE_MAX / 2U) {
+            new_capacity = required;
+        } else {
+            new_capacity *= 2U;
+        }
+    }
+    grown = (char *)realloc(builder->data, new_capacity);
+    if (grown == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    builder->data = grown;
+    builder->capacity = new_capacity;
+    return GD_OK;
+}
+
+static gd_status gd_optim_string_builder_appendf(gd_optim_string_builder *builder,
+                                                 const char *fmt,
+                                                 ...)
+{
+    va_list args;
+    va_list copy;
+    int needed;
+    size_t required;
+    gd_status st;
+    if (builder == NULL || fmt == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    va_start(args, fmt);
+    va_copy(copy, args);
+    needed = vsnprintf(NULL, 0U, fmt, args);
+    va_end(args);
+    if (needed < 0) {
+        va_end(copy);
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if ((size_t)needed > SIZE_MAX - builder->len - 1U) {
+        va_end(copy);
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    required = builder->len + (size_t)needed + 1U;
+    st = gd_optim_string_builder_reserve(builder, required);
+    if (st != GD_OK) {
+        va_end(copy);
+        return st;
+    }
+    (void)vsnprintf(builder->data + builder->len,
+                    builder->capacity - builder->len,
+                    fmt,
+                    copy);
+    va_end(copy);
+    builder->len += (size_t)needed;
+    return GD_OK;
+}
+
+static gd_status gd_optim_snprintf_name(gd_context *ctx,
+                                         char name[GD_MODULE_NAME_MAX],
+                                         const char *fmt,
+                                         uint32_t index)
+{
+    int n;
+    if (name == NULL || fmt == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    n = snprintf(name, GD_MODULE_NAME_MAX, fmt, (unsigned)index);
+    if (n < 0 || (size_t)n >= GD_MODULE_NAME_MAX) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "optimizer checkpoint buffer name too long");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_state_module_add_buffer(gd_context *ctx,
+                                                      gd_module *module,
+                                                      const char *name,
+                                                      gd_tensor *tensor)
+{
+    gd_status st;
+    if (ctx == NULL || module == NULL || name == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_module_add_buffer(module, name, tensor);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "optimizer checkpoint buffer registration failed");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_build_state_module(gd_context *ctx,
+                                                 gd_optimizer *optimizer,
+                                                 gd_module *module)
+{
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL || module == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(module, 0, sizeof(*module));
+    st = gd_module_init(ctx, module, GD_OPTIM_STATE_MODULE_NAME);
+    if (st != GD_OK) {
+        return st;
+    }
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        char name[GD_MODULE_NAME_MAX];
+        st = gd_optim_snprintf_name(ctx, name, "slot_%06u_m", i);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_state_module_add_buffer(ctx, module, name, &slot->m);
+        if (st != GD_OK) { return st; }
+        st = gd_optim_snprintf_name(ctx, name, "slot_%06u_v", i);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_state_module_add_buffer(ctx, module, name, &slot->v);
+        if (st != GD_OK) { return st; }
+        if (slot->has_master) {
+            st = gd_optim_snprintf_name(ctx, name, "slot_%06u_master", i);
+            if (st != GD_OK) { return st; }
+            st = gd_optimizer_state_module_add_buffer(ctx, module, name, &slot->master);
+            if (st != GD_OK) { return st; }
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_build_state_metadata(const gd_optimizer *optimizer,
+                                                   char **metadata_out,
+                                                   size_t *metadata_len_out)
+{
+    gd_optim_string_builder builder;
+    uint32_t i;
+    gd_status st;
+    if (metadata_out != NULL) {
+        *metadata_out = NULL;
+    }
+    if (metadata_len_out != NULL) {
+        *metadata_len_out = 0U;
+    }
+    if (optimizer == NULL || metadata_out == NULL || metadata_len_out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(&builder, 0, sizeof(builder));
+#define GD_OPTIM_META_APPEND(...)                                             \
+    do {                                                                      \
+        st = gd_optim_string_builder_appendf(&builder, __VA_ARGS__);           \
+        if (st != GD_OK) {                                                    \
+            gd_optim_string_builder_free(&builder);                            \
+            return st;                                                        \
+        }                                                                     \
+    } while (0)
+    GD_OPTIM_META_APPEND("format=%s\n", GD_OPTIM_STATE_FORMAT);
+    GD_OPTIM_META_APPEND("optimizer_type=adamw\n");
+    GD_OPTIM_META_APPEND("global_step=%llu\n", (unsigned long long)optimizer->step);
+    GD_OPTIM_META_APPEND("param_count=%u\n", (unsigned)optimizer->param_count);
+    GD_OPTIM_META_APPEND("config.lr=%.9g\n", (double)optimizer->config.lr);
+    GD_OPTIM_META_APPEND("config.beta1=%.9g\n", (double)optimizer->config.beta1);
+    GD_OPTIM_META_APPEND("config.beta2=%.9g\n", (double)optimizer->config.beta2);
+    GD_OPTIM_META_APPEND("config.eps=%.9g\n", (double)optimizer->config.eps);
+    GD_OPTIM_META_APPEND("config.weight_decay=%.9g\n", (double)optimizer->config.weight_decay);
+    GD_OPTIM_META_APPEND("config.bias_correction=%u\n", optimizer->config.bias_correction ? 1U : 0U);
+    for (i = 0U; i < optimizer->param_count; ++i) {
+        const gd_optimizer_param *slot = &optimizer->params[i];
+        GD_OPTIM_META_APPEND("param.%u.path=%s\n", (unsigned)i, slot->path);
+        GD_OPTIM_META_APPEND("param.%u.step=%llu\n", (unsigned)i, (unsigned long long)slot->step);
+        GD_OPTIM_META_APPEND("param.%u.beta1_power=%.9g\n", (unsigned)i, (double)slot->beta1_power);
+        GD_OPTIM_META_APPEND("param.%u.beta2_power=%.9g\n", (unsigned)i, (double)slot->beta2_power);
+        GD_OPTIM_META_APPEND("param.%u.lr_mult=%.9g\n", (unsigned)i, (double)slot->lr_mult);
+        GD_OPTIM_META_APPEND("param.%u.weight_decay=%.9g\n", (unsigned)i, (double)slot->weight_decay);
+        GD_OPTIM_META_APPEND("param.%u.trainable=%u\n", (unsigned)i, slot->trainable ? 1U : 0U);
+        GD_OPTIM_META_APPEND("param.%u.has_master=%u\n", (unsigned)i, slot->has_master ? 1U : 0U);
+    }
+#undef GD_OPTIM_META_APPEND
+    *metadata_out = builder.data;
+    *metadata_len_out = builder.len;
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_metadata_value(const char *metadata,
+                                             const char *key,
+                                             const char **value_out,
+                                             size_t *value_len_out)
+{
+    const char *line;
+    const size_t key_len = key != NULL ? strlen(key) : 0U;
+    if (metadata == NULL || key == NULL || value_out == NULL || value_len_out == NULL || key_len == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    line = metadata;
+    while (*line != '\0') {
+        const char *end = strchr(line, '\n');
+        const size_t line_len = end != NULL ? (size_t)(end - line) : strlen(line);
+        if (line_len > key_len && memcmp(line, key, key_len) == 0 && line[key_len] == '=') {
+            *value_out = line + key_len + 1U;
+            *value_len_out = line_len - key_len - 1U;
+            return GD_OK;
+        }
+        if (end == NULL) {
+            break;
+        }
+        line = end + 1;
+    }
+    return GD_ERR_BAD_STATE;
+}
+
+static gd_status gd_optimizer_metadata_copy_value(gd_context *ctx,
+                                                  const char *metadata,
+                                                  const char *key,
+                                                  char *buffer,
+                                                  size_t buffer_size)
+{
+    const char *value;
+    size_t value_len;
+    gd_status st;
+    if (ctx == NULL || metadata == NULL || key == NULL || buffer == NULL || buffer_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_optimizer_metadata_value(metadata, key, &value, &value_len);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "optimizer checkpoint metadata key missing");
+    }
+    if (value_len >= buffer_size) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "optimizer checkpoint metadata value too long");
+    }
+    memcpy(buffer, value, value_len);
+    buffer[value_len] = '\0';
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_metadata_get_string(gd_context *ctx,
+                                                  const char *metadata,
+                                                  const char *key,
+                                                  char *buffer,
+                                                  size_t buffer_size)
+{
+    return gd_optimizer_metadata_copy_value(ctx, metadata, key, buffer, buffer_size);
+}
+
+static gd_status gd_optimizer_metadata_get_u64(gd_context *ctx,
+                                               const char *metadata,
+                                               const char *key,
+                                               uint64_t *out)
+{
+    char buffer[128];
+    char *end = NULL;
+    unsigned long long parsed;
+    gd_status st;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_optimizer_metadata_copy_value(ctx, metadata, key, buffer, sizeof(buffer));
+    if (st != GD_OK) {
+        return st;
+    }
+    errno = 0;
+    parsed = strtoull(buffer, &end, 10);
+    if (errno != 0 || end == buffer || *end != '\0') {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "optimizer checkpoint metadata uint parse failed");
+    }
+    *out = (uint64_t)parsed;
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_metadata_get_bool(gd_context *ctx,
+                                                const char *metadata,
+                                                const char *key,
+                                                bool *out)
+{
+    uint64_t value;
+    gd_status st;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_optimizer_metadata_get_u64(ctx, metadata, key, &value);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (value > 1U) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "optimizer checkpoint metadata bool parse failed");
+    }
+    *out = value != 0U;
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_metadata_get_f32(gd_context *ctx,
+                                               const char *metadata,
+                                               const char *key,
+                                               float *out)
+{
+    char buffer[128];
+    char *end = NULL;
+    float parsed;
+    gd_status st;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_optimizer_metadata_copy_value(ctx, metadata, key, buffer, sizeof(buffer));
+    if (st != GD_OK) {
+        return st;
+    }
+    errno = 0;
+    parsed = strtof(buffer, &end);
+    if (errno != 0 || end == buffer || *end != '\0' || parsed != parsed) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
+                                    "optimizer checkpoint metadata float parse failed");
+    }
+    *out = parsed;
+    return GD_OK;
+}
+
+static gd_status gd_optimizer_metadata_param_key(char key[128],
+                                                 uint32_t index,
+                                                 const char *field)
+{
+    int n;
+    if (key == NULL || field == NULL || field[0] == '\0') {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    n = snprintf(key, 128U, "param.%u.%s", (unsigned)index, field);
+    if (n < 0 || (size_t)n >= 128U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+static void gd_optimizer_saved_state_free(gd_optimizer_saved_state *saved)
+{
+    if (saved == NULL) {
+        return;
+    }
+    free(saved->params);
+    memset(saved, 0, sizeof(*saved));
+}
+
+static gd_status gd_optimizer_parse_state_metadata(gd_context *ctx,
+                                                   const gd_optimizer *optimizer,
+                                                   const char *metadata,
+                                                   gd_optimizer_saved_state *saved)
+{
+    char text[GD_MODULE_PATH_MAX];
+    uint64_t u64_value;
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL || metadata == NULL || saved == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(saved, 0, sizeof(*saved));
+    st = gd_optimizer_metadata_get_string(ctx, metadata, "format", text, sizeof(text));
+    if (st != GD_OK) { return st; }
+    if (strcmp(text, GD_OPTIM_STATE_FORMAT) != 0) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                    "optimizer checkpoint format mismatch");
+    }
+    st = gd_optimizer_metadata_get_string(ctx, metadata, "optimizer_type", text, sizeof(text));
+    if (st != GD_OK) { return st; }
+    if (strcmp(text, "adamw") != 0) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                    "optimizer checkpoint type mismatch");
+    }
+    st = gd_optimizer_metadata_get_u64(ctx, metadata, "global_step", &saved->step);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_u64(ctx, metadata, "param_count", &u64_value);
+    if (st != GD_OK) { return st; }
+    if (u64_value != (uint64_t)optimizer->param_count || u64_value > (uint64_t)UINT32_MAX) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                    "optimizer checkpoint param count mismatch");
+    }
+    saved->param_count = (uint32_t)u64_value;
+    st = gd_optimizer_metadata_get_f32(ctx, metadata, "config.lr", &saved->config.lr);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_f32(ctx, metadata, "config.beta1", &saved->config.beta1);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_f32(ctx, metadata, "config.beta2", &saved->config.beta2);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_f32(ctx, metadata, "config.eps", &saved->config.eps);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_f32(ctx, metadata, "config.weight_decay", &saved->config.weight_decay);
+    if (st != GD_OK) { return st; }
+    st = gd_optimizer_metadata_get_bool(ctx, metadata, "config.bias_correction", &saved->config.bias_correction);
+    if (st != GD_OK) { return st; }
+    if (!gd_adamw_config_valid(&saved->config)) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                    "optimizer checkpoint config invalid");
+    }
+    if (saved->param_count != 0U) {
+        saved->params = (gd_optimizer_saved_param_state *)calloc(saved->param_count,
+                                                                 sizeof(saved->params[0]));
+        if (saved->params == NULL) {
+            return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY,
+                                        "optimizer checkpoint saved state allocation failed");
+        }
+    }
+    for (i = 0U; i < saved->param_count; ++i) {
+        gd_optimizer_saved_param_state *param_state = &saved->params[i];
+        const gd_optimizer_param *slot = &optimizer->params[i];
+        char key[128];
+        st = gd_optimizer_metadata_param_key(key, i, "path");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_string(ctx, metadata, key, text, sizeof(text));
+        if (st != GD_OK) { return st; }
+        if (strcmp(text, slot->path) != 0) {
+            return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                        "optimizer checkpoint param path mismatch");
+        }
+        st = gd_optimizer_metadata_param_key(key, i, "step");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_u64(ctx, metadata, key, &param_state->step);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "beta1_power");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_f32(ctx, metadata, key, &param_state->beta1_power);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "beta2_power");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_f32(ctx, metadata, key, &param_state->beta2_power);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "lr_mult");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_f32(ctx, metadata, key, &param_state->lr_mult);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "weight_decay");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_f32(ctx, metadata, key, &param_state->weight_decay);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "trainable");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_bool(ctx, metadata, key, &param_state->trainable);
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_param_key(key, i, "has_master");
+        if (st != GD_OK) { return st; }
+        st = gd_optimizer_metadata_get_bool(ctx, metadata, key, &param_state->has_master);
+        if (st != GD_OK) { return st; }
+        if (param_state->has_master != slot->has_master) {
+            return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                        "optimizer checkpoint master-state mismatch");
+        }
+        if (param_state->beta1_power < 0.0f || param_state->beta1_power > 1.0f ||
+            param_state->beta2_power < 0.0f || param_state->beta2_power > 1.0f ||
+            param_state->lr_mult < 0.0f || param_state->lr_mult > FLT_MAX ||
+            param_state->weight_decay < 0.0f || param_state->weight_decay > FLT_MAX) {
+            return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                        "optimizer checkpoint param options invalid");
+        }
+    }
+    return GD_OK;
+}
+
+static void gd_optimizer_apply_saved_state(gd_optimizer *optimizer,
+                                           const gd_optimizer_saved_state *saved)
+{
+    uint32_t i;
+    if (optimizer == NULL || saved == NULL) {
+        return;
+    }
+    optimizer->config = saved->config;
+    optimizer->step = saved->step;
+    for (i = 0U; i < saved->param_count; ++i) {
+        gd_optimizer_param *slot = &optimizer->params[i];
+        const gd_optimizer_saved_param_state *param_state = &saved->params[i];
+        slot->step = param_state->step;
+        slot->beta1_power = param_state->beta1_power;
+        slot->beta2_power = param_state->beta2_power;
+        slot->lr_mult = param_state->lr_mult;
+        slot->weight_decay = param_state->weight_decay;
+        slot->trainable = param_state->trainable;
+    }
 }
 
 static float gd_amp_clamp_scale(float value, const gd_amp_config *config)
@@ -507,6 +1023,36 @@ bool gd_amp_scaler_last_found_inf(const gd_amp_scaler *scaler)
 uint32_t gd_amp_scaler_growth_tracker(const gd_amp_scaler *scaler)
 {
     return scaler != NULL ? scaler->growth_tracker : 0U;
+}
+
+gd_status gd_amp_scaler_get_state(const gd_amp_scaler *scaler,
+                                  gd_amp_scaler_state *out)
+{
+    if (scaler == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    out->config = scaler->config;
+    out->scale = scaler->scale;
+    out->growth_tracker = scaler->growth_tracker;
+    out->last_found_inf = scaler->last_found_inf;
+    return GD_OK;
+}
+
+gd_status gd_amp_scaler_set_state(gd_amp_scaler *scaler,
+                                  const gd_amp_scaler_state *state)
+{
+    if (scaler == NULL || state == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_amp_config_valid(&state->config) ||
+        !gd_amp_float_finite_positive(state->scale)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    scaler->config = state->config;
+    scaler->scale = gd_amp_clamp_scale(state->scale, &state->config);
+    scaler->growth_tracker = state->growth_tracker;
+    scaler->last_found_inf = state->last_found_inf;
+    return GD_OK;
 }
 
 static void gd_amp_scaler_update(gd_amp_scaler *scaler, bool found_inf)
@@ -1301,4 +1847,77 @@ gd_status gd_optimizer_last_grad_norm(gd_context *ctx,
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer)
 {
     return optimizer != NULL ? optimizer->step : 0U;
+}
+
+gd_status gd_optimizer_save_state(gd_context *ctx,
+                                  const gd_optimizer *optimizer,
+                                  const char *path)
+{
+    gd_module state_module;
+    gd_module_save_options options;
+    char *metadata = NULL;
+    size_t metadata_len = 0U;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL || path == NULL || path[0] == '\0') {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(&state_module, 0, sizeof(state_module));
+    st = gd_optimizer_build_state_metadata(optimizer, &metadata, &metadata_len);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "optimizer checkpoint metadata allocation failed");
+    }
+    st = gd_optimizer_build_state_module(ctx, (gd_optimizer *)optimizer, &state_module);
+    if (st == GD_OK) {
+        options = gd_module_save_options_default();
+        options.metadata = metadata;
+        options.metadata_len = metadata_len;
+        options.include_buffers = true;
+        st = gd_module_save_state(ctx, &state_module, path, &options);
+    }
+    gd_module_deinit(&state_module);
+    free(metadata);
+    return st == GD_OK ? GD_OK : gd_context_set_error(ctx, st, "optimizer checkpoint save failed");
+}
+
+gd_status gd_optimizer_load_state(gd_context *ctx,
+                                  gd_optimizer *optimizer,
+                                  const char *path,
+                                  bool strict)
+{
+    gd_module state_module;
+    gd_module_load_options options;
+    gd_optimizer_saved_state saved;
+    char *metadata = NULL;
+    size_t metadata_len = 0U;
+    gd_status st;
+    if (ctx == NULL || optimizer == NULL || path == NULL || path[0] == '\0') {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(&state_module, 0, sizeof(state_module));
+    memset(&saved, 0, sizeof(saved));
+    st = gd_checkpoint_read_metadata(path, &metadata, &metadata_len);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "optimizer checkpoint metadata read failed");
+    }
+    (void)metadata_len;
+    st = gd_optimizer_parse_state_metadata(ctx, optimizer, metadata, &saved);
+    free(metadata);
+    metadata = NULL;
+    if (st != GD_OK) {
+        gd_optimizer_saved_state_free(&saved);
+        return st;
+    }
+    st = gd_optimizer_build_state_module(ctx, optimizer, &state_module);
+    if (st == GD_OK) {
+        options = gd_module_load_options_default();
+        options.strict = strict;
+        options.load_buffers = true;
+        st = gd_module_load_state(ctx, &state_module, path, &options);
+    }
+    gd_module_deinit(&state_module);
+    if (st == GD_OK) {
+        gd_optimizer_apply_saved_state(optimizer, &saved);
+    }
+    gd_optimizer_saved_state_free(&saved);
+    return st == GD_OK ? GD_OK : gd_context_set_error(ctx, st, "optimizer checkpoint load failed");
 }

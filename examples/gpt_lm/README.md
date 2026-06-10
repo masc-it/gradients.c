@@ -21,7 +21,7 @@ Build and run training:
 make -C examples/gpt_lm run ARGS="--epochs 2 --batch-size 32"
 ```
 
-At the end of every epoch, training evaluates the `val` split, saves `checkpoints/gpt_lm_best.gdckpt` whenever validation loss improves, and stops early after 10 validation epochs without improvement by default.
+At the end of every epoch, training evaluates the `val` split, saves `checkpoints/gpt_lm_best.gdckpt` whenever validation loss improves, writes a full-resume `checkpoints/gpt_lm_latest.gdckpt`, and stops early after 10 validation epochs without improvement by default. Optimizer/scaler/trainer state lives in sidecars next to each model checkpoint (`*.optim.gdckpt` and `*.train`).
 
 Overfit smoke tests:
 
@@ -40,6 +40,12 @@ Checkpoint inference after training:
 
 ```sh
 make -C examples/gpt_lm infer ARGS="--checkpoint checkpoints/gpt_lm_best.gdckpt --prompt 'Don Abbondio' --max-new-tokens 64"
+```
+
+Full training resume:
+
+```sh
+make -C examples/gpt_lm run ARGS="--resume-checkpoint checkpoints/gpt_lm_latest.gdckpt --epochs 500 --batch-size 96"
 ```
 
 Periodic batched generation during training:
@@ -64,10 +70,13 @@ Useful runtime options:
 --warmup-steps N        # default -1 means total_steps / 10
 --generate TEXT
 --generate-every-n-steps N
---checkpoint-path PATH
---load-checkpoint PATH
+--checkpoint-path PATH        # best-val model checkpoint
+--latest-checkpoint-path PATH # full-resume checkpoint saved every epoch
+--load-checkpoint PATH        # model weights only
+--resume-checkpoint PATH      # model + optimizer/scaler/trainer sidecars
 --val-split NAME
 --no-save-best
+--no-save-latest
 --early-stopping-patience N # 0 disables; default 10
 --max-new-tokens N
 --temperature T         # 0 means greedy

@@ -45,6 +45,13 @@ typedef struct gd_amp_config {
     uint32_t growth_interval;
 } gd_amp_config;
 
+typedef struct gd_amp_scaler_state {
+    gd_amp_config config;
+    float scale;
+    uint32_t growth_tracker;
+    bool last_found_inf;
+} gd_amp_scaler_state;
+
 gd_adamw_config gd_adamw_config_default(void);
 gd_lr_scheduler_config gd_lr_scheduler_config_default(void);
 gd_amp_config gd_amp_config_default(void);
@@ -59,6 +66,11 @@ float gd_amp_scaler_scale(const gd_amp_scaler *scaler);
 bool gd_amp_scaler_enabled(const gd_amp_scaler *scaler);
 bool gd_amp_scaler_last_found_inf(const gd_amp_scaler *scaler);
 uint32_t gd_amp_scaler_growth_tracker(const gd_amp_scaler *scaler);
+/* Round-trip dynamic loss-scale state for exact mixed-precision resume. */
+gd_status gd_amp_scaler_get_state(const gd_amp_scaler *scaler,
+                                  gd_amp_scaler_state *out);
+gd_status gd_amp_scaler_set_state(gd_amp_scaler *scaler,
+                                  const gd_amp_scaler_state *state);
 
 gd_status gd_adamw_create(gd_context *ctx,
                           const gd_param_set *params,
@@ -94,6 +106,17 @@ gd_status gd_optimizer_last_grad_norm(gd_context *ctx,
                                       const gd_optimizer *optimizer,
                                       float *out);
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer);
+
+/* Save/load backend-independent AdamW optimizer state. The target optimizer
+ * must already be constructed over the same ordered parameter set before load;
+ * strict loads require exact state tensor matches. */
+gd_status gd_optimizer_save_state(gd_context *ctx,
+                                  const gd_optimizer *optimizer,
+                                  const char *path);
+gd_status gd_optimizer_load_state(gd_context *ctx,
+                                  gd_optimizer *optimizer,
+                                  const char *path,
+                                  bool strict);
 
 #ifdef __cplusplus
 }

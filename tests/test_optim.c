@@ -313,6 +313,31 @@ static void run_amp_adamw_test(void)
     gd_context_destroy(ctx);
 }
 
+static void run_amp_scaler_state_roundtrip_test(void)
+{
+    gd_amp_config amp = gd_amp_config_default();
+    gd_amp_scaler *scaler_a = NULL;
+    gd_amp_scaler *scaler_b = NULL;
+    gd_amp_scaler_state state;
+
+    amp.init_scale = 16.0f;
+    amp.growth_interval = 3U;
+    CHECK_OK(gd_amp_scaler_create(&amp, &scaler_a));
+    CHECK_OK(gd_amp_scaler_create(NULL, &scaler_b));
+    CHECK_OK(gd_amp_scaler_get_state(scaler_a, &state));
+    state.scale = 64.0f;
+    state.growth_tracker = 2U;
+    state.last_found_inf = true;
+    state.config.defer_found_inf = true;
+    CHECK_OK(gd_amp_scaler_set_state(scaler_b, &state));
+    CHECK(gd_amp_scaler_scale(scaler_b) == 64.0f, "scaler state restores scale");
+    CHECK(gd_amp_scaler_growth_tracker(scaler_b) == 2U, "scaler state restores tracker");
+    CHECK(gd_amp_scaler_last_found_inf(scaler_b), "scaler state restores overflow flag");
+
+    gd_amp_scaler_destroy(scaler_b);
+    gd_amp_scaler_destroy(scaler_a);
+}
+
 static void run_amp_adamw_grad_clip_test(void)
 {
     gd_context *ctx = NULL;
@@ -398,12 +423,129 @@ static void run_amp_adamw_grad_clip_test(void)
     gd_context_destroy(ctx);
 }
 
+static void run_checkpoint_adamw_step(gd_context *ctx,
+                                      gd_optimizer *opt,
+                                      gd_tensor *param,
+                                      gd_tensor *grad_seed,
+                                      float lr)
+{
+    gd_tensor y;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_relu(ctx, param, &y));
+    CHECK_OK(gd_backward(ctx, &y, grad_seed));
+    CHECK_OK(gd_optimizer_step_lr(ctx, opt, lr));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+}
+
+static void run_adamw_checkpoint_state_test(void)
+{
+    const char *path = "build/test_optimizer_state.gdckpt";
+    gd_memory_config mem = optim_config();
+    gd_adamw_config adam = gd_adamw_config_default();
+    gd_context *ctx_a = NULL;
+    gd_context *ctx_b = NULL;
+    gd_optimizer *opt_a = NULL;
+    gd_optimizer *opt_b = NULL;
+    gd_tensor param_a;
+    gd_tensor grad_seed_a;
+    gd_tensor param_b;
+    gd_tensor grad_seed_b;
+    gd_param_ref ref_a;
+    gd_param_ref ref_b;
+    gd_param_set set_a;
+    gd_param_set set_b;
+    int64_t shape[1] = {2};
+    const float p0_f32[2] = {1.0f, 2.0f};
+    const float g0_f32[2] = {0.125f, -0.25f};
+    uint16_t p0[2];
+    uint16_t grad_bits[2];
+    uint16_t after_step1[2];
+    uint16_t got_a[2];
+    uint16_t got_b[2];
+    uint32_t i;
+
+    (void)remove(path);
+    adam.lr = 0.0f;
+    adam.beta1 = 0.9f;
+    adam.beta2 = 0.99f;
+    adam.eps = 1.0e-6f;
+    adam.weight_decay = 1.0e-2f;
+    adam.bias_correction = true;
+    for (i = 0U; i < 2U; ++i) {
+        p0[i] = f32_to_f16_bits(p0_f32[i]);
+        grad_bits[i] = f32_to_f16_bits(g0_f32[i]);
+    }
+
+    CHECK_OK(gd_context_create(&mem, &ctx_a));
+    CHECK_OK(gd_tensor_empty(ctx_a, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &param_a));
+    CHECK_OK(gd_tensor_empty(ctx_a, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &grad_seed_a));
+    CHECK_OK(gd_tensor_write(ctx_a, &param_a, p0, sizeof(p0)));
+    CHECK_OK(gd_tensor_write(ctx_a, &grad_seed_a, grad_bits, sizeof(grad_bits)));
+    param_a.requires_grad = true;
+    gd_param_set_init(&set_a);
+    memset(&ref_a, 0, sizeof(ref_a));
+    (void)snprintf(ref_a.path, sizeof(ref_a.path), "%s", "param");
+    ref_a.tensor = &param_a;
+    ref_a.group_index = -1;
+    ref_a.lr_mult = 1.0f;
+    ref_a.weight_decay = adam.weight_decay;
+    ref_a.trainable = true;
+    set_a.items = &ref_a;
+    set_a.count = 1U;
+    set_a.capacity = 1U;
+    CHECK_OK(gd_adamw_create(ctx_a, &set_a, &adam, &opt_a));
+    CHECK_OK(gd_context_seal_params(ctx_a));
+    run_checkpoint_adamw_step(ctx_a, opt_a, &param_a, &grad_seed_a, 1.0e-2f);
+    CHECK_OK(gd_tensor_read(ctx_a, &param_a, after_step1, sizeof(after_step1)));
+    CHECK_OK(gd_optimizer_save_state(ctx_a, opt_a, path));
+    run_checkpoint_adamw_step(ctx_a, opt_a, &param_a, &grad_seed_a, 1.0e-2f);
+    CHECK_OK(gd_tensor_read(ctx_a, &param_a, got_a, sizeof(got_a)));
+    CHECK(gd_optimizer_step_count(opt_a) == 2U, "reference optimizer reached step 2");
+
+    CHECK_OK(gd_context_create(&mem, &ctx_b));
+    CHECK_OK(gd_tensor_empty(ctx_b, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &param_b));
+    CHECK_OK(gd_tensor_empty(ctx_b, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, shape), 256U, &grad_seed_b));
+    CHECK_OK(gd_tensor_write(ctx_b, &param_b, after_step1, sizeof(after_step1)));
+    CHECK_OK(gd_tensor_write(ctx_b, &grad_seed_b, grad_bits, sizeof(grad_bits)));
+    param_b.requires_grad = true;
+    gd_param_set_init(&set_b);
+    memset(&ref_b, 0, sizeof(ref_b));
+    (void)snprintf(ref_b.path, sizeof(ref_b.path), "%s", "param");
+    ref_b.tensor = &param_b;
+    ref_b.group_index = -1;
+    ref_b.lr_mult = 1.0f;
+    ref_b.weight_decay = adam.weight_decay;
+    ref_b.trainable = true;
+    set_b.items = &ref_b;
+    set_b.count = 1U;
+    set_b.capacity = 1U;
+    CHECK_OK(gd_adamw_create(ctx_b, &set_b, &adam, &opt_b));
+    CHECK_OK(gd_optimizer_load_state(ctx_b, opt_b, path, true));
+    CHECK(gd_optimizer_step_count(opt_b) == 1U, "loaded optimizer restores step count");
+    CHECK_OK(gd_context_seal_params(ctx_b));
+    run_checkpoint_adamw_step(ctx_b, opt_b, &param_b, &grad_seed_b, 1.0e-2f);
+    CHECK_OK(gd_tensor_read(ctx_b, &param_b, got_b, sizeof(got_b)));
+    for (i = 0U; i < 2U; ++i) {
+        CHECK(got_b[i] == got_a[i], "loaded optimizer continuation matches uninterrupted run");
+    }
+    CHECK(gd_optimizer_step_count(opt_b) == 2U, "loaded optimizer advances from restored step");
+
+    gd_optimizer_destroy(opt_b);
+    gd_context_destroy(ctx_b);
+    gd_optimizer_destroy(opt_a);
+    gd_context_destroy(ctx_a);
+    (void)remove(path);
+}
+
 int main(void)
 {
     run_lr_scheduler_value_test();
     run_adamw_dynamic_lr_test();
     run_amp_adamw_test();
+    run_amp_scaler_state_roundtrip_test();
     run_amp_adamw_grad_clip_test();
+    run_adamw_checkpoint_state_test();
     printf("test_optim: ok\n");
     return 0;
 }

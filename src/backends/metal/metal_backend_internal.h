@@ -36,6 +36,10 @@ struct gd_backend {
     void *sigmoid_backward_f32_pso;
     void *sigmoid_backward_saved_f16_pso;
     void *sigmoid_backward_saved_f32_pso;
+    void *tanh_f32_pso;
+    void *tanh_backward_f32_pso;
+    void *tanh_backward_saved_f16_pso;
+    void *tanh_backward_saved_f32_pso;
     void *dropout_forward_f16_pso;
     void *dropout_forward_f32_pso;
     void *dropout_add_forward_f16_pso;

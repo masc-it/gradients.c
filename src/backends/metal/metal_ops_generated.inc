@@ -13,3 +13,5 @@
     GD_METAL_PIPELINE_INDEX("gd_sub_row_bcast_kernel", binary_row_bcast_pso, GD_OP_SUB),
     GD_METAL_PIPELINE_INDEX("gd_sigmoid_kernel", unary_pso, GD_OP_SIGMOID),
     GD_METAL_PIPELINE_INDEX("gd_sigmoid_backward_kernel", unary_backward_pso, GD_OP_SIGMOID),
+    GD_METAL_PIPELINE_INDEX("gd_tanh_kernel", unary_pso, GD_OP_TANH),
+    GD_METAL_PIPELINE_INDEX("gd_tanh_backward_kernel", unary_backward_pso, GD_OP_TANH),

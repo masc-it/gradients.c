@@ -32,7 +32,8 @@ typedef enum gd_op_kind {
     GD_OP_LM_CROSS_ENTROPY = 26,
     GD_OP_QKV_SPLIT_ROPE = 27,
     GD_OP_POWLU_SPLIT_LINEAR = 28,
-    GD_OP_COUNT = 29,
+    GD_OP_TANH = 29,
+    GD_OP_COUNT = 30,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

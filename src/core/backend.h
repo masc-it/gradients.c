@@ -239,6 +239,11 @@ gd_status gd_backend_sigmoid_backward_from_output(gd_backend *backend,
                                                   const gd_backend_tensor_view *sigmoid_out,
                                                   const gd_backend_tensor_view *grad_out,
                                                   const gd_backend_tensor_view *grad_x);
+/* Tanh autograd fast path: grad_x = grad_out * (1 - y^2), using saved forward y. */
+gd_status gd_backend_tanh_backward_from_output(gd_backend *backend,
+                                               const gd_backend_tensor_view *tanh_out,
+                                               const gd_backend_tensor_view *grad_out,
+                                               const gd_backend_tensor_view *grad_x);
 /* Fused dx12 = powlu_split_backward(x12, grad_out @ w^T, m) for gated MLPs. */
 gd_status gd_backend_powlu_split_linear_backward_x12(gd_backend *backend,
                                                      const gd_backend_tensor_view *x12,

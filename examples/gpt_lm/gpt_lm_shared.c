@@ -740,16 +740,12 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
         .prefix_len = 0,
         .max_seqlen = GPT_CONTEXT_LENGTH,
     };
-    int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
-    gd_tensor qkv_parts[3];
-    gd_tensor q_view;
-    gd_tensor k_view;
-    gd_tensor v_view;
     gd_tensor q_rot;
     gd_tensor k_rot;
+    gd_tensor v_view;
     gd_tensor attn;
     gd_tensor attn_flat;
     gd_tensor attn_proj;
@@ -759,7 +755,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     gd_tensor mlp_proj;
     gd_status st;
     int64_t n_tokens;
-    int64_t q_shape[3];
     int64_t flat_shape[2];
 
     if (ctx == NULL || model == NULL || cache == NULL || block == NULL || x == NULL ||
@@ -774,9 +769,6 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
         cu_seqlens->shape[0] != cache->batch_size + 1) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    q_shape[0] = n_tokens;
-    q_shape[1] = GPT_N_HEADS;
-    q_shape[2] = GPT_HEAD_DIM;
     flat_shape[0] = n_tokens;
     flat_shape[1] = GPT_D_MODEL;
 
@@ -785,17 +777,15 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->qkv_proj, &normed, &qkv);
     if (st != GD_OK) { return st; }
-    st = gd_split(ctx, &qkv, qkv_sizes, 3U, -1, qkv_parts);
-    if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[0], gd_shape_make(3U, q_shape), &q_view);
-    if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[1], gd_shape_make(3U, q_shape), &k_view);
-    if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[2], gd_shape_make(3U, q_shape), &v_view);
-    if (st != GD_OK) { return st; }
-    st = gd_rope(ctx, &q_view, positions, &rope_cfg, &q_rot);
-    if (st != GD_OK) { return st; }
-    st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
+    st = gd_qkv_split_rope(ctx,
+                            &qkv,
+                            positions,
+                            GPT_N_HEADS,
+                            GPT_HEAD_DIM,
+                            &rope_cfg,
+                            &q_rot,
+                            &k_rot,
+                            &v_view);
     if (st != GD_OK) { return st; }
     st = gd_kv_cache_append_packed(ctx,
                                     &cache->k[block_index],
@@ -849,16 +839,15 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
         .sliding_window = GPT_SDPA_WINDOW,
         .prefix_len = 0,
     };
-    int64_t qkv_sizes[3] = {GPT_D_MODEL, GPT_D_MODEL, GPT_D_MODEL};
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
-    gd_tensor qkv_parts[3];
-    gd_tensor q_view;
-    gd_tensor k_view;
-    gd_tensor v_view;
+    gd_tensor q_rot_3d;
+    gd_tensor k_rot_3d;
+    gd_tensor v_view_3d;
     gd_tensor q_rot;
     gd_tensor k_rot;
+    gd_tensor v_view;
     gd_tensor attn;
     gd_tensor attn_flat;
     gd_tensor attn_proj;
@@ -890,17 +879,21 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->qkv_proj, &normed, &qkv);
     if (st != GD_OK) { return st; }
-    st = gd_split(ctx, &qkv, qkv_sizes, 3U, -1, qkv_parts);
+    st = gd_qkv_split_rope(ctx,
+                            &qkv,
+                            positions,
+                            GPT_N_HEADS,
+                            GPT_HEAD_DIM,
+                            &rope_cfg,
+                            &q_rot_3d,
+                            &k_rot_3d,
+                            &v_view_3d);
     if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[0], gd_shape_make(4U, q_shape), &q_view);
+    st = gd_reshape(ctx, &q_rot_3d, gd_shape_make(4U, q_shape), &q_rot);
     if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[1], gd_shape_make(4U, q_shape), &k_view);
+    st = gd_reshape(ctx, &k_rot_3d, gd_shape_make(4U, q_shape), &k_rot);
     if (st != GD_OK) { return st; }
-    st = gd_reshape(ctx, &qkv_parts[2], gd_shape_make(4U, q_shape), &v_view);
-    if (st != GD_OK) { return st; }
-    st = gd_rope(ctx, &q_view, positions, &rope_cfg, &q_rot);
-    if (st != GD_OK) { return st; }
-    st = gd_rope(ctx, &k_view, positions, &rope_cfg, &k_rot);
+    st = gd_reshape(ctx, &v_view_3d, gd_shape_make(4U, q_shape), &v_view);
     if (st != GD_OK) { return st; }
     st = gd_kv_cache_append_positions(ctx,
                                        &cache->k[block_index],
@@ -1047,6 +1040,42 @@ char *gpt_default_tokenizer_path(const char *data_dir)
     return path;
 }
 
+void gpt_generation_tokenizer_init(gd_context *ctx,
+                                   const gpt_config *config,
+                                   gpt_generation_tokenizer *out)
+{
+    gd_tokenizer_config tok_cfg;
+    char *default_tok_path = NULL;
+    const char *tokenizer_path;
+    if (config == NULL || out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "generation tokenizer arguments", __LINE__);
+    }
+    memset(out, 0, sizeof(*out));
+    tok_cfg.split_digits = 1;
+    tok_cfg.allow_special = 1;
+    default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
+    tokenizer_path = config->tokenizer_path != NULL ? config->tokenizer_path : default_tok_path;
+    if (tokenizer_path == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "tokenizer path allocation", __LINE__);
+    }
+    TRY(ctx, gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &out->tok));
+    out->path = tokenizer_path;
+    out->owned_path = default_tok_path;
+    if (gd_tokenizer_id(out->tok, "<|im_end|>", &out->stop_token) != GD_OK) {
+        out->stop_token = -1;
+    }
+}
+
+void gpt_generation_tokenizer_deinit(gpt_generation_tokenizer *tokenizer)
+{
+    if (tokenizer == NULL) {
+        return;
+    }
+    gd_tokenizer_destroy(tokenizer->tok);
+    free(tokenizer->owned_path);
+    memset(tokenizer, 0, sizeof(*tokenizer));
+}
+
 static gd_status gpt_data_i32_tensor(gd_context *ctx,
                                      const int32_t *values,
                                      int64_t count,
@@ -1185,18 +1214,17 @@ static int gpt_sample_next_token(float *logits,
     return best;
 }
 
-static void gpt_generate_prompts(gd_context *ctx,
-                                 gpt_lm *model,
-                                 const gpt_config *config,
-                                 const char *const *prompts,
-                                 int n_prompts,
-                                 const char *tag,
-                                 size_t step,
-                                 bool restore_training)
+static void gpt_generate_prompts_loaded(gd_context *ctx,
+                                        gpt_lm *model,
+                                        const gpt_config *config,
+                                        const char *const *prompts,
+                                        int n_prompts,
+                                        const char *tag,
+                                        size_t step,
+                                        bool restore_training,
+                                        const gpt_generation_tokenizer *tokenizer)
 {
-    gd_tokenizer *tok = NULL;
-    gd_tokenizer_config tok_cfg;
-    char *default_tok_path = NULL;
+    gd_tokenizer *tok;
     const char *tokenizer_path;
     int32_t **encoded = NULL;
     int32_t **seq_ids = NULL;
@@ -1220,27 +1248,20 @@ static void gpt_generate_prompts(gd_context *ctx,
     int room_for_prompt;
     int generated = 0;
     int finished_count = 0;
-    int32_t stop_token = -1;
+    int32_t stop_token;
     int b;
     int i;
     uint64_t rng;
     double start;
     double elapsed;
 
-    if (ctx == NULL || model == NULL || config == NULL || prompts == NULL || n_prompts <= 0) {
+    if (ctx == NULL || model == NULL || config == NULL || prompts == NULL || n_prompts <= 0 ||
+        tokenizer == NULL || tokenizer->tok == NULL || tokenizer->path == NULL) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "generation arguments", __LINE__);
     }
-    tok_cfg.split_digits = 1;
-    tok_cfg.allow_special = 1;
-    default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
-    tokenizer_path = config->tokenizer_path != NULL ? config->tokenizer_path : default_tok_path;
-    if (tokenizer_path == NULL) {
-        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "tokenizer path allocation", __LINE__);
-    }
-    TRY(ctx, gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &tok));
-    if (gd_tokenizer_id(tok, "<|im_end|>", &stop_token) != GD_OK) {
-        stop_token = -1;
-    }
+    tok = tokenizer->tok;
+    tokenizer_path = tokenizer->path;
+    stop_token = tokenizer->stop_token;
 
     encoded = (int32_t **)calloc((size_t)n_prompts, sizeof(encoded[0]));
     seq_ids = (int32_t **)calloc((size_t)n_prompts, sizeof(seq_ids[0]));
@@ -1477,15 +1498,42 @@ static void gpt_generate_prompts(gd_context *ctx,
     free(n_encoded);
     free(seq_ids);
     free(encoded);
-    gd_tokenizer_destroy(tok);
-    free(default_tok_path);
+}
+
+void gpt_generate_with_tokenizer(gd_context *ctx,
+                                 gpt_lm *model,
+                                 const gpt_config *config,
+                                 const gpt_generation_tokenizer *tokenizer)
+{
+    const char *prompts[1];
+    prompts[0] = config->generate_prompt;
+    gpt_generate_prompts_loaded(ctx, model, config, prompts, 1, "user", 0U, false, tokenizer);
 }
 
 void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config)
 {
-    const char *prompts[1];
-    prompts[0] = config->generate_prompt;
-    gpt_generate_prompts(ctx, model, config, prompts, 1, "user", 0U, false);
+    gpt_generation_tokenizer tokenizer;
+    gpt_generation_tokenizer_init(ctx, config, &tokenizer);
+    gpt_generate_with_tokenizer(ctx, model, config, &tokenizer);
+    gpt_generation_tokenizer_deinit(&tokenizer);
+}
+
+void gpt_generate_vowels_with_tokenizer(gd_context *ctx,
+                                        gpt_lm *model,
+                                        const gpt_config *config,
+                                        size_t step,
+                                        const gpt_generation_tokenizer *tokenizer)
+{
+    static const char *const prompts[GPT_GENERATE_VOWEL_PROMPT_COUNT] = {"a", "e", "i", "o", "u"};
+    gpt_generate_prompts_loaded(ctx,
+                                model,
+                                config,
+                                prompts,
+                                (int)GPT_GENERATE_VOWEL_PROMPT_COUNT,
+                                "vowels",
+                                step,
+                                true,
+                                tokenizer);
 }
 
 void gpt_generate_vowels(gd_context *ctx,
@@ -1493,13 +1541,8 @@ void gpt_generate_vowels(gd_context *ctx,
                          const gpt_config *config,
                          size_t step)
 {
-    static const char *const prompts[GPT_GENERATE_VOWEL_PROMPT_COUNT] = {"a", "e", "i", "o", "u"};
-    gpt_generate_prompts(ctx,
-                         model,
-                         config,
-                         prompts,
-                         (int)GPT_GENERATE_VOWEL_PROMPT_COUNT,
-                         "vowels",
-                         step,
-                         true);
+    gpt_generation_tokenizer tokenizer;
+    gpt_generation_tokenizer_init(ctx, config, &tokenizer);
+    gpt_generate_vowels_with_tokenizer(ctx, model, config, step, &tokenizer);
+    gpt_generation_tokenizer_deinit(&tokenizer);
 }

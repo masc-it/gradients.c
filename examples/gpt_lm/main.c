@@ -581,6 +581,7 @@ static void train_one_batch(gd_context *ctx,
                             gd_amp_scaler *scaler,
                             const gd_lr_scheduler_config *lr_config,
                             const gpt_config *config,
+                            const gpt_generation_tokenizer *generation_tokenizer,
                             size_t global_step,
                             size_t total_steps,
                             size_t epoch,
@@ -667,7 +668,11 @@ static void train_one_batch(gd_context *ctx,
 
     if (config->generate_every_n_steps > 0 &&
         (current_step % (size_t)config->generate_every_n_steps) == 0U) {
-        gpt_generate_vowels(ctx, model, config, current_step);
+        if (generation_tokenizer != NULL) {
+            gpt_generate_vowels_with_tokenizer(ctx, model, config, current_step, generation_tokenizer);
+        } else {
+            gpt_generate_vowels(ctx, model, config, current_step);
+        }
     }
 }
 
@@ -1304,7 +1309,15 @@ static void train_gpt(gd_context *ctx,
                                             0U;
     size_t start_epoch = resume_state != NULL && resume_state->loaded ? resume_state->epoch + 1U : 1U;
     size_t epoch;
+    gpt_generation_tokenizer generation_tokenizer;
+    const gpt_generation_tokenizer *generation_tokenizer_ptr = NULL;
     float best_val_loss = resume_state != NULL && resume_state->loaded ? resume_state->best_val_loss : INFINITY;
+
+    memset(&generation_tokenizer, 0, sizeof(generation_tokenizer));
+    if (config->generate_every_n_steps > 0) {
+        gpt_generation_tokenizer_init(ctx, config, &generation_tokenizer);
+        generation_tokenizer_ptr = &generation_tokenizer;
+    }
 
     if (resume_state != NULL && resume_state->loaded) {
         printf("resume_training: next_epoch=%zu/%d global_step=%zu best_val_loss=%.6f epochs_without_improvement=%zu\n",
@@ -1335,6 +1348,7 @@ static void train_gpt(gd_context *ctx,
                             scaler,
                             lr_config,
                             config,
+                            generation_tokenizer_ptr,
                             global_step,
                             total_steps,
                             epoch,
@@ -1400,6 +1414,7 @@ static void train_gpt(gd_context *ctx,
             }
         }
     }
+    gpt_generation_tokenizer_deinit(&generation_tokenizer);
 }
 
 

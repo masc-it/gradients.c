@@ -345,12 +345,15 @@ int main(int argc, char **argv)
     gd_context *ctx = NULL;
     gd_status st;
     gpt_lm model;
+    gpt_generation_tokenizer generation_tokenizer;
+    bool generation_tokenizer_ready = false;
     gd_module_load_options load_options;
     char line[GPT_GENERATE_LINE_MAX];
     char prompt[GPT_GENERATE_LINE_MAX + sizeof(GPT_GENERATE_IM_START)];
     int exit_code = 1;
 
     memset(&model, 0, sizeof(model));
+    memset(&generation_tokenizer, 0, sizeof(generation_tokenizer));
     tokenizer_from_metadata[0] = '\0';
     st = gd_checkpoint_read_metadata(config.checkpoint_path, &metadata, &metadata_len);
     if (st == GD_OK) {
@@ -398,6 +401,8 @@ int main(int argc, char **argv)
     TRY(ctx, gd_module_load_state(ctx, &model.mod, config.checkpoint_path, &load_options));
     TRY(ctx, gd_context_seal_params(ctx));
     gd_module_set_training(&model.mod, false);
+    gpt_generation_tokenizer_init(ctx, &config, &generation_tokenizer);
+    generation_tokenizer_ready = true;
 
     for (;;) {
         printf("prefix> ");
@@ -427,10 +432,13 @@ int main(int argc, char **argv)
             continue;
         }
         config.generate_prompt = prompt;
-        gpt_generate(ctx, &model, &config);
+        gpt_generate_with_tokenizer(ctx, &model, &config, &generation_tokenizer);
     }
     exit_code = 0;
 
+    if (generation_tokenizer_ready) {
+        gpt_generation_tokenizer_deinit(&generation_tokenizer);
+    }
     gpt_lm_deinit(&model);
     gd_context_destroy(ctx);
     free(metadata);

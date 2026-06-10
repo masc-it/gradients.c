@@ -126,6 +126,13 @@ typedef struct gpt_config {
     float logits_softcap;
 } gpt_config;
 
+typedef struct gpt_generation_tokenizer {
+    gd_tokenizer *tok;
+    const char *path;
+    char *owned_path;
+    int32_t stop_token;
+} gpt_generation_tokenizer;
+
 void gpt_fail_status(gd_context *ctx, gd_status st, const char *expr, int line);
 double gpt_wall_seconds(void);
 size_t gpt_param_count_for_layers(int n_layers);
@@ -141,10 +148,23 @@ gd_status gpt_lm_forward(gd_context *ctx,
                          uint64_t step,
                          gd_tensor *loss);
 char *gpt_default_tokenizer_path(const char *data_dir);
+void gpt_generation_tokenizer_init(gd_context *ctx,
+                                   const gpt_config *config,
+                                   gpt_generation_tokenizer *out);
+void gpt_generation_tokenizer_deinit(gpt_generation_tokenizer *tokenizer);
 void gpt_generate(gd_context *ctx, gpt_lm *model, const gpt_config *config);
+void gpt_generate_with_tokenizer(gd_context *ctx,
+                                 gpt_lm *model,
+                                 const gpt_config *config,
+                                 const gpt_generation_tokenizer *tokenizer);
 void gpt_generate_vowels(gd_context *ctx,
                          gpt_lm *model,
                          const gpt_config *config,
                          size_t step);
+void gpt_generate_vowels_with_tokenizer(gd_context *ctx,
+                                        gpt_lm *model,
+                                        const gpt_config *config,
+                                        size_t step,
+                                        const gpt_generation_tokenizer *tokenizer);
 
 #endif /* GPT_LM_SHARED_H */

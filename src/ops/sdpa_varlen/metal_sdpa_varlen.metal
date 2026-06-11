@@ -542,6 +542,9 @@ static inline float gd_sdpa_varlen_sum_lanes8(float x)
     return x;
 }
 
+/* These DH=64 fast kernels are f16-only. Keep staged q/k/v/go tiles as half
+ * in threadgroup memory and promote on arithmetic; this halves threadgroup
+ * traffic without changing source precision. */
 kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
     device const half *q [[buffer(0)]],
     device const half *k [[buffer(1)]],
@@ -552,8 +555,8 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
-    threadgroup float ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
-    threadgroup float vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
     int n_qb = int(p.n_qb_max);
     int qb = int(tgid) % n_qb;
@@ -608,8 +611,8 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
             int c = idx % GD_SDPA_VARLEN_DH64;
             int kg = start + kb + jj;
             int kbase = ((kg * int(p.hkv) + hkv) * GD_SDPA_VARLEN_DH64);
-            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = float(k[kbase + c]);
-            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = float(v[kbase + c]);
+            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = k[kbase + c];
+            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = v[kbase + c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
@@ -619,7 +622,7 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
                     float ss = 0.0f;
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
-                        ss += qreg[x] * ksh[jj * GD_SDPA_VARLEN_DH64 + c];
+                        ss += qreg[x] * float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
                     }
                     ss = gd_sdpa_varlen_sum_lanes8(ss) * p.scale;
                     float mnew = (ss > m) ? ss : m;
@@ -628,7 +631,7 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
                     l = l * corr + e;
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
-                        acc[x] = acc[x] * corr + e * vsh[jj * GD_SDPA_VARLEN_DH64 + c];
+                        acc[x] = acc[x] * corr + e * float(vsh[jj * GD_SDPA_VARLEN_DH64 + c]);
                     }
                     m = mnew;
                 }
@@ -657,8 +660,8 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
-    threadgroup float ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
-    threadgroup float vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
     int n_qb = int(p.n_qb_max);
     int qb = int(tgid) % n_qb;
@@ -718,8 +721,8 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
             int c = idx % GD_SDPA_VARLEN_DH64;
             int kg = start + kb + jj;
             int kbase = ((kg * int(p.hkv) + hkv) * GD_SDPA_VARLEN_DH64);
-            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = float(k[kbase + c]);
-            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = float(v[kbase + c]);
+            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = k[kbase + c];
+            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = v[kbase + c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
@@ -730,8 +733,8 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
                     float dp = 0.0f;
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
-                        ss += qreg[x] * ksh[jj * GD_SDPA_VARLEN_DH64 + c];
-                        dp += goreg[x] * vsh[jj * GD_SDPA_VARLEN_DH64 + c];
+                        ss += qreg[x] * float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                        dp += goreg[x] * float(vsh[jj * GD_SDPA_VARLEN_DH64 + c]);
                     }
                     ss = gd_sdpa_varlen_sum_lanes8(ss) * p.scale;
                     dp = gd_sdpa_varlen_sum_lanes8(dp);
@@ -742,7 +745,7 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
                     raw = raw * corr + e * dp;
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
-                        float kc = ksh[jj * GD_SDPA_VARLEN_DH64 + c];
+                        float kc = float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
                         acc[x] = acc[x] * corr + e * dp * kc;
                         ksum[x] = ksum[x] * corr + e * kc;
                     }
@@ -781,8 +784,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
-    threadgroup float qsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
-    threadgroup float gsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half qsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half gsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup float msh[GD_METAL_SDPA_BK];
     threadgroup float lsh[GD_METAL_SDPA_BK];
     threadgroup float dsh[GD_METAL_SDPA_BK];
@@ -839,8 +842,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
                 int c = idx % GD_SDPA_VARLEN_DH64;
                 int qg = start + qb + ii;
                 int qbase = (qg * int(p.hq) + hq) * GD_SDPA_VARLEN_DH64;
-                qsh[ii * GD_SDPA_VARLEN_DH64 + c] = float(q[qbase + c]);
-                gsh[ii * GD_SDPA_VARLEN_DH64 + c] = float(go[qbase + c]);
+                qsh[ii * GD_SDPA_VARLEN_DH64 + c] = q[qbase + c];
+                gsh[ii * GD_SDPA_VARLEN_DH64 + c] = go[qbase + c];
             }
             for (int ii = int(tid); ii < tile; ii += int(GD_METAL_SDPA_DKV_WIDE_THREADS)) {
                 int qg = start + qb + ii;
@@ -858,8 +861,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
                 float ds = 0.0f;
                 for (int x = 0; x < GD_SDPA_VARLEN_DH64_WIDE_CHANS; ++x) {
                     int c = lane + x * int(GD_METAL_SDPA_DKV_WIDE_LANES);
-                    ss += qsh[ii * GD_SDPA_VARLEN_DH64 + c] * kreg[x];
-                    dp += gsh[ii * GD_SDPA_VARLEN_DH64 + c] * vreg[x];
+                    ss += float(qsh[ii * GD_SDPA_VARLEN_DH64 + c]) * kreg[x];
+                    dp += float(gsh[ii * GD_SDPA_VARLEN_DH64 + c]) * vreg[x];
                 }
                 ss = gd_sdpa_varlen_sum_lanes8(ss);
                 dp = gd_sdpa_varlen_sum_lanes8(dp);
@@ -874,8 +877,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
                 if (active) {
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_WIDE_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_WIDE_LANES);
-                        dvacc[x] += pj * gsh[ii * GD_SDPA_VARLEN_DH64 + c];
-                        dkacc[x] += p.scale * ds * qsh[ii * GD_SDPA_VARLEN_DH64 + c];
+                        dvacc[x] += pj * float(gsh[ii * GD_SDPA_VARLEN_DH64 + c]);
+                        dkacc[x] += p.scale * ds * float(qsh[ii * GD_SDPA_VARLEN_DH64 + c]);
                     }
                 }
             }
@@ -910,8 +913,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
-    threadgroup float qsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
-    threadgroup float gsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half qsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half gsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup float msh[GD_METAL_SDPA_BK];
     threadgroup float lsh[GD_METAL_SDPA_BK];
     threadgroup float dsh[GD_METAL_SDPA_BK];
@@ -979,8 +982,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
                 int c = idx % GD_SDPA_VARLEN_DH64;
                 int qg = start + qb + ii;
                 int qbase = (qg * int(p.hq) + hq) * GD_SDPA_VARLEN_DH64;
-                qsh[ii * GD_SDPA_VARLEN_DH64 + c] = float(q[qbase + c]);
-                gsh[ii * GD_SDPA_VARLEN_DH64 + c] = float(go[qbase + c]);
+                qsh[ii * GD_SDPA_VARLEN_DH64 + c] = q[qbase + c];
+                gsh[ii * GD_SDPA_VARLEN_DH64 + c] = go[qbase + c];
             }
             for (int ii = int(tid); ii < tile; ii += int(GD_METAL_SDPA_DKV_WIDE_THREADS)) {
                 int qg = start + qb + ii;
@@ -998,8 +1001,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
                 float ds = 0.0f;
                 for (int x = 0; x < GD_SDPA_VARLEN_DH64_WIDE_CHANS; ++x) {
                     int c = lane + x * int(GD_METAL_SDPA_DKV_WIDE_LANES);
-                    ss += qsh[ii * GD_SDPA_VARLEN_DH64 + c] * kreg[x];
-                    dp += gsh[ii * GD_SDPA_VARLEN_DH64 + c] * vreg[x];
+                    ss += float(qsh[ii * GD_SDPA_VARLEN_DH64 + c]) * kreg[x];
+                    dp += float(gsh[ii * GD_SDPA_VARLEN_DH64 + c]) * vreg[x];
                 }
                 ss = gd_sdpa_varlen_sum_lanes8(ss);
                 dp = gd_sdpa_varlen_sum_lanes8(dp);
@@ -1014,8 +1017,8 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
                 if (active) {
                     for (int x = 0; x < GD_SDPA_VARLEN_DH64_WIDE_CHANS; ++x) {
                         int c = lane + x * int(GD_METAL_SDPA_DKV_WIDE_LANES);
-                        dvacc[x] += pj * gsh[ii * GD_SDPA_VARLEN_DH64 + c];
-                        dkacc[x] += p.scale * ds * qsh[ii * GD_SDPA_VARLEN_DH64 + c];
+                        dvacc[x] += pj * float(gsh[ii * GD_SDPA_VARLEN_DH64 + c]);
+                        dkacc[x] += p.scale * ds * float(qsh[ii * GD_SDPA_VARLEN_DH64 + c]);
                     }
                 }
             }

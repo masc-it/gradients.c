@@ -1249,6 +1249,7 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     int generated = 0;
     int finished_count = 0;
     int32_t stop_token;
+    bool stream_tokens;
     int b;
     int i;
     uint64_t rng;
@@ -1262,6 +1263,7 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     tok = tokenizer->tok;
     tokenizer_path = tokenizer->path;
     stop_token = tokenizer->stop_token;
+    stream_tokens = n_prompts == 1;
 
     encoded = (int32_t **)calloc((size_t)n_prompts, sizeof(encoded[0]));
     seq_ids = (int32_t **)calloc((size_t)n_prompts, sizeof(seq_ids[0]));
@@ -1375,6 +1377,11 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
         }
     }
 
+    if (stream_tokens) {
+        printf("  prefix=\"%s\" prompt_tokens=%d generated_text:", prompts[0], prompt_len[0]);
+        fflush(stdout);
+    }
+
     while (generated < max_new && finished_count < n_prompts) {
         bool appended_any = false;
         for (b = 0; b < n_prompts; ++b) {
@@ -1393,6 +1400,14 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
             }
             seq_ids[b][seq_len[b]] = (int32_t)next_ids[b];
             seq_len[b] += 1;
+            if (stream_tokens) {
+                char *piece = NULL;
+                const int32_t token_id = (int32_t)next_ids[b];
+                TRY(ctx, gd_tokenizer_decode(tok, &token_id, 1, &piece));
+                printf("%s", piece != NULL ? piece : "");
+                fflush(stdout);
+                gd_tokenizer_free(piece);
+            }
             appended_any = true;
         }
         if (!appended_any) {
@@ -1442,6 +1457,20 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     }
 
     elapsed = gpt_wall_seconds() - start;
+    if (stream_tokens) {
+        printf("\n");
+    } else {
+        for (b = 0; b < n_prompts; ++b) {
+            char *decoded_new = NULL;
+            const int generated_len = seq_len[b] - prompt_len[b];
+            TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b] + prompt_len[b], generated_len, &decoded_new));
+            printf("  prefix=\"%s\" prompt_tokens=%d generated_text=%s\n",
+                   prompts[b],
+                   prompt_len[b],
+                   decoded_new != NULL ? decoded_new : "");
+            gd_tokenizer_free(decoded_new);
+        }
+    }
     printf("generate%s%s: tokenizer=%s batch=%d generated=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f elapsed=%.3fs tok/s=%.1f",
            tag != NULL ? ":" : "",
            tag != NULL ? tag : "",
@@ -1458,22 +1487,6 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
         printf(" step=%zu", step);
     }
     printf("\n");
-    for (b = 0; b < n_prompts; ++b) {
-        char *decoded = NULL;
-        char *decoded_new = NULL;
-        const int generated_len = seq_len[b] - prompt_len[b];
-        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b], seq_len[b], &decoded));
-        TRY(ctx, gd_tokenizer_decode(tok, seq_ids[b] + prompt_len[b], generated_len, &decoded_new));
-        printf("  prefix=\"%s\" prompt_tokens=%d generated_text=%s\n",
-               prompts[b],
-               prompt_len[b],
-               decoded_new != NULL ? decoded_new : "");
-        if (n_prompts == 1) {
-            printf("full_text:\n%s\n", decoded != NULL ? decoded : "");
-        }
-        gd_tokenizer_free(decoded_new);
-        gd_tokenizer_free(decoded);
-    }
 
     if (restore_training) {
         gd_module_set_training(&model->mod, true);

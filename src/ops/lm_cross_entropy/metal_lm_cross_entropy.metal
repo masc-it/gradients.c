@@ -194,25 +194,53 @@ kernel void gd_lm_cross_entropy_finalize_f32_kernel(
     row_inv_sum[row] = inv_sum;
 }
 
-kernel void gd_lm_cross_entropy_normalize_f32_kernel(
-    device const uchar *loss_sumbuf [[buffer(0)]],
-    device const uchar *valid_countbuf [[buffer(1)]],
+kernel void gd_lm_cross_entropy_reduce_normalize_f32_kernel(
+    device const uchar *row_lossbuf [[buffer(0)]],
+    device const uchar *row_validbuf [[buffer(1)]],
     device uchar *lossbuf [[buffer(2)]],
     device uchar *inv_valid_countbuf [[buffer(3)]],
-    constant gd_metal_lm_cross_entropy_args &args [[buffer(4)]])
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(4)]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]])
 {
-    device const float *loss_sum = reinterpret_cast<device const float *>(loss_sumbuf + args.row_loss_offset);
-    device const float *valid_count = reinterpret_cast<device const float *>(valid_countbuf + args.row_max_offset);
+    threadgroup float partial_loss[GD_METAL_LM_CROSS_ENTROPY_MAX_SIMDGROUPS];
+    threadgroup float shared_loss[1];
+    threadgroup float partial_valid[GD_METAL_LM_CROSS_ENTROPY_MAX_SIMDGROUPS];
+    threadgroup float shared_valid[1];
+    const uint simdgroups = args.simdgroups;
+    const ulong thread_i = ulong(simdgroup_id) * 32ul + ulong(simd_lane);
+    const ulong thread_stride = 32ul * ulong(simdgroups);
+    device const float *row_loss = reinterpret_cast<device const float *>(row_lossbuf + args.row_loss_offset);
+    device const float *row_valid = reinterpret_cast<device const float *>(row_validbuf + args.row_max_offset);
     device float *loss = reinterpret_cast<device float *>(lossbuf + args.out_offset);
     device float *inv_valid_count = reinterpret_cast<device float *>(inv_valid_countbuf + args.inv_valid_count_offset);
-    const float n = valid_count[0];
-    if (n > 0.0f) {
-        const float inv = 1.0f / n;
-        inv_valid_count[0] = inv;
-        loss[0] = loss_sum[0] * inv;
-    } else {
-        inv_valid_count[0] = 0.0f;
-        loss[0] = gd_lm_ce_nan();
+    float local_loss = 0.0f;
+    float local_valid = 0.0f;
+    for (ulong i = thread_i; i < args.rows; i += thread_stride) {
+        local_loss += row_loss[i];
+        local_valid += row_valid[i];
+    }
+    const float loss_sum = gd_lm_ce_threadgroup_sum(local_loss,
+                                                    partial_loss,
+                                                    shared_loss,
+                                                    simd_lane,
+                                                    simdgroup_id,
+                                                    simdgroups);
+    const float valid_count = gd_lm_ce_threadgroup_sum(local_valid,
+                                                       partial_valid,
+                                                       shared_valid,
+                                                       simd_lane,
+                                                       simdgroup_id,
+                                                       simdgroups);
+    if (thread_i == 0ul) {
+        if (valid_count > 0.0f) {
+            const float inv = 1.0f / valid_count;
+            inv_valid_count[0] = inv;
+            loss[0] = loss_sum * inv;
+        } else {
+            inv_valid_count[0] = 0.0f;
+            loss[0] = gd_lm_ce_nan();
+        }
     }
 }
 

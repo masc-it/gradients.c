@@ -1,6 +1,6 @@
 #include "lm_cross_entropy_impl.h"
 
-#include "../_shared/reduce/reduce_core.h"
+#include "../autograd_impl.h"
 #include "../linear/linear_impl.h"
 #include "../op_common.h"
 #include "../../core/memory_internal.h"
@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GD_LM_CROSS_ENTROPY_DEFAULT_CHUNK_CLASSES 1024ULL
+#define GD_LM_CROSS_ENTROPY_DEFAULT_CHUNK_CLASSES 2048ULL
 #define GD_LM_CROSS_ENTROPY_F32_NEG_INF_PATTERN 0xff800000U
 
 static gd_status gd_lm_cross_entropy_validate_targets(gd_context *ctx,
@@ -264,24 +264,24 @@ static gd_status gd_lm_cross_entropy_dispatch_finalize(gd_context *ctx,
     return GD_OK;
 }
 
-static gd_status gd_lm_cross_entropy_dispatch_normalize(gd_context *ctx,
-                                                        const gd_tensor *loss_sum,
-                                                        const gd_tensor *valid_count,
-                                                        const gd_tensor *loss,
-                                                        const gd_tensor *inv_valid_count)
+static gd_status gd_lm_cross_entropy_dispatch_reduce_normalize(gd_context *ctx,
+                                                               const gd_tensor *row_loss,
+                                                               const gd_tensor *row_valid,
+                                                               const gd_tensor *loss,
+                                                               const gd_tensor *inv_valid_count)
 {
-    gd_backend_tensor_view sv;
-    gd_backend_tensor_view cv;
+    gd_backend_tensor_view rv;
+    gd_backend_tensor_view vv;
     gd_backend_tensor_view lv;
     gd_backend_tensor_view nv;
     gd_status st;
-    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, loss_sum, &sv));
-    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, valid_count, &cv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_loss, &rv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_valid, &vv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, loss, &lv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, inv_valid_count, &nv));
-    st = gd_backend_lm_cross_entropy_normalize(gd_context_backend(ctx), &sv, &cv, &lv, &nv);
+    st = gd_backend_lm_cross_entropy_reduce_normalize(gd_context_backend(ctx), &rv, &vv, &lv, &nv);
     if (st != GD_OK) {
-        return gd_context_set_error(ctx, st, "backend lm_cross_entropy normalize failed");
+        return gd_context_set_error(ctx, st, "backend lm_cross_entropy reduce-normalize failed");
     }
     return GD_OK;
 }
@@ -354,8 +354,6 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     gd_tensor row_max;
     gd_tensor row_inv_sum;
     gd_tensor row_valid;
-    gd_tensor loss_sum;
-    gd_tensor valid_count;
     gd_tensor inv_valid_count;
     gd_tensor normalized_loss;
     gd_backend_matrix_view hv;
@@ -370,8 +368,6 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     memset(&row_max, 0, sizeof(row_max));
     memset(&row_inv_sum, 0, sizeof(row_inv_sum));
     memset(&row_valid, 0, sizeof(row_valid));
-    memset(&loss_sum, 0, sizeof(loss_sum));
-    memset(&valid_count, 0, sizeof(valid_count));
     memset(&inv_valid_count, 0, sizeof(inv_valid_count));
     memset(&normalized_loss, 0, sizeof(normalized_loss));
     if (ctx == NULL || hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
@@ -479,15 +475,11 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_reduce_sum(ctx, &row_loss, &loss_sum);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_reduce_sum(ctx, &row_valid, &valid_count);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_lm_cross_entropy_dispatch_normalize(ctx, &loss_sum, &valid_count, &normalized_loss, &inv_valid_count);
+    st = gd_lm_cross_entropy_dispatch_reduce_normalize(ctx,
+                                                       &row_loss,
+                                                       &row_valid,
+                                                       &normalized_loss,
+                                                       &inv_valid_count);
     if (st != GD_OK) {
         return st;
     }
@@ -497,14 +489,6 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         return st;
     }
     st = gd_lm_cross_entropy_free_scratch(ctx, &row_valid);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_lm_cross_entropy_free_scratch(ctx, &loss_sum);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_lm_cross_entropy_free_scratch(ctx, &valid_count);
     if (st != GD_OK) {
         return st;
     }
@@ -573,6 +557,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
     gd_backend_matrix_view hv;
     bool need_hidden;
     bool need_weight;
+    bool single_chunk;
     uint64_t chunk_size;
     uint64_t class_start;
     if (grad_hidden != NULL) {
@@ -639,27 +624,40 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
     if (!gd_linear_flat_matrix_view_from_tensor(hidden, info.rows, info.k, &hv)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy backward invalid hidden view");
     }
+    chunk_size = gd_lm_cross_entropy_chunk_classes(info.n);
+    single_chunk = chunk_size >= (uint64_t)info.n;
     if (need_hidden) {
-        st = gd_tensor_zeros(ctx,
-                             GD_ARENA_SCRATCH,
-                             GD_DTYPE_F16,
-                             gd_shape_make(hidden->rank, hidden->shape),
-                             256U,
-                             &dhidden);
+        if (single_chunk) {
+            st = gd_tensor_empty(ctx,
+                                 GD_ARENA_SCRATCH,
+                                 GD_DTYPE_F16,
+                                 gd_shape_make(hidden->rank, hidden->shape),
+                                 256U,
+                                 &dhidden);
+        } else {
+            st = gd_tensor_zeros(ctx,
+                                 GD_ARENA_SCRATCH,
+                                 GD_DTYPE_F16,
+                                 gd_shape_make(hidden->rank, hidden->shape),
+                                 256U,
+                                 &dhidden);
+        }
         if (st != GD_OK) {
             return st;
         }
         dhidden.is_leaf = false;
-        st = gd_tensor_empty(ctx,
-                             GD_ARENA_SCRATCH,
-                             GD_DTYPE_F16,
-                             gd_shape_make(hidden->rank, hidden->shape),
-                             256U,
-                             &partial_dhidden);
-        if (st != GD_OK) {
-            return st;
+        if (!single_chunk) {
+            st = gd_tensor_empty(ctx,
+                                 GD_ARENA_SCRATCH,
+                                 GD_DTYPE_F16,
+                                 gd_shape_make(hidden->rank, hidden->shape),
+                                 256U,
+                                 &partial_dhidden);
+            if (st != GD_OK) {
+                return st;
+            }
+            partial_dhidden.is_leaf = false;
         }
-        partial_dhidden.is_leaf = false;
     }
     if (need_weight) {
         st = gd_tensor_empty(ctx,
@@ -673,7 +671,6 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         }
         dweight.is_leaf = false;
     }
-    chunk_size = gd_lm_cross_entropy_chunk_classes(info.n);
     for (class_start = 0U; class_start < (uint64_t)info.n; class_start += chunk_size) {
         const uint64_t remaining = (uint64_t)info.n - class_start;
         const uint64_t chunk_classes = remaining < chunk_size ? remaining : chunk_size;
@@ -713,24 +710,35 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         }
         if (need_hidden) {
             gd_backend_matrix_view dhv;
-            gd_backend_matrix_view phv;
-            if (!gd_linear_flat_matrix_view_from_tensor(&dhidden, info.rows, info.k, &dhv) ||
-                !gd_linear_flat_matrix_view_from_tensor(&partial_dhidden, info.rows, info.k, &phv)) {
+            if (!gd_linear_flat_matrix_view_from_tensor(&dhidden, info.rows, info.k, &dhv)) {
                 return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid hidden grad view");
             }
-            st = gd_backend_matmul(gd_context_backend(ctx), &lv, &wv, &phv);
-            if (st != GD_OK) {
-                return gd_context_set_error(ctx, st, "backend lm_cross_entropy hidden grad chunk failed");
-            }
-            st = gd_backend_accumulate(gd_context_backend(ctx),
-                                       (gd_backend_buffer *)dhidden.storage.buffer,
-                                       dhidden.storage.offset + dhidden.view_offset,
-                                       (gd_backend_buffer *)partial_dhidden.storage.buffer,
-                                       partial_dhidden.storage.offset + partial_dhidden.view_offset,
-                                       (size_t)info.rows * (size_t)info.k,
-                                       (uint32_t)GD_DTYPE_F16);
-            if (st != GD_OK) {
-                return gd_context_set_error(ctx, st, "backend lm_cross_entropy hidden grad accumulate failed");
+            if (single_chunk) {
+                st = gd_backend_matmul(gd_context_backend(ctx), &lv, &wv, &dhv);
+                if (st != GD_OK) {
+                    return gd_context_set_error(ctx, st, "backend lm_cross_entropy hidden grad chunk failed");
+                }
+            } else {
+                gd_backend_matrix_view phv;
+                if (!gd_linear_flat_matrix_view_from_tensor(&partial_dhidden, info.rows, info.k, &phv)) {
+                    return gd_context_set_error(ctx,
+                                                GD_ERR_INVALID_ARGUMENT,
+                                                "lm_cross_entropy invalid partial hidden grad view");
+                }
+                st = gd_backend_matmul(gd_context_backend(ctx), &lv, &wv, &phv);
+                if (st != GD_OK) {
+                    return gd_context_set_error(ctx, st, "backend lm_cross_entropy hidden grad chunk failed");
+                }
+                st = gd_backend_accumulate(gd_context_backend(ctx),
+                                           (gd_backend_buffer *)dhidden.storage.buffer,
+                                           dhidden.storage.offset + dhidden.view_offset,
+                                           (gd_backend_buffer *)partial_dhidden.storage.buffer,
+                                           partial_dhidden.storage.offset + partial_dhidden.view_offset,
+                                           (size_t)info.rows * (size_t)info.k,
+                                           (uint32_t)GD_DTYPE_F16);
+                if (st != GD_OK) {
+                    return gd_context_set_error(ctx, st, "backend lm_cross_entropy hidden grad accumulate failed");
+                }
             }
         }
         if (need_weight) {
@@ -754,9 +762,11 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         }
     }
     if (need_hidden) {
-        st = gd_lm_cross_entropy_free_scratch(ctx, &partial_dhidden);
-        if (st != GD_OK) {
-            return st;
+        if (!single_chunk) {
+            st = gd_lm_cross_entropy_free_scratch(ctx, &partial_dhidden);
+            if (st != GD_OK) {
+                return st;
+            }
         }
         *grad_hidden = dhidden;
     }

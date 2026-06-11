@@ -620,15 +620,15 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
-gd_status gd_backend_lm_cross_entropy_normalize(gd_backend *backend,
-                                                const gd_backend_tensor_view *loss_sum,
-                                                const gd_backend_tensor_view *valid_count,
-                                                const gd_backend_tensor_view *loss,
-                                                const gd_backend_tensor_view *inv_valid_count)
+gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
+                                                       const gd_backend_tensor_view *row_loss,
+                                                       const gd_backend_tensor_view *row_valid,
+                                                       const gd_backend_tensor_view *loss,
+                                                       const gd_backend_tensor_view *inv_valid_count)
 {
     (void)backend;
-    (void)loss_sum;
-    (void)valid_count;
+    (void)row_loss;
+    (void)row_valid;
     (void)loss;
     (void)inv_valid_count;
     return GD_ERR_UNSUPPORTED;

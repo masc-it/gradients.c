@@ -407,11 +407,11 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                                const gd_backend_tensor_view *row_inv_sum,
                                                const gd_backend_tensor_view *row_valid,
                                                uint64_t total_classes);
-gd_status gd_backend_lm_cross_entropy_normalize(gd_backend *backend,
-                                                const gd_backend_tensor_view *loss_sum,
-                                                const gd_backend_tensor_view *valid_count,
-                                                const gd_backend_tensor_view *loss,
-                                                const gd_backend_tensor_view *inv_valid_count);
+gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
+                                                       const gd_backend_tensor_view *row_loss,
+                                                       const gd_backend_tensor_view *row_valid,
+                                                       const gd_backend_tensor_view *loss,
+                                                       const gd_backend_tensor_view *inv_valid_count);
 gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *logits_chunk,
                                                      const gd_backend_tensor_view *targets,

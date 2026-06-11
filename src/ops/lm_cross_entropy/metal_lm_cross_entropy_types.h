@@ -12,6 +12,7 @@ typedef struct gd_metal_lm_cross_entropy_args {
     gd_metal_u64 row_max_offset;
     gd_metal_u64 row_inv_sum_offset;
     gd_metal_u64 grad_out_offset;
+    gd_metal_u64 inv_valid_count_offset;
     gd_metal_u64 out_offset;
     gd_metal_u64 rows;
     gd_metal_u64 chunk_classes;
@@ -24,7 +25,7 @@ typedef struct gd_metal_lm_cross_entropy_args {
 } gd_metal_lm_cross_entropy_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 104U,
+_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 112U,
                "gd_metal_lm_cross_entropy_args ABI mismatch");
 #endif
 

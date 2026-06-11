@@ -39,6 +39,7 @@ gd_status gd_linear_transposed_weight(gd_context *ctx,
 
 /* Fused tied LM head + cross entropy:
  * hidden [..., D], weight [V, D], targets [rows] -> scalar F32 mean loss.
+ * Negative target ids are ignored and the loss is averaged over valid rows.
  * Uses the same F16 logits semantics as linear_transposed_weight followed by
  * cross_entropy, but records one training op for the combined LM-head loss. */
 gd_status gd_lm_cross_entropy(gd_context *ctx,

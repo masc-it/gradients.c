@@ -160,7 +160,8 @@ kernel void gd_lm_cross_entropy_finalize_f32_kernel(
     device uchar *row_lossbuf [[buffer(1)]],
     device uchar *row_maxbuf [[buffer(2)]],
     device uchar *row_inv_sumbuf [[buffer(3)]],
-    constant gd_metal_lm_cross_entropy_args &args [[buffer(4)]],
+    device uchar *row_validbuf [[buffer(4)]],
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(5)]],
     uint row [[thread_position_in_grid]])
 {
     if (ulong(row) >= args.rows) {
@@ -170,17 +171,49 @@ kernel void gd_lm_cross_entropy_finalize_f32_kernel(
     device float *row_loss = reinterpret_cast<device float *>(row_lossbuf + args.row_loss_offset);
     device float *row_max = reinterpret_cast<device float *>(row_maxbuf + args.row_max_offset);
     device float *row_inv_sum = reinterpret_cast<device float *>(row_inv_sumbuf + args.row_inv_sum_offset);
+    device float *row_valid = reinterpret_cast<device float *>(row_validbuf + args.out_offset);
     const int target = targets[row];
-    if (target < 0 || ulong(target) >= ulong(args.total_classes)) {
+    if (target < 0) {
+        row_loss[row] = 0.0f;
+        row_max[row] = 0.0f;
+        row_inv_sum[row] = 0.0f;
+        row_valid[row] = 0.0f;
+        return;
+    }
+    if (ulong(target) >= ulong(args.total_classes)) {
         row_loss[row] = gd_lm_ce_nan();
         row_max[row] = 0.0f;
         row_inv_sum[row] = 0.0f;
+        row_valid[row] = 1.0f;
         return;
     }
+    row_valid[row] = 1.0f;
     const float sum = row_inv_sum[row];
     const float inv_sum = 1.0f / sum;
     row_loss[row] = log(sum) + row_max[row] - row_loss[row];
     row_inv_sum[row] = inv_sum;
+}
+
+kernel void gd_lm_cross_entropy_normalize_f32_kernel(
+    device const uchar *loss_sumbuf [[buffer(0)]],
+    device const uchar *valid_countbuf [[buffer(1)]],
+    device uchar *lossbuf [[buffer(2)]],
+    device uchar *inv_valid_countbuf [[buffer(3)]],
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(4)]])
+{
+    device const float *loss_sum = reinterpret_cast<device const float *>(loss_sumbuf + args.row_loss_offset);
+    device const float *valid_count = reinterpret_cast<device const float *>(valid_countbuf + args.row_max_offset);
+    device float *loss = reinterpret_cast<device float *>(lossbuf + args.out_offset);
+    device float *inv_valid_count = reinterpret_cast<device float *>(inv_valid_countbuf + args.inv_valid_count_offset);
+    const float n = valid_count[0];
+    if (n > 0.0f) {
+        const float inv = 1.0f / n;
+        inv_valid_count[0] = inv;
+        loss[0] = loss_sum[0] * inv;
+    } else {
+        inv_valid_count[0] = 0.0f;
+        loss[0] = gd_lm_ce_nan();
+    }
 }
 
 kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
@@ -189,8 +222,9 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     device const uchar *row_maxbuf [[buffer(2)]],
     device const uchar *row_inv_sumbuf [[buffer(3)]],
     device const uchar *gradbuf [[buffer(4)]],
-    device uchar *grad_logitsbuf [[buffer(5)]],
-    constant gd_metal_lm_cross_entropy_args &args [[buffer(6)]],
+    device const uchar *inv_valid_countbuf [[buffer(5)]],
+    device uchar *grad_logitsbuf [[buffer(6)]],
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(7)]],
     uint3 tgpos [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simdgroup_id [[simdgroup_index_in_threadgroup]])
@@ -205,6 +239,7 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     device const float *row_max = reinterpret_cast<device const float *>(row_maxbuf + args.row_max_offset);
     device const float *row_inv_sum = reinterpret_cast<device const float *>(row_inv_sumbuf + args.row_inv_sum_offset);
     device const float *grad_loss = reinterpret_cast<device const float *>(gradbuf + args.grad_out_offset);
+    device const float *inv_valid_count = reinterpret_cast<device const float *>(inv_valid_countbuf + args.inv_valid_count_offset);
     device half *grad_logits = reinterpret_cast<device half *>(grad_logitsbuf + args.out_offset);
     if (row >= args.rows) {
         return;
@@ -217,7 +252,7 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
         }
         return;
     }
-    const float seed = grad_loss[0] * args.scale;
+    const float seed = grad_loss[0] * args.scale * inv_valid_count[0];
     const float rm = row_max[row];
     const float inv_sum = row_inv_sum[row];
     const ulong target_u = ulong(target);

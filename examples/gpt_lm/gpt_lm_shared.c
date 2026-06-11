@@ -674,7 +674,8 @@ gd_status gpt_lm_forward(gd_context *ctx,
     if (input_ids->shape[0] <= 0 || (input_ids->shape[0] % GPT_CONTEXT_LENGTH) != 0) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (cu_seqlens->rank != 1U || cu_seqlens->shape[0] != input_ids->shape[0] / GPT_CONTEXT_LENGTH + 1) {
+    if (cu_seqlens->rank != 1U || cu_seqlens->shape[0] < 2 ||
+        cu_seqlens->shape[0] > input_ids->shape[0] + 1) {
         return GD_ERR_INVALID_ARGUMENT;
     }
 

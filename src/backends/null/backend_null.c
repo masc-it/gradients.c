@@ -607,6 +607,7 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                                const gd_backend_tensor_view *row_loss,
                                                const gd_backend_tensor_view *row_max,
                                                const gd_backend_tensor_view *row_inv_sum,
+                                               const gd_backend_tensor_view *row_valid,
                                                uint64_t total_classes)
 {
     (void)backend;
@@ -614,7 +615,22 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
     (void)row_loss;
     (void)row_max;
     (void)row_inv_sum;
+    (void)row_valid;
     (void)total_classes;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_lm_cross_entropy_normalize(gd_backend *backend,
+                                                const gd_backend_tensor_view *loss_sum,
+                                                const gd_backend_tensor_view *valid_count,
+                                                const gd_backend_tensor_view *loss,
+                                                const gd_backend_tensor_view *inv_valid_count)
+{
+    (void)backend;
+    (void)loss_sum;
+    (void)valid_count;
+    (void)loss;
+    (void)inv_valid_count;
     return GD_ERR_UNSUPPORTED;
 }
 
@@ -624,6 +640,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *row_max,
                                                      const gd_backend_tensor_view *row_inv_sum,
                                                      const gd_backend_tensor_view *grad_loss,
+                                                     const gd_backend_tensor_view *inv_valid_count,
                                                      const gd_backend_tensor_view *grad_logits_chunk,
                                                      uint64_t class_start,
                                                      uint64_t total_classes,
@@ -636,6 +653,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
     (void)row_max;
     (void)row_inv_sum;
     (void)grad_loss;
+    (void)inv_valid_count;
     (void)grad_logits_chunk;
     (void)class_start;
     (void)total_classes;

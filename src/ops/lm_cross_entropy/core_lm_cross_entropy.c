@@ -237,25 +237,51 @@ static gd_status gd_lm_cross_entropy_dispatch_finalize(gd_context *ctx,
                                                        const gd_tensor *row_loss,
                                                        const gd_tensor *row_max,
                                                        const gd_tensor *row_inv_sum,
+                                                       const gd_tensor *row_valid,
                                                        uint64_t total_classes)
 {
     gd_backend_tensor_view tv;
     gd_backend_tensor_view rv;
     gd_backend_tensor_view mv;
     gd_backend_tensor_view iv;
+    gd_backend_tensor_view vv;
     gd_status st;
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, targets, &tv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_loss, &rv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_max, &mv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_inv_sum, &iv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_valid, &vv));
     st = gd_backend_lm_cross_entropy_finalize(gd_context_backend(ctx),
                                               &tv,
                                               &rv,
                                               &mv,
                                               &iv,
+                                              &vv,
                                               total_classes);
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend lm_cross_entropy finalize failed");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_lm_cross_entropy_dispatch_normalize(gd_context *ctx,
+                                                        const gd_tensor *loss_sum,
+                                                        const gd_tensor *valid_count,
+                                                        const gd_tensor *loss,
+                                                        const gd_tensor *inv_valid_count)
+{
+    gd_backend_tensor_view sv;
+    gd_backend_tensor_view cv;
+    gd_backend_tensor_view lv;
+    gd_backend_tensor_view nv;
+    gd_status st;
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, loss_sum, &sv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, valid_count, &cv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, loss, &lv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, inv_valid_count, &nv));
+    st = gd_backend_lm_cross_entropy_normalize(gd_context_backend(ctx), &sv, &cv, &lv, &nv);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend lm_cross_entropy normalize failed");
     }
     return GD_OK;
 }
@@ -266,6 +292,7 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
                                                              const gd_tensor *row_max,
                                                              const gd_tensor *row_inv_sum,
                                                              const gd_tensor *grad_out,
+                                                             const gd_tensor *inv_valid_count,
                                                              const gd_tensor *grad_logits_chunk,
                                                              uint64_t class_start,
                                                              uint64_t total_classes,
@@ -277,6 +304,7 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
     gd_backend_tensor_view mv;
     gd_backend_tensor_view iv;
     gd_backend_tensor_view gv;
+    gd_backend_tensor_view nv;
     gd_backend_tensor_view dgv;
     gd_status st;
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, logits_chunk, &lv));
@@ -284,6 +312,7 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_max, &mv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_inv_sum, &iv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, grad_out, &gv));
+    GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, inv_valid_count, &nv));
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, grad_logits_chunk, &dgv));
     st = gd_backend_lm_cross_entropy_backward_chunk(gd_context_backend(ctx),
                                                     &lv,
@@ -291,6 +320,7 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
                                                     &mv,
                                                     &iv,
                                                     &gv,
+                                                    &nv,
                                                     &dgv,
                                                     class_start,
                                                     total_classes,
@@ -323,11 +353,15 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     gd_tensor row_loss;
     gd_tensor row_max;
     gd_tensor row_inv_sum;
+    gd_tensor row_valid;
+    gd_tensor loss_sum;
+    gd_tensor valid_count;
+    gd_tensor inv_valid_count;
+    gd_tensor normalized_loss;
     gd_backend_matrix_view hv;
     int64_t row_shape[1];
     uint64_t chunk_size;
     uint64_t class_start;
-    float inv_rows;
     bool needs_grad;
     if (loss != NULL) {
         memset(loss, 0, sizeof(*loss));
@@ -335,6 +369,11 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     memset(&row_loss, 0, sizeof(row_loss));
     memset(&row_max, 0, sizeof(row_max));
     memset(&row_inv_sum, 0, sizeof(row_inv_sum));
+    memset(&row_valid, 0, sizeof(row_valid));
+    memset(&loss_sum, 0, sizeof(loss_sum));
+    memset(&valid_count, 0, sizeof(valid_count));
+    memset(&inv_valid_count, 0, sizeof(inv_valid_count));
+    memset(&normalized_loss, 0, sizeof(normalized_loss));
     if (ctx == NULL || hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -363,14 +402,30 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, row_shape), 256U, &row_valid);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(0U, NULL), 256U, &inv_valid_count);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(0U, NULL), 256U, &normalized_loss);
+    if (st != GD_OK) {
+        return st;
+    }
     row_loss.is_leaf = false;
     row_max.is_leaf = false;
     row_inv_sum.is_leaf = false;
+    row_valid.is_leaf = false;
+    inv_valid_count.is_leaf = false;
+    normalized_loss.is_leaf = false;
     GD_TRY(gd_tensor_zero_(ctx, &row_loss));
     GD_TRY(gd_lm_cross_entropy_fill_tensor_pattern(ctx,
                                                    &row_max,
                                                    GD_LM_CROSS_ENTROPY_F32_NEG_INF_PATTERN));
     GD_TRY(gd_tensor_zero_(ctx, &row_inv_sum));
+    GD_TRY(gd_tensor_zero_(ctx, &row_valid));
     if (!gd_linear_flat_matrix_view_from_tensor(hidden, info.rows, info.k, &hv)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid hidden matrix view");
     }
@@ -414,16 +469,42 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
             return st;
         }
     }
-    st = gd_lm_cross_entropy_dispatch_finalize(ctx, targets, &row_loss, &row_max, &row_inv_sum, (uint64_t)info.n);
+    st = gd_lm_cross_entropy_dispatch_finalize(ctx,
+                                                targets,
+                                                &row_loss,
+                                                &row_max,
+                                                &row_inv_sum,
+                                                &row_valid,
+                                                (uint64_t)info.n);
     if (st != GD_OK) {
         return st;
     }
-    inv_rows = 1.0f / (float)info.rows;
-    st = gd_reduce_all_forward_impl(ctx, &row_loss, loss, GD_OP_LM_CROSS_ENTROPY, inv_rows);
+    st = gd_reduce_sum(ctx, &row_loss, &loss_sum);
     if (st != GD_OK) {
         return st;
     }
+    st = gd_reduce_sum(ctx, &row_valid, &valid_count);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_dispatch_normalize(ctx, &loss_sum, &valid_count, &normalized_loss, &inv_valid_count);
+    if (st != GD_OK) {
+        return st;
+    }
+    *loss = normalized_loss;
     st = gd_lm_cross_entropy_free_scratch(ctx, &row_loss);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_free_scratch(ctx, &row_valid);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_free_scratch(ctx, &loss_sum);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_lm_cross_entropy_free_scratch(ctx, &valid_count);
     if (st != GD_OK) {
         return st;
     }
@@ -431,7 +512,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     if (needs_grad) {
         const gd_tensor *inputs[3];
         gd_tensor *outputs[1];
-        const gd_tensor *saved[2];
+        const gd_tensor *saved[3];
         const gd_lm_cross_entropy_attrs attrs = {
             .logits_softcap = logits_softcap,
         };
@@ -441,6 +522,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         outputs[0] = loss;
         saved[0] = &row_max;
         saved[1] = &row_inv_sum;
+        saved[2] = &inv_valid_count;
         st = gd_autograd_record(ctx,
                                 GD_OP_LM_CROSS_ENTROPY,
                                 inputs,
@@ -450,7 +532,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
                                 &attrs,
                                 (uint32_t)sizeof(attrs),
                                 saved,
-                                2U);
+                                3U);
         if (st != GD_OK) {
             return st;
         }
@@ -460,6 +542,10 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
             return st;
         }
         st = gd_lm_cross_entropy_free_scratch(ctx, &row_inv_sum);
+        if (st != GD_OK) {
+            return st;
+        }
+        st = gd_lm_cross_entropy_free_scratch(ctx, &inv_valid_count);
         if (st != GD_OK) {
             return st;
         }
@@ -473,6 +559,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   const gd_tensor *targets,
                                                   const gd_tensor *row_max,
                                                   const gd_tensor *row_inv_sum,
+                                                  const gd_tensor *inv_valid_count,
                                                   float logits_softcap,
                                                   const gd_tensor *grad_out,
                                                   gd_tensor *grad_hidden,
@@ -498,7 +585,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
     memset(&dweight, 0, sizeof(dweight));
     memset(&partial_dhidden, 0, sizeof(partial_dhidden));
     if (ctx == NULL || hidden == NULL || weight == NULL || targets == NULL ||
-        row_max == NULL || row_inv_sum == NULL || grad_out == NULL) {
+        row_max == NULL || row_inv_sum == NULL || inv_valid_count == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     need_hidden = grad_hidden != NULL;
@@ -531,6 +618,16 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         row_max->shape[0] != (int64_t)info.rows || row_inv_sum->shape[0] != (int64_t)info.rows ||
         !gd_tensor_is_contiguous(row_max) || !gd_tensor_is_contiguous(row_inv_sum)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy row stats invalid");
+    }
+    st = gd_tensor_validate(ctx, inv_valid_count);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (inv_valid_count->dtype != GD_DTYPE_F32 || inv_valid_count->rank != 0U ||
+        !gd_tensor_is_contiguous(inv_valid_count)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "lm_cross_entropy backward needs scalar f32 inv_valid_count");
     }
     st = gd_tensor_validate(ctx, grad_out);
     if (st != GD_OK) {
@@ -605,10 +702,11 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                          row_max,
                                                          row_inv_sum,
                                                          grad_out,
+                                                         inv_valid_count,
                                                          &logits_chunk,
                                                          class_start,
                                                          (uint64_t)info.n,
-                                                         1.0f / (float)info.rows,
+                                                         1.0f,
                                                          logits_softcap);
         if (st != GD_OK) {
             return st;

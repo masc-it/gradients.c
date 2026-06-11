@@ -43,6 +43,7 @@ typedef enum gd_gdds_generated_kind {
     GD_GDDS_GENERATED_MASK = 2,
     GD_GDDS_GENERATED_CU_SEQLENS = 3,
     GD_GDDS_GENERATED_POSITIONS = 4,
+    GD_GDDS_GENERATED_CU_SEQLENS_FROM_LENGTHS = 5,
 } gd_gdds_generated_kind;
 
 typedef struct gd_gdds_field_info {

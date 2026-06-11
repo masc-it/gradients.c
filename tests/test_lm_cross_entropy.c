@@ -196,6 +196,7 @@ static void compute_softcapped_oracle(const uint16_t *hidden_h,
     float soft_logits[SOFT_ROWS * SOFT_VOCAB];
     uint16_t dlogits_h[SOFT_ROWS * SOFT_VOCAB];
     float loss_sum = 0.0f;
+    int valid_rows = 0;
     int r;
     int v;
     int d;
@@ -214,9 +215,21 @@ static void compute_softcapped_oracle(const uint16_t *hidden_h,
         }
     }
     for (r = 0; r < SOFT_ROWS; ++r) {
+        if (targets_h[r] >= 0 && targets_h[r] < SOFT_VOCAB) {
+            valid_rows += 1;
+        }
+    }
+    CHECK(valid_rows > 0, "oracle needs at least one valid target");
+    for (r = 0; r < SOFT_ROWS; ++r) {
         const int32_t target = targets_h[r];
         float row_max = soft_logits[(size_t)r * (size_t)SOFT_VOCAB];
         float row_sum = 0.0f;
+        if (target < 0 || target >= SOFT_VOCAB) {
+            for (v = 0; v < SOFT_VOCAB; ++v) {
+                dlogits_h[(size_t)r * (size_t)SOFT_VOCAB + (size_t)v] = f32_to_f16_bits(0.0f);
+            }
+            continue;
+        }
         for (v = 1; v < SOFT_VOCAB; ++v) {
             const float value = soft_logits[(size_t)r * (size_t)SOFT_VOCAB + (size_t)v];
             if (value > row_max) {
@@ -233,11 +246,11 @@ static void compute_softcapped_oracle(const uint16_t *hidden_h,
             if (v == target) {
                 p -= 1.0f;
             }
-            p *= (1.0f / (float)SOFT_ROWS) * softcap_grad_f32(soft_logits[idx], cap);
+            p *= (1.0f / (float)valid_rows) * softcap_grad_f32(soft_logits[idx], cap);
             dlogits_h[idx] = f32_to_f16_bits(p);
         }
     }
-    *loss_out = loss_sum / (float)SOFT_ROWS;
+    *loss_out = loss_sum / (float)valid_rows;
     for (r = 0; r < SOFT_ROWS; ++r) {
         for (d = 0; d < SOFT_DIM; ++d) {
             float acc = 0.0f;
@@ -262,12 +275,17 @@ static void compute_softcapped_oracle(const uint16_t *hidden_h,
     }
 }
 
-static void run_softcapped_case(float cap, float *loss_out, uint16_t *dh_out, uint16_t *dw_out)
+static void run_softcapped_case_with_targets(const int32_t *targets_arg,
+                                             float cap,
+                                             float *loss_out,
+                                             uint16_t *dh_out,
+                                             uint16_t *dw_out)
 {
     const int64_t hidden_shape[2] = {SOFT_ROWS, SOFT_DIM};
     const int64_t weight_shape[2] = {SOFT_VOCAB, SOFT_DIM};
     const int64_t target_shape[1] = {SOFT_ROWS};
-    const int32_t targets_h[SOFT_ROWS] = {0, 15, 3, 31, 16, 1};
+    const int32_t default_targets[SOFT_ROWS] = {0, 15, 3, 31, 16, 1};
+    const int32_t *targets_h = targets_arg != NULL ? targets_arg : default_targets;
     uint16_t hidden_h[SOFT_HCOUNT];
     uint16_t weight_h[SOFT_WCOUNT];
     gd_context *ctx = NULL;
@@ -286,7 +304,7 @@ static void run_softcapped_case(float cap, float *loss_out, uint16_t *dh_out, ui
     CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, target_shape), 256U, &targets));
     CHECK_OK(gd_tensor_write(ctx, &hidden, hidden_h, sizeof(hidden_h)));
     CHECK_OK(gd_tensor_write(ctx, &weight, weight_h, sizeof(weight_h)));
-    CHECK_OK(gd_tensor_write(ctx, &targets, targets_h, sizeof(targets_h)));
+    CHECK_OK(gd_tensor_write(ctx, &targets, targets_h, (size_t)SOFT_ROWS * sizeof(targets_h[0])));
     hidden.requires_grad = true;
     weight.requires_grad = true;
     CHECK_OK(gd_context_seal_params(ctx));
@@ -376,6 +394,45 @@ static void test_fused_matches_materialized(void)
     }
 }
 
+static void test_ignore_index_matches_oracle(void)
+{
+    const float cap = 0.0f;
+    const int32_t targets_h[SOFT_ROWS] = {0, -1, 3, 31, -1, 1};
+    float actual_loss = 0.0f;
+    float expected_loss = 0.0f;
+    uint16_t hidden_h[SOFT_HCOUNT];
+    uint16_t weight_h[SOFT_WCOUNT];
+    uint16_t actual_dh[SOFT_HCOUNT];
+    uint16_t expected_dh[SOFT_HCOUNT];
+    uint16_t actual_dw[SOFT_WCOUNT];
+    uint16_t expected_dw[SOFT_WCOUNT];
+    uint32_t i;
+    memset(actual_dh, 0, sizeof(actual_dh));
+    memset(expected_dh, 0, sizeof(expected_dh));
+    memset(actual_dw, 0, sizeof(actual_dw));
+    memset(expected_dw, 0, sizeof(expected_dw));
+    fill_hidden(hidden_h, SOFT_HCOUNT);
+    fill_weight(weight_h, SOFT_WCOUNT);
+    compute_softcapped_oracle(hidden_h,
+                              weight_h,
+                              targets_h,
+                              cap,
+                              &expected_loss,
+                              expected_dh,
+                              expected_dw);
+    run_softcapped_case_with_targets(targets_h, cap, &actual_loss, actual_dh, actual_dw);
+    CHECK(abs_f32(actual_loss - expected_loss) <= 1.5e-3f,
+          "ignore-index lm_cross_entropy loss matches oracle");
+    for (i = 0U; i < SOFT_HCOUNT; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(actual_dh[i]) - f16_bits_to_f32(expected_dh[i])) <= 1.5e-3f,
+              "ignore-index lm_cross_entropy hidden grad matches oracle");
+    }
+    for (i = 0U; i < SOFT_WCOUNT; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(actual_dw[i]) - f16_bits_to_f32(expected_dw[i])) <= 1.5e-3f,
+              "ignore-index lm_cross_entropy weight grad matches oracle");
+    }
+}
+
 static void test_softcapped_matches_oracle(void)
 {
     const float cap = 0.75f;
@@ -402,7 +459,7 @@ static void test_softcapped_matches_oracle(void)
                               &expected_loss,
                               expected_dh,
                               expected_dw);
-    run_softcapped_case(cap, &actual_loss, actual_dh, actual_dw);
+    run_softcapped_case_with_targets(NULL, cap, &actual_loss, actual_dh, actual_dw);
     CHECK(abs_f32(actual_loss - expected_loss) <= 1.5e-3f,
           "softcapped lm_cross_entropy loss matches oracle");
     for (i = 0U; i < SOFT_HCOUNT; ++i) {
@@ -418,6 +475,7 @@ static void test_softcapped_matches_oracle(void)
 int main(void)
 {
     test_fused_matches_materialized();
+    test_ignore_index_matches_oracle();
     test_softcapped_matches_oracle();
     printf("test_lm_cross_entropy: ok\n");
     return 0;

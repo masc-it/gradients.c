@@ -17,6 +17,11 @@ static id<MTLComputePipelineState> gd_lm_cross_entropy_finalize_f32_pso(gd_backe
     return (__bridge id<MTLComputePipelineState>)backend->lm_cross_entropy_finalize_f32_pso;
 }
 
+static id<MTLComputePipelineState> gd_lm_cross_entropy_normalize_f32_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->lm_cross_entropy_normalize_f32_pso;
+}
+
 static id<MTLComputePipelineState> gd_lm_cross_entropy_backward_chunk_f16_pso(gd_backend *backend)
 {
     return (__bridge id<MTLComputePipelineState>)backend->lm_cross_entropy_backward_chunk_f16_pso;
@@ -118,7 +123,8 @@ static gd_status gd_lm_cross_entropy_online_update_validate(const gd_backend_ten
 static gd_status gd_lm_cross_entropy_finalize_validate(const gd_backend_tensor_view *targets,
                                                        const gd_backend_tensor_view *row_loss,
                                                        const gd_backend_tensor_view *row_max,
-                                                       const gd_backend_tensor_view *row_inv_sum)
+                                                       const gd_backend_tensor_view *row_inv_sum,
+                                                       const gd_backend_tensor_view *row_valid)
 {
     if (!gd_lm_cross_entropy_view_range_valid(targets) ||
         targets->dtype != (uint32_t)GD_DTYPE_I32 || targets->rank != 1U ||
@@ -127,10 +133,17 @@ static gd_status gd_lm_cross_entropy_finalize_validate(const gd_backend_tensor_v
         !gd_lm_cross_entropy_row_vector_valid(targets, row_loss) ||
         !gd_lm_cross_entropy_row_vector_valid(targets, row_max) ||
         !gd_lm_cross_entropy_row_vector_valid(targets, row_inv_sum) ||
+        !gd_lm_cross_entropy_row_vector_valid(targets, row_valid) ||
         targets->shape[0] > (int64_t)UINT32_MAX) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     return GD_OK;
+}
+
+static bool gd_lm_cross_entropy_scalar_f32_valid(const gd_backend_tensor_view *view)
+{
+    return gd_lm_cross_entropy_view_range_valid(view) && view->dtype == (uint32_t)GD_DTYPE_F32 &&
+           view->rank == 0U && view->count == 1U;
 }
 
 static gd_status gd_lm_cross_entropy_backward_chunk_validate(const gd_backend_tensor_view *logits,
@@ -138,6 +151,7 @@ static gd_status gd_lm_cross_entropy_backward_chunk_validate(const gd_backend_te
                                                              const gd_backend_tensor_view *row_max,
                                                              const gd_backend_tensor_view *row_inv_sum,
                                                              const gd_backend_tensor_view *grad_loss,
+                                                             const gd_backend_tensor_view *inv_valid_count,
                                                              const gd_backend_tensor_view *grad_logits,
                                                              uint64_t class_start,
                                                              uint64_t total_classes)
@@ -152,10 +166,10 @@ static gd_status gd_lm_cross_entropy_backward_chunk_validate(const gd_backend_te
     if (st != GD_OK) {
         return st;
     }
-    if (!gd_lm_cross_entropy_view_range_valid(grad_loss) ||
+    if (!gd_lm_cross_entropy_scalar_f32_valid(grad_loss) ||
+        !gd_lm_cross_entropy_scalar_f32_valid(inv_valid_count) ||
         !gd_lm_cross_entropy_view_range_valid(grad_logits) ||
-        grad_loss->dtype != (uint32_t)GD_DTYPE_F32 || grad_loss->rank != 0U ||
-        grad_loss->count != 1U || grad_logits->dtype != (uint32_t)GD_DTYPE_F16 ||
+        grad_logits->dtype != (uint32_t)GD_DTYPE_F16 ||
         grad_logits->rank != 2U || grad_logits->shape[0] != logits->shape[0] ||
         grad_logits->shape[1] != logits->shape[1] || grad_logits->strides[1] != 1 ||
         grad_logits->strides[0] != grad_logits->shape[1] || grad_logits->count != logits->count) {
@@ -185,6 +199,7 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
                                           const gd_backend_tensor_view *row_max,
                                           const gd_backend_tensor_view *row_inv_sum,
                                           const gd_backend_tensor_view *grad_loss,
+                                          const gd_backend_tensor_view *inv_valid_count,
                                           const gd_backend_tensor_view *out,
                                           uint64_t class_start,
                                           uint64_t total_classes,
@@ -198,6 +213,7 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
     args->row_max_offset = row_max != NULL ? (uint64_t)row_max->offset : 0U;
     args->row_inv_sum_offset = row_inv_sum != NULL ? (uint64_t)row_inv_sum->offset : 0U;
     args->grad_out_offset = grad_loss != NULL ? (uint64_t)grad_loss->offset : 0U;
+    args->inv_valid_count_offset = inv_valid_count != NULL ? (uint64_t)inv_valid_count->offset : 0U;
     args->out_offset = out != NULL ? (uint64_t)out->offset : 0U;
     args->rows = targets != NULL ? (uint64_t)targets->shape[0] : 0U;
     args->chunk_classes = logits != NULL ? (uint64_t)logits->shape[1] : 0U;
@@ -255,6 +271,7 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                   row_inv_sum,
                                   NULL,
                                   NULL,
+                                  NULL,
                                   class_start,
                                   total_classes,
                                   1.0f,
@@ -278,6 +295,7 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                                const gd_backend_tensor_view *row_loss,
                                                const gd_backend_tensor_view *row_max,
                                                const gd_backend_tensor_view *row_inv_sum,
+                                               const gd_backend_tensor_view *row_valid,
                                                uint64_t total_classes)
 {
     id<MTLCommandBuffer> command_buffer;
@@ -290,7 +308,7 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
     if (backend == NULL || total_classes == 0U) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_lm_cross_entropy_finalize_validate(targets, row_loss, row_max, row_inv_sum);
+    st = gd_lm_cross_entropy_finalize_validate(targets, row_loss, row_max, row_inv_sum, row_valid);
     if (st != GD_OK) {
         return st;
     }
@@ -310,6 +328,7 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                   row_inv_sum,
                                   NULL,
                                   NULL,
+                                  row_valid,
                                   0U,
                                   total_classes,
                                   1.0f,
@@ -319,9 +338,63 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_loss->buffer) offset:0U atIndex:1U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:2U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:3U];
-    [encoder setBytes:&args length:sizeof(args) atIndex:4U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_valid->buffer) offset:0U atIndex:4U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:5U];
     grid = MTLSizeMake((NSUInteger)args.rows, 1U, 1U);
     threads = MTLSizeMake(128U, 1U, 1U);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+    return gd_metal_finish_immediate(command_buffer, immediate);
+}
+
+gd_status gd_backend_lm_cross_entropy_normalize(gd_backend *backend,
+                                                const gd_backend_tensor_view *loss_sum,
+                                                const gd_backend_tensor_view *valid_count,
+                                                const gd_backend_tensor_view *loss,
+                                                const gd_backend_tensor_view *inv_valid_count)
+{
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+    gd_metal_lm_cross_entropy_args args;
+    MTLSize grid;
+    MTLSize threads;
+    bool immediate;
+    gd_status st;
+    if (backend == NULL || !gd_lm_cross_entropy_scalar_f32_valid(loss_sum) ||
+        !gd_lm_cross_entropy_scalar_f32_valid(valid_count) ||
+        !gd_lm_cross_entropy_scalar_f32_valid(loss) ||
+        !gd_lm_cross_entropy_scalar_f32_valid(inv_valid_count)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
+    if (st != GD_OK) {
+        return st;
+    }
+    encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return GD_ERR_INTERNAL;
+    }
+    gd_lm_cross_entropy_fill_args(&args,
+                                  NULL,
+                                  NULL,
+                                  loss_sum,
+                                  valid_count,
+                                  NULL,
+                                  NULL,
+                                  inv_valid_count,
+                                  loss,
+                                  0U,
+                                  0U,
+                                  1.0f,
+                                  0.0f);
+    [encoder setComputePipelineState:gd_lm_cross_entropy_normalize_f32_pso(backend)];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(loss_sum->buffer) offset:0U atIndex:0U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(valid_count->buffer) offset:0U atIndex:1U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(loss->buffer) offset:0U atIndex:2U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(inv_valid_count->buffer) offset:0U atIndex:3U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:4U];
+    grid = MTLSizeMake(1U, 1U, 1U);
+    threads = MTLSizeMake(1U, 1U, 1U);
     [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
     [encoder endEncoding];
     return gd_metal_finish_immediate(command_buffer, immediate);
@@ -333,6 +406,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *row_max,
                                                      const gd_backend_tensor_view *row_inv_sum,
                                                      const gd_backend_tensor_view *grad_loss,
+                                                     const gd_backend_tensor_view *inv_valid_count,
                                                      const gd_backend_tensor_view *grad_logits_chunk,
                                                      uint64_t class_start,
                                                      uint64_t total_classes,
@@ -354,6 +428,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      row_max,
                                                      row_inv_sum,
                                                      grad_loss,
+                                                     inv_valid_count,
                                                      grad_logits_chunk,
                                                      class_start,
                                                      total_classes);
@@ -375,6 +450,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                   row_max,
                                   row_inv_sum,
                                   grad_loss,
+                                  inv_valid_count,
                                   grad_logits_chunk,
                                   class_start,
                                   total_classes,
@@ -386,8 +462,9 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:2U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:3U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_loss->buffer) offset:0U atIndex:4U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_logits_chunk->buffer) offset:0U atIndex:5U];
-    [encoder setBytes:&args length:sizeof(args) atIndex:6U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(inv_valid_count->buffer) offset:0U atIndex:5U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_logits_chunk->buffer) offset:0U atIndex:6U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:7U];
     grid = MTLSizeMake((NSUInteger)args.rows, 1U, 1U);
     threads = MTLSizeMake(32U, (NSUInteger)args.simdgroups, 1U);
     [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];

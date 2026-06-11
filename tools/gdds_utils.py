@@ -68,6 +68,7 @@ GENERATED_CODES: dict[str, int] = {
     "mask": 2,
     "cu_seqlens": 3,
     "positions": 4,
+    "cu_seqlens_from_lengths": 5,
 }
 
 
@@ -361,6 +362,11 @@ def _normalize_fields(fields: Sequence[FieldSpec | Mapping[str, Any]]) -> list[F
         elif field.generated == "positions":
             if field.dtype != "i32" or source.collate != "packed_sequence":
                 raise ValueError(f"generated positions field {field.name!r} requires i32 packed_sequence source")
+        elif field.generated == "cu_seqlens_from_lengths":
+            if field.dtype != "i32" or source.dtype != "i32" or source.collate != "packed_sequence" or source.shape != (-1,):
+                raise ValueError(
+                    f"generated cu_seqlens_from_lengths field {field.name!r} requires i32 packed_sequence source [-1]"
+                )
     return out
 
 

@@ -157,6 +157,7 @@ static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
     GD_METAL_PIPELINE("gd_cross_entropy_backward_stats_f16_kernel", cross_entropy_backward_stats_f16_pso),
     GD_METAL_PIPELINE("gd_lm_cross_entropy_online_update_f16_kernel", lm_cross_entropy_online_update_f16_pso),
     GD_METAL_PIPELINE("gd_lm_cross_entropy_finalize_f32_kernel", lm_cross_entropy_finalize_f32_pso),
+    GD_METAL_PIPELINE("gd_lm_cross_entropy_normalize_f32_kernel", lm_cross_entropy_normalize_f32_pso),
     GD_METAL_PIPELINE("gd_lm_cross_entropy_backward_chunk_f16_kernel", lm_cross_entropy_backward_chunk_f16_pso),
     GD_METAL_PIPELINE("gd_mse_forward_f16_kernel", mse_forward_f16_pso),
     GD_METAL_PIPELINE("gd_mse_forward_f32_kernel", mse_forward_f32_pso),

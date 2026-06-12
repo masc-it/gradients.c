@@ -221,3 +221,159 @@ gd_status gd_train_batch(gd_context *ctx,
     }
     return GD_OK;
 }
+
+gd_eval_config gd_eval_config_default(gd_dataset *dataset, int batch_size)
+{
+    gd_eval_config config;
+    memset(&config, 0, sizeof(config));
+    config.dataset = dataset;
+    config.batch_size = batch_size;
+    config.scope = GD_SCOPE_EVAL;
+    config.prefetch_next = true;
+    return config;
+}
+
+gd_status gd_eval_mean_loss(gd_context *ctx,
+                            const gd_eval_config *config,
+                            gd_eval_loss_fn loss_fn,
+                            void *user_data,
+                            float *mean_loss_out)
+{
+    gd_dataloader *loader = NULL;
+    gd_batch *batch = NULL;
+    gd_scope_mode scope;
+    gd_dataloader_config loader_config;
+    gd_status st = GD_OK;
+    uint64_t samples;
+    uint64_t steps;
+    uint64_t step_index;
+    double total_loss = 0.0;
+    int batch_size;
+    bool in_step = false;
+    bool restore_training = false;
+    bool was_training = false;
+
+    if (mean_loss_out != NULL) {
+        *mean_loss_out = 0.0f;
+    }
+    if (ctx == NULL || config == NULL || config->dataset == NULL ||
+        config->batch_size <= 0 || config->num_workers < 0 || config->prefetch_factor < 0 ||
+        loss_fn == NULL || mean_loss_out == NULL) {
+        return gd_train_batch_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid eval config");
+    }
+    scope = config->scope == GD_SCOPE_NONE ? GD_SCOPE_EVAL : config->scope;
+    if (scope != GD_SCOPE_EVAL && scope != GD_SCOPE_INFER) {
+        return gd_train_batch_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid eval scope");
+    }
+    samples = gd_dataset_num_samples(config->dataset);
+    if (samples == 0U) {
+        return gd_train_batch_error(ctx, GD_ERR_INVALID_ARGUMENT, "empty eval dataset");
+    }
+    batch_size = config->batch_size;
+    if ((uint64_t)batch_size > samples) {
+        batch_size = (int)samples;
+    }
+    if (batch_size <= 0) {
+        return gd_train_batch_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid eval batch size");
+    }
+    steps = samples / (uint64_t)batch_size;
+    if (config->max_steps > 0U && config->max_steps < steps) {
+        steps = config->max_steps;
+    }
+    if (steps == 0U) {
+        return gd_train_batch_error(ctx, GD_ERR_INVALID_ARGUMENT, "eval dataset has no full batches");
+    }
+
+    if (config->module != NULL) {
+        was_training = config->module->training;
+        gd_module_set_training(config->module, false);
+        restore_training = true;
+    }
+
+    loader_config = gd_dataloader_config_default(batch_size);
+    if (config->num_workers > 0) {
+        loader_config.num_workers = config->num_workers;
+    }
+    if (config->prefetch_factor > 0) {
+        loader_config.prefetch_factor = config->prefetch_factor;
+    }
+    st = gd_dataloader_create(ctx, config->dataset, NULL, &loader_config, &loader);
+    if (st != GD_OK) {
+        st = gd_train_batch_error(ctx, st, "eval dataloader create failed");
+        goto done;
+    }
+    st = gd_dataloader_prefetch(loader);
+    if (st != GD_OK) {
+        st = gd_train_batch_error(ctx, st, "eval dataloader prefetch failed");
+        goto done;
+    }
+
+    for (step_index = 0U; step_index < steps; ++step_index) {
+        gd_eval_batch_step step;
+        gd_tensor loss;
+        float loss_value = 0.0f;
+        memset(&step, 0, sizeof(step));
+        memset(&loss, 0, sizeof(loss));
+
+        st = gd_dataloader_next(loader, &batch);
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval dataloader next failed");
+            goto done;
+        }
+        st = gd_begin_step(ctx, scope, batch);
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval begin step failed");
+            goto done;
+        }
+        in_step = true;
+
+        step.ctx = ctx;
+        step.batch = batch;
+        step.step_index = step_index;
+        st = loss_fn(&step, user_data, &loss);
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval loss callback failed");
+            goto done;
+        }
+        st = gd_tensor_item(ctx, &loss, &loss_value);
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval loss read failed");
+            goto done;
+        }
+        st = gd_end_step(ctx);
+        in_step = false;
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval end step failed");
+            goto done;
+        }
+        st = gd_dataloader_release(loader, batch);
+        batch = NULL;
+        if (st != GD_OK) {
+            st = gd_train_batch_error(ctx, st, "eval dataloader release failed");
+            goto done;
+        }
+        if (config->prefetch_next && step_index + 1U < steps) {
+            st = gd_dataloader_prefetch(loader);
+            if (st != GD_OK) {
+                st = gd_train_batch_error(ctx, st, "eval dataloader prefetch failed");
+                goto done;
+            }
+        }
+        total_loss += (double)loss_value;
+    }
+
+    *mean_loss_out = (float)(total_loss / (double)steps);
+
+done:
+    if (in_step) {
+        (void)gd_end_step(ctx);
+    }
+    if (batch != NULL && loader != NULL) {
+        (void)gd_dataloader_release(loader, batch);
+    }
+    gd_dataloader_destroy(loader);
+    if (restore_training) {
+        gd_module_set_training(config->module, was_training);
+    }
+    return st;
+}

@@ -506,13 +506,34 @@ static gd_status create_gdds_loader(gd_context *ctx,
     return GD_OK;
 }
 
-static gd_tensor *required_batch_tensor(gd_context *ctx, gd_batch *batch, const char *name, int line)
+static gd_status gpt_lm_forward_batch(gd_context *ctx,
+                                      gpt_lm *model,
+                                      gd_batch *batch,
+                                      uint64_t step,
+                                      gd_tensor *loss_out)
 {
-    gd_tensor *tensor = gd_batch_tensor(batch, name);
-    if (tensor == NULL) {
-        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, name, line);
+    gd_tensor *input_ids;
+    gd_tensor *target_ids;
+    gd_tensor *positions;
+    gd_tensor *cu_seqlens;
+    if (ctx == NULL || model == NULL || batch == NULL || loss_out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    return tensor;
+    input_ids = gd_batch_tensor(batch, "input_ids");
+    target_ids = gd_batch_tensor(batch, "target_ids");
+    positions = gd_batch_tensor(batch, "positions");
+    cu_seqlens = gd_batch_tensor(batch, "cu_seqlens");
+    if (input_ids == NULL || target_ids == NULL || positions == NULL || cu_seqlens == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gpt_lm_forward(ctx,
+                          model,
+                          input_ids,
+                          target_ids,
+                          positions,
+                          cu_seqlens,
+                          step,
+                          loss_out);
 }
 
 static gd_adamw_config gpt_adamw_config(float lr, float weight_decay)
@@ -571,38 +592,36 @@ static size_t effective_steps_per_epoch(uint64_t dataset_samples,
     return (size_t)requested_batches;
 }
 
-typedef struct gpt_train_batch_user {
+typedef struct gpt_batch_user {
     gpt_lm *model;
-} gpt_train_batch_user;
+} gpt_batch_user;
 
 static gd_status gpt_train_loss_fn(const gd_train_batch_step *step,
                                    void *user_data,
                                    gd_tensor *loss_out)
 {
-    const gpt_train_batch_user *run = (const gpt_train_batch_user *)user_data;
-    gd_tensor *input_ids;
-    gd_tensor *target_ids;
-    gd_tensor *positions;
-    gd_tensor *cu_seqlens;
+    const gpt_batch_user *run = (const gpt_batch_user *)user_data;
     if (step == NULL || run == NULL || run->model == NULL || loss_out == NULL ||
         step->ctx == NULL || step->batch == NULL || step->global_step == UINT64_MAX) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    input_ids = gd_batch_tensor(step->batch, "input_ids");
-    target_ids = gd_batch_tensor(step->batch, "target_ids");
-    positions = gd_batch_tensor(step->batch, "positions");
-    cu_seqlens = gd_batch_tensor(step->batch, "cu_seqlens");
-    if (input_ids == NULL || target_ids == NULL || positions == NULL || cu_seqlens == NULL) {
+    return gpt_lm_forward_batch(step->ctx,
+                                run->model,
+                                step->batch,
+                                step->global_step + UINT64_C(1),
+                                loss_out);
+}
+
+static gd_status gpt_eval_loss_fn(const gd_eval_batch_step *step,
+                                  void *user_data,
+                                  gd_tensor *loss_out)
+{
+    const gpt_batch_user *run = (const gpt_batch_user *)user_data;
+    if (step == NULL || run == NULL || run->model == NULL || loss_out == NULL ||
+        step->ctx == NULL || step->batch == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    return gpt_lm_forward(step->ctx,
-                          run->model,
-                          input_ids,
-                          target_ids,
-                          positions,
-                          cu_seqlens,
-                          step->global_step + UINT64_C(1),
-                          loss_out);
+    return gpt_lm_forward_batch(step->ctx, run->model, step->batch, 0U, loss_out);
 }
 
 static void train_one_batch(gd_context *ctx,
@@ -637,7 +656,7 @@ static void train_one_batch(gd_context *ctx,
         .read_grad_norm = report != 0 && config->grad_clip_norm > 0.0f,
         .sync_scaler = report != 0,
     };
-    gpt_train_batch_user step_user = {
+    gpt_batch_user step_user = {
         .model = model,
     };
     gd_train_batch_result step_result;
@@ -1143,55 +1162,26 @@ static float evaluate_gpt_loss(gd_context *ctx,
                                gd_dataset *dataset,
                                const gpt_config *config)
 {
-    gd_dataloader *loader = NULL;
-    const bool was_training = model->mod.training;
-    const uint64_t samples = gd_dataset_num_samples(dataset);
-    int eval_batch_size;
-    size_t steps;
-    size_t step;
-    double total_loss = 0.0;
-    if (dataset == NULL || samples == 0U) {
+    float mean_loss = NAN;
+    gd_eval_config eval_config;
+    gpt_batch_user eval_user;
+    if (dataset == NULL || gd_dataset_num_samples(dataset) == 0U) {
         return NAN;
     }
-    eval_batch_size = config->batch_size;
-    if ((uint64_t)eval_batch_size > samples) {
-        eval_batch_size = (int)samples;
-    }
-    if (eval_batch_size <= 0) {
-        return NAN;
-    }
-    steps = (size_t)(samples / (uint64_t)eval_batch_size);
-    if (steps == 0U) {
-        return NAN;
-    }
-    gd_module_set_training(&model->mod, false);
-    TRY(ctx, create_gdds_loader(ctx, dataset, NULL, eval_batch_size, &loader));
-    for (step = 0U; step < steps; ++step) {
-        gd_batch *batch = NULL;
-        gd_tensor *input_ids;
-        gd_tensor *target_ids;
-        gd_tensor *positions;
-        gd_tensor *cu_seqlens;
-        gd_tensor loss;
-        float loss_value = 0.0f;
-        TRY(ctx, gd_dataloader_next(loader, &batch));
-        TRY(ctx, gd_begin_step(ctx, GD_SCOPE_INFER, batch));
-        input_ids = required_batch_tensor(ctx, batch, "input_ids", __LINE__);
-        target_ids = required_batch_tensor(ctx, batch, "target_ids", __LINE__);
-        positions = required_batch_tensor(ctx, batch, "positions", __LINE__);
-        cu_seqlens = required_batch_tensor(ctx, batch, "cu_seqlens", __LINE__);
-        TRY(ctx, gpt_lm_forward(ctx, model, input_ids, target_ids, positions, cu_seqlens, 0U, &loss));
-        TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-        TRY(ctx, gd_end_step(ctx));
-        TRY(ctx, gd_dataloader_release(loader, batch));
-        if (step + 1U < steps) {
-            TRY(ctx, gd_dataloader_prefetch(loader));
-        }
-        total_loss += (double)loss_value;
-    }
-    gd_dataloader_destroy(loader);
-    gd_module_set_training(&model->mod, was_training);
-    return (float)(total_loss / (double)steps);
+    eval_config = (gd_eval_config){
+        .dataset = dataset,
+        .module = &model->mod,
+        .batch_size = config->batch_size,
+        .num_workers = 1,
+        .prefetch_factor = 2,
+        .scope = GD_SCOPE_EVAL,
+        .prefetch_next = true,
+    };
+    eval_user = (gpt_batch_user){
+        .model = model,
+    };
+    TRY(ctx, gd_eval_mean_loss(ctx, &eval_config, gpt_eval_loss_fn, &eval_user, &mean_loss));
+    return mean_loss;
 }
 
 static void gpt_save_checkpoint_bundle(gd_context *ctx,

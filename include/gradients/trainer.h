@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <gradients/dataloader.h>
+#include <gradients/module.h>
 #include <gradients/optimizer.h>
 #include <gradients/status.h>
 #include <gradients/tensor.h>
@@ -64,6 +65,38 @@ gd_status gd_train_batch(gd_context *ctx,
                          gd_train_batch_loss_fn loss_fn,
                          void *user_data,
                          gd_train_batch_result *out);
+
+/* Mean-loss evaluation helper over a dataset. It owns eval dataloader creation,
+ * scope begin/end, loss readback, batch release/prefetch, and optional module
+ * training-mode restore. */
+typedef struct gd_eval_batch_step {
+    gd_context *ctx;
+    gd_batch *batch;
+    uint64_t step_index;
+} gd_eval_batch_step;
+
+typedef gd_status (*gd_eval_loss_fn)(const gd_eval_batch_step *step,
+                                     void *user_data,
+                                     gd_tensor *loss_out);
+
+typedef struct gd_eval_config {
+    gd_dataset *dataset;
+    gd_module *module; /* Optional: set eval mode for the run, then restore. */
+    int batch_size;
+    int num_workers;     /* 0 => dataloader default. */
+    int prefetch_factor; /* 0 => dataloader default. */
+    gd_scope_mode scope; /* GD_SCOPE_NONE => GD_SCOPE_EVAL. */
+    uint64_t max_steps;  /* 0 => all full batches. */
+    bool prefetch_next;
+} gd_eval_config;
+
+gd_eval_config gd_eval_config_default(gd_dataset *dataset, int batch_size);
+
+gd_status gd_eval_mean_loss(gd_context *ctx,
+                            const gd_eval_config *config,
+                            gd_eval_loss_fn loss_fn,
+                            void *user_data,
+                            float *mean_loss_out);
 
 #ifdef __cplusplus
 }

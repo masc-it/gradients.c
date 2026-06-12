@@ -980,6 +980,7 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
                                  const gd_backend_tensor_view *v,
                                  const gd_backend_tensor_view *cu_seqlens,
                                  const gd_backend_tensor_view *out,
+                                 const gd_backend_tensor_view *stats,
                                  const gd_backend_sdpa_varlen_args *args)
 {
     (void)backend;
@@ -988,6 +989,7 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
     (void)v;
     (void)cu_seqlens;
     (void)out;
+    (void)stats;
     (void)args;
     return GD_ERR_UNSUPPORTED;
 }

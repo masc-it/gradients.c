@@ -611,6 +611,7 @@ typedef struct gd_backend_sdpa_varlen_args {
     uint32_t sliding_window;
     uint32_t prefix_len;
     uint32_t max_seqlen;
+    uint32_t use_forward_stats;
 } gd_backend_sdpa_varlen_args;
 
 typedef struct gd_backend_sdpa_decode_args {
@@ -630,6 +631,7 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
                                  const gd_backend_tensor_view *v,
                                  const gd_backend_tensor_view *cu_seqlens,
                                  const gd_backend_tensor_view *out,
+                                 const gd_backend_tensor_view *stats,
                                  const gd_backend_sdpa_varlen_args *args);
 gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
                                           const gd_backend_tensor_view *grad_out,

@@ -135,6 +135,35 @@ static gd_backend_sdpa_varlen_args gd_sdpa_varlen_backend_args(const gd_sdpa_var
     return args;
 }
 
+static bool gd_sdpa_varlen_can_save_forward_stats(const gd_tensor *q,
+                                                  const gd_sdpa_varlen_attrs *attrs)
+{
+    return q != NULL && attrs != NULL && q->dtype == GD_DTYPE_F16 && q->shape[2] == 64 &&
+           attrs->causal != 0 && attrs->sliding_window > 0;
+}
+
+static gd_status gd_sdpa_varlen_validate_forward_stats(gd_context *ctx,
+                                                       const gd_tensor *q,
+                                                       const gd_tensor *stats)
+{
+    gd_status st;
+    if (ctx == NULL || q == NULL || stats == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_validate(ctx, stats);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (stats->dtype != GD_DTYPE_F32 || stats->rank != 3U ||
+        stats->shape[0] != q->shape[0] || stats->shape[1] != q->shape[1] ||
+        stats->shape[2] != 3 || !gd_tensor_is_contiguous(stats)) {
+        return gd_context_set_error(ctx,
+                                    GD_ERR_INVALID_ARGUMENT,
+                                    "sdpa_varlen forward stats must be contiguous f32 [N,H,3]");
+    }
+    return GD_OK;
+}
+
 gd_status gd_sdpa_varlen(gd_context *ctx,
                          const gd_tensor *q,
                          const gd_tensor *k,
@@ -147,15 +176,21 @@ gd_status gd_sdpa_varlen(gd_context *ctx,
     gd_sdpa_varlen_attrs attrs;
     gd_backend_sdpa_varlen_args backend_args;
     gd_tensor y;
+    gd_tensor stats;
     gd_backend_tensor_view qv;
     gd_backend_tensor_view kv;
     gd_backend_tensor_view vv;
     gd_backend_tensor_view cuv;
     gd_backend_tensor_view yv;
+    gd_backend_tensor_view statsv;
     int64_t shape[3];
+    int64_t stats_shape[3];
+    bool save_stats;
     if (out != NULL) {
         memset(out, 0, sizeof(*out));
     }
+    memset(&stats, 0, sizeof(stats));
+    memset(&statsv, 0, sizeof(statsv));
     if (ctx == NULL || q == NULL || k == NULL || v == NULL || cu_seqlens == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -171,19 +206,51 @@ gd_status gd_sdpa_varlen(gd_context *ctx,
         return st;
     }
     y.is_leaf = false;
+    save_stats = (q->requires_grad || k->requires_grad || v->requires_grad) &&
+                 gd_context_scope_mode(ctx) == GD_SCOPE_TRAIN &&
+                 gd_sdpa_varlen_can_save_forward_stats(q, &attrs);
+    if (save_stats) {
+        stats_shape[0] = q->shape[0];
+        stats_shape[1] = q->shape[1];
+        stats_shape[2] = 3;
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_SCRATCH,
+                             GD_DTYPE_F32,
+                             gd_shape_make(3U, stats_shape),
+                             256U,
+                             &stats);
+        if (st != GD_OK) {
+            return st;
+        }
+        stats.is_leaf = false;
+    }
     if (!gd_op_tensor_view_from_tensor(q, &qv) || !gd_op_tensor_view_from_tensor(k, &kv) ||
         !gd_op_tensor_view_from_tensor(v, &vv) || !gd_op_tensor_view_from_tensor(cu_seqlens, &cuv) ||
-        !gd_op_tensor_view_from_tensor(&y, &yv)) {
+        !gd_op_tensor_view_from_tensor(&y, &yv) ||
+        (save_stats && !gd_op_tensor_view_from_tensor(&stats, &statsv))) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "sdpa_varlen invalid tensor view");
     }
     backend_args = gd_sdpa_varlen_backend_args(&attrs);
-    st = gd_backend_sdpa_varlen(gd_context_backend(ctx), &qv, &kv, &vv, &cuv, &yv, &backend_args);
+    st = gd_backend_sdpa_varlen(gd_context_backend(ctx),
+                                &qv,
+                                &kv,
+                                &vv,
+                                &cuv,
+                                &yv,
+                                save_stats ? &statsv : NULL,
+                                &backend_args);
+    if (st == GD_ERR_UNSUPPORTED && save_stats) {
+        gd_context_clear_error(ctx);
+        save_stats = false;
+        st = gd_backend_sdpa_varlen(gd_context_backend(ctx), &qv, &kv, &vv, &cuv, &yv, NULL, &backend_args);
+    }
     if (st != GD_OK) {
         return gd_context_set_error(ctx, st, "backend sdpa_varlen failed");
     }
     if (q->requires_grad || k->requires_grad || v->requires_grad) {
         const gd_tensor *inputs[4] = {q, k, v, cu_seqlens};
         gd_tensor *outputs[1] = {&y};
+        const gd_tensor *saved[1] = {&stats};
         st = gd_autograd_record(ctx,
                                 GD_OP_SDPA_VARLEN,
                                 inputs,
@@ -192,8 +259,8 @@ gd_status gd_sdpa_varlen(gd_context *ctx,
                                 1U,
                                 &attrs,
                                 (uint32_t)sizeof(attrs),
-                                NULL,
-                                0U);
+                                save_stats ? saved : NULL,
+                                save_stats ? 1U : 0U);
         if (st != GD_OK) {
             return st;
         }
@@ -202,16 +269,17 @@ gd_status gd_sdpa_varlen(gd_context *ctx,
     return GD_OK;
 }
 
-gd_status gd_sdpa_varlen_backward(gd_context *ctx,
-                                  const gd_tensor *q,
-                                  const gd_tensor *k,
-                                  const gd_tensor *v,
-                                  const gd_tensor *cu_seqlens,
-                                  const gd_tensor *grad_out,
-                                  const gd_sdpa_varlen_config *config,
-                                  gd_tensor *grad_q,
-                                  gd_tensor *grad_k,
-                                  gd_tensor *grad_v)
+gd_status gd_sdpa_varlen_backward_with_stats(gd_context *ctx,
+                                             const gd_tensor *q,
+                                             const gd_tensor *k,
+                                             const gd_tensor *v,
+                                             const gd_tensor *cu_seqlens,
+                                             const gd_tensor *forward_stats,
+                                             const gd_tensor *grad_out,
+                                             const gd_sdpa_varlen_config *config,
+                                             gd_tensor *grad_q,
+                                             gd_tensor *grad_k,
+                                             gd_tensor *grad_v)
 {
     gd_status st;
     gd_sdpa_varlen_attrs attrs;
@@ -235,6 +303,7 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
     bool need_grad_q = grad_q != NULL;
     bool need_grad_k = grad_k != NULL;
     bool need_grad_v = grad_v != NULL;
+    bool using_forward_stats = forward_stats != NULL;
     if (grad_q != NULL) {
         memset(grad_q, 0, sizeof(*grad_q));
     }
@@ -275,6 +344,12 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
     stats_shape[0] = q->shape[0];
     stats_shape[1] = q->shape[1];
     stats_shape[2] = 3;
+    if (using_forward_stats) {
+        st = gd_sdpa_varlen_validate_forward_stats(ctx, q, forward_stats);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, q->dtype, gd_shape_make(3U, q_shape), 256U, &dq);
     if (st != GD_OK) {
         return st;
@@ -287,14 +362,18 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(3U, stats_shape), 256U, &stats);
-    if (st != GD_OK) {
-        return st;
+    if (using_forward_stats) {
+        stats = *forward_stats;
+    } else {
+        st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(3U, stats_shape), 256U, &stats);
+        if (st != GD_OK) {
+            return st;
+        }
+        stats.is_leaf = false;
     }
     dq.is_leaf = false;
     dk.is_leaf = false;
     dv.is_leaf = false;
-    stats.is_leaf = false;
     if (!gd_op_tensor_view_from_tensor(grad_out, &gov) || !gd_op_tensor_view_from_tensor(q, &qv) ||
         !gd_op_tensor_view_from_tensor(k, &kv) || !gd_op_tensor_view_from_tensor(v, &vv) ||
         !gd_op_tensor_view_from_tensor(cu_seqlens, &cuv) || !gd_op_tensor_view_from_tensor(&dq, &dqv) ||
@@ -303,6 +382,7 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "sdpa_varlen backward invalid tensor view");
     }
     backend_args = gd_sdpa_varlen_backend_args(&attrs);
+    backend_args.use_forward_stats = using_forward_stats ? 1U : 0U;
     st = gd_backend_sdpa_varlen_backward(gd_context_backend(ctx),
                                          &gov,
                                          &qv,
@@ -327,4 +407,28 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
         *grad_v = dv;
     }
     return GD_OK;
+}
+
+gd_status gd_sdpa_varlen_backward(gd_context *ctx,
+                                  const gd_tensor *q,
+                                  const gd_tensor *k,
+                                  const gd_tensor *v,
+                                  const gd_tensor *cu_seqlens,
+                                  const gd_tensor *grad_out,
+                                  const gd_sdpa_varlen_config *config,
+                                  gd_tensor *grad_q,
+                                  gd_tensor *grad_k,
+                                  gd_tensor *grad_v)
+{
+    return gd_sdpa_varlen_backward_with_stats(ctx,
+                                             q,
+                                             k,
+                                             v,
+                                             cu_seqlens,
+                                             NULL,
+                                             grad_out,
+                                             config,
+                                             grad_q,
+                                             grad_k,
+                                             grad_v);
 }

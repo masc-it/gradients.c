@@ -160,10 +160,12 @@ struct gd_backend {
     void *permute_transpose_u32_pso;
     void *sdpa_varlen_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_pso;
+    void *sdpa_varlen_prefix_window_dh64_f16_stats_pso;
     void *sdpa_varlen_bwd_stats_pso;
     void *sdpa_varlen_bwd_pso;
     void *sdpa_varlen_bwd_dkv_pso;
     void *sdpa_varlen_bwd_stats_dq_dh64_f16_pso;
+    void *sdpa_varlen_bwd_saved_stats_dq_dh64_f16_pso;
     void *sdpa_varlen_bwd_dkv_dh64_f16_pso;
     void *sdpa_varlen_bwd_dkv_split_dh64_f16_pso;
     void *sdpa_varlen_bwd_dkv_reduce_f16_pso;

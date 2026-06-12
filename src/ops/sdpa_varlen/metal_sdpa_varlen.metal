@@ -648,6 +648,117 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
     }
 }
 
+
+kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_stats_kernel(
+    device const half *q [[buffer(0)]],
+    device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]],
+    device const int *cu [[buffer(3)]],
+    device half *out [[buffer(4)]],
+    constant gd_metal_sdpa_varlen_args &p [[buffer(5)]],
+    device float *stats [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+
+    int n_qb = int(p.n_qb_max);
+    int qb = int(tgid) % n_qb;
+    int r = int(tgid) / n_qb;
+    int hq = r % int(p.hq);
+    int b = r / int(p.hq);
+    int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
+    int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
+    if (b >= int(p.batch)) {
+        return;
+    }
+
+    int start = cu[b];
+    int T = cu[b + 1] - start;
+    int group = int(p.hq) / int(p.hkv);
+    int hkv = hq / group;
+    int i = qb * int(GD_METAL_SDPA_CAUSAL_QROWS) + local_q;
+    bool active = i < T;
+    int qg = start + i;
+    int qbase = active ? ((qg * int(p.hq) + hq) * GD_SDPA_VARLEN_DH64) : 0;
+
+    float qreg[GD_SDPA_VARLEN_DH64_CHANS];
+    float acc[GD_SDPA_VARLEN_DH64_CHANS];
+    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+        qreg[x] = active ? float(q[qbase + c]) : 0.0f;
+        acc[x] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int q0 = qb * int(GD_METAL_SDPA_CAUSAL_QROWS);
+    int kb_start = gd_sdpa_varlen_kb_start(q0, T, int(p.window), int(p.prefix_len));
+    int kb_prefix_end = gd_sdpa_varlen_kb_prefix_end(T, int(p.window), int(p.prefix_len));
+    int kb_end = gd_sdpa_varlen_kb_end(q0,
+                                       int(GD_METAL_SDPA_CAUSAL_QROWS),
+                                       T,
+                                       int(p.causal),
+                                       int(p.prefix_len));
+    for (int kb = 0; kb < kb_end; kb += int(GD_METAL_SDPA_BK)) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - int(GD_METAL_SDPA_BK);
+            continue;
+        }
+        int tile = kb_end - kb;
+        if (tile > int(GD_METAL_SDPA_BK)) {
+            tile = int(GD_METAL_SDPA_BK);
+        }
+        for (int idx = int(tid); idx < tile * GD_SDPA_VARLEN_DH64;
+             idx += int(GD_METAL_SDPA_CAUSAL_THREADS)) {
+            int jj = idx / GD_SDPA_VARLEN_DH64;
+            int c = idx % GD_SDPA_VARLEN_DH64;
+            int kg = start + kb + jj;
+            int kbase = ((kg * int(p.hkv) + hkv) * GD_SDPA_VARLEN_DH64);
+            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = k[kbase + c];
+            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_varlen_allowed(i, j, int(p.causal), int(p.window), int(p.prefix_len))) {
+                    float ss = 0.0f;
+                    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+                        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+                        ss += qreg[x] * float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                    }
+                    ss = gd_sdpa_varlen_sum_lanes8(ss) * p.scale;
+                    float mnew = (ss > m) ? ss : m;
+                    float corr = exp(m - mnew);
+                    float e = exp(ss - mnew);
+                    l = l * corr + e;
+                    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+                        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+                        acc[x] = acc[x] * corr + e * float(vsh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                    }
+                    m = mnew;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+        int sbase = (qg * int(p.hq) + hq) * 3;
+        if (lane == 0) {
+            stats[sbase + 0] = m;
+            stats[sbase + 1] = l;
+            stats[sbase + 2] = 0.0f;
+        }
+        for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+            int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+            out[qbase + c] = half(acc[x] * inv_l);
+        }
+    }
+}
+
 kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
     device const half *go [[buffer(0)]],
     device const half *q [[buffer(1)]],
@@ -762,6 +873,124 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
         if (lane == 0) {
             stats[sbase + 0] = m;
             stats[sbase + 1] = l;
+            stats[sbase + 2] = D;
+        }
+        for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+            int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+            dq[qbase + c] = half(p.scale * (acc[x] - D * ksum[x]) * inv_l);
+        }
+    }
+}
+
+
+kernel void gd_sdpa_varlen_bwd_saved_stats_dq_prefix_window_lane8_dh64_f16_kernel(
+    device const half *go [[buffer(0)]],
+    device const half *q [[buffer(1)]],
+    device const half *k [[buffer(2)]],
+    device const half *v [[buffer(3)]],
+    device const int *cu [[buffer(4)]],
+    device half *dq [[buffer(5)]],
+    constant gd_metal_sdpa_varlen_args &p [[buffer(6)]],
+    device float *stats [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+    threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
+
+    int n_qb = int(p.n_qb_max);
+    int qb = int(tgid) % n_qb;
+    int r = int(tgid) / n_qb;
+    int hq = r % int(p.hq);
+    int b = r / int(p.hq);
+    int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
+    int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
+    if (b >= int(p.batch)) {
+        return;
+    }
+
+    int start = cu[b];
+    int T = cu[b + 1] - start;
+    int group = int(p.hq) / int(p.hkv);
+    int hkv = hq / group;
+    int i = qb * int(GD_METAL_SDPA_CAUSAL_QROWS) + local_q;
+    bool active = i < T;
+    int qg = start + i;
+    int qbase = active ? ((qg * int(p.hq) + hq) * GD_SDPA_VARLEN_DH64) : 0;
+    int sbase = active ? ((qg * int(p.hq) + hq) * 3) : 0;
+
+    float qreg[GD_SDPA_VARLEN_DH64_CHANS];
+    float goreg[GD_SDPA_VARLEN_DH64_CHANS];
+    float acc[GD_SDPA_VARLEN_DH64_CHANS];
+    float ksum[GD_SDPA_VARLEN_DH64_CHANS];
+    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+        qreg[x] = active ? float(q[qbase + c]) : 0.0f;
+        goreg[x] = active ? float(go[qbase + c]) : 0.0f;
+        acc[x] = 0.0f;
+        ksum[x] = 0.0f;
+    }
+    const float m = active ? stats[sbase + 0] : -INFINITY;
+    const float l = active ? stats[sbase + 1] : 0.0f;
+    float raw = 0.0f;
+
+    int q0 = qb * int(GD_METAL_SDPA_CAUSAL_QROWS);
+    int kb_start = gd_sdpa_varlen_kb_start(q0, T, int(p.window), int(p.prefix_len));
+    int kb_prefix_end = gd_sdpa_varlen_kb_prefix_end(T, int(p.window), int(p.prefix_len));
+    int kb_end = gd_sdpa_varlen_kb_end(q0,
+                                       int(GD_METAL_SDPA_CAUSAL_QROWS),
+                                       T,
+                                       int(p.causal),
+                                       int(p.prefix_len));
+    for (int kb = 0; kb < kb_end; kb += int(GD_METAL_SDPA_BK)) {
+        if (kb < kb_start && (kb_prefix_end == 0 || kb >= kb_prefix_end)) {
+            kb = kb_start - int(GD_METAL_SDPA_BK);
+            continue;
+        }
+        int tile = kb_end - kb;
+        if (tile > int(GD_METAL_SDPA_BK)) {
+            tile = int(GD_METAL_SDPA_BK);
+        }
+        for (int idx = int(tid); idx < tile * GD_SDPA_VARLEN_DH64;
+             idx += int(GD_METAL_SDPA_CAUSAL_THREADS)) {
+            int jj = idx / GD_SDPA_VARLEN_DH64;
+            int c = idx % GD_SDPA_VARLEN_DH64;
+            int kg = start + kb + jj;
+            int kbase = ((kg * int(p.hkv) + hkv) * GD_SDPA_VARLEN_DH64);
+            ksh[jj * GD_SDPA_VARLEN_DH64 + c] = k[kbase + c];
+            vsh[jj * GD_SDPA_VARLEN_DH64 + c] = v[kbase + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active && l > 0.0f) {
+            for (int jj = 0; jj < tile; ++jj) {
+                int j = kb + jj;
+                if (gd_sdpa_varlen_allowed(i, j, int(p.causal), int(p.window), int(p.prefix_len))) {
+                    float ss = 0.0f;
+                    float dp = 0.0f;
+                    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+                        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+                        ss += qreg[x] * float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                        dp += goreg[x] * float(vsh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                    }
+                    ss = gd_sdpa_varlen_sum_lanes8(ss) * p.scale;
+                    dp = gd_sdpa_varlen_sum_lanes8(dp);
+                    float e = exp(ss - m);
+                    raw += e * dp;
+                    for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {
+                        int c = lane + x * int(GD_METAL_SDPA_DKV_LANES);
+                        float kc = float(ksh[jj * GD_SDPA_VARLEN_DH64 + c]);
+                        acc[x] += e * dp * kc;
+                        ksum[x] += e * kc;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+        float D = raw * inv_l;
+        if (lane == 0) {
             stats[sbase + 2] = D;
         }
         for (int x = 0; x < GD_SDPA_VARLEN_DH64_CHANS; ++x) {

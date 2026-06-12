@@ -17,6 +17,11 @@ static id<MTLComputePipelineState> gd_sdpa_varlen_prefix_window_dh64_f16_pso(gd_
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_prefix_window_dh64_f16_pso;
 }
 
+static id<MTLComputePipelineState> gd_sdpa_varlen_prefix_window_dh64_f16_stats_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_prefix_window_dh64_f16_stats_pso;
+}
+
 static id<MTLComputePipelineState> gd_sdpa_varlen_bwd_stats_pso(gd_backend *backend)
 {
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_bwd_stats_pso;
@@ -35,6 +40,11 @@ static id<MTLComputePipelineState> gd_sdpa_varlen_bwd_dkv_pso(gd_backend *backen
 static id<MTLComputePipelineState> gd_sdpa_varlen_bwd_stats_dq_dh64_f16_pso(gd_backend *backend)
 {
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_bwd_stats_dq_dh64_f16_pso;
+}
+
+static id<MTLComputePipelineState> gd_sdpa_varlen_bwd_saved_stats_dq_dh64_f16_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_bwd_saved_stats_dq_dh64_f16_pso;
 }
 
 static id<MTLComputePipelineState> gd_sdpa_varlen_bwd_dkv_dh64_f16_pso(gd_backend *backend)
@@ -299,6 +309,7 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
                                  const gd_backend_tensor_view *v,
                                  const gd_backend_tensor_view *cu_seqlens,
                                  const gd_backend_tensor_view *out,
+                                 const gd_backend_tensor_view *stats,
                                  const gd_backend_sdpa_varlen_args *args)
 {
     id<MTLCommandBuffer> command_buffer;
@@ -309,8 +320,12 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
     bool immediate;
     gd_status st;
     if (backend == NULL || !gd_sdpa_varlen_shapes_valid(q, k, v, cu_seqlens, out) ||
+        (stats != NULL && !gd_sdpa_varlen_stats_valid(q, stats)) ||
         !gd_sdpa_varlen_args_valid(args, q, cu_seqlens)) {
         return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (stats != NULL && !gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
+        return GD_ERR_UNSUPPORTED;
     }
     st = gd_metal_command_for_op(backend, &command_buffer, &immediate);
     if (st != GD_OK) {
@@ -320,18 +335,22 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
     if (encoder == nil) {
         return GD_ERR_INTERNAL;
     }
-    gd_sdpa_varlen_fill_metal_args(&p, q, k, cu_seqlens, out, NULL, NULL, NULL, NULL, NULL, args);
+    gd_sdpa_varlen_fill_metal_args(&p, q, k, cu_seqlens, out, NULL, NULL, NULL, NULL, stats, args);
     p.v_offset = (uint64_t)v->offset;
     if (gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
         p.n_qb_max = (args->max_seqlen + GD_METAL_SDPA_CAUSAL_QROWS - 1U) /
                      GD_METAL_SDPA_CAUSAL_QROWS;
-        [encoder setComputePipelineState:gd_sdpa_varlen_prefix_window_dh64_f16_pso(backend)];
+        [encoder setComputePipelineState:stats != NULL ? gd_sdpa_varlen_prefix_window_dh64_f16_stats_pso(backend) :
+                                          gd_sdpa_varlen_prefix_window_dh64_f16_pso(backend)];
         [encoder setBuffer:gd_sdpa_varlen_buffer(q->buffer) offset:q->offset atIndex:0U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(k->buffer) offset:k->offset atIndex:1U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(v->buffer) offset:v->offset atIndex:2U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(cu_seqlens->buffer) offset:cu_seqlens->offset atIndex:3U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(out->buffer) offset:out->offset atIndex:4U];
         [encoder setBytes:&p length:sizeof(p) atIndex:5U];
+        if (stats != NULL) {
+            [encoder setBuffer:gd_sdpa_varlen_buffer(stats->buffer) offset:stats->offset atIndex:6U];
+        }
         groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq * (NSUInteger)p.n_qb_max, 1U, 1U);
         threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_CAUSAL_THREADS, 1U, 1U);
         [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
@@ -403,6 +422,10 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
                                    stats,
                                    args);
     p.v_offset = (uint64_t)v->offset;
+    if (args->use_forward_stats != 0U && !gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
+        [encoder endEncoding];
+        return GD_ERR_UNSUPPORTED;
+    }
     if (gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
         const uint32_t n_qb = (args->max_seqlen + GD_METAL_SDPA_CAUSAL_QROWS - 1U) /
                                GD_METAL_SDPA_CAUSAL_QROWS;
@@ -440,7 +463,9 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
             }
         }
 
-        [encoder setComputePipelineState:gd_sdpa_varlen_bwd_stats_dq_dh64_f16_pso(backend)];
+        [encoder setComputePipelineState:args->use_forward_stats != 0U ?
+                                          gd_sdpa_varlen_bwd_saved_stats_dq_dh64_f16_pso(backend) :
+                                          gd_sdpa_varlen_bwd_stats_dq_dh64_f16_pso(backend)];
         [encoder setBuffer:gd_sdpa_varlen_buffer(grad_out->buffer) offset:grad_out->offset atIndex:0U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(q->buffer) offset:q->offset atIndex:1U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(k->buffer) offset:k->offset atIndex:2U];

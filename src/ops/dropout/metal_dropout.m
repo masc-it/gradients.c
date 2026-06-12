@@ -3,6 +3,7 @@
 
 #include <gradients/tensor.h>
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -141,6 +142,18 @@ static gd_status gd_dropout_validate_mask(const gd_backend_tensor_view *ref,
     return GD_OK;
 }
 
+static uint32_t gd_dropout_threshold(float p)
+{
+    const double threshold = ceil((double)p * 16777216.0);
+    if (threshold <= 0.0) {
+        return 0U;
+    }
+    if (threshold >= 16777216.0) {
+        return 16777216U;
+    }
+    return (uint32_t)threshold;
+}
+
 static void gd_dropout_fill_args(const gd_backend_tensor_view *src,
                                  const gd_backend_tensor_view *dst,
                                  const gd_backend_tensor_view *mask,
@@ -155,7 +168,7 @@ static void gd_dropout_fill_args(const gd_backend_tensor_view *src,
     args->mask_offset = mask != NULL ? (uint64_t)mask->offset : 0U;
     args->count = (uint64_t)src->count;
     args->seed = seed;
-    args->p = p;
+    args->threshold = gd_dropout_threshold(p);
     args->scale = scale;
     args->dtype = src->dtype;
 }
@@ -176,7 +189,7 @@ static void gd_dropout_add_fill_args(const gd_backend_tensor_view *residual,
     args->mask_offset = (uint64_t)mask->offset;
     args->count = (uint64_t)src->count;
     args->seed = seed;
-    args->p = p;
+    args->threshold = gd_dropout_threshold(p);
     args->scale = scale;
     args->dtype = src->dtype;
 }

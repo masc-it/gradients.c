@@ -13,7 +13,7 @@ typedef struct gd_metal_dropout_args {
     gd_metal_u64 mask_offset; /* Forward/saved-backward mask offset; zero for recompute backward. */
     gd_metal_u64 count;
     gd_metal_u64 seed;
-    float p;
+    gd_metal_u32 threshold;
     float scale;
     gd_metal_u32 dtype;
     gd_metal_u32 pad0;
@@ -26,7 +26,7 @@ typedef struct gd_metal_dropout_add_args {
     gd_metal_u64 mask_offset;
     gd_metal_u64 count;
     gd_metal_u64 seed;
-    float p;
+    gd_metal_u32 threshold;
     float scale;
     gd_metal_u32 dtype;
     gd_metal_u32 pad0;

@@ -11,12 +11,11 @@ static inline ulong gd_dropout_splitmix64(ulong x)
     return x ^ (x >> 31);
 }
 
-static inline bool gd_dropout_keep(ulong seed, ulong index, float p)
+static inline bool gd_dropout_keep(ulong seed, ulong index, uint threshold)
 {
     const ulong r = gd_dropout_splitmix64(seed + index);
     const uint mant = uint((r >> 40) & 0xfffffful);
-    const float u = float(mant) * (1.0f / 16777216.0f);
-    return u >= p;
+    return mant >= threshold;
 }
 
 static inline void gd_dropout_forward_f16_one(device const half *x,
@@ -25,7 +24,7 @@ static inline void gd_dropout_forward_f16_one(device const half *x,
                                               constant gd_metal_dropout_args &args,
                                               ulong i)
 {
-    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const bool keep = gd_dropout_keep(args.seed, i, args.threshold);
     mask[i] = keep ? uchar(1) : uchar(0);
     y[i] = keep ? half(float(x[i]) * args.scale) : half(0.0h);
 }
@@ -36,7 +35,7 @@ static inline void gd_dropout_forward_f32_one(device const float *x,
                                               constant gd_metal_dropout_args &args,
                                               ulong i)
 {
-    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const bool keep = gd_dropout_keep(args.seed, i, args.threshold);
     mask[i] = keep ? uchar(1) : uchar(0);
     y[i] = keep ? x[i] * args.scale : 0.0f;
 }
@@ -46,7 +45,7 @@ static inline void gd_dropout_backward_recompute_f16_one(device const half *g,
                                                          constant gd_metal_dropout_args &args,
                                                          ulong i)
 {
-    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const bool keep = gd_dropout_keep(args.seed, i, args.threshold);
     dx[i] = keep ? half(float(g[i]) * args.scale) : half(0.0h);
 }
 
@@ -55,7 +54,7 @@ static inline void gd_dropout_backward_recompute_f32_one(device const float *g,
                                                          constant gd_metal_dropout_args &args,
                                                          ulong i)
 {
-    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const bool keep = gd_dropout_keep(args.seed, i, args.threshold);
     dx[i] = keep ? g[i] * args.scale : 0.0f;
 }
 
@@ -134,7 +133,7 @@ static inline void gd_dropout_add_forward_f16_one(device const half *residual,
                                                   constant gd_metal_dropout_add_args &args,
                                                   ulong i)
 {
-    const bool keep = gd_dropout_keep(args.seed, i, args.p);
+    const bool keep = gd_dropout_keep(args.seed, i, args.threshold);
     const half dropped = keep ? half(float(x[i]) * args.scale) : half(0.0h);
     mask[i] = keep ? uchar(1) : uchar(0);
     y[i] = residual[i] + dropped;

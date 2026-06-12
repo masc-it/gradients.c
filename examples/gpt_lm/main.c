@@ -91,6 +91,10 @@ static void print_usage(const char *argv0)
     printf("  --load-checkpoint PATH      load model weights only before training/generation\n");
     printf("  --resume-checkpoint PATH    resume model + optimizer + scaler/trainer sidecars\n");
     printf("  --val-split NAME            validation split name for validation/checkpointing (default: val)\n");
+    printf("  --metrics-dir PATH          metrics JSONL root directory (default: data/metrics)\n");
+    printf("  --metrics-project NAME      metrics project directory (default: gpt_lm)\n");
+    printf("  --metrics-run-id ID         metrics run id/file stem (default: timestamp-pid)\n");
+    printf("  --no-metrics                disable metrics JSONL logging\n");
     printf("  --no-save-best              disable best validation checkpoint writes\n");
     printf("  --no-save-latest            disable latest full-resume checkpoint writes\n");
     printf("  --early-stopping-patience N validation epochs without improvement before stopping; 0 disables (default: %d)\n",
@@ -130,6 +134,9 @@ static gpt_config gpt_config_default(void)
     config.load_checkpoint_path = NULL;
     config.resume_checkpoint_path = NULL;
     config.val_split = "val";
+    config.metrics_dir = "data/metrics";
+    config.metrics_project = "gpt_lm";
+    config.metrics_run_id = NULL;
     config.epochs = GPT_DEFAULT_EPOCHS;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
@@ -141,6 +148,7 @@ static gpt_config gpt_config_default(void)
     config.epochs_set = false;
     config.save_best = true;
     config.save_latest = true;
+    config.metrics_enabled = true;
     config.overfit_num_samples = 0U;
     config.seed = GPT_DEFAULT_SEED;
     config.dropout_p = GPT_DEFAULT_DROPOUT_P;
@@ -206,6 +214,25 @@ static gpt_config parse_args(int argc, char **argv)
         value = arg_value(argc, argv, &i, "--val-split");
         if (value != NULL) {
             config.val_split = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--metrics-dir");
+        if (value != NULL) {
+            config.metrics_dir = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--metrics-project");
+        if (value != NULL) {
+            config.metrics_project = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--metrics-run-id");
+        if (value != NULL) {
+            config.metrics_run_id = value;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-metrics") == 0) {
+            config.metrics_enabled = false;
             continue;
         }
         if (strcmp(argv[i], "--no-save-best") == 0) {
@@ -632,6 +659,7 @@ static void train_one_batch(gd_context *ctx,
                             const gd_lr_scheduler_config *lr_config,
                             const gpt_config *config,
                             const gpt_generation_tokenizer *generation_tokenizer,
+                            gd_metrics_logger *metrics,
                             size_t global_step,
                             size_t total_steps,
                             size_t epoch,
@@ -701,6 +729,28 @@ static void train_one_batch(gd_context *ctx,
                tokens_per_sec,
                (double)(step_result.has_amp_state ? step_result.amp_scale : gd_amp_scaler_scale(scaler)),
                step_result.has_amp_state && step_result.found_inf ? " found_inf" : "");
+        if (metrics != NULL) {
+            const gd_metrics_field fields[] = {
+                gd_metrics_u64("epoch", (uint64_t)epoch),
+                gd_metrics_u64("epoch_step", (uint64_t)epoch_step),
+                gd_metrics_u64("steps_per_epoch", (uint64_t)steps_per_epoch),
+                gd_metrics_u64("step", (uint64_t)current_step),
+                gd_metrics_u64("total_steps", (uint64_t)total_steps),
+                gd_metrics_f64("loss", (double)(step_result.has_loss_value ? step_result.loss_value : 0.0f)),
+                gd_metrics_f64("lr", (double)(step_result.has_lr ? step_result.lr : 0.0f)),
+                gd_metrics_bool("grad_clip_enabled", config->grad_clip_norm > 0.0f),
+                gd_metrics_f64("grad_norm", (double)grad_norm),
+                gd_metrics_f64("grad_clip_norm", (double)config->grad_clip_norm),
+                gd_metrics_f64("batch_s", batches_per_sec),
+                gd_metrics_f64("tok_s", tokens_per_sec),
+                gd_metrics_f64("amp_scale",
+                               (double)(step_result.has_amp_state ?
+                                            step_result.amp_scale :
+                                            gd_amp_scaler_scale(scaler))),
+                gd_metrics_bool("found_inf", step_result.has_amp_state && step_result.found_inf),
+            };
+            (void)gd_metrics_logger_log_event(metrics, "train", fields, GD_ARRAY_LEN(fields));
+        }
         *last_report_time = now;
         *last_report_step = current_step;
     }
@@ -1259,6 +1309,7 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                           const gd_lr_scheduler_config *lr_config,
                                           gd_dataset *val_dataset,
                                           const gpt_config *config,
+                                          gd_metrics_logger *metrics,
                                           size_t epoch,
                                           size_t global_step,
                                           float *best_val_loss,
@@ -1299,10 +1350,32 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                        0U,
                                        val_loss,
                                        *best_val_loss);
+            if (metrics != NULL) {
+                const gd_metrics_field fields[] = {
+                    gd_metrics_string("kind", "best"),
+                    gd_metrics_string("path", config->checkpoint_path),
+                    gd_metrics_u64("epoch", (uint64_t)epoch),
+                    gd_metrics_u64("step", (uint64_t)global_step),
+                    gd_metrics_f64("val_loss", (double)val_loss),
+                    gd_metrics_f64("best_val_loss", (double)*best_val_loss),
+                };
+                (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
+            }
         }
     }
     if (out_improved != NULL) {
         *out_improved = improved;
+    }
+    if (metrics != NULL) {
+        const gd_metrics_field fields[] = {
+            gd_metrics_u64("epoch", (uint64_t)epoch),
+            gd_metrics_u64("step", (uint64_t)global_step),
+            gd_metrics_f64("val_loss", (double)val_loss),
+            gd_metrics_f64("best_val_loss", best_val_loss != NULL ? (double)*best_val_loss : (double)val_loss),
+            gd_metrics_bool("improved", improved),
+            gd_metrics_bool("save_best", config->save_best),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "eval", fields, GD_ARRAY_LEN(fields));
     }
     printf("\n");
     return true;
@@ -1317,6 +1390,7 @@ static void train_gpt(gd_context *ctx,
                       const gd_lr_scheduler_config *lr_config,
                       const gpt_config *config,
                       const gpt_training_state *resume_state,
+                      gd_metrics_logger *metrics,
                       size_t steps_per_epoch,
                       size_t total_steps)
 {
@@ -1368,6 +1442,7 @@ static void train_gpt(gd_context *ctx,
                             lr_config,
                             config,
                             generation_tokenizer_ptr,
+                            metrics,
                             global_step,
                             total_steps,
                             epoch,
@@ -1391,6 +1466,7 @@ static void train_gpt(gd_context *ctx,
                                                       lr_config,
                                                       val_dataset,
                                                       config,
+                                                      metrics,
                                                       epoch,
                                                       global_step,
                                                       &best_val_loss,
@@ -1421,6 +1497,18 @@ static void train_gpt(gd_context *ctx,
                                            epochs_without_improvement,
                                            val_loss,
                                            best_val_loss);
+                if (metrics != NULL) {
+                    const gd_metrics_field fields[] = {
+                        gd_metrics_string("kind", "latest"),
+                        gd_metrics_string("path", config->latest_checkpoint_path),
+                        gd_metrics_u64("epoch", (uint64_t)epoch),
+                        gd_metrics_u64("step", (uint64_t)global_step),
+                        gd_metrics_u64("epochs_without_improvement", (uint64_t)epochs_without_improvement),
+                        gd_metrics_f64("val_loss", (double)val_loss),
+                        gd_metrics_f64("best_val_loss", (double)best_val_loss),
+                    };
+                    (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
+                }
                 printf("\n");
             }
             if (should_stop) {
@@ -1429,6 +1517,15 @@ static void train_gpt(gd_context *ctx,
                        global_step,
                        config->early_stopping_patience,
                        (double)best_val_loss);
+                if (metrics != NULL) {
+                    const gd_metrics_field fields[] = {
+                        gd_metrics_u64("epoch", (uint64_t)epoch),
+                        gd_metrics_u64("step", (uint64_t)global_step),
+                        gd_metrics_i64("patience", (int64_t)config->early_stopping_patience),
+                        gd_metrics_f64("best_val_loss", (double)best_val_loss),
+                    };
+                    (void)gd_metrics_logger_log_event(metrics, "early_stopping", fields, GD_ARRAY_LEN(fields));
+                }
                 break;
             }
         }
@@ -1449,6 +1546,7 @@ int main(int argc, char **argv)
     gd_param_set params;
     gd_optimizer *optimizer = NULL;
     gd_amp_scaler *scaler = NULL;
+    gd_metrics_logger *metrics = NULL;
     gd_lr_scheduler_config lr_config;
     gpt_training_state resume_state;
     size_t dataset_samples = 0U;
@@ -1478,6 +1576,19 @@ int main(int argc, char **argv)
     }
     if (GPT_D_MODEL != GPT_N_HEADS * GPT_HEAD_DIM) {
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
+    }
+
+    if (config.metrics_enabled) {
+        gd_metrics_config metrics_config = gd_metrics_config_default(config.metrics_project);
+        metrics_config.root_dir = config.metrics_dir;
+        metrics_config.run_id = config.metrics_run_id;
+        TRY(ctx, gd_metrics_logger_start(&metrics_config, &metrics));
+        printf("metrics: path=%s project=%s run_id=%s\n",
+               gd_metrics_logger_path(metrics),
+               gd_metrics_logger_project(metrics),
+               gd_metrics_logger_run_id(metrics));
+    } else {
+        printf("metrics: disabled\n");
     }
 
     if (config.epochs > 0) {
@@ -1629,6 +1740,52 @@ int main(int argc, char **argv)
            mem.state_bytes / (1024U * 1024U),
            mem.scratch_slot_bytes / (1024U * 1024U),
            mem.data_slot_bytes / (1024U * 1024U));
+    if (metrics != NULL) {
+        const gd_metrics_field fields[] = {
+            gd_metrics_string("data_dir", config.data_dir),
+            gd_metrics_string("tokenizer_path", config.tokenizer_path),
+            gd_metrics_string("checkpoint_path", config.checkpoint_path),
+            gd_metrics_string("latest_checkpoint_path", config.latest_checkpoint_path),
+            gd_metrics_string("load_checkpoint_path", config.load_checkpoint_path),
+            gd_metrics_string("resume_checkpoint_path", config.resume_checkpoint_path),
+            gd_metrics_string("val_split", config.val_split),
+            gd_metrics_i64("epochs", (int64_t)config.epochs),
+            gd_metrics_i64("batch_size", (int64_t)config.batch_size),
+            gd_metrics_i64("layers", (int64_t)config.n_layers),
+            gd_metrics_i64("context_length", (int64_t)GPT_CONTEXT_LENGTH),
+            gd_metrics_i64("vocab_size", (int64_t)GPT_VOCAB_SIZE),
+            gd_metrics_i64("d_model", (int64_t)GPT_D_MODEL),
+            gd_metrics_i64("heads", (int64_t)GPT_N_HEADS),
+            gd_metrics_i64("head_dim", (int64_t)GPT_HEAD_DIM),
+            gd_metrics_i64("mlp_hidden", (int64_t)GPT_MLP_HIDDEN),
+            gd_metrics_i64("report_every", (int64_t)config.report_every),
+            gd_metrics_i64("early_stopping_patience", (int64_t)config.early_stopping_patience),
+            gd_metrics_i64("warmup_steps", (int64_t)config.lr_warmup_steps),
+            gd_metrics_u64("seed", config.seed),
+            gd_metrics_f64("dropout", (double)config.dropout_p),
+            gd_metrics_f64("lr_max", (double)config.lr_max),
+            gd_metrics_f64("lr_min", (double)config.lr_min),
+            gd_metrics_f64("weight_decay", (double)config.weight_decay),
+            gd_metrics_f64("grad_clip_norm", (double)config.grad_clip_norm),
+            gd_metrics_u64("dataset_samples", (uint64_t)dataset_samples),
+            gd_metrics_u64("dataset_tokens", (uint64_t)dataset_tokens),
+            gd_metrics_u64("val_samples", (uint64_t)val_samples),
+            gd_metrics_u64("val_tokens", (uint64_t)val_tokens),
+            gd_metrics_u64("steps_per_epoch", (uint64_t)steps_per_epoch),
+            gd_metrics_u64("samples_per_epoch", (uint64_t)samples_per_epoch),
+            gd_metrics_u64("total_steps", (uint64_t)total_steps),
+            gd_metrics_u64("total_params", total_params),
+            gd_metrics_u64("trainable_params", trainable_params),
+            gd_metrics_u64("param_bytes", param_bytes),
+            gd_metrics_u64("memory_params_bytes", (uint64_t)mem.params_bytes),
+            gd_metrics_u64("memory_state_bytes", (uint64_t)mem.state_bytes),
+            gd_metrics_u64("memory_scratch_slot_bytes", (uint64_t)mem.scratch_slot_bytes),
+            gd_metrics_u64("memory_data_slot_bytes", (uint64_t)mem.data_slot_bytes),
+            gd_metrics_bool("save_best", config.save_best),
+            gd_metrics_bool("save_latest", config.save_latest),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "run_config", fields, GD_ARRAY_LEN(fields));
+    }
 
     if (config.epochs > 0) {
         train_gpt(ctx,
@@ -1640,6 +1797,7 @@ int main(int argc, char **argv)
                   &lr_config,
                   &config,
                   &resume_state,
+                  metrics,
                   steps_per_epoch,
                   total_steps);
         TRY(ctx, gd_optimizer_sync_state(ctx, optimizer));
@@ -1657,10 +1815,29 @@ int main(int argc, char **argv)
                stats.scratch.max_slot_watermark / (1024U * 1024U),
                stats.data.max_slot_watermark / (1024U * 1024U),
                (unsigned long long)stats.backend_waits);
+        if (metrics != NULL) {
+            const gd_metrics_field fields[] = {
+                gd_metrics_u64("params_watermark_bytes", (uint64_t)stats.params.watermark),
+                gd_metrics_u64("state_watermark_bytes", (uint64_t)stats.state.watermark),
+                gd_metrics_u64("scratch_max_slot_watermark_bytes",
+                               (uint64_t)stats.scratch.max_slot_watermark),
+                gd_metrics_u64("data_max_slot_watermark_bytes", (uint64_t)stats.data.max_slot_watermark),
+                gd_metrics_u64("backend_waits", stats.backend_waits),
+            };
+            (void)gd_metrics_logger_log_event(metrics, "memory_watermark", fields, GD_ARRAY_LEN(fields));
+        }
+    }
+    if (metrics != NULL) {
+        const gd_metrics_field fields[] = {
+            gd_metrics_u64("optimizer_steps", (uint64_t)optimizer_steps),
+            gd_metrics_u64("metrics_dropped", gd_metrics_logger_dropped(metrics)),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "run_end", fields, GD_ARRAY_LEN(fields));
     }
     printf("gpt_lm: ok optimizer_steps=%zu\n", optimizer_steps);
     exit_code = 0;
 
+    gd_metrics_logger_stop(metrics);
     gd_amp_scaler_destroy(scaler);
     gd_optimizer_destroy(optimizer);
     gd_param_set_free(&params);

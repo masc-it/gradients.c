@@ -100,6 +100,9 @@ typedef struct gpt_config {
     const char *load_checkpoint_path;
     const char *resume_checkpoint_path;
     const char *val_split;
+    const char *metrics_dir;
+    const char *metrics_project;
+    const char *metrics_run_id;
     int epochs;
     int batch_size;
     int n_layers;
@@ -111,6 +114,7 @@ typedef struct gpt_config {
     bool epochs_set;
     bool save_best;
     bool save_latest;
+    bool metrics_enabled;
     uint64_t overfit_num_samples;
     uint64_t seed;
     float dropout_p;

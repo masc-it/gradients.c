@@ -13,5 +13,6 @@
 #include <gradients/optimizer.h>
 #include <gradients/trainer.h>
 #include <gradients/tokenizer.h>
+#include <gradients/metrics.h>
 
 #endif /* GRADIENTS_GRADIENTS_H */

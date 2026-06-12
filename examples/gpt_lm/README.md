@@ -75,9 +75,15 @@ DATA_DIR=data
 make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 2 --batch-size 64"
 ```
 
-By default, training evaluates the `val` split at the end of each epoch, writes `checkpoints/gpt_lm_best.gdckpt` when validation improves, writes `checkpoints/gpt_lm_latest.gdckpt` for full resume, and stops after 10 validation epochs without improvement. Optimizer/scaler/trainer state lives in sidecars next to each model checkpoint: `*.optim.gdckpt` and `*.train`.
+By default, training evaluates the `val` split at the end of each epoch, writes `checkpoints/gpt_lm_best.gdckpt` when validation improves, writes `checkpoints/gpt_lm_latest.gdckpt` for full resume, emits async JSONL metrics under `data/metrics/gpt_lm/`, and stops after 10 validation epochs without improvement. Optimizer/scaler/trainer state lives in sidecars next to each model checkpoint: `*.optim.gdckpt` and `*.train`.
 
-If both `--no-save-best` and `--early-stopping-patience 0` are set, validation is skipped. `--no-save-latest` disables latest/full-resume checkpoint writes.
+If both `--no-save-best` and `--early-stopping-patience 0` are set, validation is skipped. `--no-save-latest` disables latest/full-resume checkpoint writes. Metrics can be disabled with `--no-metrics`, or routed with `--metrics-dir`, `--metrics-project`, and `--metrics-run-id`.
+
+Run the live dashboard from the repository root with:
+
+```sh
+uv run tools/gd_dash/main.py --metrics-dir data/metrics
+```
 
 ## Smoke tests
 
@@ -148,6 +154,10 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --load-checkpoint PATH        # model weights only
 --resume-checkpoint PATH      # model + optimizer/scaler/trainer sidecars
 --val-split NAME
+--metrics-dir PATH          # default data/metrics
+--metrics-project NAME      # default gpt_lm
+--metrics-run-id ID         # default timestamp-pid
+--no-metrics
 --no-save-best
 --no-save-latest
 --early-stopping-patience N # 0 disables; default 10

@@ -122,7 +122,7 @@ $(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_
 	$(CC) $(CPPFLAGS) $(CFLAGS) main_generate.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
 run: $(TRAIN_BIN)
-	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) $(ARGS)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics $(ARGS)
 
 infer: $(INFER_BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(INFER_BIN) --data-dir $(DATA_DIR) $(ARGS)
@@ -131,16 +131,16 @@ interactive: $(GENERATE_BIN)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(GENERATE_BIN) --data-dir $(DATA_DIR) $(ARGS)
 
 overfit-smoke: $(BIN)
-	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --no-save-best $(ARGS)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --no-save-best $(ARGS)
 
 generate-smoke: $(BIN)
-	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 0 --generate "Don Abbondio" --max-new-tokens 16 $(ARGS)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 0 --generate "Don Abbondio" --max-new-tokens 16 $(ARGS)
 
 periodic-generate-smoke: $(BIN)
-	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --generate-every-n-steps 1 --max-new-tokens 4 --no-save-best $(ARGS)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --generate-every-n-steps 1 --max-new-tokens 4 --no-save-best $(ARGS)
 
 checkpoint-smoke: $(TRAIN_BIN) $(INFER_BIN)
-	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) --epochs 1 --batch-size 32 --overfit-num-samples 32 --report-every 1 --checkpoint-path checkpoints/smoke_best.gdckpt $(ARGS)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 32 --overfit-num-samples 32 --report-every 1 --checkpoint-path checkpoints/smoke_best.gdckpt $(ARGS)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(INFER_BIN) --data-dir $(DATA_DIR) --checkpoint checkpoints/smoke_best.gdckpt --prompt "Don Abbondio" --max-new-tokens 8 $(ARGS)
 
 smoke: overfit-smoke generate-smoke periodic-generate-smoke

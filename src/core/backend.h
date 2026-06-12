@@ -64,12 +64,24 @@ typedef struct gd_backend_adamw_desc {
     size_t m_offset;
     gd_backend_buffer *v_buffer;
     size_t v_offset;
+    gd_backend_buffer *state_f32_buffer;  /* Optional device AdamW scalar state. */
+    size_t beta1_power_offset;
+    size_t beta2_power_offset;
+    size_t step_scale_offset;
+    size_t decay_scale_offset;
+    size_t eps_scaled_offset;
+    gd_backend_buffer *state_i32_buffer;  /* Optional device step counters. */
+    size_t param_step_offset;
+    size_t optimizer_step_offset;
     size_t count;
     uint32_t param_dtype;
     uint32_t grad_dtype;
     uint32_t has_master;
     uint32_t has_grad_scale;
     uint32_t has_found_inf;
+    uint32_t has_device_state;
+    uint32_t bias_correction;
+    uint32_t update_optimizer_step;
     float lr;
     float beta1;
     float beta2;
@@ -79,12 +91,25 @@ typedef struct gd_backend_adamw_desc {
     float bias_correction2;
 } gd_backend_adamw_desc;
 
+typedef struct gd_backend_amp_state_desc {
+    gd_backend_buffer *scale_buffer; /* F32[2]: scale, inv_scale. */
+    size_t scale_offset;
+    gd_backend_buffer *flags_buffer; /* I32[3]: growth_tracker, found_inf, last_found_inf. */
+    size_t flags_offset;
+    float growth_factor;
+    float backoff_factor;
+    float min_scale;
+    float max_scale;
+    uint32_t growth_interval;
+} gd_backend_amp_state_desc;
+
 typedef struct gd_backend_amp_unscale_desc {
     gd_backend_buffer *grad_buffer;
     size_t grad_offset;
     size_t count;
     uint32_t grad_dtype;
-    float inv_scale;
+    gd_backend_buffer *inv_scale_buffer;
+    size_t inv_scale_offset;
     gd_backend_buffer *found_inf_buffer;
     size_t found_inf_offset;
 } gd_backend_amp_unscale_desc;
@@ -97,7 +122,8 @@ typedef struct gd_backend_grad_norm_desc {
     gd_backend_buffer *partial_buffer;
     size_t partial_offset;
     size_t partial_count;
-    float grad_scale;
+    gd_backend_buffer *grad_scale_buffer;
+    size_t grad_scale_offset;
     gd_backend_buffer *found_inf_buffer;
     size_t found_inf_offset;
     uint32_t has_found_inf;
@@ -665,6 +691,26 @@ gd_status gd_backend_kv_cache_append_packed(gd_backend *backend,
                                             const gd_backend_tensor_view *v_new,
                                             const gd_backend_kv_cache_append_args *args);
 
+gd_status gd_backend_amp_begin_step(gd_backend *backend,
+                                    const gd_backend_amp_state_desc *desc);
+gd_status gd_backend_amp_finish_step(gd_backend *backend,
+                                     const gd_backend_amp_state_desc *desc);
+gd_status gd_backend_amp_fill_scale(gd_backend *backend,
+                                    gd_backend_buffer *dst_buffer,
+                                    size_t dst_offset,
+                                    size_t count,
+                                    uint32_t dtype,
+                                    gd_backend_buffer *scale_buffer,
+                                    size_t scale_offset);
+gd_status gd_backend_amp_scale(gd_backend *backend,
+                               gd_backend_buffer *dst_buffer,
+                               size_t dst_offset,
+                               gd_backend_buffer *src_buffer,
+                               size_t src_offset,
+                               size_t count,
+                               uint32_t dtype,
+                               gd_backend_buffer *scale_buffer,
+                               size_t scale_offset);
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc);
 gd_status gd_backend_adamw_batch(gd_backend *backend,
                                   const gd_backend_adamw_desc *descs,

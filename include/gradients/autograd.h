@@ -11,6 +11,8 @@
 extern "C" {
 #endif
 
+typedef struct gd_amp_scaler gd_amp_scaler;
+
 /* Reverse-mode vector-Jacobian product. If grad_output is NULL, a tensor of
    ones with output's shape/dtype is used. Gradients are scope-local scratch
    tensors and remain valid until the next gd_begin_step() reuses their arena slot. */
@@ -24,6 +26,13 @@ gd_status gd_backward_scaled(gd_context *ctx,
                              const gd_tensor *output,
                              const gd_tensor *grad_output,
                              float scale);
+
+/* AMP backward reads the loss scale from scaler device state, avoiding a
+   per-step CPU scale dependency. */
+gd_status gd_backward_amp(gd_context *ctx,
+                          const gd_tensor *output,
+                          const gd_tensor *grad_output,
+                          gd_amp_scaler *scaler);
 
 gd_status gd_backward_many(gd_context *ctx,
                            uint32_t n_outputs,

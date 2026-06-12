@@ -32,11 +32,6 @@ typedef struct gd_lr_scheduler_config {
 
 typedef struct gd_amp_config {
     bool enabled;
-    /* When true, optimizer steps keep found-inf skip logic on the backend and
-       optimistically update CPU-side scaler state without a mid-step readback.
-       This removes a per-step synchronization for workloads that expect finite
-       gradients, at the cost of delayed CPU visibility for rare overflows. */
-    bool defer_found_inf;
     float init_scale;
     float growth_factor;
     float backoff_factor;
@@ -60,17 +55,29 @@ gd_status gd_lr_scheduler_value(const gd_lr_scheduler_config *config,
                                 uint64_t step,
                                 float *lr_out);
 
-gd_status gd_amp_scaler_create(const gd_amp_config *config, gd_amp_scaler **out);
+gd_status gd_amp_scaler_create(gd_context *ctx,
+                                const gd_amp_config *config,
+                                gd_amp_scaler **out);
 void gd_amp_scaler_destroy(gd_amp_scaler *scaler);
 float gd_amp_scaler_scale(const gd_amp_scaler *scaler);
 bool gd_amp_scaler_enabled(const gd_amp_scaler *scaler);
 bool gd_amp_scaler_last_found_inf(const gd_amp_scaler *scaler);
 uint32_t gd_amp_scaler_growth_tracker(const gd_amp_scaler *scaler);
+gd_status gd_amp_scaler_sync(gd_context *ctx, gd_amp_scaler *scaler);
 /* Round-trip dynamic loss-scale state for exact mixed-precision resume. */
-gd_status gd_amp_scaler_get_state(const gd_amp_scaler *scaler,
+gd_status gd_amp_scaler_get_state(gd_context *ctx,
+                                  gd_amp_scaler *scaler,
                                   gd_amp_scaler_state *out);
-gd_status gd_amp_scaler_set_state(gd_amp_scaler *scaler,
+gd_status gd_amp_scaler_set_state(gd_context *ctx,
+                                  gd_amp_scaler *scaler,
                                   const gd_amp_scaler_state *state);
+gd_status gd_amp_scaler_fill_scale(gd_context *ctx,
+                                   gd_amp_scaler *scaler,
+                                   gd_tensor *dst);
+gd_status gd_amp_scaler_scale_tensor(gd_context *ctx,
+                                     gd_amp_scaler *scaler,
+                                     const gd_tensor *src,
+                                     gd_tensor *dst);
 
 gd_status gd_adamw_create(gd_context *ctx,
                           const gd_param_set *params,
@@ -105,6 +112,7 @@ gd_status gd_optimizer_step_amp_clip_lr(gd_context *ctx,
 gd_status gd_optimizer_last_grad_norm(gd_context *ctx,
                                       const gd_optimizer *optimizer,
                                       float *out);
+gd_status gd_optimizer_sync_state(gd_context *ctx, gd_optimizer *optimizer);
 uint64_t gd_optimizer_step_count(const gd_optimizer *optimizer);
 
 /* Save/load backend-independent AdamW optimizer state. The target optimizer

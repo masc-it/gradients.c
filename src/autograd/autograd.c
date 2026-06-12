@@ -3,6 +3,8 @@
 #include "../core/backend.h"
 #include "../core/memory_internal.h"
 
+#include <gradients/optimizer.h>
+
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -840,6 +842,58 @@ static gd_status gd_seed_output_grad(gd_bwd_ctx *bwd,
     return gd_autograd_accumulate(bwd, output->id, &seed);
 }
 
+static gd_status gd_seed_output_grad_amp(gd_bwd_ctx *bwd,
+                                         const gd_tensor *output,
+                                         const gd_tensor *grad_output,
+                                         gd_amp_scaler *scaler)
+{
+    gd_tensor seed;
+    gd_status st;
+    if (output == NULL || output->id == 0U) {
+        return gd_context_set_error(bwd->ctx, GD_ERR_INVALID_ARGUMENT, "invalid backward output tensor");
+    }
+    if (scaler == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (grad_output != NULL) {
+        if (!gd_tensors_same_shape(output, grad_output)) {
+            return gd_context_set_error(bwd->ctx, GD_ERR_INVALID_ARGUMENT, "backward seed shape mismatch");
+        }
+        st = gd_tensor_empty(bwd->ctx,
+                             GD_ARENA_SCRATCH,
+                             grad_output->dtype,
+                             gd_shape_make(grad_output->rank, grad_output->shape),
+                             GD_AUTOGRAD_GRAD_ALIGNMENT,
+                             &seed);
+        if (st != GD_OK) {
+            return st;
+        }
+        seed.requires_grad = false;
+        seed.is_leaf = false;
+        st = gd_amp_scaler_scale_tensor(bwd->ctx, scaler, grad_output, &seed);
+        if (st != GD_OK) {
+            return st;
+        }
+        return gd_autograd_accumulate(bwd, output->id, &seed);
+    }
+    st = gd_tensor_empty(bwd->ctx,
+                         GD_ARENA_SCRATCH,
+                         output->dtype,
+                         gd_shape_make(output->rank, output->shape),
+                         GD_AUTOGRAD_GRAD_ALIGNMENT,
+                         &seed);
+    if (st != GD_OK) {
+        return st;
+    }
+    seed.requires_grad = false;
+    seed.is_leaf = false;
+    st = gd_amp_scaler_fill_scale(bwd->ctx, scaler, &seed);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_autograd_accumulate(bwd, output->id, &seed);
+}
+
 static gd_status gd_backward_many_impl(gd_context *ctx,
                                        uint32_t n_outputs,
                                        const gd_tensor *const *outputs,
@@ -914,6 +968,80 @@ done:
     return st;
 }
 
+static gd_status gd_backward_many_amp_impl(gd_context *ctx,
+                                           uint32_t n_outputs,
+                                           const gd_tensor *const *outputs,
+                                           const gd_tensor *const *grad_outputs,
+                                           gd_amp_scaler *scaler)
+{
+    gd_autograd_state *state;
+    gd_bwd_ctx bwd;
+    bool old_recording;
+    gd_status st = GD_OK;
+    uint32_t i;
+    if (ctx == NULL || n_outputs == 0U || outputs == NULL || scaler == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_context_in_scope(ctx)) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "backward requires active scope");
+    }
+    state = gd_context_autograd(ctx);
+    if (state == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    old_recording = state->recording;
+    state->recording = false;
+    bwd.ctx = ctx;
+    bwd.tape = state;
+
+    st = gd_autograd_build_live_spans(state);
+    if (st != GD_OK) {
+        st = gd_context_set_error(ctx, st, "failed to build autograd live span table");
+        goto done;
+    }
+
+    for (i = 0U; i < n_outputs; ++i) {
+        const gd_tensor *grad = grad_outputs != NULL ? grad_outputs[i] : NULL;
+        st = gd_seed_output_grad_amp(&bwd, outputs[i], grad, scaler);
+        if (st != GD_OK) {
+            goto done;
+        }
+    }
+
+    for (i = state->n_nodes; i > 0U; --i) {
+        const gd_tape_node *node = &state->nodes[i - 1U];
+        const gd_autograd_rule *rule;
+        if (!gd_node_has_output_grad(state, node)) {
+            st = gd_release_node_forward_refs(ctx, state, node, outputs, n_outputs);
+            if (st != GD_OK) {
+                goto done;
+            }
+            continue;
+        }
+        rule = gd_autograd_rule_for(node->op);
+        if (rule == NULL || rule->backward == NULL) {
+            st = gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "missing autograd rule");
+            goto done;
+        }
+        st = rule->backward(&bwd, node);
+        if (st != GD_OK) {
+            goto done;
+        }
+        st = gd_release_node_output_grads(&bwd, node);
+        if (st != GD_OK) {
+            goto done;
+        }
+        st = gd_release_node_forward_refs(ctx, state, node, outputs, n_outputs);
+        if (st != GD_OK) {
+            goto done;
+        }
+    }
+
+done:
+    state->recording = old_recording;
+    return st;
+}
+
 gd_status gd_backward_many(gd_context *ctx,
                            uint32_t n_outputs,
                            const gd_tensor *const *outputs,
@@ -943,6 +1071,21 @@ gd_status gd_backward_scaled(gd_context *ctx,
     outputs[0] = output;
     grad_outputs[0] = grad_output;
     return gd_backward_many_impl(ctx, 1U, outputs, grad_outputs, scale);
+}
+
+gd_status gd_backward_amp(gd_context *ctx,
+                          const gd_tensor *output,
+                          const gd_tensor *grad_output,
+                          gd_amp_scaler *scaler)
+{
+    const gd_tensor *outputs[1];
+    const gd_tensor *grad_outputs[1];
+    if (scaler == NULL || !gd_amp_scaler_enabled(scaler)) {
+        return gd_backward(ctx, output, grad_output);
+    }
+    outputs[0] = output;
+    grad_outputs[0] = grad_output;
+    return gd_backward_many_amp_impl(ctx, 1U, outputs, grad_outputs, scaler);
 }
 
 gd_status gd_tensor_grad(gd_context *ctx,

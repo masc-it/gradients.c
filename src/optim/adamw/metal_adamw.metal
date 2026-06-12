@@ -5,17 +5,46 @@ using namespace metal;
 
 #include "backends/metal/metal_common.h"
 
+static inline float gd_adamw_step_scale(device const uchar *state_f32_buf,
+                                        constant gd_metal_adamw_args &args)
+{
+    if (args.has_device_state == 0u) {
+        return args.step_scale;
+    }
+    return *(reinterpret_cast<device const float *>(state_f32_buf + args.step_scale_offset));
+}
+
+static inline float gd_adamw_decay_scale(device const uchar *state_f32_buf,
+                                         constant gd_metal_adamw_args &args)
+{
+    if (args.has_device_state == 0u) {
+        return args.decay_scale;
+    }
+    return *(reinterpret_cast<device const float *>(state_f32_buf + args.decay_scale_offset));
+}
+
+static inline float gd_adamw_eps_scaled(device const uchar *state_f32_buf,
+                                        constant gd_metal_adamw_args &args)
+{
+    if (args.has_device_state == 0u) {
+        return args.eps_scaled;
+    }
+    return *(reinterpret_cast<device const float *>(state_f32_buf + args.eps_scaled_offset));
+}
+
 static inline float gd_adamw_apply(float p,
                                    float g,
                                    device float *m,
                                    device float *v,
+                                   device const uchar *state_f32_buf,
                                    ulong i,
                                    constant gd_metal_adamw_args &args)
 {
     const float m_new = fma(args.beta1, m[i], args.one_minus_beta1 * g);
     const float v_new = fma(args.beta2, v[i], args.one_minus_beta2 * g * g);
-    const float denom = sqrt(v_new) + args.eps_scaled;
-    const float p_new = p - (args.step_scale * m_new) / denom - args.decay_scale * p;
+    const float denom = sqrt(v_new) + gd_adamw_eps_scaled(state_f32_buf, args);
+    const float p_new = p - (gd_adamw_step_scale(state_f32_buf, args) * m_new) / denom -
+                        gd_adamw_decay_scale(state_f32_buf, args) * p;
 
     m[i] = m_new;
     v[i] = v_new;
@@ -51,6 +80,28 @@ static inline float gd_adamw_scale_grad(float g, float scale)
     return scale == 0.0f ? 0.0f : g * scale;
 }
 
+kernel void gd_adamw_prepare_kernel(device uchar *state_f32_buf [[buffer(0)]],
+                                    device const uchar *found_inf_buf [[buffer(1)]],
+                                    constant gd_metal_adamw_args &args [[buffer(2)]])
+{
+    if (gd_adamw_found_inf(found_inf_buf, args)) {
+        return;
+    }
+    device float *beta1_power = reinterpret_cast<device float *>(state_f32_buf + args.beta1_power_offset);
+    device float *beta2_power = reinterpret_cast<device float *>(state_f32_buf + args.beta2_power_offset);
+    device float *step_scale = reinterpret_cast<device float *>(state_f32_buf + args.step_scale_offset);
+    device float *decay_scale = reinterpret_cast<device float *>(state_f32_buf + args.decay_scale_offset);
+    device float *eps_scaled = reinterpret_cast<device float *>(state_f32_buf + args.eps_scaled_offset);
+    const float beta1_power_new = beta1_power[0] * args.beta1;
+    const float beta2_power_new = beta2_power[0] * args.beta2;
+    const float bias_correction1 = args.bias_correction != 0u ? 1.0f - beta1_power_new : 1.0f;
+    const float bias_correction2 = args.bias_correction != 0u ? 1.0f - beta2_power_new : 1.0f;
+    const float bias_correction2_sqrt = sqrt(bias_correction2);
+    step_scale[0] = args.lr * bias_correction2_sqrt / bias_correction1;
+    decay_scale[0] = args.lr * args.weight_decay;
+    eps_scaled[0] = args.eps * bias_correction2_sqrt;
+}
+
 kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
                             device const uchar *grad [[buffer(1)]],
                             device uchar *m_buf [[buffer(2)]],
@@ -59,6 +110,7 @@ kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
                             constant gd_metal_adamw_args &args [[buffer(5)]],
                             device const uchar *grad_scale_buf [[buffer(6)]],
                             device const uchar *found_inf_buf [[buffer(7)]],
+                            device const uchar *state_f32_buf [[buffer(8)]],
                             uint gid [[thread_position_in_grid]])
 {
     const ulong i = ulong(gid);
@@ -77,7 +129,7 @@ kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
                             ? float(reinterpret_cast<device const half *>(grad + args.grad_offset)[i])
                             : reinterpret_cast<device const float *>(grad + args.grad_offset)[i],
                             grad_scale);
-        const float p_new = gd_adamw_apply(master[i], g, m, v, i, args);
+        const float p_new = gd_adamw_apply(master[i], g, m, v, state_f32_buf, i, args);
         master[i] = p_new;
         param_h[i] = half(p_new);
         return;
@@ -89,7 +141,7 @@ kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
                             ? float(reinterpret_cast<device const half *>(grad + args.grad_offset)[i])
                             : reinterpret_cast<device const float *>(grad + args.grad_offset)[i],
                             grad_scale);
-        param_f[i] = gd_adamw_apply(param_f[i], g, m, v, i, args);
+        param_f[i] = gd_adamw_apply(param_f[i], g, m, v, state_f32_buf, i, args);
         return;
     }
 
@@ -99,11 +151,31 @@ kernel void gd_adamw_kernel(device uchar *param [[buffer(0)]],
 
     const float g = gd_adamw_scale_grad(gd_load_float_dtype(grad, g_byte, args.grad_dtype), grad_scale);
     const float p = args.has_master != 0u ? master[i] : gd_load_float_dtype(param, p_byte, args.param_dtype);
-    const float p_new = gd_adamw_apply(p, g, m, v, i, args);
+    const float p_new = gd_adamw_apply(p, g, m, v, state_f32_buf, i, args);
     if (args.has_master != 0u) {
         master[i] = p_new;
     }
     gd_write_float_dtype(param, p_byte, args.param_dtype, p_new);
+}
+
+kernel void gd_adamw_commit_kernel(device uchar *state_f32_buf [[buffer(0)]],
+                                   device uchar *state_i32_buf [[buffer(1)]],
+                                   device const uchar *found_inf_buf [[buffer(2)]],
+                                   constant gd_metal_adamw_args &args [[buffer(3)]])
+{
+    if (gd_adamw_found_inf(found_inf_buf, args)) {
+        return;
+    }
+    device float *beta1_power = reinterpret_cast<device float *>(state_f32_buf + args.beta1_power_offset);
+    device float *beta2_power = reinterpret_cast<device float *>(state_f32_buf + args.beta2_power_offset);
+    device uint *param_step = reinterpret_cast<device uint *>(state_i32_buf + args.param_step_offset);
+    beta1_power[0] *= args.beta1;
+    beta2_power[0] *= args.beta2;
+    param_step[0] += 1u;
+    if (args.update_optimizer_step != 0u) {
+        device uint *optimizer_step = reinterpret_cast<device uint *>(state_i32_buf + args.optimizer_step_offset);
+        optimizer_step[0] += 1u;
+    }
 }
 
 static inline float gd_grad_norm_load(device const uchar *grad,
@@ -119,13 +191,14 @@ static inline float gd_grad_norm_load(device const uchar *grad,
         const ulong byte = args.grad_offset + i * gd_dtype_elem_size(args.grad_dtype);
         g = gd_load_float_dtype(grad, byte, args.grad_dtype);
     }
-    return g * args.grad_scale;
+    return g;
 }
 
 kernel void gd_grad_norm_stage_kernel(device const uchar *grad [[buffer(0)]],
                                       device uchar *partial_buf [[buffer(1)]],
-                                      constant gd_metal_grad_norm_stage_args &args [[buffer(2)]],
+                                      device const uchar *grad_scale_buf [[buffer(2)]],
                                       device uchar *found_inf_buf [[buffer(3)]],
+                                      constant gd_metal_grad_norm_stage_args &args [[buffer(4)]],
                                       uint tid [[thread_index_in_threadgroup]],
                                       uint tg [[threadgroup_position_in_grid]])
 {
@@ -136,7 +209,8 @@ kernel void gd_grad_norm_stage_kernel(device const uchar *grad [[buffer(0)]],
     for (uint j = tid; j < GD_METAL_GRAD_NORM_BLOCK_ELEMS; j += GD_METAL_GRAD_NORM_THREADS) {
         const ulong i = block_start + ulong(j);
         if (i < args.count) {
-            const float g = gd_grad_norm_load(grad, i, args);
+            const float grad_scale = *(reinterpret_cast<device const float *>(grad_scale_buf + args.grad_scale_offset));
+            const float g = gd_grad_norm_load(grad, i, args) * grad_scale;
             if (!isfinite(g) && args.has_found_inf != 0u) {
                 gd_grad_norm_mark_found_inf(found_inf_buf, args.found_inf_offset);
             }
@@ -160,7 +234,8 @@ kernel void gd_grad_norm_stage_kernel(device const uchar *grad [[buffer(0)]],
 
 kernel void gd_grad_clip_finalize_kernel(device const uchar *partial_buf [[buffer(0)]],
                                          device uchar *scale_buf [[buffer(1)]],
-                                         constant gd_metal_grad_clip_finalize_args &args [[buffer(2)]],
+                                         device const uchar *grad_scale_buf [[buffer(2)]],
+                                         constant gd_metal_grad_clip_finalize_args &args [[buffer(3)]],
                                          uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup float sums[GD_METAL_GRAD_NORM_THREADS];
@@ -187,8 +262,9 @@ kernel void gd_grad_clip_finalize_kernel(device const uchar *partial_buf [[buffe
         } else if (!(scale < 1.0f)) {
             scale = 1.0f;
         }
+        const float grad_scale = *(reinterpret_cast<device const float *>(grad_scale_buf + args.grad_scale_offset));
         device float *out = reinterpret_cast<device float *>(scale_buf + args.scale_offset);
-        out[0] = scale * args.grad_scale;
+        out[0] = scale * grad_scale;
         out[1] = total_norm;
     }
 }

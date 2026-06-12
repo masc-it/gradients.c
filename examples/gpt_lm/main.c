@@ -530,9 +530,6 @@ static gd_adamw_config gpt_adamw_config(float lr, float weight_decay)
 static gd_amp_config gpt_amp_config(void)
 {
     gd_amp_config config = gd_amp_config_default();
-    /* Keep found-inf readback enabled so long runs can back off the dynamic
-       loss scale when F16 gradients overflow. */
-    config.defer_found_inf = false;
     config.init_scale = 8192.0f;
     config.growth_interval = 1000U;
     return config;
@@ -617,7 +614,7 @@ static void train_one_batch(gd_context *ctx,
                             cu_seqlens,
                             (uint64_t)current_step,
                             &loss));
-    TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
+    TRY(ctx, gd_backward_amp(ctx, &loss, NULL, scaler));
     if (config->grad_clip_norm > 0.0f) {
         TRY(ctx, gd_optimizer_step_amp_clip_lr(ctx, optimizer, scaler, lr, config->grad_clip_norm));
     } else {
@@ -628,16 +625,17 @@ static void train_one_batch(gd_context *ctx,
     TRY(ctx, gd_dataloader_prefetch(loader));
 
     if (report) {
-        const double now = gpt_wall_seconds();
-        const double elapsed = now - *last_report_time;
-        const size_t batches = current_step - *last_report_step;
-        const size_t tokens = batches * (size_t)config->batch_size * (size_t)GPT_CONTEXT_LENGTH;
-        const double batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
-        const double tokens_per_sec = elapsed > 0.0 ? (double)tokens / elapsed : 0.0;
         float loss_value = 0.0f;
         float grad_norm = 0.0f;
         char grad_norm_text[64];
+        double now;
+        double elapsed;
+        size_t batches;
+        size_t tokens;
+        double batches_per_sec;
+        double tokens_per_sec;
         TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
+        TRY(ctx, gd_amp_scaler_sync(ctx, scaler));
         if (config->grad_clip_norm > 0.0f) {
             TRY(ctx, gd_optimizer_last_grad_norm(ctx, optimizer, &grad_norm));
             (void)snprintf(grad_norm_text,
@@ -648,6 +646,12 @@ static void train_one_batch(gd_context *ctx,
         } else {
             (void)snprintf(grad_norm_text, sizeof(grad_norm_text), " grad_norm=off");
         }
+        now = gpt_wall_seconds();
+        elapsed = now - *last_report_time;
+        batches = current_step - *last_report_step;
+        tokens = batches * (size_t)config->batch_size * (size_t)GPT_CONTEXT_LENGTH;
+        batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
+        tokens_per_sec = elapsed > 0.0 ? (double)tokens / elapsed : 0.0;
         printf("epoch=%zu/%d batch=%zu/%zu step=%zu/%zu loss=%.6f lr=%.6g%s batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s\n",
                epoch,
                config->epochs,
@@ -863,7 +867,7 @@ static void gpt_write_training_state(gd_context *ctx,
                                      const char *model_path,
                                      const char *optimizer_path,
                                      const gd_lr_scheduler_config *lr_config,
-                                     const gd_amp_scaler *scaler,
+                                     gd_amp_scaler *scaler,
                                      size_t epoch,
                                      size_t global_step,
                                      size_t epochs_without_improvement,
@@ -876,7 +880,7 @@ static void gpt_write_training_state(gd_context *ctx,
     if (path == NULL || model_path == NULL || optimizer_path == NULL || lr_config == NULL || scaler == NULL) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "training state arguments", __LINE__);
     }
-    TRY(ctx, gd_amp_scaler_get_state(scaler, &amp_state));
+    TRY(ctx, gd_amp_scaler_get_state(ctx, scaler, &amp_state));
     ensure_checkpoint_parent_dir(ctx, path);
     file = fopen(path, "wb");
     if (file == NULL) {
@@ -895,7 +899,6 @@ static void gpt_write_training_state(gd_context *ctx,
     fprintf(file, "lr.warmup_steps=%llu\n", (unsigned long long)lr_config->warmup_steps);
     fprintf(file, "lr.total_steps=%llu\n", (unsigned long long)lr_config->total_steps);
     fprintf(file, "amp.enabled=%u\n", amp_state.config.enabled ? 1U : 0U);
-    fprintf(file, "amp.defer_found_inf=%u\n", amp_state.config.defer_found_inf ? 1U : 0U);
     fprintf(file, "amp.init_scale=%.9g\n", (double)amp_state.config.init_scale);
     fprintf(file, "amp.growth_factor=%.9g\n", (double)amp_state.config.growth_factor);
     fprintf(file, "amp.backoff_factor=%.9g\n", (double)amp_state.config.backoff_factor);
@@ -1098,7 +1101,6 @@ static void gpt_load_training_state(gd_context *ctx,
     }
 
     amp_state.config.enabled = gpt_state_bool(ctx, text, "amp.enabled");
-    amp_state.config.defer_found_inf = gpt_state_bool(ctx, text, "amp.defer_found_inf");
     amp_state.config.init_scale = gpt_state_f32(ctx, text, "amp.init_scale");
     amp_state.config.growth_factor = gpt_state_f32(ctx, text, "amp.growth_factor");
     amp_state.config.backoff_factor = gpt_state_f32(ctx, text, "amp.backoff_factor");
@@ -1108,7 +1110,7 @@ static void gpt_load_training_state(gd_context *ctx,
     amp_state.scale = gpt_state_f32(ctx, text, "amp.scale");
     amp_state.growth_tracker = gpt_state_u32(ctx, text, "amp.growth_tracker");
     amp_state.last_found_inf = gpt_state_bool(ctx, text, "amp.last_found_inf");
-    TRY(ctx, gd_amp_scaler_set_state(scaler, &amp_state));
+    TRY(ctx, gd_amp_scaler_set_state(ctx, scaler, &amp_state));
     free(text);
     printf("resumed_training_state: path=%s epoch=%zu global_step=%zu best_val_loss=%.6f amp_scale=%.1f\n",
            path,
@@ -1527,7 +1529,7 @@ int main(int argc, char **argv)
         const gd_adamw_config adam = gpt_adamw_config(config.lr_max, config.weight_decay);
         const gd_amp_config amp = gpt_amp_config();
         TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
-        TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
+        TRY(ctx, gd_amp_scaler_create(ctx, &amp, &scaler));
     }
 
     lr_config = gd_lr_scheduler_config_default();
@@ -1632,6 +1634,7 @@ int main(int argc, char **argv)
                   &resume_state,
                   steps_per_epoch,
                   total_steps);
+        TRY(ctx, gd_optimizer_sync_state(ctx, optimizer));
         optimizer_steps = (size_t)gd_optimizer_step_count(optimizer);
     }
     if (config.generate_prompt != NULL) {

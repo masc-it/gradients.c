@@ -497,7 +497,7 @@ static void train_mnist(gd_context *ctx,
                                     MNIST_DROPOUT_SEED ^ current_step,
                                     &logits));
         TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
-        TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
+        TRY(ctx, gd_backward_amp(ctx, &loss, NULL, scaler));
         TRY(ctx, gd_optimizer_step_amp_lr(ctx, optimizer, scaler, lr));
         TRY(ctx, gd_end_step(ctx));
         TRY(ctx, gd_dataloader_release(loader, batch));
@@ -608,7 +608,7 @@ int main(void)
         const gd_adamw_config adam = mnist_adamw_config(config.lr_max);
         const gd_amp_config amp = mnist_amp_config();
         TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
-        TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
+        TRY(ctx, gd_amp_scaler_create(ctx, &amp, &scaler));
     }
     TRY(ctx, gd_context_seal_params(ctx));
     TRY(ctx, gd_sampler_create_random(train_dataset, 1234U, &train_sampler));

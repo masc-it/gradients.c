@@ -1140,6 +1140,62 @@ gd_status gd_backend_kv_cache_append_packed(gd_backend *backend,
     return GD_ERR_UNSUPPORTED;
 }
 
+gd_status gd_backend_amp_begin_step(gd_backend *backend,
+                                    const gd_backend_amp_state_desc *desc)
+{
+    (void)backend;
+    (void)desc;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_amp_finish_step(gd_backend *backend,
+                                     const gd_backend_amp_state_desc *desc)
+{
+    (void)backend;
+    (void)desc;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_amp_fill_scale(gd_backend *backend,
+                                    gd_backend_buffer *dst_buffer,
+                                    size_t dst_offset,
+                                    size_t count,
+                                    uint32_t dtype,
+                                    gd_backend_buffer *scale_buffer,
+                                    size_t scale_offset)
+{
+    (void)backend;
+    (void)dst_buffer;
+    (void)dst_offset;
+    (void)count;
+    (void)dtype;
+    (void)scale_buffer;
+    (void)scale_offset;
+    return GD_ERR_UNSUPPORTED;
+}
+
+gd_status gd_backend_amp_scale(gd_backend *backend,
+                               gd_backend_buffer *dst_buffer,
+                               size_t dst_offset,
+                               gd_backend_buffer *src_buffer,
+                               size_t src_offset,
+                               size_t count,
+                               uint32_t dtype,
+                               gd_backend_buffer *scale_buffer,
+                               size_t scale_offset)
+{
+    (void)backend;
+    (void)dst_buffer;
+    (void)dst_offset;
+    (void)src_buffer;
+    (void)src_offset;
+    (void)count;
+    (void)dtype;
+    (void)scale_buffer;
+    (void)scale_offset;
+    return GD_ERR_UNSUPPORTED;
+}
+
 gd_status gd_backend_adamw(gd_backend *backend, const gd_backend_adamw_desc *desc)
 {
     (void)backend;

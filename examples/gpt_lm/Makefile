@@ -27,6 +27,10 @@ PYTHON ?= uv run --with numpy
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic
+CORE_CFLAGS ?= -std=c11 -O2 -g3 -Wall -Wextra -Wpedantic -Werror \
+               -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
+               -Wmissing-prototypes -Wno-unused-parameter
+CORE_OBJCFLAGS ?= $$(CPPFLAGS) -O2 -g3 -Wall -Wextra -Werror -fobjc-arc
 LDLIBS := -pthread -lm
 
 ifeq ($(UNAME_S),Darwin)
@@ -86,7 +90,7 @@ endif
 all: $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN)
 
 build-lib:
-	$(MAKE) -C $(ROOT) build
+	$(MAKE) -C $(ROOT) CFLAGS='$(CORE_CFLAGS)' OBJCFLAGS='$(CORE_OBJCFLAGS)' build
 
 tools:
 	$(MAKE) -C $(ROOT) tools

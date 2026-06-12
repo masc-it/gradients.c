@@ -193,7 +193,7 @@ int main(void)
     gd_optimizer *optimizer = NULL;
     gd_amp_scaler *scaler = NULL;
     TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
-    TRY(ctx, gd_amp_scaler_create(&amp, &scaler));
+    TRY(ctx, gd_amp_scaler_create(ctx, &amp, &scaler));
     TRY(ctx, gd_context_seal_params(ctx));
     gd_module_set_training(&model.mod, true);
 
@@ -210,7 +210,7 @@ int main(void)
         target = gd_batch_tensor(batch, "target");
         TRY(ctx, xor_mlp_forward(ctx, &model, x, &pred_tensor));
         TRY(ctx, gd_huber(ctx, &pred_tensor, target, &loss));
-        TRY(ctx, gd_backward_scaled(ctx, &loss, NULL, gd_amp_scaler_scale(scaler)));
+        TRY(ctx, gd_backward_amp(ctx, &loss, NULL, scaler));
         TRY(ctx, gd_optimizer_step_amp(ctx, optimizer, scaler));
         TRY(ctx, gd_end_step(ctx));
         TRY(ctx, gd_dataloader_release(loader, batch));
@@ -219,6 +219,7 @@ int main(void)
         if (report) {
             float loss_value = 0.0f;
             TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
+            TRY(ctx, gd_amp_scaler_sync(ctx, scaler));
             printf("step=%3d loss=%.6f scale=%.1f overflow=%s\n",
                    step + 1,
                    (double)loss_value,

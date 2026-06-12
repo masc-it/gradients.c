@@ -27,6 +27,10 @@ struct gd_backend {
     void *reduce_rows_pso;
     void *accumulate_pso;
     void *scale_pso;
+    void *amp_begin_step_pso;
+    void *amp_finish_step_pso;
+    void *amp_fill_scale_pso;
+    void *amp_scale_pso;
     void *amp_unscale_pso;
     void *grad_norm_stage_pso;
     void *grad_clip_finalize_pso;
@@ -168,7 +172,9 @@ struct gd_backend {
     void *sdpa_decode_tq1_dh64_f16_pso;
     void *kv_cache_append_pso;
     void *kv_cache_append_packed_pso;
+    void *adamw_prepare_pso;
     void *adamw_pso;
+    void *adamw_commit_pso;
     void *active_command_buffer;
     bool scope_active;
 };

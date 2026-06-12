@@ -3,6 +3,10 @@
 
 using namespace metal;
 
+/* PoWLU Metal kernels are f16-only; clamp inactive positive-path math to the
+ * smallest positive half so branchless evaluation stays finite for z <= 0. */
+#define GD_POWLU_F16_MIN_POS 0x1p-24f
+
 static inline float gd_powlu_exp(const float x)
 {
     return fast::exp(x);
@@ -20,59 +24,55 @@ static inline float gd_powlu_sqrt(const float x)
 
 static inline float gd_powlu_sigmoid_stable(const float x)
 {
-    if (x >= 0.0f) {
-        const float e = gd_powlu_exp(-x);
-        return 1.0f / (1.0f + e);
-    }
-    const float e = gd_powlu_exp(x);
-    return e / (1.0f + e);
-}
-
-static inline float gd_powlu_positive_pow(const float z, const float exponent)
-{
-    return gd_powlu_exp(exponent * gd_powlu_log(max(z, 0x1p-126f)));
+    const float e = gd_powlu_exp(-fabs(x));
+    const float inv = 1.0f / (1.0f + e);
+    return select(e * inv, inv, x >= 0.0f);
 }
 
 static inline float gd_powlu_gate(const float z, const float m)
 {
+    const bool pos = z > 0.0f;
     const float s = gd_powlu_sigmoid_stable(z);
-    if (z <= 0.0f) {
-        return z * s;
-    }
-    const float r = gd_powlu_sqrt(z);
+    const float neg_gate = z * s;
+    const float zp = max(z, GD_POWLU_F16_MIN_POS);
+    const float r = gd_powlu_sqrt(zp);
     const float a = m / (r + 1.0f);
-    return gd_powlu_positive_pow(z, a) * s;
+    const float pos_gate = gd_powlu_exp(a * gd_powlu_log(zp)) * s;
+    return select(neg_gate, pos_gate, pos);
 }
 
 static inline float gd_powlu_gate_grad(const float z, const float m)
 {
+    const bool pos = z > 0.0f;
     const float s = gd_powlu_sigmoid_stable(z);
-    if (z <= 0.0f) {
-        return s * (1.0f + z * (1.0f - s));
-    }
-    const float r = gd_powlu_sqrt(z);
+    const float neg_grad = s * (1.0f + z * (1.0f - s));
+    const float zp = max(z, GD_POWLU_F16_MIN_POS);
+    const float r = gd_powlu_sqrt(zp);
     const float rp1 = r + 1.0f;
     const float a = m / rp1;
-    const float lz = gd_powlu_log(max(z, 0x1p-126f));
+    const float lz = gd_powlu_log(zp);
     const float g = gd_powlu_exp(a * lz);
     const float da = -m / (2.0f * r * rp1 * rp1);
-    return g * s * (a / z + da * lz + (1.0f - s));
+    const float pos_grad = g * s * (a / zp + da * lz + (1.0f - s));
+    return select(neg_grad, pos_grad, pos);
 }
 
 static inline float2 gd_powlu_gate_and_grad(const float z, const float m)
 {
+    const bool pos = z > 0.0f;
     const float s = gd_powlu_sigmoid_stable(z);
-    if (z <= 0.0f) {
-        return float2(z * s, s * (1.0f + z * (1.0f - s)));
-    }
-    const float r = gd_powlu_sqrt(z);
+    const float neg_gate = z * s;
+    const float neg_grad = s * (1.0f + z * (1.0f - s));
+    const float zp = max(z, GD_POWLU_F16_MIN_POS);
+    const float r = gd_powlu_sqrt(zp);
     const float rp1 = r + 1.0f;
     const float a = m / rp1;
-    const float lz = gd_powlu_log(max(z, 0x1p-126f));
+    const float lz = gd_powlu_log(zp);
     const float g = gd_powlu_exp(a * lz);
     const float da = -m / (2.0f * r * rp1 * rp1);
-    const float gate = g * s;
-    return float2(gate, gate * (a / z + da * lz + (1.0f - s)));
+    const float pos_gate = g * s;
+    const float pos_grad = pos_gate * (a / zp + da * lz + (1.0f - s));
+    return float2(select(neg_gate, pos_gate, pos), select(neg_grad, pos_grad, pos));
 }
 
 kernel void gd_powlu_forward_f16_kernel(device const uchar *x1buf [[buffer(0)]],

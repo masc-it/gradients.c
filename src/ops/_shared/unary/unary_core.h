@@ -161,7 +161,7 @@ static inline gd_status gd_unary_backward_impl_with_backend(
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL ||
+    if (ctx == NULL || x == NULL || grad_out == NULL ||
         !gd_unary_spec_valid(spec) || backend_backward == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -176,6 +176,9 @@ static inline gd_status gd_unary_backward_impl_with_backend(
                                 spec->grad_contiguous_message);
     if (st != GD_OK) {
         return st;
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx,
                          GD_ARENA_SCRATCH,

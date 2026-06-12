@@ -411,7 +411,7 @@ static inline gd_status gd_reduce_axis_backward_impl(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL || !(scale == scale)) {
+    if (ctx == NULL || x == NULL || grad_out == NULL || !(scale == scale)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_reduce_validate_input(ctx, x);
@@ -430,6 +430,9 @@ static inline gd_status gd_reduce_axis_backward_impl(gd_context *ctx,
         !gd_reduce_axis_grad_shape_matches(x, grad_out, normalized_axis, keepdims)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "reduce axis backward grad_out shape mismatch");
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
@@ -458,7 +461,7 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL || !(scale == scale)) {
+    if (ctx == NULL || x == NULL || grad_out == NULL || !(scale == scale)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_reduce_validate_input(ctx, x);
@@ -474,6 +477,9 @@ static inline gd_status gd_reduce_all_backward_impl(gd_context *ctx,
     if (!grad_dtype_ok || grad_out->rank != 0U || !gd_tensor_is_contiguous(grad_out)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                     "reduce backward requires scalar grad_out with compatible dtype");
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {

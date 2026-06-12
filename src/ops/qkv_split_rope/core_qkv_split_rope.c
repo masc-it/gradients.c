@@ -319,7 +319,7 @@ gd_status gd_qkv_split_rope_backward(gd_context *ctx,
         memset(grad_qkv, 0, sizeof(*grad_qkv));
     }
     if (ctx == NULL || qkv == NULL || pos_ids == NULL || grad_q == NULL || grad_k == NULL ||
-        grad_v == NULL || grad_qkv == NULL) {
+        grad_v == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_qkv_split_rope_validate_qkv(ctx, qkv, pos_ids, n_heads, head_dim, &tokens, &width);
@@ -359,6 +359,9 @@ gd_status gd_qkv_split_rope_backward(gd_context *ctx,
     }
     if (!gd_qkv_split_rope_same_shape(grad_q, grad_k) || !gd_qkv_split_rope_same_shape(grad_q, grad_v)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "qkv_split_rope grad shape mismatch");
+    }
+    if (grad_qkv == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(qkv->rank, qkv->shape), 256U, &dqkv);
     if (st != GD_OK) {

@@ -504,8 +504,7 @@ gd_status gd_rms_norm_backward(gd_context *ctx,
     memset(&dx, 0, sizeof(dx));
     memset(&dw, 0, sizeof(dw));
     memset(&inv_rms, 0, sizeof(inv_rms));
-    if (ctx == NULL || x == NULL || weight == NULL || grad_out == NULL ||
-        (!need_grad_x && !need_grad_weight)) {
+    if (ctx == NULL || x == NULL || weight == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_rms_norm_validate_forward(ctx, x, weight, eps, &rows, &cols);
@@ -519,6 +518,9 @@ gd_status gd_rms_norm_backward(gd_context *ctx,
     st = gd_rms_norm_make_args(ctx, rows, cols, eps, &args);
     if (st != GD_OK) {
         return st;
+    }
+    if (!need_grad_x && !need_grad_weight) {
+        return GD_OK;
     }
     if (need_grad_weight) {
         int64_t stats_shape[1];

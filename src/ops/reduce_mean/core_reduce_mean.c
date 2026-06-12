@@ -60,7 +60,7 @@ gd_status gd_reduce_mean_backward(gd_context *ctx,
 {
     gd_status st;
     size_t count;
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_reduce_validate_input(ctx, x);
@@ -83,7 +83,7 @@ gd_status gd_reduce_mean_axis_backward(gd_context *ctx,
 {
     gd_status st;
     uint32_t normalized_axis;
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_reduce_validate_input(ctx, x);

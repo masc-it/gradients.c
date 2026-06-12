@@ -10,6 +10,11 @@
 extern "C" {
 #endif
 
+/* Direct backward helpers accept NULL grad_* output pointers to omit gradients.
+ * If every grad_* output is NULL, helpers validate inputs/grad_out and return
+ * GD_OK without enqueueing backward work. Requesting gradients for
+ * non-differentiable inputs still returns GD_ERR_UNSUPPORTED. */
+
 gd_status gd_relu(gd_context *ctx,
                   const gd_tensor *x,
                   gd_tensor *out);

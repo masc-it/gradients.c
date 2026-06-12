@@ -537,7 +537,11 @@ static int gd_generate_public_ops(const gd_gen_ops *ops)
                          "#include <gradients/tensor.h>\n\n"
                          "#ifdef __cplusplus\n"
                          "extern \"C\" {\n"
-                         "#endif\n\n");
+                         "#endif\n\n"
+                         "/* Direct backward helpers accept NULL grad_* output pointers to omit gradients.\n"
+                         " * If every grad_* output is NULL, helpers validate inputs/grad_out and return\n"
+                         " * GD_OK without enqueueing backward work. Requesting gradients for\n"
+                         " * non-differentiable inputs still returns GD_ERR_UNSUPPORTED. */\n\n");
     for (i = 0U; ok && i < ops->count; ++i) {
         if (ops->items[i].api_unary) {
             char tmp[1024];

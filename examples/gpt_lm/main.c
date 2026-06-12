@@ -1084,9 +1084,18 @@ static void gpt_load_training_state(gd_context *ctx,
     saved_lr.total_steps = gpt_state_u64(ctx, text, "lr.total_steps");
     if (saved_lr.max_lr != lr_config->max_lr || saved_lr.min_lr != lr_config->min_lr ||
         saved_lr.warmup_steps != lr_config->warmup_steps || saved_lr.total_steps != lr_config->total_steps) {
-        printf("resume: restored saved scheduler config; current CLI schedule differs\n");
+        printf("resume: using current scheduler config; saved checkpoint schedule differs "
+               "saved=(max=%.6g min=%.6g warmup=%llu total=%llu) "
+               "current=(max=%.6g min=%.6g warmup=%llu total=%llu)\n",
+               (double)saved_lr.max_lr,
+               (double)saved_lr.min_lr,
+               (unsigned long long)saved_lr.warmup_steps,
+               (unsigned long long)saved_lr.total_steps,
+               (double)lr_config->max_lr,
+               (double)lr_config->min_lr,
+               (unsigned long long)lr_config->warmup_steps,
+               (unsigned long long)lr_config->total_steps);
     }
-    *lr_config = saved_lr;
 
     amp_state.config.enabled = gpt_state_bool(ctx, text, "amp.enabled");
     amp_state.config.defer_found_inf = gpt_state_bool(ctx, text, "amp.defer_found_inf");
@@ -1473,7 +1482,7 @@ int main(int argc, char **argv)
             gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
         }
         total_steps = (size_t)config.epochs * steps_per_epoch;
-        if (config.save_best || config.save_latest || config.early_stopping_patience > 0) {
+        if (config.save_best || config.early_stopping_patience > 0) {
             TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, config.val_split, &val_dataset));
             val_samples = (size_t)gd_dataset_num_samples(val_dataset);
             if (val_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {

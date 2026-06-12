@@ -13,8 +13,7 @@ static gd_status gd_linear_backward_validate(gd_context *ctx,
                                              gd_linear_shape_info *info)
 {
     gd_status st;
-    if (ctx == NULL || x == NULL || w == NULL || grad_out == NULL || info == NULL ||
-        (!need_grad_x && !need_grad_w && !need_grad_bias)) {
+    if (ctx == NULL || x == NULL || w == NULL || grad_out == NULL || info == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (need_grad_bias && bias == NULL) {
@@ -74,6 +73,9 @@ gd_status gd_linear_backward(gd_context *ctx,
                                      &info);
     if (st != GD_OK) {
         return st;
+    }
+    if (!need_grad_x && !need_grad_w && !need_grad_bias) {
+        return GD_OK;
     }
     if (!gd_linear_flat_matrix_view_from_tensor(x, info.rows, info.k, &xv) ||
         !gd_op_matrix_view_from_tensor(w, &wv) ||

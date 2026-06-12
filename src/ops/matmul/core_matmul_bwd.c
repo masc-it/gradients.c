@@ -11,8 +11,7 @@ static gd_status gd_matmul_backward_validate(gd_context *ctx,
                                              gd_matmul_shape_info *info)
 {
     gd_status st;
-    if (ctx == NULL || x == NULL || w == NULL || grad_out == NULL || info == NULL ||
-        (!need_grad_x && !need_grad_w)) {
+    if (ctx == NULL || x == NULL || w == NULL || grad_out == NULL || info == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_matmul_validate_common(ctx, x, w, info);
@@ -103,6 +102,9 @@ gd_status gd_matmul_backward(gd_context *ctx,
     st = gd_matmul_backward_validate(ctx, x, w, grad_out, need_grad_x, need_grad_w, &info);
     if (st != GD_OK) {
         return st;
+    }
+    if (!need_grad_x && !need_grad_w) {
+        return GD_OK;
     }
     if (gd_matmul_i64_mul_overflow((int64_t)info.batch_count, info.m, &flat_rows)) {
         return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "matmul backward flattened row count overflow");

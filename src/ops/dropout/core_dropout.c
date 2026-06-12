@@ -444,7 +444,7 @@ gd_status gd_dropout_backward(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (!gd_dropout_probability_valid(p)) {
@@ -457,6 +457,9 @@ gd_status gd_dropout_backward(gd_context *ctx,
         return st;
     }
     (void)count;
+    if (grad_x == NULL) {
+        return GD_OK;
+    }
     if (p == 0.0f) {
         *grad_x = *grad_out;
         return GD_OK;

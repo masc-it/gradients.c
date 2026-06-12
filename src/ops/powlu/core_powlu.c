@@ -434,7 +434,7 @@ gd_status gd_powlu_split_backward(gd_context *ctx,
     if (grad_x12 != NULL) {
         memset(grad_x12, 0, sizeof(*grad_x12));
     }
-    if (ctx == NULL || x12 == NULL || grad_out == NULL || grad_x12 == NULL) {
+    if (ctx == NULL || x12 == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_powlu_validate_split_grad(ctx, x12, grad_out, m, &count);
@@ -442,6 +442,9 @@ gd_status gd_powlu_split_backward(gd_context *ctx,
         return st;
     }
     (void)count;
+    if (grad_x12 == NULL) {
+        return GD_OK;
+    }
     st = gd_tensor_empty(ctx,
                          GD_ARENA_SCRATCH,
                          x12->dtype,

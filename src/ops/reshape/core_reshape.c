@@ -201,7 +201,7 @@ gd_status gd_reshape_backward(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_tensor_validate(ctx, x);
@@ -230,6 +230,9 @@ gd_status gd_reshape_backward(gd_context *ctx,
     }
     if (x_numel != grad_numel) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "reshape backward element count mismatch");
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     return gd_reshape_view_impl(ctx,
                                 grad_out,

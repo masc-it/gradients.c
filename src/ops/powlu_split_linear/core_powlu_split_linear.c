@@ -387,8 +387,7 @@ gd_status gd_powlu_split_linear_backward_with_activation(gd_context *ctx,
     memset(&db, 0, sizeof(db));
     memset(&dact, 0, sizeof(dact));
     memset(&computed_activation, 0, sizeof(computed_activation));
-    if (ctx == NULL || x12 == NULL || w == NULL || grad_out == NULL ||
-        (!need_x12 && !need_w && !need_bias)) {
+    if (ctx == NULL || x12 == NULL || w == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (need_bias && bias == NULL) {
@@ -403,6 +402,9 @@ gd_status gd_powlu_split_linear_backward_with_activation(gd_context *ctx,
     st = gd_powlu_split_linear_validate_grad_out(ctx, grad_out, &info);
     if (st != GD_OK) {
         return st;
+    }
+    if (!need_x12 && !need_w && !need_bias) {
+        return GD_OK;
     }
     if (act != NULL) {
         st = gd_powlu_split_linear_validate_activation(ctx, act, &info);

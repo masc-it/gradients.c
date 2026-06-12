@@ -9,6 +9,11 @@
 extern "C" {
 #endif
 
+/* Direct backward helpers accept NULL grad_* output pointers to omit gradients.
+ * If every grad_* output is NULL, helpers validate inputs/grad_out and return
+ * GD_OK without enqueueing backward work. Requesting gradients for
+ * non-differentiable inputs still returns GD_ERR_UNSUPPORTED. */
+
 /* PyTorch-style F16 matrix multiplication with full batch broadcasting:
  * x [..., M, K] @ w [..., K, N] -> out [broadcast(...), M, N].
  * Inputs must be row-strided in their innermost matrix dimensions. */

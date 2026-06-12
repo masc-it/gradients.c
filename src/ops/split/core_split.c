@@ -391,7 +391,7 @@ gd_status gd_split_backward(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_outputs == NULL || sizes == NULL || grad_x == NULL ||
+    if (ctx == NULL || x == NULL || grad_outputs == NULL || sizes == NULL ||
         n_outputs == 0U || n_outputs > GD_SPLIT_MAX_OUTPUTS) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -402,6 +402,9 @@ gd_status gd_split_backward(gd_context *ctx,
     st = gd_split_validate_grad_outputs(ctx, x, grad_outputs, sizes, n_outputs, normalized_axis);
     if (st != GD_OK) {
         return st;
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx,
                          GD_ARENA_SCRATCH,

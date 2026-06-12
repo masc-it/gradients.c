@@ -286,7 +286,7 @@ gd_status gd_embedding_backward_impl(gd_context *ctx,
     }
     memset(&dtable, 0, sizeof(dtable));
     memset(&scratch, 0, sizeof(scratch));
-    if (ctx == NULL || table == NULL || ids == NULL || grad_out == NULL || grad_table == NULL) {
+    if (ctx == NULL || table == NULL || ids == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_embedding_validate_base(ctx, table, ids, &ids_count, &vocab, &dim);
@@ -314,6 +314,9 @@ gd_status gd_embedding_backward_impl(gd_context *ctx,
             return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT,
                                         "embedding backward grad_out shape/dtype mismatch");
         }
+    }
+    if (grad_table == NULL) {
+        return GD_OK;
     }
     st = gd_embedding_make_args(ctx, ids_count, vocab, dim, &args);
     if (st != GD_OK) {

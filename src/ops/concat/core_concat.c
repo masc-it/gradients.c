@@ -373,12 +373,14 @@ gd_status gd_concat_backward(gd_context *ctx,
     int64_t out_shape[GD_MAX_DIMS];
     uint32_t i;
     int64_t axis_offset = 0;
-    if (ctx == NULL || grad_out == NULL || inputs == NULL || grad_inputs == NULL ||
+    if (ctx == NULL || grad_out == NULL || inputs == NULL ||
         n_inputs == 0U || n_inputs > GD_CONCAT_MAX_INPUTS) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    for (i = 0U; i < n_inputs; ++i) {
-        memset(&grad_inputs[i], 0, sizeof(grad_inputs[i]));
+    if (grad_inputs != NULL) {
+        for (i = 0U; i < n_inputs; ++i) {
+            memset(&grad_inputs[i], 0, sizeof(grad_inputs[i]));
+        }
     }
     st = gd_concat_validate_inputs(ctx, inputs, n_inputs, axis, &normalized_axis, out_shape, NULL);
     if (st != GD_OK) {
@@ -396,6 +398,9 @@ gd_status gd_concat_backward(gd_context *ctx,
         if (grad_out->shape[i] != out_shape[i]) {
             return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "concat backward grad_out shape mismatch");
         }
+    }
+    if (grad_inputs == NULL) {
+        return GD_OK;
     }
     for (i = 0U; i < n_inputs; ++i) {
         st = gd_concat_backward_input_impl(ctx,

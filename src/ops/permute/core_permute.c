@@ -241,7 +241,7 @@ gd_status gd_permute_backward(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_tensor_validate(ctx, x);
@@ -270,6 +270,9 @@ gd_status gd_permute_backward(gd_context *ctx,
                                         GD_ERR_INVALID_ARGUMENT,
                                         "permute backward grad_out shape mismatch");
         }
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     for (d = 0U; d < n_axes; ++d) {
         inverse[normalized[d]] = d;

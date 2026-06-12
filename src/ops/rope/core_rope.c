@@ -336,13 +336,15 @@ gd_status gd_rope_backward_from_attrs(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || pos_ids == NULL || grad_out == NULL || attrs == NULL ||
-        grad_x == NULL) {
+    if (ctx == NULL || x == NULL || pos_ids == NULL || grad_out == NULL || attrs == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_rope_validate_backward_attrs(ctx, x, pos_ids, grad_out, attrs);
     if (st != GD_OK) {
         return st;
+    }
+    if (grad_x == NULL) {
+        return GD_OK;
     }
     st = gd_tensor_empty(ctx, GD_ARENA_SCRATCH, x->dtype, gd_shape_make(x->rank, x->shape), 256U, &dx);
     if (st != GD_OK) {
@@ -369,7 +371,7 @@ gd_status gd_rope_backward(gd_context *ctx,
     if (grad_x != NULL) {
         memset(grad_x, 0, sizeof(*grad_x));
     }
-    if (ctx == NULL || x == NULL || pos_ids == NULL || grad_out == NULL || grad_x == NULL) {
+    if (ctx == NULL || x == NULL || pos_ids == NULL || grad_out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_rope_validate_forward(ctx, x, pos_ids, config, &attrs);

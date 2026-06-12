@@ -232,6 +232,9 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
     gd_backend_tensor_view dkv;
     gd_backend_tensor_view dvv;
     gd_backend_tensor_view statsv;
+    bool need_grad_q = grad_q != NULL;
+    bool need_grad_k = grad_k != NULL;
+    bool need_grad_v = grad_v != NULL;
     if (grad_q != NULL) {
         memset(grad_q, 0, sizeof(*grad_q));
     }
@@ -259,6 +262,9 @@ gd_status gd_sdpa_varlen_backward(gd_context *ctx,
         return gd_context_set_error(ctx,
                                     GD_ERR_INVALID_ARGUMENT,
                                     "sdpa_varlen backward grad_out must match output shape");
+    }
+    if (!need_grad_q && !need_grad_k && !need_grad_v) {
+        return GD_OK;
     }
     q_shape[0] = q->shape[0];
     q_shape[1] = q->shape[1];

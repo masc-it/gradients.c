@@ -501,6 +501,25 @@ gd_status gd_backend_powlu_split_backward(gd_backend *backend,
                                           const gd_backend_tensor_view *grad_x12,
                                           float m);
 
+/* SwiGLU gate: out = x1 * (x2 * sigmoid(x2)), f16 contiguous tensors. */
+gd_status gd_backend_swiglu_forward(gd_backend *backend,
+                                    const gd_backend_tensor_view *x1,
+                                    const gd_backend_tensor_view *x2,
+                                    const gd_backend_tensor_view *out);
+gd_status gd_backend_swiglu_backward(gd_backend *backend,
+                                     const gd_backend_tensor_view *x1,
+                                     const gd_backend_tensor_view *x2,
+                                     const gd_backend_tensor_view *grad_out,
+                                     const gd_backend_tensor_view *grad_x1,
+                                     const gd_backend_tensor_view *grad_x2);
+gd_status gd_backend_swiglu_split_forward(gd_backend *backend,
+                                          const gd_backend_tensor_view *x12,
+                                          const gd_backend_tensor_view *out);
+gd_status gd_backend_swiglu_split_backward(gd_backend *backend,
+                                           const gd_backend_tensor_view *x12,
+                                           const gd_backend_tensor_view *grad_out,
+                                           const gd_backend_tensor_view *grad_x12);
+
 typedef struct gd_backend_rms_norm_args {
     uint64_t rows;              /* Product of all dimensions except the last. */
     uint64_t cols;              /* Last dimension / weight length. */

@@ -28,6 +28,8 @@ extern const gd_autograd_rule gd_bwd_rule_lm_cross_entropy;
 extern const gd_autograd_rule gd_bwd_rule_qkv_split_rope;
 extern const gd_autograd_rule gd_bwd_rule_powlu_split_linear;
 extern const gd_autograd_rule gd_bwd_rule_tanh;
+extern const gd_autograd_rule gd_bwd_rule_swiglu;
+extern const gd_autograd_rule gd_bwd_rule_swiglu_split_linear;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -57,6 +59,8 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_QKV_SPLIT_ROPE] = &gd_bwd_rule_qkv_split_rope,
     [GD_OP_POWLU_SPLIT_LINEAR] = &gd_bwd_rule_powlu_split_linear,
     [GD_OP_TANH] = &gd_bwd_rule_tanh,
+    [GD_OP_SWIGLU] = &gd_bwd_rule_swiglu,
+    [GD_OP_SWIGLU_SPLIT_LINEAR] = &gd_bwd_rule_swiglu_split_linear,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

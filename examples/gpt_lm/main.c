@@ -777,6 +777,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "n_heads=%d\n"
                  "head_dim=%d\n"
                  "mlp_hidden=%d\n"
+                 "ffn_activation=swiglu\n"
                  "sdpa_window=%d\n"
                  "dropout=%.9g\n"
                  "logits_softcap=%.9g\n"
@@ -827,6 +828,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "n_heads=%d\n"
                    "head_dim=%d\n"
                    "mlp_hidden=%d\n"
+                   "ffn_activation=swiglu\n"
                    "sdpa_window=%d\n"
                    "dropout=%.9g\n"
                    "logits_softcap=%.9g\n"
@@ -1577,7 +1579,7 @@ int main(int argc, char **argv)
                (unsigned long long)config.overfit_num_samples,
                samples_per_epoch);
     }
-    printf("model: vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d sdpa_window=%d dropout=%.3f logits_softcap=%.3f\n",
+    printf("model: vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d ffn=swiglu sdpa_window=%d dropout=%.3f logits_softcap=%.3f\n",
            GPT_VOCAB_SIZE,
            GPT_D_MODEL,
            config.n_layers,

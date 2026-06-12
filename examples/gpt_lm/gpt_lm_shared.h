@@ -26,7 +26,6 @@
 #define GPT_DEFAULT_WEIGHT_DECAY 1.0e-4f
 #define GPT_DEFAULT_GRAD_CLIP_NORM 1.0f
 #define GPT_DEFAULT_RMS_EPS 1.0e-5f
-#define GPT_DEFAULT_POWLU_M 2.0f
 #define GPT_DEFAULT_MIN_P 0.0f
 #define GPT_DEFAULT_REPETITION_PENALTY 1.0f
 #define GPT_DEFAULT_SEED UINT64_C(0x6750746c6d5eed00)
@@ -83,7 +82,6 @@ typedef struct gpt_lm {
     int sdpa_window;
     float dropout_p;
     float rms_eps;
-    float powlu_m;
     float logits_softcap;
     uint64_t dropout_seed;
     gd_tensor token_embedding;

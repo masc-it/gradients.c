@@ -17,7 +17,7 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 - local causal `sdpa_varlen` sliding window: 256 for training/prompt prefill
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
-- RMSNorm, RoPE, PoWLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
+- RMSNorm, RoPE, SwiGLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
 
 ## Dataset: `ita_dict`
 

@@ -1,0 +1,2 @@
+# Custom swiglu public/backend signature; this file registers GD_OP_SWIGLU.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

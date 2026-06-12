@@ -156,6 +156,49 @@ gd_status gd_powlu_split_linear_backward(gd_context *ctx,
                                          gd_tensor *grad_w,
                                          gd_tensor *grad_bias);
 
+/* SwiGLU gated activation for MLP projections:
+ * out = x1 * (x2 * sigmoid(x2)). Current implementation is optimized for
+ * contiguous F16 tensors. */
+gd_status gd_swiglu(gd_context *ctx,
+                    const gd_tensor *x1,
+                    const gd_tensor *x2,
+                    gd_tensor *out);
+
+gd_status gd_swiglu_backward(gd_context *ctx,
+                             const gd_tensor *x1,
+                             const gd_tensor *x2,
+                             const gd_tensor *grad_out,
+                             gd_tensor *grad_x1,
+                             gd_tensor *grad_x2);
+
+/* Fused split+SwiGLU for gated MLP projections:
+ * x12 [..., 2H] -> out [..., H], where x1=x12[..., :H] and x2=x12[..., H:]. */
+gd_status gd_swiglu_split(gd_context *ctx,
+                          const gd_tensor *x12,
+                          gd_tensor *out);
+
+gd_status gd_swiglu_split_backward(gd_context *ctx,
+                                   const gd_tensor *x12,
+                                   const gd_tensor *grad_out,
+                                   gd_tensor *grad_x12);
+
+/* Fused SwiGLU gated-MLP projection:
+ * y = linear(swiglu_split(x12), w, bias), with x12 [..., 2H], w [H, N]. */
+gd_status gd_swiglu_split_linear(gd_context *ctx,
+                                 const gd_tensor *x12,
+                                 const gd_tensor *w,
+                                 const gd_tensor *bias,
+                                 gd_tensor *out);
+
+gd_status gd_swiglu_split_linear_backward(gd_context *ctx,
+                                          const gd_tensor *x12,
+                                          const gd_tensor *w,
+                                          const gd_tensor *bias,
+                                          const gd_tensor *grad_out,
+                                          gd_tensor *grad_x12,
+                                          gd_tensor *grad_w,
+                                          gd_tensor *grad_bias);
+
 /* Embedding lookup. table is contiguous F16/F32 [vocab, dim], ids is a
  * contiguous I32 tensor with rank >= 1. Output is contiguous with shape
  * ids.shape + [dim] and table dtype. Invalid ids produce NaN output values;

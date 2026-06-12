@@ -337,7 +337,6 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
     model->sdpa_window = GPT_SDPA_WINDOW;
     model->dropout_p = config->dropout_p;
     model->rms_eps = GPT_DEFAULT_RMS_EPS;
-    model->powlu_m = GPT_DEFAULT_POWLU_M;
     model->logits_softcap = config->logits_softcap;
     model->dropout_seed = splitmix64(config->seed ^ UINT64_C(0xd00d1234));
 
@@ -633,12 +632,11 @@ static gd_status gpt_block_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_powlu_split_linear(ctx,
-                                &up_gate,
-                                &block->down_proj.weight,
-                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
-                                model->powlu_m,
-                                &mlp_proj);
+    st = gd_swiglu_split_linear(ctx,
+                                 &up_gate,
+                                 &block->down_proj.weight,
+                                 block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                 &mlp_proj);
     if (st != GD_OK) {
         return st;
     }
@@ -810,12 +808,11 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_powlu_split_linear(ctx,
-                                &up_gate,
-                                &block->down_proj.weight,
-                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
-                                model->powlu_m,
-                                &mlp_proj);
+    st = gd_swiglu_split_linear(ctx,
+                                 &up_gate,
+                                 &block->down_proj.weight,
+                                 block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                 &mlp_proj);
     if (st != GD_OK) { return st; }
     return gd_add(ctx, &residual, &mlp_proj, out);
 }
@@ -923,12 +920,11 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->up_gate, &mlp_normed, &up_gate);
     if (st != GD_OK) { return st; }
-    st = gd_powlu_split_linear(ctx,
-                                &up_gate,
-                                &block->down_proj.weight,
-                                block->down_proj.has_bias ? &block->down_proj.bias : NULL,
-                                model->powlu_m,
-                                &mlp_proj);
+    st = gd_swiglu_split_linear(ctx,
+                                 &up_gate,
+                                 &block->down_proj.weight,
+                                 block->down_proj.has_bias ? &block->down_proj.bias : NULL,
+                                 &mlp_proj);
     if (st != GD_OK) { return st; }
     return gd_add(ctx, &residual, &mlp_proj, out);
 }

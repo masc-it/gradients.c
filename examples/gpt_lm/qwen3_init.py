@@ -365,7 +365,7 @@ def build_up_gate(store: TensorStore, cfg, src_layer: int, projection: torch.Ten
     idx = mlp_indices(store, cfg, src_layer)
     up = store.get(f"{prefix}.up_proj.weight")[idx, :] @ projection
     gate = store.get(f"{prefix}.gate_proj.weight")[idx, :] @ projection
-    out = torch.cat([up, gate], dim=0)  # gd_powlu_split computes x1 * powlu_gate(x2)
+    out = torch.cat([up, gate], dim=0)  # gd_swiglu_split computes x1 * silu(x2)
     return normalize_std(out, TARGET_WEIGHT_STD, rescale)
 
 

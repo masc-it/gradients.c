@@ -48,10 +48,10 @@ kernel void gd_scale_kernel(device uchar *dst [[buffer(0)]],
     if (args.dtype == 1u) {
         device half *d = reinterpret_cast<device half *>(dst + args.dst_offset);
         device const half *s = reinterpret_cast<device const half *>(src + args.src_offset);
-        d[i] = half(float(s[i]) * args.scale);
+        d[i] = args.scale == 1.0f ? s[i] : half(float(s[i]) * args.scale);
     } else if (args.dtype == 3u) {
         device float *d = reinterpret_cast<device float *>(dst + args.dst_offset);
         device const float *s = reinterpret_cast<device const float *>(src + args.src_offset);
-        d[i] = s[i] * args.scale;
+        d[i] = args.scale == 1.0f ? s[i] : s[i] * args.scale;
     }
 }

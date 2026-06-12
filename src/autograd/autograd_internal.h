@@ -101,6 +101,10 @@ const void *gd_tape_attrs(const gd_autograd_state *tape,
                           uint32_t expected_size);
 
 bool gd_autograd_get_grad(gd_bwd_ctx *bwd, uint64_t tensor_id, gd_tensor *out_grad);
+bool gd_autograd_steal_grad_if_absent(gd_bwd_ctx *bwd,
+                                      uint64_t from_tensor_id,
+                                      uint64_t to_tensor_id,
+                                      gd_tensor *out_grad);
 gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
                                  uint64_t tensor_id,
                                  const gd_tensor *contrib);

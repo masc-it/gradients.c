@@ -460,14 +460,19 @@ static gd_status gd_release_grad_slot(gd_bwd_ctx *bwd, uint64_t tensor_id)
     return GD_OK;
 }
 
-static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
-                                     uint64_t tensor_id,
-                                     const gd_tensor *like,
-                                     gd_grad_slot **out_slot)
+static gd_status gd_backend_scale_tensor(gd_context *ctx,
+                                         gd_tensor *dst,
+                                         const gd_tensor *src,
+                                         float scale);
+
+static gd_status gd_create_grad_slot_copy(gd_bwd_ctx *bwd,
+                                          uint64_t tensor_id,
+                                          const gd_tensor *contrib,
+                                          gd_grad_slot **out_slot)
 {
     gd_grad_slot *slot;
     gd_status st;
-    if (bwd == NULL || bwd->tape == NULL || like == NULL || out_slot == NULL) {
+    if (bwd == NULL || bwd->tape == NULL || contrib == NULL || out_slot == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     {
@@ -488,12 +493,21 @@ static gd_status gd_create_grad_slot(gd_bwd_ctx *bwd,
         bwd->tape->n_grads += 1U;
     }
     memset(slot, 0, sizeof(*slot));
-    st = gd_tensor_zeros(bwd->ctx, GD_ARENA_SCRATCH, like->dtype, gd_shape_make(like->rank, like->shape), GD_AUTOGRAD_GRAD_ALIGNMENT, &slot->grad);
+    st = gd_tensor_empty(bwd->ctx,
+                         GD_ARENA_SCRATCH,
+                         contrib->dtype,
+                         gd_shape_make(contrib->rank, contrib->shape),
+                         GD_AUTOGRAD_GRAD_ALIGNMENT,
+                         &slot->grad);
     if (st != GD_OK) {
         return st;
     }
     slot->grad.requires_grad = false;
     slot->grad.is_leaf = false;
+    st = gd_backend_scale_tensor(bwd->ctx, &slot->grad, contrib, 1.0f);
+    if (st != GD_OK) {
+        return st;
+    }
     slot->tensor_id = tensor_id;
     slot->occupied = true;
     *out_slot = slot;
@@ -766,6 +780,37 @@ bool gd_autograd_get_grad(gd_bwd_ctx *bwd, uint64_t tensor_id, gd_tensor *out_gr
     return true;
 }
 
+bool gd_autograd_steal_grad_if_absent(gd_bwd_ctx *bwd,
+                                      uint64_t from_tensor_id,
+                                      uint64_t to_tensor_id,
+                                      gd_tensor *out_grad)
+{
+    /*
+     * Backward rules for single-output passthrough edges (for example residual
+     * add) can transfer the output gradient slot to one input when that input
+     * does not have a gradient yet.  The rule has already copied the tensor
+     * descriptor locally, and the normal post-rule output-gradient release will
+     * become a no-op because the slot id no longer names the output.
+     */
+    gd_grad_slot *from_slot;
+    if (out_grad != NULL) {
+        memset(out_grad, 0, sizeof(*out_grad));
+    }
+    if (bwd == NULL || bwd->tape == NULL || from_tensor_id == 0U || to_tensor_id == 0U ||
+        from_tensor_id == to_tensor_id || gd_find_grad_slot(bwd->tape, to_tensor_id) != NULL) {
+        return false;
+    }
+    from_slot = gd_find_grad_slot(bwd->tape, from_tensor_id);
+    if (from_slot == NULL) {
+        return false;
+    }
+    from_slot->tensor_id = to_tensor_id;
+    if (out_grad != NULL) {
+        *out_grad = from_slot->grad;
+    }
+    return true;
+}
+
 gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
                                  uint64_t tensor_id,
                                  const gd_tensor *contrib)
@@ -783,10 +828,11 @@ gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
         if (gd_autograd_can_adopt_contrib(bwd, contrib)) {
             return gd_adopt_grad_slot(bwd, tensor_id, contrib, &slot);
         }
-        st = gd_create_grad_slot(bwd, tensor_id, contrib, &slot);
+        st = gd_create_grad_slot_copy(bwd, tensor_id, contrib, &slot);
         if (st != GD_OK) {
             return st;
         }
+        return gd_autograd_release_temporary_contrib(bwd, contrib);
     }
     st = gd_backend_accumulate_tensor(bwd->ctx, &slot->grad, contrib);
     if (st != GD_OK) {

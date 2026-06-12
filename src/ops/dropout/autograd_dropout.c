@@ -27,7 +27,8 @@ static gd_status gd_dropout_autograd_backward(gd_bwd_ctx *bwd,
         if (x == NULL) {
             return GD_ERR_INTERNAL;
         }
-        if (residual->requires_grad) {
+        if (residual->requires_grad &&
+            !gd_autograd_steal_grad_if_absent(bwd, out->id, residual->id, NULL)) {
             GD_TRY(gd_autograd_accumulate(bwd, residual->id, &grad_out));
         }
         if (x->requires_grad) {

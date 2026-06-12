@@ -51,7 +51,9 @@ static gd_status gd_add_autograd_backward(gd_bwd_ctx *bwd,
                                reduce_y ? &dy : NULL));
     }
     if (need_x) {
-        GD_TRY(gd_autograd_accumulate(bwd, x->id, reduce_x ? &dx : &grad_out));
+        if (reduce_x || !gd_autograd_steal_grad_if_absent(bwd, out->id, x->id, NULL)) {
+            GD_TRY(gd_autograd_accumulate(bwd, x->id, reduce_x ? &dx : &grad_out));
+        }
     }
     if (need_y) {
         GD_TRY(gd_autograd_accumulate(bwd, y->id, reduce_y ? &dy : &grad_out));

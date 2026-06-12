@@ -175,7 +175,6 @@ static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
     GD_METAL_PIPELINE("gd_powlu_backward_f16_kernel", powlu_backward_f16_pso),
     GD_METAL_PIPELINE("gd_powlu_split_forward_f16_kernel", powlu_split_forward_f16_pso),
     GD_METAL_PIPELINE("gd_powlu_split_backward_f16_kernel", powlu_split_backward_f16_pso),
-    GD_METAL_PIPELINE("gd_powlu_split_linear_backward_x12_f16_reg_kernel", powlu_split_linear_backward_x12_f16_reg_pso),
     GD_METAL_PIPELINE("gd_embedding_forward_f16_kernel", embedding_forward_f16_pso),
     GD_METAL_PIPELINE("gd_embedding_forward_f32_kernel", embedding_forward_f32_pso),
     GD_METAL_PIPELINE("gd_embedding_forward_vec16_f16_kernel", embedding_forward_vec16_f16_pso),

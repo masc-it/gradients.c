@@ -12,6 +12,7 @@ static gd_status gd_lm_cross_entropy_autograd_backward(gd_bwd_ctx *bwd,
     const gd_tensor *row_max = gd_tape_saved(bwd->tape, node, 0U);
     const gd_tensor *row_inv_sum = gd_tape_saved(bwd->tape, node, 1U);
     const gd_tensor *inv_valid_count = gd_tape_saved(bwd->tape, node, 2U);
+    const gd_tensor *saved_logits = node->n_saved == 4U ? gd_tape_saved(bwd->tape, node, 3U) : NULL;
     const gd_lm_cross_entropy_attrs *attrs =
         (const gd_lm_cross_entropy_attrs *)gd_tape_attrs(bwd->tape,
                                                          node,
@@ -22,7 +23,8 @@ static gd_status gd_lm_cross_entropy_autograd_backward(gd_bwd_ctx *bwd,
     bool need_hidden;
     bool need_weight;
     if (hidden == NULL || weight == NULL || targets == NULL || out == NULL ||
-        row_max == NULL || row_inv_sum == NULL || inv_valid_count == NULL || attrs == NULL) {
+        row_max == NULL || row_inv_sum == NULL || inv_valid_count == NULL || attrs == NULL ||
+        (node->n_saved != 3U && node->n_saved != 4U)) {
         return GD_ERR_INTERNAL;
     }
     if (!gd_autograd_get_grad(bwd, out->id, &grad_out)) {
@@ -40,6 +42,7 @@ static gd_status gd_lm_cross_entropy_autograd_backward(gd_bwd_ctx *bwd,
                                                    row_max,
                                                    row_inv_sum,
                                                    inv_valid_count,
+                                                   saved_logits,
                                                    attrs->logits_softcap,
                                                    &grad_out,
                                                    need_hidden ? &dhidden : NULL,

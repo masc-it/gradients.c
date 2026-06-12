@@ -205,39 +205,6 @@ static gd_status gd_powlu_split_linear_validate_grad_out(gd_context *ctx,
     return GD_OK;
 }
 
-static gd_status gd_powlu_split_linear_dispatch_backward_x12(gd_context *ctx,
-                                                             const gd_tensor *x12,
-                                                             const gd_tensor *w,
-                                                             const gd_tensor *grad_out,
-                                                             const gd_powlu_split_linear_shape_info *info,
-                                                             float m,
-                                                             gd_tensor *grad_x12)
-{
-    gd_backend_tensor_view x12v;
-    gd_backend_tensor_view dx12v;
-    gd_backend_matrix_view wv;
-    gd_backend_matrix_view gv;
-    gd_status st;
-    if (!gd_op_tensor_view_from_tensor(x12, &x12v) ||
-        !gd_op_tensor_view_from_tensor(grad_x12, &dx12v) ||
-        !gd_op_matrix_view_from_tensor(w, &wv) ||
-        !gd_linear_flat_matrix_view_from_tensor(grad_out, info->rows, info->out_cols, &gv)) {
-        return gd_context_set_error(ctx,
-                                    GD_ERR_INVALID_ARGUMENT,
-                                    "powlu_split_linear backward invalid backend view");
-    }
-    st = gd_backend_powlu_split_linear_backward_x12(gd_context_backend(ctx),
-                                                    &x12v,
-                                                    &wv,
-                                                    &gv,
-                                                    &dx12v,
-                                                    m);
-    if (st != GD_OK) {
-        return st;
-    }
-    return GD_OK;
-}
-
 static gd_status gd_powlu_split_linear_recompute_activation(gd_context *ctx,
                                                             const gd_tensor *x12,
                                                             float m,
@@ -432,32 +399,17 @@ gd_status gd_powlu_split_linear_backward_with_activation(gd_context *ctx,
     }
 
     if (need_x12) {
-        st = gd_tensor_empty(ctx,
-                             GD_ARENA_SCRATCH,
-                             GD_DTYPE_F16,
-                             gd_shape_make(x12->rank, x12->shape),
-                             256U,
-                             &dx12);
+        st = gd_powlu_split_linear_ensure_activation(ctx, x12, act, m, &computed_activation, &act);
         if (st != GD_OK) {
             return st;
         }
-        dx12.is_leaf = false;
-        st = gd_powlu_split_linear_dispatch_backward_x12(ctx, x12, w, grad_out, &info, m, &dx12);
-        if (st == GD_ERR_UNSUPPORTED) {
-            st = gd_powlu_split_linear_ensure_activation(ctx, x12, act, m, &computed_activation, &act);
-            if (st != GD_OK) {
-                return st;
-            }
-            st = gd_linear_backward(ctx, act, w, bias, grad_out, &dact, NULL, NULL);
-            if (st != GD_OK) {
-                return st;
-            }
-            st = gd_powlu_split_backward(ctx, x12, &dact, m, &dx12);
-        }
+        st = gd_linear_backward(ctx, act, w, bias, grad_out, &dact, NULL, NULL);
         if (st != GD_OK) {
-            return gd_context_set_error(ctx,
-                                        st,
-                                        "backend powlu_split_linear backward x12 failed");
+            return st;
+        }
+        st = gd_powlu_split_backward(ctx, x12, &dact, m, &dx12);
+        if (st != GD_OK) {
+            return gd_context_set_error(ctx, st, "powlu_split_linear backward x12 failed");
         }
     }
 

@@ -6,7 +6,7 @@
 of extension: new ops, new architectures, new attention mechanisms, and new
 backend kernels should be straightforward to add. 
 
-It provides graph capture, CPU reference execution, and Metal acceleration, with operator definitions, shape/meta logic, autograd rules, and backend kernels kept in per-op capsules.
+Supported backends as of now: Metal
 
 ## Adding a new operator
 

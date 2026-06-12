@@ -571,6 +571,40 @@ static size_t effective_steps_per_epoch(uint64_t dataset_samples,
     return (size_t)requested_batches;
 }
 
+typedef struct gpt_train_batch_user {
+    gpt_lm *model;
+} gpt_train_batch_user;
+
+static gd_status gpt_train_loss_fn(const gd_train_batch_step *step,
+                                   void *user_data,
+                                   gd_tensor *loss_out)
+{
+    const gpt_train_batch_user *run = (const gpt_train_batch_user *)user_data;
+    gd_tensor *input_ids;
+    gd_tensor *target_ids;
+    gd_tensor *positions;
+    gd_tensor *cu_seqlens;
+    if (step == NULL || run == NULL || run->model == NULL || loss_out == NULL ||
+        step->ctx == NULL || step->batch == NULL || step->global_step == UINT64_MAX) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    input_ids = gd_batch_tensor(step->batch, "input_ids");
+    target_ids = gd_batch_tensor(step->batch, "target_ids");
+    positions = gd_batch_tensor(step->batch, "positions");
+    cu_seqlens = gd_batch_tensor(step->batch, "cu_seqlens");
+    if (input_ids == NULL || target_ids == NULL || positions == NULL || cu_seqlens == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gpt_lm_forward(step->ctx,
+                          run->model,
+                          input_ids,
+                          target_ids,
+                          positions,
+                          cu_seqlens,
+                          step->global_step + UINT64_C(1),
+                          loss_out);
+}
+
 static void train_one_batch(gd_context *ctx,
                             gpt_lm *model,
                             gd_dataloader *loader,
@@ -587,45 +621,29 @@ static void train_one_batch(gd_context *ctx,
                             double *last_report_time,
                             size_t *last_report_step)
 {
-    gd_batch *batch = NULL;
-    gd_tensor *input_ids;
-    gd_tensor *target_ids;
-    gd_tensor *positions;
-    gd_tensor *cu_seqlens;
-    gd_tensor loss;
-    float lr = 0.0f;
     const size_t current_step = global_step + 1U;
     const int report = config->report_every > 0 &&
                        (global_step == 0U || current_step % (size_t)config->report_every == 0U ||
                         current_step == total_steps);
-
-    TRY(ctx, gd_lr_scheduler_value(lr_config, (uint64_t)global_step, &lr));
-    TRY(ctx, gd_dataloader_next(loader, &batch));
-    TRY(ctx, gd_begin_step(ctx, GD_SCOPE_TRAIN, batch));
-    input_ids = required_batch_tensor(ctx, batch, "input_ids", __LINE__);
-    target_ids = required_batch_tensor(ctx, batch, "target_ids", __LINE__);
-    positions = required_batch_tensor(ctx, batch, "positions", __LINE__);
-    cu_seqlens = required_batch_tensor(ctx, batch, "cu_seqlens", __LINE__);
-    TRY(ctx, gpt_lm_forward(ctx,
-                            model,
-                            input_ids,
-                            target_ids,
-                            positions,
-                            cu_seqlens,
-                            (uint64_t)current_step,
-                            &loss));
-    TRY(ctx, gd_backward_amp(ctx, &loss, NULL, scaler));
-    if (config->grad_clip_norm > 0.0f) {
-        TRY(ctx, gd_optimizer_step_amp_clip_lr(ctx, optimizer, scaler, lr, config->grad_clip_norm));
-    } else {
-        TRY(ctx, gd_optimizer_step_amp_lr(ctx, optimizer, scaler, lr));
-    }
-    TRY(ctx, gd_end_step(ctx));
-    TRY(ctx, gd_dataloader_release(loader, batch));
-    TRY(ctx, gd_dataloader_prefetch(loader));
+    const gd_train_batch_config step_config = {
+        .loader = loader,
+        .optimizer = optimizer,
+        .scaler = scaler,
+        .lr_schedule = lr_config,
+        .global_step = (uint64_t)global_step,
+        .grad_clip_norm = config->grad_clip_norm,
+        .prefetch_next = true,
+        .read_loss_value = report != 0,
+        .read_grad_norm = report != 0 && config->grad_clip_norm > 0.0f,
+        .sync_scaler = report != 0,
+    };
+    gpt_train_batch_user step_user = {
+        .model = model,
+    };
+    gd_train_batch_result step_result;
+    TRY(ctx, gd_train_batch(ctx, &step_config, gpt_train_loss_fn, &step_user, &step_result));
 
     if (report) {
-        float loss_value = 0.0f;
         float grad_norm = 0.0f;
         char grad_norm_text[64];
         double now;
@@ -634,10 +652,8 @@ static void train_one_batch(gd_context *ctx,
         size_t tokens;
         double batches_per_sec;
         double tokens_per_sec;
-        TRY(ctx, gd_tensor_item(ctx, &loss, &loss_value));
-        TRY(ctx, gd_amp_scaler_sync(ctx, scaler));
         if (config->grad_clip_norm > 0.0f) {
-            TRY(ctx, gd_optimizer_last_grad_norm(ctx, optimizer, &grad_norm));
+            grad_norm = step_result.has_grad_norm ? step_result.grad_norm : 0.0f;
             (void)snprintf(grad_norm_text,
                            sizeof(grad_norm_text),
                            " grad_norm=%.4g clip=%.3g",
@@ -659,13 +675,13 @@ static void train_one_batch(gd_context *ctx,
                steps_per_epoch,
                current_step,
                total_steps,
-               (double)loss_value,
-               (double)lr,
+               (double)(step_result.has_loss_value ? step_result.loss_value : 0.0f),
+               (double)(step_result.has_lr ? step_result.lr : 0.0f),
                grad_norm_text,
                batches_per_sec,
                tokens_per_sec,
-               (double)gd_amp_scaler_scale(scaler),
-               gd_amp_scaler_last_found_inf(scaler) ? " found_inf" : "");
+               (double)(step_result.has_amp_state ? step_result.amp_scale : gd_amp_scaler_scale(scaler)),
+               step_result.has_amp_state && step_result.found_inf ? " found_inf" : "");
         *last_report_time = now;
         *last_report_step = current_step;
     }

@@ -41,10 +41,8 @@ from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_jsonl  # noqa: E402
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
-DEFAULT_CLEAN_DIR = Path("/Users/mascit/projects/DataFarmer/data/definizioni-clean")
-DEFAULT_ENRICHED_DIR = Path(
-    "/Users/mascit/projects/DataFarmer/data/definizioni-clean-enriched"
-)
+DEFAULT_CLEAN_DIR = Path("~/projects/DataFarmer/data/definizioni-clean")
+DEFAULT_ENRICHED_DIR = Path("~/projects/DataFarmer/data/definizioni-clean-enriched")
 DEFAULT_CONTEXT_LENGTH = 512
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_VAL_FRACTION = 0.05
@@ -114,7 +112,9 @@ def fields_for_context(context_length: int) -> list[FieldSpec]:
         FieldSpec("input_ids", "i32", (-1,), collate="packed_sequence", ragged_dim=0),
         FieldSpec("positions", "i32", (-1,), collate="packed_sequence", ragged_dim=0),
         FieldSpec("target_ids", "i32", (-1,), collate="packed_sequence", ragged_dim=0),
-        FieldSpec("segment_lengths", "i32", (-1,), collate="packed_sequence", ragged_dim=0),
+        FieldSpec(
+            "segment_lengths", "i32", (-1,), collate="packed_sequence", ragged_dim=0
+        ),
         FieldSpec(
             "cu_seqlens",
             "i32",
@@ -458,7 +458,9 @@ def i32_tensor(array: np.ndarray) -> TensorData:
     return TensorData(dtype="i32", shape=(int(arr.size),), data=arr.tobytes(order="C"))
 
 
-def _segment_lengths_and_positions(doc_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _segment_lengths_and_positions(
+    doc_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """Return attention segment lengths and per-segment positions for one row."""
 
     if doc_ids.ndim != 1 or doc_ids.size == 0:

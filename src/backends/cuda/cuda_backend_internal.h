@@ -11,14 +11,24 @@
 
 #define GD_CUDA_DEFAULT_THREADS_PER_BLOCK 256U
 
+typedef enum gd_cuda_memory_mode {
+    GD_CUDA_MEMORY_DEVICE = 0,
+    GD_CUDA_MEMORY_MANAGED = 1,
+} gd_cuda_memory_mode;
+
 struct gd_backend {
     cudaStream_t stream;
+    cudaStream_t transfer_stream;
+    gd_cuda_memory_mode memory_mode;
+    int device;
     bool scope_active;
 };
 
 struct gd_backend_buffer {
     void *ptr;
+    void *host_ptr;
     size_t nbytes;
+    bool host_visible;
 };
 
 gd_status gd_cuda_status(cudaError_t err);

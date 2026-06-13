@@ -47,7 +47,10 @@ typedef struct gd_span {
     size_t alignment;
     uint64_t generation;
     void *buffer;
+    /* Optional CPU mapping for host-visible backends. NULL for device-local memory. */
     void *host_ptr;
+    /* Opaque validation cookie. Treat as read-only metadata. */
+    uint64_t cookie;
 } gd_span;
 
 typedef struct gd_arena_stats {

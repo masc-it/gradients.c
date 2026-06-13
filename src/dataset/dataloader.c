@@ -393,12 +393,13 @@ gd_status gd_dl_fill_slot(gd_dataloader *dl,
             gd_batch_clear_data_binding(slot);
             return status;
         }
-        if (field->tensor.storage.host_ptr == NULL) {
+        status = gd_context_data_slot_upload(dl->ctx, &field->tensor.storage,
+                                             field->host_data, field->nbytes);
+        if (status != GD_OK) {
             (void)gd_context_data_slot_abort(dl->ctx, data_slot, data_generation);
             gd_batch_clear_data_binding(slot);
-            return GD_ERR_UNSUPPORTED;
+            return status;
         }
-        memcpy(field->tensor.storage.host_ptr, field->host_data, field->nbytes);
         field->tensor.version += 1U;
         if (field->tensor.version == 0U) {
             field->tensor.version = 1U;

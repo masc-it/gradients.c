@@ -250,11 +250,7 @@ gd_status gd_tensor_item(gd_context *ctx, const gd_tensor *src, float *out)
     if (src->storage.offset > SIZE_MAX - src->view_offset) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor item invalid descriptor");
     }
-    st = gd_context_wait_for_span(ctx, &src->storage);
-    if (st != GD_OK) {
-        return st;
-    }
-    st = gd_context_flush_backend(ctx);
+    st = gd_context_prepare_span_transfer(ctx, &src->storage);
     if (st != GD_OK) {
         return st;
     }

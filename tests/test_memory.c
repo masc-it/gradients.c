@@ -46,16 +46,19 @@ static void test_arena_contract(gd_context *ctx)
     fail.buffer = (void *)(uintptr_t)0x1U;
     fail.host_ptr = (void *)(uintptr_t)0x2U;
     CHECK_STATUS(gd_alloc_scratch(ctx, 8U, 8U, &fail), GD_ERR_BAD_STATE);
-    CHECK(fail.nbytes == 0U && fail.buffer == NULL && fail.host_ptr == NULL && fail.slot == -1,
+    CHECK(fail.nbytes == 0U && fail.buffer == NULL && fail.host_ptr == NULL &&
+              fail.cookie == 0U && fail.slot == -1,
           "failed scratch alloc clears output span");
     gd_context_clear_error(ctx);
 
     CHECK_OK(gd_alloc_params(ctx, 1U, 256U, &a));
     CHECK_OK(gd_alloc_params(ctx, 7U, 64U, &b));
     CHECK(a.arena == GD_ARENA_PARAMS && a.slot == -1, "params span metadata");
-    CHECK(a.buffer != NULL && a.host_ptr != NULL, "params span exposes backend buffer and shared host pointer");
+    CHECK(a.buffer != NULL, "params span exposes backend buffer");
     CHECK(a.offset % 256U == 0U, "params offset 256B aligned");
-    CHECK(((uintptr_t)a.host_ptr % 256U) == 0U, "params host ptr 256B aligned");
+    if (a.host_ptr != NULL) {
+        CHECK(((uintptr_t)a.host_ptr % 256U) == 0U, "params host ptr 256B aligned");
+    }
     CHECK(b.offset % 64U == 0U, "params offset 64B aligned");
 
     CHECK_OK(gd_memory_stats_query(ctx, &before));

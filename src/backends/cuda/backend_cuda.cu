@@ -65,6 +65,26 @@ __global__ static void gd_cuda_fill_kernel(unsigned char *dst,
     }
 }
 
+static gd_cuda_memory_mode gd_cuda_memory_mode_from_env(void)
+{
+    const char *mode = getenv("GD_CUDA_MEMORY");
+    if (mode == NULL || mode[0] == '\0' || strcmp(mode, "device") == 0) {
+        return GD_CUDA_MEMORY_DEVICE;
+    }
+    if (strcmp(mode, "managed") == 0 || strcmp(mode, "unified") == 0) {
+        return GD_CUDA_MEMORY_MANAGED;
+    }
+    return GD_CUDA_MEMORY_DEVICE;
+}
+
+static gd_status gd_cuda_activate(gd_backend *backend)
+{
+    if (backend == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_cuda_status(cudaSetDevice(backend->device));
+}
+
 gd_status gd_backend_create_default(gd_backend **out_backend)
 {
     gd_backend *backend;
@@ -87,11 +107,19 @@ gd_status gd_backend_create_default(gd_backend **out_backend)
     if (backend == NULL) {
         return GD_ERR_OUT_OF_MEMORY;
     }
+    backend->device = 0;
     err = cudaStreamCreateWithFlags(&backend->stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         free(backend);
         return gd_cuda_status(err);
     }
+    err = cudaStreamCreateWithFlags(&backend->transfer_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        (void)cudaStreamDestroy(backend->stream);
+        free(backend);
+        return gd_cuda_status(err);
+    }
+    backend->memory_mode = gd_cuda_memory_mode_from_env();
     backend->scope_active = false;
     *out_backend = backend;
     return GD_OK;
@@ -102,8 +130,15 @@ void gd_backend_destroy(gd_backend *backend)
     if (backend == NULL) {
         return;
     }
+    (void)cudaSetDevice(backend->device);
     if (backend->stream != NULL) {
         (void)cudaStreamSynchronize(backend->stream);
+    }
+    if (backend->transfer_stream != NULL) {
+        (void)cudaStreamSynchronize(backend->transfer_stream);
+        (void)cudaStreamDestroy(backend->transfer_stream);
+    }
+    if (backend->stream != NULL) {
         (void)cudaStreamDestroy(backend->stream);
     }
     free(backend);
@@ -136,18 +171,28 @@ gd_status gd_backend_buffer_create(gd_backend *backend,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out_buffer = NULL;
+    err = cudaSetDevice(backend->device);
+    if (err != cudaSuccess) {
+        return gd_cuda_status(err);
+    }
     buffer = (gd_backend_buffer *)calloc(1U, sizeof(*buffer));
     if (buffer == NULL) {
         return GD_ERR_OUT_OF_MEMORY;
     }
     ptr = NULL;
-    err = cudaMallocManaged(&ptr, nbytes, cudaMemAttachGlobal);
+    if (backend->memory_mode == GD_CUDA_MEMORY_MANAGED) {
+        err = cudaMallocManaged(&ptr, nbytes, cudaMemAttachGlobal);
+    } else {
+        err = cudaMalloc(&ptr, nbytes);
+    }
     if (err != cudaSuccess) {
         free(buffer);
         return gd_cuda_status(err);
     }
     buffer->ptr = ptr;
+    buffer->host_ptr = backend->memory_mode == GD_CUDA_MEMORY_MANAGED ? ptr : NULL;
     buffer->nbytes = nbytes;
+    buffer->host_visible = backend->memory_mode == GD_CUDA_MEMORY_MANAGED;
     *out_buffer = buffer;
     return GD_OK;
 }
@@ -170,12 +215,12 @@ size_t gd_backend_buffer_nbytes(const gd_backend_buffer *buffer)
 
 void *gd_backend_buffer_host_ptr(gd_backend_buffer *buffer)
 {
-    return buffer != NULL ? buffer->ptr : NULL;
+    return buffer != NULL ? buffer->host_ptr : NULL;
 }
 
 bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer)
 {
-    return buffer != NULL && buffer->ptr != NULL;
+    return buffer != NULL && buffer->host_visible;
 }
 
 gd_status gd_backend_scope_begin(gd_backend *backend)
@@ -196,8 +241,11 @@ gd_status gd_backend_flush(gd_backend *backend)
     if (backend == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_cuda_status(cudaStreamSynchronize(backend->stream));
-    backend->scope_active = false;
     return st;
 }
 
@@ -212,15 +260,19 @@ gd_status gd_backend_upload(gd_backend *backend,
         !gd_cuda_byte_range_valid(buffer, offset, nbytes)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_cuda_status(cudaMemcpyAsync((unsigned char *)buffer->ptr + offset,
                                         src,
                                         nbytes,
                                         cudaMemcpyHostToDevice,
-                                        backend->stream));
+                                        backend->transfer_stream));
     if (st != GD_OK) {
         return st;
     }
-    return gd_cuda_finish_if_immediate(backend);
+    return gd_cuda_status(cudaStreamSynchronize(backend->transfer_stream));
 }
 
 gd_status gd_backend_download(gd_backend *backend,
@@ -234,15 +286,19 @@ gd_status gd_backend_download(gd_backend *backend,
         !gd_cuda_byte_range_valid(buffer, offset, nbytes)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
+    }
     st = gd_cuda_status(cudaMemcpyAsync(dst,
                                         (const unsigned char *)buffer->ptr + offset,
                                         nbytes,
                                         cudaMemcpyDeviceToHost,
-                                        backend->stream));
+                                        backend->transfer_stream));
     if (st != GD_OK) {
         return st;
     }
-    return gd_cuda_status(cudaStreamSynchronize(backend->stream));
+    return gd_cuda_status(cudaStreamSynchronize(backend->transfer_stream));
 }
 
 gd_status gd_backend_fill(gd_backend *backend,
@@ -260,6 +316,10 @@ gd_status gd_backend_fill(gd_backend *backend,
         count > UINT32_MAX || !gd_cuda_count_bytes(count, elem_size, &nbytes) ||
         !gd_cuda_byte_range_valid(buffer, offset, nbytes)) {
         return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
     }
     blocks = gd_cuda_blocks_for_count(count, GD_CUDA_DEFAULT_THREADS_PER_BLOCK);
     gd_cuda_fill_kernel<<<blocks, GD_CUDA_DEFAULT_THREADS_PER_BLOCK, 0U, backend->stream>>>(
@@ -1471,6 +1531,10 @@ gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fen
     }
     out_fence->handle = NULL;
     event = NULL;
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
+    }
     err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         return gd_cuda_status(err);

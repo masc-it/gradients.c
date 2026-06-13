@@ -31,17 +31,13 @@ gd_status gd_span_upload(gd_context *ctx,
     if (ctx == NULL || dst == NULL || src == NULL || nbytes == 0U) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_context_wait_for_span(ctx, dst);
+    st = gd_context_prepare_span_transfer(ctx, dst);
     if (st != GD_OK) {
         return st;
     }
     if (!gd_range_inside(dst->nbytes, dst_offset, nbytes) ||
         dst->offset > SIZE_MAX - dst_offset) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "span upload range out of bounds");
-    }
-    st = gd_context_flush_backend(ctx);
-    if (st != GD_OK) {
-        return st;
     }
     backend = gd_context_backend(ctx);
     if (backend == NULL || dst->buffer == NULL) {
@@ -69,17 +65,13 @@ gd_status gd_span_download(gd_context *ctx,
     if (ctx == NULL || src == NULL || dst == NULL || nbytes == 0U) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_context_wait_for_span(ctx, src);
+    st = gd_context_prepare_span_transfer(ctx, src);
     if (st != GD_OK) {
         return st;
     }
     if (!gd_range_inside(src->nbytes, src_offset, nbytes) ||
         src->offset > SIZE_MAX - src_offset) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "span download range out of bounds");
-    }
-    st = gd_context_flush_backend(ctx);
-    if (st != GD_OK) {
-        return st;
     }
     backend = gd_context_backend(ctx);
     if (backend == NULL || src->buffer == NULL) {

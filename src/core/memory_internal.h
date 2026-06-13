@@ -28,6 +28,10 @@ gd_status gd_context_data_slot_tensor(gd_context *ctx,
                                       gd_shape shape,
                                       size_t alignment,
                                       gd_tensor *out);
+gd_status gd_context_data_slot_upload(gd_context *ctx,
+                                      const gd_span *dst,
+                                      const void *src,
+                                      size_t nbytes);
 gd_status gd_context_data_slot_publish(gd_context *ctx,
                                        int32_t slot,
                                        uint64_t generation);
@@ -53,6 +57,7 @@ gd_status gd_context_set_error(gd_context *ctx, gd_status status, const char *me
 gd_status gd_context_flush_backend(gd_context *ctx);
 gd_status gd_context_synchronize(gd_context *ctx);
 gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span);
+gd_status gd_context_prepare_span_transfer(gd_context *ctx, const gd_span *span);
 
 gd_status gd_context_alloc_span(gd_context *ctx,
                                 gd_arena_kind arena,

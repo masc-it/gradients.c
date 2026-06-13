@@ -32,6 +32,7 @@ typedef struct gd_arena {
     size_t watermark;
     size_t default_alignment;
     uint64_t generation;
+    uint64_t cookie_key;
     gd_free_block *free_blocks;
     uint32_t free_count;
     uint32_t free_capacity;
@@ -211,6 +212,65 @@ static size_t gd_normalize_alignment(const gd_arena *arena, size_t alignment)
     return alignment == 0U ? arena->default_alignment : alignment;
 }
 
+static uint64_t gd_mix64(uint64_t x)
+{
+    x ^= x >> 30U;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27U;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31U;
+    return x;
+}
+
+static uint64_t gd_arena_cookie_key(gd_arena_kind kind,
+                                    int32_t slot,
+                                    const gd_backend_buffer *buffer,
+                                    size_t capacity)
+{
+    uint64_t x = UINT64_C(0x6a09e667f3bcc909);
+    x ^= gd_mix64((uint64_t)(uint32_t)kind + UINT64_C(0x9e3779b97f4a7c15));
+    x ^= gd_mix64((uint64_t)(uint32_t)slot + UINT64_C(0xbb67ae8584caa73b));
+    x ^= gd_mix64((uint64_t)(uintptr_t)buffer + UINT64_C(0x3c6ef372fe94f82b));
+    x ^= gd_mix64((uint64_t)capacity + UINT64_C(0xa54ff53a5f1d36f1));
+    x = gd_mix64(x);
+    return x != 0U ? x : UINT64_C(0x510e527fade682d1);
+}
+
+static uint64_t gd_span_cookie(const gd_arena *arena,
+                               size_t offset,
+                               size_t nbytes,
+                               size_t alignment)
+{
+    uint64_t x;
+    if (arena == NULL) {
+        return 0U;
+    }
+    x = arena->cookie_key;
+    x ^= gd_mix64(arena->generation + UINT64_C(0x9e3779b97f4a7c15));
+    x ^= gd_mix64((uint64_t)offset + UINT64_C(0xbb67ae8584caa73b));
+    x ^= gd_mix64((uint64_t)nbytes + UINT64_C(0x3c6ef372fe94f82b));
+    x ^= gd_mix64((uint64_t)alignment + UINT64_C(0xa54ff53a5f1d36f1));
+    x = gd_mix64(x);
+    return x != 0U ? x : UINT64_C(0x1f83d9abfb41bd6b);
+}
+
+static void gd_span_init_from_arena(gd_span *out,
+                                    const gd_arena *arena,
+                                    size_t offset,
+                                    size_t nbytes,
+                                    size_t alignment)
+{
+    out->arena = arena->kind;
+    out->slot = arena->slot;
+    out->offset = offset;
+    out->nbytes = nbytes;
+    out->alignment = alignment;
+    out->generation = arena->generation;
+    out->buffer = (void *)arena->buffer;
+    out->host_ptr = arena->base != NULL ? arena->base + offset : NULL;
+    out->cookie = gd_span_cookie(arena, offset, nbytes, alignment);
+}
+
 static gd_status gd_arena_init(gd_backend *backend,
                                gd_arena *arena,
                                gd_arena_kind kind,
@@ -228,13 +288,19 @@ static gd_status gd_arena_init(gd_backend *backend,
     if (st != GD_OK) {
         return st;
     }
-    if (!gd_backend_buffer_is_host_visible(arena->buffer)) {
+    if (gd_backend_buffer_nbytes(arena->buffer) < capacity) {
         gd_backend_buffer_destroy(arena->buffer);
         memset(arena, 0, sizeof(*arena));
-        return GD_ERR_UNSUPPORTED;
+        return GD_ERR_INTERNAL;
     }
     arena->base = (unsigned char *)gd_backend_buffer_host_ptr(arena->buffer);
-    if (arena->base == NULL || gd_backend_buffer_nbytes(arena->buffer) < capacity) {
+    if (gd_backend_buffer_is_host_visible(arena->buffer)) {
+        if (arena->base == NULL) {
+            gd_backend_buffer_destroy(arena->buffer);
+            memset(arena, 0, sizeof(*arena));
+            return GD_ERR_INTERNAL;
+        }
+    } else if (arena->base != NULL) {
         gd_backend_buffer_destroy(arena->buffer);
         memset(arena, 0, sizeof(*arena));
         return GD_ERR_INTERNAL;
@@ -244,6 +310,7 @@ static gd_status gd_arena_init(gd_backend *backend,
     arena->capacity = capacity;
     arena->default_alignment = default_alignment;
     arena->generation = 1U;
+    arena->cookie_key = gd_arena_cookie_key(kind, slot, arena->buffer, capacity);
     if (kind == GD_ARENA_SCRATCH) {
         arena->free_blocks = (gd_free_block *)gd_heap_alloc(GD_ARENA_MAX_FREE_BLOCKS *
                                                             sizeof(arena->free_blocks[0]));
@@ -444,14 +511,7 @@ static gd_status gd_arena_alloc(gd_context *ctx,
     }
     if (arena->free_count != 0U &&
         gd_arena_alloc_from_free(arena, nbytes, alignment, &off) == GD_OK) {
-        out->arena = arena->kind;
-        out->slot = arena->slot;
-        out->offset = off;
-        out->nbytes = nbytes;
-        out->alignment = alignment;
-        out->generation = arena->generation;
-        out->buffer = arena->buffer;
-        out->host_ptr = arena->base + off;
+        gd_span_init_from_arena(out, arena, off, nbytes, alignment);
         return GD_OK;
     }
     if (!gd_align_up_size(arena->offset, alignment, &off)) {
@@ -464,14 +524,7 @@ static gd_status gd_arena_alloc(gd_context *ctx,
     if (arena->offset > arena->watermark) {
         arena->watermark = arena->offset;
     }
-    out->arena = arena->kind;
-    out->slot = arena->slot;
-    out->offset = off;
-    out->nbytes = nbytes;
-    out->alignment = alignment;
-    out->generation = arena->generation;
-    out->buffer = arena->buffer;
-    out->host_ptr = arena->base + off;
+    gd_span_init_from_arena(out, arena, off, nbytes, alignment);
     return GD_OK;
 }
 
@@ -779,7 +832,14 @@ bool gd_context_span_is_live(const gd_context *ctx, const gd_span *span)
     if (span->offset > arena->capacity || span->nbytes > arena->capacity - span->offset) {
         return false;
     }
-    if (arena->base != NULL && span->host_ptr != arena->base + span->offset) {
+    if (span->cookie != gd_span_cookie(arena, span->offset, span->nbytes, span->alignment)) {
+        return false;
+    }
+    if (arena->base != NULL) {
+        if (span->host_ptr != arena->base + span->offset) {
+            return false;
+        }
+    } else if (span->host_ptr != NULL) {
         return false;
     }
     return true;
@@ -840,6 +900,41 @@ gd_status gd_context_wait_for_span(gd_context *ctx, const gd_span *span)
     return gd_backend_wait_until(ctx, fence);
 }
 
+static bool gd_context_span_has_active_work(const gd_context *ctx, const gd_span *span)
+{
+    if (ctx == NULL || span == NULL || !ctx->in_scope) {
+        return false;
+    }
+    switch (span->arena) {
+    case GD_ARENA_PARAMS:
+    case GD_ARENA_STATE:
+        return true;
+    case GD_ARENA_SCRATCH:
+        return span->slot >= 0 && ctx->scratch.current == span->slot;
+    case GD_ARENA_DATA:
+        return span->slot >= 0 && ctx->active_data_slot == span->slot;
+    default:
+        return false;
+    }
+}
+
+gd_status gd_context_prepare_span_transfer(gd_context *ctx, const gd_span *span)
+{
+    gd_status st;
+    if (ctx == NULL || span == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_context_wait_for_span(ctx, span);
+    if (st != GD_OK) {
+        return st;
+    }
+    if ((span->arena == GD_ARENA_SCRATCH || span->arena == GD_ARENA_DATA) &&
+        gd_context_span_has_active_work(ctx, span)) {
+        return gd_context_flush_backend(ctx);
+    }
+    return GD_OK;
+}
+
 static bool gd_state_access_valid(gd_state_access access)
 {
     return access == GD_STATE_READ || access == GD_STATE_WRITE ||
@@ -864,12 +959,10 @@ static bool gd_state_object_registered(const gd_context *ctx,
 static bool gd_state_object_live(const gd_context *ctx, const gd_state_object *object)
 {
     if (ctx == NULL || object == NULL || object->owner != ctx ||
-        !gd_state_object_registered(ctx, object) || object->span.arena != GD_ARENA_STATE ||
-        object->span.generation != ctx->state.generation || object->span.buffer != ctx->state.buffer) {
+        !gd_state_object_registered(ctx, object) || object->span.arena != GD_ARENA_STATE) {
         return false;
     }
-    return object->span.offset <= ctx->state.capacity &&
-           object->span.nbytes <= ctx->state.capacity - object->span.offset;
+    return gd_context_span_is_live(ctx, &object->span);
 }
 
 static int32_t gd_state_touched_find(const gd_context *ctx,
@@ -1260,6 +1353,49 @@ gd_status gd_context_data_slot_tensor(gd_context *ctx,
     tensor.requires_grad = false;
     tensor.is_leaf = true;
     *out = tensor;
+    return GD_OK;
+}
+
+gd_status gd_context_data_slot_upload(gd_context *ctx,
+                                      const gd_span *dst,
+                                      const void *src,
+                                      size_t nbytes)
+{
+    gd_backend *backend;
+    gd_status st;
+    if (ctx == NULL || dst == NULL || src == NULL || nbytes == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (dst->arena != GD_ARENA_DATA || dst->slot < 0 ||
+        (uint32_t)dst->slot >= ctx->data.n_slots) {
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "data slot upload requires data span");
+    }
+    if (!gd_context_span_is_live(ctx, dst)) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "data slot upload span is stale");
+    }
+    if (nbytes > dst->nbytes) {
+        return gd_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "data slot upload range out of bounds");
+    }
+    pthread_mutex_lock(&ctx->data_mutex);
+    if (ctx->data.slot_states[(uint32_t)dst->slot] !=
+            (uint8_t)GD_DATA_SLOT_FILLING_INTERNAL ||
+        ctx->data.slots[(uint32_t)dst->slot].generation != dst->generation) {
+        pthread_mutex_unlock(&ctx->data_mutex);
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "data slot is not fillable");
+    }
+    pthread_mutex_unlock(&ctx->data_mutex);
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || dst->buffer == NULL) {
+        return gd_set_error(ctx, GD_ERR_BAD_STATE, "data slot upload missing backend buffer");
+    }
+    st = gd_backend_upload(backend,
+                           (gd_backend_buffer *)dst->buffer,
+                           dst->offset,
+                           src,
+                           nbytes);
+    if (st != GD_OK) {
+        return gd_set_error(ctx, st, "backend data slot upload failed");
+    }
     return GD_OK;
 }
 

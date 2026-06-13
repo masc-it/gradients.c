@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 int main(void)
 {
@@ -29,13 +31,22 @@ int main(void)
         gd_backend_destroy(backend);
         return 3;
     }
-    if (!gd_backend_buffer_is_host_visible(buffer) ||
-        gd_backend_buffer_host_ptr(buffer) == NULL ||
-        gd_backend_buffer_nbytes(buffer) != sizeof(src)) {
-        fprintf(stderr, "bad CUDA buffer metadata\n");
-        gd_backend_buffer_destroy(buffer);
-        gd_backend_destroy(backend);
-        return 4;
+    {
+        const char *memory_mode = getenv("GD_CUDA_MEMORY");
+        const int expect_host_visible =
+            memory_mode != NULL &&
+            (strcmp(memory_mode, "managed") == 0 || strcmp(memory_mode, "unified") == 0);
+        const int host_visible = gd_backend_buffer_is_host_visible(buffer) ? 1 : 0;
+        void *host_ptr = gd_backend_buffer_host_ptr(buffer);
+        if (gd_backend_buffer_nbytes(buffer) != sizeof(src) ||
+            host_visible != expect_host_visible ||
+            (host_visible && host_ptr == NULL) ||
+            (!host_visible && host_ptr != NULL)) {
+            fprintf(stderr, "bad CUDA buffer metadata\n");
+            gd_backend_buffer_destroy(buffer);
+            gd_backend_destroy(backend);
+            return 4;
+        }
     }
 
     st = gd_backend_upload(backend, buffer, 0U, src, sizeof(src));

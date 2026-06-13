@@ -1,871 +1,880 @@
-/*
- * gradients.c operator registry generator.
- *
- * This tool intentionally reads filenames only.  Makefile passes discovered
- * capsule files; file names define op kind, registry symbols, and coverage.
- */
-
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
-typedef enum gen_category {
-    GEN_NONE = 0,
-    GEN_CORE,
-    GEN_GRAD,
-    GEN_CPU,
-    GEN_METAL,
-    GEN_METAL_SHADER
-} gen_category;
+#define GD_GEN_MAX_OPS 512U
+#define GD_GEN_NAME_MAX 96U
+#define GD_GEN_PATH_MAX 4096U
 
-typedef struct gen_file {
-    char *path;
-    char *op;
-    char *role;
-    char *name;
-    char *kind_enum;
-    char *symbol_suffix;
-} gen_file;
+#define GD_OPS_DIR "src/ops"
+#define GD_OP_KIND_PATH "src/ops/op_kind.h"
+#define GD_OP_REGISTRY_PATH "src/ops/op_registry.c"
+#define GD_OPS_GENERATED_PATH "include/gradients/ops_generated.h"
+#define GD_BACKEND_GENERATED_PATH "src/core/backend_generated.h"
+#define GD_NULL_BACKEND_GENERATED_PATH "src/backends/null/backend_generated.c"
+#define GD_METAL_OPS_GENERATED_PATH "src/backends/metal/metal_ops_generated.inc"
 
-typedef struct gen_vec {
-    gen_file *items;
-    size_t count;
-    size_t cap;
-} gen_vec;
+typedef struct gd_gen_op {
+    char name[GD_GEN_NAME_MAX];
+    char upper[GD_GEN_NAME_MAX];
+    bool has_core;
+    bool has_autograd;
+    bool api_unary;
+    bool api_binary;
+    bool api_dropout;
+    bool backend_unary;
+    bool backend_binary;
+    uint32_t old_id;
+    uint32_t new_id;
+} gd_gen_op;
 
-typedef struct str_vec {
-    char **items;
-    size_t count;
-    size_t cap;
-} str_vec;
+typedef struct gd_gen_ops {
+    gd_gen_op items[GD_GEN_MAX_OPS];
+    uint32_t count;
+} gd_gen_ops;
 
-typedef struct gen_inputs {
-    char *out_dir;
-    gen_vec core;
-    gen_vec grad;
-    gen_vec cpu;
-    gen_vec metal;
-    gen_vec metal_shader;
-} gen_inputs;
+static uint32_t gd_generated_changed_count;
 
-static void die_errno(const char *what, const char *path)
+static bool gd_path_join(char *out, size_t out_size, const char *a, const char *b)
 {
-    if (path != NULL) {
-        (void)fprintf(stderr, "gen_ops: %s %s: %s\n", what, path, strerror(errno));
-    } else {
-        (void)fprintf(stderr, "gen_ops: %s: %s\n", what, strerror(errno));
-    }
-    exit(1);
-}
-
-static void die_msg(const char *msg)
-{
-    (void)fprintf(stderr, "gen_ops: %s\n", msg);
-    exit(1);
-}
-
-static void die_path(const char *msg, const char *path)
-{
-    (void)fprintf(stderr, "gen_ops: %s: %s\n", msg, path);
-    exit(1);
-}
-
-static void *xmalloc(size_t size)
-{
-    void *ptr = malloc(size == 0u ? 1u : size);
-
-    if (ptr == NULL) {
-        die_errno("malloc", NULL);
-    }
-    return ptr;
-}
-
-static void *xrealloc(void *ptr, size_t size)
-{
-    void *next = realloc(ptr, size == 0u ? 1u : size);
-
-    if (next == NULL) {
-        die_errno("realloc", NULL);
-    }
-    return next;
-}
-
-static char *xstrdup(const char *s)
-{
-    size_t len = strlen(s);
-    char *out = xmalloc(len + 1u);
-
-    (void)memcpy(out, s, len + 1u);
-    return out;
-}
-
-static char *copy_range(const char *s, size_t len)
-{
-    char *out = xmalloc(len + 1u);
-
-    if (len > 0u) {
-        (void)memcpy(out, s, len);
-    }
-    out[len] = '\0';
-    return out;
-}
-
-static char *concat2(const char *a, const char *b)
-{
-    size_t alen = strlen(a);
-    size_t blen = strlen(b);
-    char *out = xmalloc(alen + blen + 1u);
-
-    (void)memcpy(out, a, alen);
-    (void)memcpy(out + alen, b, blen + 1u);
-    return out;
-}
-
-static char *concat3(const char *a, const char *b, const char *c)
-{
-    size_t alen = strlen(a);
-    size_t blen = strlen(b);
-    size_t clen = strlen(c);
-    char *out = xmalloc(alen + blen + clen + 1u);
-
-    (void)memcpy(out, a, alen);
-    (void)memcpy(out + alen, b, blen);
-    (void)memcpy(out + alen + blen, c, clen + 1u);
-    return out;
-}
-
-static bool starts_with(const char *s, const char *prefix)
-{
-    size_t n = strlen(prefix);
-
-    return strncmp(s, prefix, n) == 0;
-}
-
-static bool ends_with(const char *s, const char *suffix)
-{
-    size_t slen = strlen(s);
-    size_t tlen = strlen(suffix);
-
-    if (slen < tlen) {
+    int n;
+    if (out == NULL || a == NULL || b == NULL || out_size == 0U) {
         return false;
     }
-    return strcmp(s + slen - tlen, suffix) == 0;
+    n = snprintf(out, out_size, "%s/%s", a, b);
+    return n >= 0 && (size_t)n < out_size;
 }
 
-static const char *path_basename(const char *path)
+static bool gd_file_exists(const char *path)
 {
-    const char *slash = strrchr(path, '/');
-
-    return slash == NULL ? path : slash + 1;
+    struct stat st;
+    return path != NULL && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static char *path_parent_basename(const char *path)
+static bool gd_dir_exists(const char *path)
 {
-    const char *slash = strrchr(path, '/');
-    const char *prev = NULL;
-
-    if (slash == NULL || slash == path) {
-        return NULL;
-    }
-
-    prev = slash - 1;
-    while (prev > path && *prev != '/') {
-        prev--;
-    }
-    if (*prev == '/') {
-        prev++;
-    }
-    if (prev >= slash) {
-        return NULL;
-    }
-    return copy_range(prev, (size_t)(slash - prev));
+    struct stat st;
+    return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static bool is_snake_name(const char *s)
+static bool gd_snprintf_ok(char *out, size_t out_size, const char *fmt, const char *a, const char *b)
+{
+    int n;
+    if (out == NULL || fmt == NULL || out_size == 0U) {
+        return false;
+    }
+    n = snprintf(out, out_size, fmt, a, b);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_valid_op_name(const char *name)
 {
     size_t i;
-    size_t len = strlen(s);
     bool prev_underscore = false;
-
-    if (len == 0u || s[0] == '_' || s[len - 1u] == '_') {
+    if (name == NULL || name[0] == '\0' || !islower((unsigned char)name[0])) {
         return false;
     }
-    for (i = 0u; i < len; i++) {
-        char c = s[i];
-
+    for (i = 0U; name[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (islower(c) || isdigit(c)) {
+            prev_underscore = false;
+            continue;
+        }
         if (c == '_') {
-            if (prev_underscore) {
+            if (prev_underscore || name[i + 1U] == '\0') {
                 return false;
             }
             prev_underscore = true;
             continue;
         }
-        prev_underscore = false;
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
-            return false;
-        }
+        return false;
     }
-    return true;
+    return i < GD_GEN_NAME_MAX;
 }
 
-static char upper_ascii(char c)
-{
-    if (c >= 'a' && c <= 'z') {
-        return (char)(c - ('a' - 'A'));
-    }
-    return c;
-}
-
-static char *snake_to_upper(const char *s)
+static void gd_upper_from_name(const char *name, char *out, size_t out_size)
 {
     size_t i;
-    size_t len = strlen(s);
-    char *out = xmalloc(len + 1u);
-
-    for (i = 0u; i < len; i++) {
-        out[i] = upper_ascii(s[i]);
+    if (out == NULL || out_size == 0U) {
+        return;
     }
-    out[len] = '\0';
-    return out;
-}
-
-static bool role_is_fwd(const char *role)
-{
-    return strcmp(role, "fwd") == 0;
-}
-
-static char *kind_name_from_parts(const char *op, const char *role)
-{
-    if (role == NULL || role_is_fwd(role)) {
-        return xstrdup(op);
+    for (i = 0U; name != NULL && name[i] != '\0' && i + 1U < out_size; ++i) {
+        out[i] = (char)toupper((unsigned char)name[i]);
     }
-    return concat3(op, "_", role);
+    out[i] = '\0';
 }
 
-static char *kind_enum_from_name(const char *name)
-{
-    char *upper = snake_to_upper(name);
-    char *out = concat2("_GD_OP_", upper);
-
-    free(upper);
-    return out;
-}
-
-static void gen_file_clear(gen_file *file)
-{
-    free(file->path);
-    free(file->op);
-    free(file->role);
-    free(file->name);
-    free(file->kind_enum);
-    free(file->symbol_suffix);
-    *file = (gen_file){0};
-}
-
-static void gen_vec_push(gen_vec *vec, gen_file file)
-{
-    if (vec->count == vec->cap) {
-        size_t next_cap = vec->cap == 0u ? 16u : vec->cap * 2u;
-
-        if (next_cap < vec->cap) {
-            die_msg("too many operator files");
-        }
-        vec->items = xrealloc(vec->items, next_cap * sizeof(vec->items[0]));
-        vec->cap = next_cap;
-    }
-    vec->items[vec->count] = file;
-    vec->count++;
-}
-
-static void gen_vec_clear(gen_vec *vec)
+static void gd_lower_from_upper(const char *upper, char *out, size_t out_size)
 {
     size_t i;
-
-    for (i = 0u; i < vec->count; i++) {
-        gen_file_clear(&vec->items[i]);
+    if (out == NULL || out_size == 0U) {
+        return;
     }
-    free(vec->items);
-    *vec = (gen_vec){0};
+    for (i = 0U; upper != NULL && upper[i] != '\0' && i + 1U < out_size; ++i) {
+        out[i] = (char)tolower((unsigned char)upper[i]);
+    }
+    out[i] = '\0';
 }
 
-static void str_vec_push_unique(str_vec *vec, const char *s)
+static gd_gen_op *gd_find_op(gd_gen_ops *ops, const char *name)
 {
-    size_t i;
-
-    for (i = 0u; i < vec->count; i++) {
-        if (strcmp(vec->items[i], s) == 0) {
-            return;
-        }
+    uint32_t i;
+    if (ops == NULL || name == NULL) {
+        return NULL;
     }
-    if (vec->count == vec->cap) {
-        size_t next_cap = vec->cap == 0u ? 16u : vec->cap * 2u;
-
-        if (next_cap < vec->cap) {
-            die_msg("too many operator kinds");
-        }
-        vec->items = xrealloc(vec->items, next_cap * sizeof(vec->items[0]));
-        vec->cap = next_cap;
-    }
-    vec->items[vec->count] = xstrdup(s);
-    vec->count++;
-}
-
-static void str_vec_clear(str_vec *vec)
-{
-    size_t i;
-
-    for (i = 0u; i < vec->count; i++) {
-        free(vec->items[i]);
-    }
-    free(vec->items);
-    *vec = (str_vec){0};
-}
-
-static const gen_file *find_by_kind(const gen_vec *vec, const char *kind_enum)
-{
-    size_t i;
-
-    for (i = 0u; i < vec->count; i++) {
-        if (strcmp(vec->items[i].kind_enum, kind_enum) == 0) {
-            return &vec->items[i];
+    for (i = 0U; i < ops->count; ++i) {
+        if (strcmp(ops->items[i].name, name) == 0) {
+            return &ops->items[i];
         }
     }
     return NULL;
 }
 
-static void ensure_unique_kind(const gen_vec *vec, const gen_file *file, const char *category)
+static gd_gen_op *gd_add_op(gd_gen_ops *ops, const char *name)
 {
-    if (find_by_kind(vec, file->kind_enum) != NULL) {
-        (void)fprintf(stderr,
-                      "gen_ops: duplicate %s entry for %s: %s\n",
-                      category,
-                      file->kind_enum,
-                      file->path);
-        exit(1);
+    gd_gen_op *op;
+    if (ops == NULL || name == NULL || ops->count >= GD_GEN_MAX_OPS) {
+        return NULL;
     }
+    op = &ops->items[ops->count];
+    memset(op, 0, sizeof(*op));
+    snprintf(op->name, sizeof(op->name), "%s", name);
+    gd_upper_from_name(name, op->upper, sizeof(op->upper));
+    ops->count += 1U;
+    return op;
 }
 
-static void fill_common(gen_file *file, const char *path, char *op, char *role)
+static char *gd_trim(char *s)
 {
-    file->path = xstrdup(path);
-    file->op = op;
-    file->role = role;
-    file->name = kind_name_from_parts(op, role);
-    file->kind_enum = kind_enum_from_name(file->name);
-    file->symbol_suffix = xstrdup(file->name);
+    char *end;
+    if (s == NULL) {
+        return NULL;
+    }
+    while (isspace((unsigned char)*s)) {
+        s += 1;
+    }
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) {
+        end -= 1;
+    }
+    *end = '\0';
+    return s;
 }
 
-static gen_file parse_role_file(const char *path, const char *prefix, const char *ext)
+static void gd_parse_op_def(gd_gen_op *op, const char *path)
 {
-    const char *base = path_basename(path);
-    size_t prefix_len = strlen(prefix);
-    size_t ext_len = strlen(ext);
-    size_t base_len = strlen(base);
-    size_t body_len;
-    char *body = NULL;
-    char *parent = NULL;
-    char *op = NULL;
-    char *role = NULL;
-    gen_file out = {0};
-
-    if (!starts_with(base, prefix) || !ends_with(base, ext) || base_len <= prefix_len + ext_len) {
-        die_path("filename does not match expected operator capsule grammar", path);
+    FILE *f;
+    char line[256];
+    if (op == NULL || path == NULL) {
+        return;
     }
-
-    body_len = base_len - prefix_len - ext_len;
-    body = copy_range(base + prefix_len, body_len);
-    parent = path_parent_basename(path);
-
-    if (parent != NULL) {
-        size_t parent_len = strlen(parent);
-
-        if (!is_snake_name(parent)) {
-            die_path("operator directory is not lowercase snake_case", path);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *eq;
+        char *key;
+        char *value;
+        char *comment = strchr(line, '#');
+        if (comment != NULL) {
+            *comment = '\0';
         }
-        if (body_len <= parent_len ||
-            strncmp(body, parent, parent_len) != 0 ||
-            body[parent_len] != '_' ||
-            body[parent_len + 1u] == '\0') {
-            die_path("filename operator prefix does not match operator directory", path);
+        eq = strchr(line, '=');
+        if (eq == NULL) {
+            continue;
         }
-        op = xstrdup(parent);
-        role = xstrdup(body + parent_len + 1u);
-    } else {
-        char *sep = strrchr(body, '_');
-
-        if (sep == NULL || sep == body || sep[1] == '\0') {
-            die_path("filename missing role suffix", path);
-        }
-        *sep = '\0';
-        op = xstrdup(body);
-        role = xstrdup(sep + 1);
-    }
-
-    if (!is_snake_name(op)) {
-        die_path("operator name is not lowercase snake_case", path);
-    }
-    if (!is_snake_name(role)) {
-        die_path("operator role is not lowercase snake_case", path);
-    }
-
-    fill_common(&out, path, op, role);
-    free(body);
-    free(parent);
-    return out;
-}
-
-static gen_file parse_grad_file(const char *path)
-{
-    const char *prefix = "grad_";
-    const char *ext = ".c";
-    const char *base = path_basename(path);
-    size_t prefix_len = strlen(prefix);
-    size_t ext_len = strlen(ext);
-    size_t base_len = strlen(base);
-    size_t body_len;
-    char *op = NULL;
-    char *parent = NULL;
-    gen_file out = {0};
-
-    if (!starts_with(base, prefix) || !ends_with(base, ext) || base_len <= prefix_len + ext_len) {
-        die_path("filename does not match expected grad capsule grammar", path);
-    }
-
-    body_len = base_len - prefix_len - ext_len;
-    op = copy_range(base + prefix_len, body_len);
-    parent = path_parent_basename(path);
-
-    if (parent != NULL) {
-        if (!is_snake_name(parent)) {
-            die_path("operator directory is not lowercase snake_case", path);
-        }
-        if (strcmp(parent, op) != 0) {
-            die_path("grad filename operator does not match operator directory", path);
-        }
-    }
-    if (!is_snake_name(op)) {
-        die_path("operator name is not lowercase snake_case", path);
-    }
-
-    fill_common(&out, path, op, NULL);
-    free(parent);
-    return out;
-}
-
-static gen_category option_category(const char *arg)
-{
-    if (strcmp(arg, "--core") == 0) {
-        return GEN_CORE;
-    }
-    if (strcmp(arg, "--grad") == 0) {
-        return GEN_GRAD;
-    }
-    if (strcmp(arg, "--cpu") == 0) {
-        return GEN_CPU;
-    }
-    if (strcmp(arg, "--metal") == 0) {
-        return GEN_METAL;
-    }
-    if (strcmp(arg, "--metal-shaders") == 0) {
-        return GEN_METAL_SHADER;
-    }
-    return GEN_NONE;
-}
-
-static bool is_option(const char *arg)
-{
-    return starts_with(arg, "--");
-}
-
-static void add_file(gen_inputs *inputs, gen_category category, const char *path)
-{
-    gen_file file;
-
-    switch (category) {
-    case GEN_CORE:
-        file = parse_role_file(path, "core_", ".c");
-        ensure_unique_kind(&inputs->core, &file, "core");
-        gen_vec_push(&inputs->core, file);
-        break;
-    case GEN_GRAD:
-        file = parse_grad_file(path);
-        ensure_unique_kind(&inputs->grad, &file, "grad");
-        gen_vec_push(&inputs->grad, file);
-        break;
-    case GEN_CPU:
-        file = parse_role_file(path, "cpu_", ".c");
-        ensure_unique_kind(&inputs->cpu, &file, "cpu");
-        gen_vec_push(&inputs->cpu, file);
-        break;
-    case GEN_METAL:
-        file = parse_role_file(path, "metal_", ".m");
-        ensure_unique_kind(&inputs->metal, &file, "metal");
-        gen_vec_push(&inputs->metal, file);
-        break;
-    case GEN_METAL_SHADER:
-        file = parse_role_file(path, "metal_", ".metal");
-        ensure_unique_kind(&inputs->metal_shader, &file, "metal shader");
-        gen_vec_push(&inputs->metal_shader, file);
-        break;
-    case GEN_NONE:
-        die_path("file argument appears before category option", path);
-        break;
-    }
-}
-
-static void parse_args(int argc, char **argv, gen_inputs *inputs)
-{
-    gen_category current = GEN_NONE;
-    int i;
-
-    if (argc == 1) {
-        die_msg("usage: gen_ops --out DIR [--core files...] [--grad files...] [--cpu files...] [--metal files...] [--metal-shaders files...]");
-    }
-
-    for (i = 1; i < argc; i++) {
-        gen_category category;
-
-        if (strcmp(argv[i], "--out") == 0) {
-            i++;
-            if (i >= argc) {
-                die_msg("--out requires a directory");
+        *eq = '\0';
+        key = gd_trim(line);
+        value = gd_trim(eq + 1);
+        if (strcmp(key, "api") == 0) {
+            if (strcmp(value, "unary") == 0) {
+                op->api_unary = true;
+            } else if (strcmp(value, "binary") == 0) {
+                op->api_binary = true;
+            } else if (strcmp(value, "dropout") == 0) {
+                op->api_dropout = true;
             }
-            free(inputs->out_dir);
-            inputs->out_dir = xstrdup(argv[i]);
-            current = GEN_NONE;
+        } else if (strcmp(key, "backend") == 0) {
+            if (strcmp(value, "unary") == 0) {
+                op->backend_unary = true;
+            } else if (strcmp(value, "binary") == 0) {
+                op->backend_binary = true;
+            }
+        }
+    }
+    fclose(f);
+}
+
+static int gd_scan_ops(gd_gen_ops *ops)
+{
+    DIR *dir;
+    struct dirent *entry;
+    if (ops == NULL) {
+        return 1;
+    }
+    dir = opendir(GD_OPS_DIR);
+    if (dir == NULL) {
+        fprintf(stderr, "gen_ops: failed to open %s: %s\n", GD_OPS_DIR, strerror(errno));
+        return 1;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        char op_dir[GD_GEN_PATH_MAX];
+        char path[GD_GEN_PATH_MAX];
+        gd_gen_op *op;
+        if (entry->d_name[0] == '.') {
             continue;
         }
-
-        category = option_category(argv[i]);
-        if (category != GEN_NONE) {
-            current = category;
+        if (!gd_valid_op_name(entry->d_name)) {
             continue;
         }
-
-        if (is_option(argv[i])) {
-            die_path("unknown option", argv[i]);
+        if (!gd_path_join(op_dir, sizeof(op_dir), GD_OPS_DIR, entry->d_name) ||
+            !gd_dir_exists(op_dir)) {
+            continue;
         }
-        add_file(inputs, current, argv[i]);
-    }
-
-    if (inputs->out_dir == NULL) {
-        die_msg("missing --out DIR");
-    }
-}
-
-static char *out_path(const char *out_dir, const char *name)
-{
-    size_t len = strlen(out_dir);
-
-    if (len > 0u && out_dir[len - 1u] == '/') {
-        return concat2(out_dir, name);
-    }
-    return concat3(out_dir, "/", name);
-}
-
-static FILE *open_out(const char *out_dir, const char *name, char **path_out)
-{
-    char *path = out_path(out_dir, name);
-    FILE *file = fopen(path, "w");
-
-    if (file == NULL) {
-        die_errno("open", path);
-    }
-    *path_out = path;
-    return file;
-}
-
-static void close_out(FILE *file, const char *path)
-{
-    if (ferror(file) != 0) {
-        die_errno("write", path);
-    }
-    if (fclose(file) != 0) {
-        die_errno("close", path);
-    }
-}
-
-static void emit_generated_banner(FILE *file)
-{
-    (void)fprintf(file, "/* Generated by tools/gen_ops.c; do not edit. */\n\n");
-}
-
-static void emit_op_kind_h(const gen_inputs *inputs)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, "op_kind.h", &path);
-    size_t i;
-
-    emit_generated_banner(file);
-    (void)fprintf(file, "#ifndef GRADIENTS_GENERATED_OP_KIND_H\n");
-    (void)fprintf(file, "#define GRADIENTS_GENERATED_OP_KIND_H\n\n");
-    (void)fprintf(file, "typedef enum _gd_op_kind {\n");
-    (void)fprintf(file, "    _GD_OP_INVALID = 0,\n");
-    for (i = 0u; i < inputs->core.count; i++) {
-        (void)fprintf(file, "    %s,\n", inputs->core.items[i].kind_enum);
-    }
-    (void)fprintf(file, "    _GD_OP_COUNT\n");
-    (void)fprintf(file, "} _gd_op_kind;\n\n");
-    (void)fprintf(file, "#endif /* GRADIENTS_GENERATED_OP_KIND_H */\n");
-
-    close_out(file, path);
-    free(path);
-}
-
-static void emit_op_registry_inc(const gen_inputs *inputs)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, "op_registry.inc", &path);
-    size_t i;
-
-    emit_generated_banner(file);
-    for (i = 0u; i < inputs->core.count; i++) {
-        const gen_file *entry = &inputs->core.items[i];
-
-        (void)fprintf(file,
-                      "extern const _gd_op_def _gd_opdef_%s;\n",
-                      entry->symbol_suffix);
-    }
-    if (inputs->core.count > 0u) {
-        (void)fprintf(file, "\n");
-    }
-    if (inputs->core.count == 0u) {
-        (void)fprintf(file, "static const _gd_op_def *const g_op_defs[_GD_OP_COUNT] = {0};\n\n");
-    } else {
-        (void)fprintf(file, "static const _gd_op_def *const g_op_defs[_GD_OP_COUNT] = {\n");
-        for (i = 0u; i < inputs->core.count; i++) {
-            const gen_file *entry = &inputs->core.items[i];
-
-            (void)fprintf(file,
-                          "    [%s] = &_gd_opdef_%s,\n",
-                          entry->kind_enum,
-                          entry->symbol_suffix);
+        op = gd_add_op(ops, entry->d_name);
+        if (op == NULL) {
+            closedir(dir);
+            fprintf(stderr, "gen_ops: too many ops\n");
+            return 1;
         }
-        (void)fprintf(file, "};\n\n");
-    }
-    (void)fprintf(file, "static const char *const g_op_kind_names[_GD_OP_COUNT] = {\n");
-    (void)fprintf(file, "    [_GD_OP_INVALID] = \"invalid\",\n");
-    for (i = 0u; i < inputs->core.count; i++) {
-        const gen_file *entry = &inputs->core.items[i];
-
-        (void)fprintf(file,
-                      "    [%s] = \"%s\",\n",
-                      entry->kind_enum,
-                      entry->name);
-    }
-    (void)fprintf(file, "};\n");
-
-    close_out(file, path);
-    free(path);
-}
-
-static void emit_bwd_registry_inc(const gen_inputs *inputs)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, "bwd_registry.inc", &path);
-    size_t i;
-
-    emit_generated_banner(file);
-    for (i = 0u; i < inputs->grad.count; i++) {
-        const gen_file *entry = &inputs->grad.items[i];
-
-        (void)fprintf(file,
-                      "extern const _gd_bwd_rule _gd_bwd_rule_%s;\n",
-                      entry->symbol_suffix);
-    }
-    if (inputs->grad.count > 0u) {
-        (void)fprintf(file, "\n");
-    }
-    if (inputs->grad.count == 0u) {
-        (void)fprintf(file, "static const _gd_bwd_rule *const g_bwd_rules[_GD_OP_COUNT] = {0};\n");
-    } else {
-        (void)fprintf(file, "static const _gd_bwd_rule *const g_bwd_rules[_GD_OP_COUNT] = {\n");
-        for (i = 0u; i < inputs->grad.count; i++) {
-            const gen_file *entry = &inputs->grad.items[i];
-
-            (void)fprintf(file,
-                          "    [%s] = &_gd_bwd_rule_%s,\n",
-                          entry->kind_enum,
-                          entry->symbol_suffix);
+        if (!gd_snprintf_ok(path, sizeof(path), "%s/core_%s.c", op_dir, op->name)) {
+            closedir(dir);
+            fprintf(stderr, "gen_ops: path too long for %s\n", op->name);
+            return 1;
         }
-        (void)fprintf(file, "};\n");
-    }
-
-    close_out(file, path);
-    free(path);
-}
-
-static void emit_backend_registry_inc(const gen_inputs *inputs,
-                                      const gen_vec *vec,
-                                      const char *filename,
-                                      const char *type_name,
-                                      const char *symbol_prefix,
-                                      const char *array_name,
-                                      const char *count_name)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, filename, &path);
-    size_t i;
-
-    emit_generated_banner(file);
-    for (i = 0u; i < vec->count; i++) {
-        const gen_file *entry = &vec->items[i];
-
-        (void)fprintf(file,
-                      "extern const %s %s_%s;\n",
-                      type_name,
-                      symbol_prefix,
-                      entry->symbol_suffix);
-    }
-    if (vec->count > 0u) {
-        (void)fprintf(file, "\n");
-    }
-    if (vec->count == 0u) {
-        (void)fprintf(file, "static const %s *const %s[1] = {0};\n", type_name, array_name);
-    } else {
-        (void)fprintf(file,
-                      "static const %s *const %s[%zu] = {\n",
-                      type_name,
-                      array_name,
-                      vec->count);
-        for (i = 0u; i < vec->count; i++) {
-            const gen_file *entry = &vec->items[i];
-
-            (void)fprintf(file, "    &%s_%s,\n", symbol_prefix, entry->symbol_suffix);
+        op->has_core = gd_file_exists(path);
+        if (!gd_snprintf_ok(path, sizeof(path), "%s/autograd_%s.c", op_dir, op->name)) {
+            closedir(dir);
+            fprintf(stderr, "gen_ops: path too long for %s\n", op->name);
+            return 1;
         }
-        (void)fprintf(file, "};\n");
-    }
-    (void)fprintf(file, "static const unsigned %s = %zuu;\n", count_name, vec->count);
-
-    close_out(file, path);
-    free(path);
-}
-
-static void emit_metal_shaders_mk(const gen_inputs *inputs)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, "metal_shaders.mk", &path);
-    size_t i;
-
-    (void)fprintf(file, "# Generated by tools/gen_ops.c; do not edit.\n\n");
-    (void)fprintf(file, "METAL_OP_SHADER_FILES :=");
-    if (inputs->metal_shader.count == 0u) {
-        (void)fprintf(file, "\n");
-    } else {
-        (void)fprintf(file, " \\\n");
-        for (i = 0u; i < inputs->metal_shader.count; i++) {
-            const char *suffix = i + 1u == inputs->metal_shader.count ? "" : " \\";
-
-            (void)fprintf(file, "  %s%s\n", inputs->metal_shader.items[i].path, suffix);
+        op->has_autograd = gd_file_exists(path);
+        if (!gd_snprintf_ok(path, sizeof(path), "%s/op_%s.def", op_dir, op->name)) {
+            closedir(dir);
+            fprintf(stderr, "gen_ops: path too long for %s\n", op->name);
+            return 1;
+        }
+        gd_parse_op_def(op, path);
+        if (!op->has_core && !op->has_autograd) {
+            ops->count -= 1U;
         }
     }
-
-    close_out(file, path);
-    free(path);
+    closedir(dir);
+    return 0;
 }
 
-static const char *matrix_path(const gen_vec *vec, const char *kind_enum)
+static void gd_apply_existing_order(gd_gen_ops *ops)
 {
-    const gen_file *entry = find_by_kind(vec, kind_enum);
-
-    return entry == NULL ? "" : entry->path;
-}
-
-static const char *matrix_mark(const gen_vec *vec, const char *kind_enum)
-{
-    return find_by_kind(vec, kind_enum) == NULL ? "" : "yes";
-}
-
-static void matrix_add_all(str_vec *kinds, const gen_vec *vec)
-{
-    size_t i;
-
-    for (i = 0u; i < vec->count; i++) {
-        str_vec_push_unique(kinds, vec->items[i].kind_enum);
+    FILE *f;
+    char line[512];
+    if (ops == NULL) {
+        return;
     }
-}
-
-static void emit_op_matrix_md(const gen_inputs *inputs)
-{
-    char *path = NULL;
-    FILE *file = open_out(inputs->out_dir, "op_matrix.md", &path);
-    str_vec kinds = {0};
-    size_t i;
-
-    matrix_add_all(&kinds, &inputs->core);
-    matrix_add_all(&kinds, &inputs->grad);
-    matrix_add_all(&kinds, &inputs->cpu);
-    matrix_add_all(&kinds, &inputs->metal);
-    matrix_add_all(&kinds, &inputs->metal_shader);
-
-    (void)fprintf(file, "# Operator Matrix\n\n");
-    (void)fprintf(file, "Generated by `tools/gen_ops.c`. Source of truth is `src/ops/*/*`.\n\n");
-    if (kinds.count == 0u) {
-        (void)fprintf(file, "No operator capsule files discovered.\n");
-    } else {
-        (void)fprintf(file, "| op kind | core | grad | cpu | metal host | metal shader |\n");
-        (void)fprintf(file, "| --- | --- | --- | --- | --- | --- |\n");
-        for (i = 0u; i < kinds.count; i++) {
-            const char *kind = kinds.items[i];
-
-            (void)fprintf(file,
-                          "| `%s` | %s | %s | %s | %s | %s |\n",
-                          kind,
-                          matrix_path(&inputs->core, kind),
-                          matrix_mark(&inputs->grad, kind),
-                          matrix_mark(&inputs->cpu, kind),
-                          matrix_mark(&inputs->metal, kind),
-                          matrix_mark(&inputs->metal_shader, kind));
+    f = fopen(GD_OP_KIND_PATH, "r");
+    if (f == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = strstr(line, "GD_OP_");
+        while (p != NULL) {
+            char token[GD_GEN_NAME_MAX];
+            char lower[GD_GEN_NAME_MAX];
+            size_t len = 0U;
+            char *q = p + strlen("GD_OP_");
+            while ((isupper((unsigned char)q[len]) || isdigit((unsigned char)q[len]) || q[len] == '_') &&
+                   len + 1U < sizeof(token)) {
+                len += 1U;
+            }
+            if (len > 0U) {
+                uint32_t value = 0U;
+                char *eq;
+                memcpy(token, q, len);
+                token[len] = '\0';
+                gd_lower_from_upper(token, lower, sizeof(lower));
+                if (strcmp(lower, "invalid") != 0 && strcmp(lower, "count") != 0) {
+                    gd_gen_op *op = gd_find_op(ops, lower);
+                    if (op != NULL) {
+                        eq = strchr(q + len, '=');
+                        if (eq != NULL) {
+                            unsigned long parsed = strtoul(eq + 1, NULL, 10);
+                            if (parsed > 0UL && parsed <= UINT32_MAX) {
+                                value = (uint32_t)parsed;
+                            }
+                        }
+                        if (value != 0U) {
+                            op->old_id = value;
+                        }
+                    }
+                }
+            }
+            p = strstr(q + len, "GD_OP_");
         }
     }
-
-    str_vec_clear(&kinds);
-    close_out(file, path);
-    free(path);
+    fclose(f);
 }
 
-static void emit_all(const gen_inputs *inputs)
+static int gd_compare_ops(const void *a, const void *b)
 {
-    emit_op_kind_h(inputs);
-    emit_op_registry_inc(inputs);
-    emit_bwd_registry_inc(inputs);
-    emit_backend_registry_inc(inputs,
-                              &inputs->cpu,
-                              "cpu_registry.inc",
-                              "_gd_cpu_op",
-                              "_gd_cpu_op",
-                              "g_cpu_ops",
-                              "g_cpu_op_count");
-    emit_backend_registry_inc(inputs,
-                              &inputs->metal,
-                              "metal_registry.inc",
-                              "_gd_metal_op",
-                              "_gd_metal_op",
-                              "g_metal_ops",
-                              "g_metal_op_count");
-    emit_metal_shaders_mk(inputs);
-    emit_op_matrix_md(inputs);
+    const gd_gen_op *oa = (const gd_gen_op *)a;
+    const gd_gen_op *ob = (const gd_gen_op *)b;
+    if (oa->old_id != 0U && ob->old_id != 0U) {
+        if (oa->old_id < ob->old_id) {
+            return -1;
+        }
+        if (oa->old_id > ob->old_id) {
+            return 1;
+        }
+        return strcmp(oa->name, ob->name);
+    }
+    if (oa->old_id != 0U) {
+        return -1;
+    }
+    if (ob->old_id != 0U) {
+        return 1;
+    }
+    return strcmp(oa->name, ob->name);
 }
 
-static void gen_inputs_clear(gen_inputs *inputs)
+static void gd_assign_new_ids(gd_gen_ops *ops)
 {
-    free(inputs->out_dir);
-    gen_vec_clear(&inputs->core);
-    gen_vec_clear(&inputs->grad);
-    gen_vec_clear(&inputs->cpu);
-    gen_vec_clear(&inputs->metal);
-    gen_vec_clear(&inputs->metal_shader);
-    *inputs = (gen_inputs){0};
+    uint32_t i;
+    qsort(ops->items, ops->count, sizeof(ops->items[0]), gd_compare_ops);
+    for (i = 0U; i < ops->count; ++i) {
+        ops->items[i].new_id = i + 1U;
+    }
+}
+
+static bool gd_append(char **buf, size_t *len, size_t *cap, const char *text)
+{
+    size_t need;
+    size_t text_len;
+    char *grown;
+    if (buf == NULL || len == NULL || cap == NULL || text == NULL) {
+        return false;
+    }
+    text_len = strlen(text);
+    if (*len > SIZE_MAX - text_len - 1U) {
+        return false;
+    }
+    need = *len + text_len + 1U;
+    if (need > *cap) {
+        size_t new_cap = *cap == 0U ? 4096U : *cap;
+        while (new_cap < need) {
+            if (new_cap > SIZE_MAX / 2U) {
+                return false;
+            }
+            new_cap *= 2U;
+        }
+        grown = (char *)realloc(*buf, new_cap);
+        if (grown == NULL) {
+            return false;
+        }
+        *buf = grown;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, text, text_len + 1U);
+    *len += text_len;
+    return true;
+}
+
+static bool gd_appendf(char **buf, size_t *len, size_t *cap, const char *fmt, const char *a, uint32_t b)
+{
+    char tmp[512];
+    int n = snprintf(tmp, sizeof(tmp), fmt, a, b);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) {
+        return false;
+    }
+    return gd_append(buf, len, cap, tmp);
+}
+
+static bool gd_read_file(const char *path, char **out, size_t *out_len)
+{
+    FILE *f;
+    long size;
+    char *buf;
+    size_t nread;
+    if (out == NULL || out_len == NULL) {
+        return false;
+    }
+    *out = NULL;
+    *out_len = 0U;
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return false;
+    }
+    if (fseek(f, 0L, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    size = ftell(f);
+    if (size < 0L) {
+        fclose(f);
+        return false;
+    }
+    if (fseek(f, 0L, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    buf = (char *)malloc((size_t)size + 1U);
+    if (buf == NULL) {
+        fclose(f);
+        return false;
+    }
+    nread = fread(buf, 1U, (size_t)size, f);
+    fclose(f);
+    if (nread != (size_t)size) {
+        free(buf);
+        return false;
+    }
+    buf[nread] = '\0';
+    *out = buf;
+    *out_len = nread;
+    return true;
+}
+
+static int gd_write_if_changed(const char *path, const char *content, size_t len)
+{
+    char *old = NULL;
+    size_t old_len = 0U;
+    FILE *f;
+    bool same = false;
+    if (gd_read_file(path, &old, &old_len)) {
+        same = old_len == len && memcmp(old, content, len) == 0;
+    }
+    free(old);
+    if (same) {
+        printf("[ops-registry] unchanged %s\n", path);
+        return 0;
+    }
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "gen_ops: failed to write %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (fwrite(content, 1U, len, f) != len) {
+        fprintf(stderr, "gen_ops: short write %s\n", path);
+        fclose(f);
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "gen_ops: failed to close %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    gd_generated_changed_count += 1U;
+    printf("[ops-registry] generated %s\n", path);
+    return 0;
+}
+
+static int gd_touch_file(const char *path)
+{
+    FILE *f;
+    if (path == NULL) {
+        return 1;
+    }
+    f = fopen(path, "ab");
+    if (f == NULL) {
+        fprintf(stderr, "gen_ops: failed to touch %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "gen_ops: failed to close %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+static int gd_generate_op_kind(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#ifndef GD_OP_KIND_H\n"
+                         "#define GD_OP_KIND_H\n\n"
+                         "/* @generated by tools/gen_ops.c; do not edit. */\n"
+                         "typedef enum gd_op_kind {\n"
+                         "    GD_OP_INVALID = 0,\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        ok = gd_appendf(&buf, &len, &cap, "    GD_OP_%s = %u,\n", ops->items[i].upper, ops->items[i].new_id);
+    }
+    if (ok) {
+        char tmp[128];
+        int n = snprintf(tmp, sizeof(tmp), "    GD_OP_COUNT = %u,\n", ops->count + 1U);
+        ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+    }
+    ok = ok && gd_append(&buf, &len, &cap, "} gd_op_kind;\n\n#endif /* GD_OP_KIND_H */\n");
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render op_kind.h\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_OP_KIND_PATH, buf, len);
+    free(buf);
+    return (int)i;
+}
+
+static int gd_generate_public_ops(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#ifndef GRADIENTS_OPS_GENERATED_H\n"
+                         "#define GRADIENTS_OPS_GENERATED_H\n\n"
+                         "/* @generated by tools/gen_ops.c; do not edit. */\n\n"
+                         "#include <gradients/status.h>\n"
+                         "#include <gradients/tensor.h>\n\n"
+                         "#ifdef __cplusplus\n"
+                         "extern \"C\" {\n"
+                         "#endif\n\n"
+                         "/* Direct backward helpers accept NULL grad_* output pointers to omit gradients.\n"
+                         " * If every grad_* output is NULL, helpers validate inputs/grad_out and return\n"
+                         " * GD_OK without enqueueing backward work. Requesting gradients for\n"
+                         " * non-differentiable inputs still returns GD_ERR_UNSUPPORTED. */\n\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].api_unary) {
+            char tmp[1024];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_%s(gd_context *ctx,\n"
+                             "                  const gd_tensor *x,\n"
+                             "                  gd_tensor *out);\n\n"
+                             "gd_status gd_%s_backward(gd_context *ctx,\n"
+                             "                           const gd_tensor *x,\n"
+                             "                           const gd_tensor *grad_out,\n"
+                             "                           gd_tensor *grad_x);\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].api_binary) {
+            char tmp[1400];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_%s(gd_context *ctx,\n"
+                             "                  const gd_tensor *x,\n"
+                             "                  const gd_tensor *y,\n"
+                             "                  gd_tensor *out);\n\n"
+                             "gd_status gd_%s_backward(gd_context *ctx,\n"
+                             "                           const gd_tensor *x,\n"
+                             "                           const gd_tensor *y,\n"
+                             "                           const gd_tensor *grad_out,\n"
+                             "                           gd_tensor *grad_x,\n"
+                             "                           gd_tensor *grad_y);\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].api_dropout) {
+            char tmp[1600];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_%s(gd_context *ctx,\n"
+                             "                  const gd_tensor *x,\n"
+                             "                  float p,\n"
+                             "                  bool training,\n"
+                             "                  uint64_t seed,\n"
+                             "                  gd_tensor *out);\n\n"
+                             "gd_status gd_%s_backward(gd_context *ctx,\n"
+                             "                           const gd_tensor *x,\n"
+                             "                           const gd_tensor *grad_out,\n"
+                             "                           float p,\n"
+                             "                           uint64_t seed,\n"
+                             "                           gd_tensor *grad_x);\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+    }
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#ifdef __cplusplus\n"
+                         "}\n"
+                         "#endif\n\n"
+                         "#endif /* GRADIENTS_OPS_GENERATED_H */\n");
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render ops_generated.h\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_OPS_GENERATED_PATH, buf, len);
+    free(buf);
+    return (int)i;
+}
+
+static int gd_generate_backend_header(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#ifndef GD_CORE_BACKEND_GENERATED_H\n"
+                         "#define GD_CORE_BACKEND_GENERATED_H\n\n"
+                         "/* @generated by tools/gen_ops.c; do not edit. */\n\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].backend_unary) {
+            char tmp[1024];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_backend_%s(gd_backend *backend,\n"
+                             "                          const gd_backend_tensor_view *x,\n"
+                             "                          const gd_backend_tensor_view *y);\n"
+                             "gd_status gd_backend_%s_backward(gd_backend *backend,\n"
+                             "                                   const gd_backend_tensor_view *x,\n"
+                             "                                   const gd_backend_tensor_view *grad_out,\n"
+                             "                                   const gd_backend_tensor_view *grad_x);\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].backend_binary) {
+            char tmp[1024];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_backend_%s(gd_backend *backend,\n"
+                             "                          const gd_backend_tensor_view *x,\n"
+                             "                          const gd_backend_tensor_view *y,\n"
+                             "                          const gd_backend_tensor_view *out);\n\n",
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+    }
+    ok = ok && gd_append(&buf, &len, &cap, "#endif /* GD_CORE_BACKEND_GENERATED_H */\n");
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render backend_generated.h\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_BACKEND_GENERATED_PATH, buf, len);
+    free(buf);
+    return (int)i;
+}
+
+static int gd_generate_null_backend(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#include \"../../core/backend.h\"\n\n"
+                         "/* @generated by tools/gen_ops.c; do not edit. */\n\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].backend_unary) {
+            char tmp[1600];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_backend_%s(gd_backend *backend,\n"
+                             "                          const gd_backend_tensor_view *x,\n"
+                             "                          const gd_backend_tensor_view *y)\n"
+                             "{\n"
+                             "    (void)backend;\n"
+                             "    (void)x;\n"
+                             "    (void)y;\n"
+                             "    return GD_ERR_UNSUPPORTED;\n"
+                             "}\n\n"
+                             "gd_status gd_backend_%s_backward(gd_backend *backend,\n"
+                             "                                   const gd_backend_tensor_view *x,\n"
+                             "                                   const gd_backend_tensor_view *grad_out,\n"
+                             "                                   const gd_backend_tensor_view *grad_x)\n"
+                             "{\n"
+                             "    (void)backend;\n"
+                             "    (void)x;\n"
+                             "    (void)grad_out;\n"
+                             "    (void)grad_x;\n"
+                             "    return GD_ERR_UNSUPPORTED;\n"
+                             "}\n\n",
+                             ops->items[i].name,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].backend_binary) {
+            char tmp[1200];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "gd_status gd_backend_%s(gd_backend *backend,\n"
+                             "                          const gd_backend_tensor_view *x,\n"
+                             "                          const gd_backend_tensor_view *y,\n"
+                             "                          const gd_backend_tensor_view *out)\n"
+                             "{\n"
+                             "    (void)backend;\n"
+                             "    (void)x;\n"
+                             "    (void)y;\n"
+                             "    (void)out;\n"
+                             "    return GD_ERR_UNSUPPORTED;\n"
+                             "}\n\n",
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+    }
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render null backend stubs\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_NULL_BACKEND_GENERATED_PATH, buf, len);
+    free(buf);
+    return (int)i;
+}
+
+static int gd_generate_metal_ops(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "/* @generated by tools/gen_ops.c; do not edit.\n"
+                         "   Included inside gd_metal_pipeline_specs[]. */\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].backend_unary) {
+            char tmp[512];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "    GD_METAL_PIPELINE_INDEX(\"gd_%s_kernel\", unary_pso, GD_OP_%s),\n"
+                             "    GD_METAL_PIPELINE_INDEX(\"gd_%s_backward_kernel\", "
+                             "unary_backward_pso, GD_OP_%s),\n",
+                             ops->items[i].name,
+                             ops->items[i].upper,
+                             ops->items[i].name,
+                             ops->items[i].upper);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+        if (ok && ops->items[i].backend_binary) {
+            char tmp[768];
+            int n = snprintf(tmp,
+                             sizeof(tmp),
+                             "    GD_METAL_PIPELINE_INDEX(\"gd_%s_kernel\", binary_pso, GD_OP_%s),\n"
+                             "    GD_METAL_PIPELINE_INDEX(\"gd_%s_bcast_kernel\", "
+                             "binary_bcast_pso, GD_OP_%s),\n"
+                             "    GD_METAL_PIPELINE_INDEX(\"gd_%s_row_bcast_kernel\", "
+                             "binary_row_bcast_pso, GD_OP_%s),\n",
+                             ops->items[i].name,
+                             ops->items[i].upper,
+                             ops->items[i].name,
+                             ops->items[i].upper,
+                             ops->items[i].name,
+                             ops->items[i].upper);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+    }
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render metal op pipeline table\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_METAL_OPS_GENERATED_PATH, buf, len);
+    free(buf);
+    return (int)i;
+}
+
+static int gd_generate_registry(const gd_gen_ops *ops)
+{
+    char *buf = NULL;
+    size_t len = 0U;
+    size_t cap = 0U;
+    uint32_t i;
+    bool ok = true;
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "#include \"autograd_impl.h\"\n\n"
+                         "/* @generated by tools/gen_ops.c; do not edit. */\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].has_autograd) {
+            ok = gd_appendf(&buf, &len, &cap,
+                            "extern const gd_autograd_rule gd_bwd_rule_%s;\n",
+                            ops->items[i].name,
+                            0U);
+        }
+    }
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "\nstatic const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {\n");
+    for (i = 0U; ok && i < ops->count; ++i) {
+        if (ops->items[i].has_autograd) {
+            char tmp[512];
+            int n = snprintf(tmp, sizeof(tmp),
+                             "    [GD_OP_%s] = &gd_bwd_rule_%s,\n",
+                             ops->items[i].upper,
+                             ops->items[i].name);
+            ok = n >= 0 && (size_t)n < sizeof(tmp) && gd_append(&buf, &len, &cap, tmp);
+        }
+    }
+    ok = ok && gd_append(&buf, &len, &cap,
+                         "};\n\n"
+                         "const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)\n"
+                         "{\n"
+                         "    if (kind <= GD_OP_INVALID || kind >= GD_OP_COUNT) {\n"
+                         "        return NULL;\n"
+                         "    }\n"
+                         "    return gd_bwd_rules[kind];\n"
+                         "}\n");
+    if (!ok) {
+        free(buf);
+        fprintf(stderr, "gen_ops: failed to render op_registry.c\n");
+        return 1;
+    }
+    i = (uint32_t)gd_write_if_changed(GD_OP_REGISTRY_PATH, buf, len);
+    free(buf);
+    return (int)i;
 }
 
 int main(int argc, char **argv)
 {
-    gen_inputs inputs = {0};
-
-    parse_args(argc, argv, &inputs);
-    emit_all(&inputs);
-    gen_inputs_clear(&inputs);
+    const char *stamp_path = NULL;
+    gd_gen_ops ops;
+    if (argc == 3 && strcmp(argv[1], "--stamp") == 0) {
+        stamp_path = argv[2];
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: %s [--stamp PATH]\n", argv[0]);
+        return 2;
+    }
+    memset(&ops, 0, sizeof(ops));
+    if (gd_scan_ops(&ops) != 0) {
+        return 1;
+    }
+    gd_apply_existing_order(&ops);
+    gd_assign_new_ids(&ops);
+    if (gd_generate_op_kind(&ops) != 0) {
+        return 1;
+    }
+    if (gd_generate_public_ops(&ops) != 0) {
+        return 1;
+    }
+    if (gd_generate_backend_header(&ops) != 0) {
+        return 1;
+    }
+    if (gd_generate_null_backend(&ops) != 0) {
+        return 1;
+    }
+    if (gd_generate_metal_ops(&ops) != 0) {
+        return 1;
+    }
+    if (gd_generate_registry(&ops) != 0) {
+        return 1;
+    }
+    if (stamp_path != NULL) {
+        if (gd_generated_changed_count != 0U || !gd_file_exists(stamp_path)) {
+            if (gd_touch_file(stamp_path) != 0) {
+                return 1;
+            }
+            printf("[ops-registry] touched %s\n", stamp_path);
+        } else {
+            printf("[ops-registry] stamp unchanged %s\n", stamp_path);
+        }
+    }
+    printf("[ops-registry] ops=%u\n", ops.count);
     return 0;
 }

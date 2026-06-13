@@ -1,7 +1,5 @@
 #include "tokenizer_internal.h"
 
-#include "../core/internal.h"
-
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,45 +18,45 @@ static gd_status gd_read_file(const char *path, uint8_t **data_out, size_t *len_
     uint8_t *data;
 
     if (path == NULL || data_out == NULL || len_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid file read arguments");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid file read arguments");
     }
     *data_out = NULL;
     *len_out = 0U;
     f = fopen(path, "rb");
     if (f == NULL) {
-        return _gd_error(GD_ERR_IO, "failed to open tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to open tokenizer input");
     }
     if (fseek(f, 0L, SEEK_END) != 0) {
         fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to seek tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to seek tokenizer input");
     }
     end = ftell(f);
     if (end < 0) {
         fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to size tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to size tokenizer input");
     }
     if ((unsigned long)end > (unsigned long)SIZE_MAX) {
         fclose(f);
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer input too large");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer input too large");
     }
     if (fseek(f, 0L, SEEK_SET) != 0) {
         fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to rewind tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to rewind tokenizer input");
     }
     data = (uint8_t *)gd_xmalloc((size_t)end);
     if (data == NULL) {
         fclose(f);
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer input allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer input allocation failed");
     }
     nread = fread(data, 1U, (size_t)end, f);
     if (nread != (size_t)end) {
         free(data);
         fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to read tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to read tokenizer input");
     }
     if (fclose(f) != 0) {
         free(data);
-        return _gd_error(GD_ERR_IO, "failed to close tokenizer input");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to close tokenizer input");
     }
     *data_out = data;
     *len_out = (size_t)end;
@@ -80,19 +78,19 @@ static gd_status gd_build_words_from_map(const gd_word_map *map,
     size_t i;
 
     if (map == NULL || words_out == NULL || n_words_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid word map conversion");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid word map conversion");
     }
     *words_out = NULL;
     *n_words_out = 0;
     if (map->size > (size_t)INT_MAX) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "too many unique tokenizer pieces");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many unique tokenizer pieces");
     }
     if (gd_mul_overflows_size(map->size, sizeof(gd_bpe_word))) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "word array allocation overflow");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "word array allocation overflow");
     }
     words = (gd_bpe_word *)calloc(map->size == 0U ? 1U : map->size, sizeof(gd_bpe_word));
     if (words == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "word array allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "word array allocation failed");
     }
     for (i = 0U; i < map->cap; ++i) {
         const gd_word_map_entry *entry = &map->entries[i];
@@ -102,7 +100,7 @@ static gd_status gd_build_words_from_map(const gd_word_map *map,
         }
         if (entry->len > (size_t)INT_MAX) {
             free(words);
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer piece too large");
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer piece too large");
         }
         words[n_words].ids = (int32_t *)gd_xmalloc(entry->len * sizeof(int32_t));
         if (words[n_words].ids == NULL) {
@@ -111,7 +109,7 @@ static gd_status gd_build_words_from_map(const gd_word_map *map,
                 free(words[k].ids);
             }
             free(words);
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "word token allocation failed");
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "word token allocation failed");
         }
         for (j = 0U; j < entry->len; ++j) {
             words[n_words].ids[j] = (int32_t)entry->bytes[j];
@@ -251,11 +249,11 @@ static gd_status gd_add_special_tokens(gd_tokenizer *tok,
         int j;
         const char *s = special_tokens[i];
         if (s == NULL || s[0] == '\0') {
-            return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid special token");
+            return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid special token");
         }
         for (j = 0; j < i; ++j) {
             if (strcmp(s, special_tokens[j]) == 0) {
-                return _gd_error(GD_ERR_INVALID_ARGUMENT, "duplicate special token");
+                return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "duplicate special token");
             }
         }
         status = gd_tokenizer_add_token(tok, (const uint8_t *)s, strlen(s), 1, -1, -1, NULL);
@@ -281,18 +279,18 @@ gd_status gd_bpe_tokenizer_train(const char **input_paths,
     gd_status status;
 
     if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer output is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer output is null");
     }
     *out = NULL;
     if (input_paths == NULL || n_input_paths <= 0 || cfg == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid BPE train arguments");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid BPE train arguments");
     }
     if (cfg->n_special_tokens < 0 || cfg->n_special_tokens > GD_BPE_MAX_SPECIALS ||
         (cfg->n_special_tokens > 0 && cfg->special_tokens == NULL)) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid special token config");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid special token config");
     }
     if (cfg->vocab_size < GD_BPE_N_BYTES + cfg->n_special_tokens) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "BPE vocab_size too small");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "BPE vocab_size too small");
     }
     target_vocab = cfg->vocab_size;
     min_frequency = cfg->min_frequency <= 0 ? 2 : cfg->min_frequency;
@@ -325,7 +323,7 @@ gd_status gd_bpe_tokenizer_train(const char **input_paths,
         if (input_paths[i] == NULL) {
             gd_word_map_free(&word_map);
             gd_tokenizer_destroy(tok);
-            return _gd_error(GD_ERR_INVALID_ARGUMENT, "null tokenizer input path");
+            return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "null tokenizer input path");
         }
         status = gd_read_file(input_paths[i], &data, &len);
         if (status != GD_OK) {
@@ -391,14 +389,14 @@ gd_status gd_bpe_tokenizer_train(const char **input_paths,
         if (left < 0 || right < 0 || left >= tok->n_tokens || right >= tok->n_tokens) {
             gd_bpe_words_free(words, n_words);
             gd_tokenizer_destroy(tok);
-            return _gd_error(GD_ERR_INTERNAL, "BPE trainer selected invalid pair");
+            return gd_tokenizer_error(GD_ERR_INTERNAL, "BPE trainer selected invalid pair");
         }
         lt = &tok->tokens[left];
         rt = &tok->tokens[right];
         if (lt->len + rt->len > sizeof(merged_bytes)) {
             gd_bpe_words_free(words, n_words);
             gd_tokenizer_destroy(tok);
-            return _gd_error(GD_ERR_INTERNAL, "BPE merge exceeded piece limit");
+            return gd_tokenizer_error(GD_ERR_INTERNAL, "BPE merge exceeded piece limit");
         }
         merged_len = lt->len + rt->len;
         memcpy(merged_bytes, lt->bytes, lt->len);

@@ -1,231 +1,148 @@
-#include "gradients/tokenizer.h"
+#include <gradients/tokenizer.h>
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define CHECK_OK(expr)                                                           \
-    do {                                                                         \
-        gd_status status_ = (expr);                                              \
-        if (status_ != GD_OK) {                                                  \
-            fprintf(stderr, "%s failed: %s\n", #expr, gd_last_error());        \
-            return 1;                                                            \
-        }                                                                        \
+#define CHECK(cond, msg)                                                       \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "test_tokenizer failed: %s (%s:%d)\n", (msg),     \
+                    __FILE__, __LINE__);                                       \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-#define CHECK_TRUE(expr)                                                         \
-    do {                                                                         \
-        if (!(expr)) {                                                           \
-            fprintf(stderr, "%s failed at %s:%d\n", #expr, __FILE__, __LINE__); \
-            return 1;                                                            \
-        }                                                                        \
+#define CHECK_OK(expr)                                                         \
+    do {                                                                       \
+        gd_status tokenizer_st__ = (expr);                                     \
+        if (tokenizer_st__ != GD_OK) {                                         \
+            fprintf(stderr,                                                    \
+                    "test_tokenizer failed: %s -> %s (%s:%d)\n",              \
+                    #expr,                                                     \
+                    gd_status_string(tokenizer_st__),                          \
+                    __FILE__,                                                  \
+                    __LINE__);                                                 \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-#define CHECK_STATUS(expr, expected)                                             \
-    do {                                                                         \
-        gd_status status_ = (expr);                                              \
-        if (status_ != (expected)) {                                             \
-            fprintf(stderr,                                                       \
-                    "%s got %s expected %s; last_error=%s\n",                   \
-                    #expr,                                                       \
-                    gd_status_name(status_),                                     \
-                    gd_status_name(expected),                                    \
-                    gd_last_error());                                            \
-            return 1;                                                            \
-        }                                                                        \
+#define CHECK_STATUS(expr, want)                                               \
+    do {                                                                       \
+        gd_status tokenizer_st__ = (expr);                                     \
+        if (tokenizer_st__ != (want)) {                                        \
+            fprintf(stderr,                                                    \
+                    "test_tokenizer failed: %s -> %s, want %s (%s:%d)\n",     \
+                    #expr,                                                     \
+                    gd_status_string(tokenizer_st__),                          \
+                    gd_status_string((want)),                                  \
+                    __FILE__,                                                  \
+                    __LINE__);                                                 \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-static int write_file(const char *path, const char *text)
+static void write_text_file(const char *path, const char *text)
 {
     FILE *f = fopen(path, "wb");
-    if (f == NULL) {
-        return 1;
-    }
-    if (fwrite(text, 1U, strlen(text), f) != strlen(text)) {
-        (void)fclose(f);
-        return 1;
-    }
-    if (fclose(f) != 0) {
-        return 1;
-    }
-    return 0;
+    size_t len = strlen(text);
+    CHECK(f != NULL, "open corpus");
+    CHECK(fwrite(text, 1U, len, f) == len, "write corpus");
+    CHECK(fclose(f) == 0, "close corpus");
 }
 
-static int ids_equal(const int32_t *a, int na, const int32_t *b, int nb)
+static int contains_id(const int32_t *ids, int n_ids, int32_t id)
 {
     int i;
-    if (na != nb) {
-        return 0;
-    }
-    for (i = 0; i < na; ++i) {
-        if (a[i] != b[i]) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int has_digit_run_123(const int32_t *ids, int n_ids)
-{
-    int i;
-    for (i = 0; i + 2 < n_ids; ++i) {
-        if (ids[i] == (int32_t)'1' && ids[i + 1] == (int32_t)'2' &&
-            ids[i + 2] == (int32_t)'3') {
+    for (i = 0; i < n_ids; ++i) {
+        if (ids[i] == id) {
             return 1;
         }
     }
     return 0;
 }
 
-static int train_fixture(const char *path, gd_tokenizer **tok_out)
-{
-    const char *inputs[1];
-    const char *specials[3] = {"<|pad|>", "<|im_start|>", "<|im_end|>"};
-    gd_bpe_train_config cfg;
-
-    inputs[0] = path;
-    cfg.vocab_size = 320;
-    cfg.min_frequency = 2;
-    cfg.split_digits = 1;
-    cfg.n_special_tokens = 3;
-    cfg.special_tokens = specials;
-    cfg.seed = 1234U;
-    CHECK_OK(gd_bpe_tokenizer_train(inputs, 1, &cfg, tok_out));
-    return 0;
-}
-
-static int test_train_encode_decode_save_load(void)
-{
-    const char *corpus_path = "/tmp/gd_tokenizer_corpus.txt";
-    const char *tok_path = "/tmp/gd_tokenizer.json";
-    const char *corpus =
-        "<|im_start|>ciao mondo 123 abc123def<|im_end|>\n"
-        "<|im_start|>ciao mondo 123 abc123def<|im_end|>\n"
-        "hello hello hello world world token token token\n"
-        "digits 9876543210 must stay split\n";
-    gd_tokenizer *tok_a = NULL;
-    gd_tokenizer *tok_b = NULL;
-    gd_tokenizer *loaded = NULL;
-    int32_t im_start = -1;
-    int32_t im_end = -1;
-    int32_t pad = -1;
-    int32_t *ids = NULL;
-    int32_t *ids_loaded = NULL;
-    int n_ids = 0;
-    int n_ids_loaded = 0;
-    char *decoded = NULL;
-    gd_tokenizer_config load_cfg;
-
-    CHECK_TRUE(write_file(corpus_path, corpus) == 0);
-    CHECK_TRUE(train_fixture(corpus_path, &tok_a) == 0);
-    CHECK_TRUE(train_fixture(corpus_path, &tok_b) == 0);
-    CHECK_TRUE(gd_tokenizer_vocab_size(tok_a) >= 256 + 3);
-    CHECK_TRUE(gd_tokenizer_hash(tok_a) == gd_tokenizer_hash(tok_b));
-
-    CHECK_OK(gd_tokenizer_id(tok_a, "<|pad|>", &pad));
-    CHECK_OK(gd_tokenizer_id(tok_a, "<|im_start|>", &im_start));
-    CHECK_OK(gd_tokenizer_id(tok_a, "<|im_end|>", &im_end));
-    CHECK_TRUE(pad == 256);
-    CHECK_TRUE(im_start == 257);
-    CHECK_TRUE(im_end == 258);
-
-    CHECK_OK(gd_tokenizer_encode(tok_a,
-                                 "<|im_start|>perché abc123def<|im_end|>",
-                                 &ids,
-                                 &n_ids));
-    CHECK_TRUE(n_ids >= 8);
-    CHECK_TRUE(ids[0] == im_start);
-    CHECK_TRUE(ids[n_ids - 1] == im_end);
-    CHECK_TRUE(ids[1] != pad);
-    CHECK_TRUE(has_digit_run_123(ids, n_ids));
-
-    CHECK_OK(gd_tokenizer_decode(tok_a, ids, n_ids, &decoded));
-    CHECK_TRUE(strcmp(decoded, "<|im_start|>perché abc123def<|im_end|>") == 0);
-
-    CHECK_OK(gd_bpe_tokenizer_save(tok_a, tok_path));
-    load_cfg.split_digits = 1;
-    load_cfg.allow_special = 1;
-    CHECK_OK(gd_bpe_tokenizer_load(tok_path, &load_cfg, &loaded));
-    CHECK_TRUE(gd_tokenizer_hash(tok_a) == gd_tokenizer_hash(loaded));
-    CHECK_OK(gd_tokenizer_encode(loaded,
-                                 "<|im_start|>perché abc123def<|im_end|>",
-                                 &ids_loaded,
-                                 &n_ids_loaded));
-    CHECK_TRUE(ids_equal(ids, n_ids, ids_loaded, n_ids_loaded));
-
-    gd_tokenizer_free(ids);
-    gd_tokenizer_free(ids_loaded);
-    gd_tokenizer_free(decoded);
-    gd_tokenizer_destroy(tok_a);
-    gd_tokenizer_destroy(tok_b);
-    gd_tokenizer_destroy(loaded);
-    (void)remove(corpus_path);
-    (void)remove(tok_path);
-    return 0;
-}
-
-static int test_invalid_special_policy(void)
-{
-    const char *corpus_path = "/tmp/gd_tokenizer_invalid_special.txt";
-    const char *inputs[1];
-    const char *specials[2] = {"<|im_start|>", "<|im_start|>"};
-    gd_bpe_train_config cfg;
-    gd_tokenizer *tok = NULL;
-
-    CHECK_TRUE(write_file(corpus_path, "hello world hello world\n") == 0);
-    inputs[0] = corpus_path;
-    cfg.vocab_size = 300;
-    cfg.min_frequency = 2;
-    cfg.split_digits = 1;
-    cfg.n_special_tokens = 2;
-    cfg.special_tokens = specials;
-    cfg.seed = 1234U;
-    CHECK_STATUS(gd_bpe_tokenizer_train(inputs, 1, &cfg, &tok), GD_ERR_INVALID_ARGUMENT);
-    CHECK_TRUE(strstr(gd_last_error(), "duplicate special token") != NULL);
-    gd_tokenizer_destroy(tok);
-    (void)remove(corpus_path);
-    return 0;
-}
-
-static int test_digit_split_blocks_digit_merges(void)
-{
-    const char *corpus_path = "/tmp/gd_tokenizer_digits.txt";
-    const char *corpus =
-        "11111111111111111111111111111111111111111111111111\n"
-        "22222222222222222222222222222222222222222222222222\n"
-        "12312312312312312312312312312312312312312312312312\n";
-    gd_tokenizer *tok = NULL;
-    int32_t *ids = NULL;
-    int n_ids = 0;
-
-    CHECK_TRUE(write_file(corpus_path, corpus) == 0);
-    CHECK_TRUE(train_fixture(corpus_path, &tok) == 0);
-    CHECK_OK(gd_tokenizer_encode(tok, "123321", &ids, &n_ids));
-    CHECK_TRUE(n_ids == 6);
-    CHECK_TRUE(ids[0] == (int32_t)'1');
-    CHECK_TRUE(ids[1] == (int32_t)'2');
-    CHECK_TRUE(ids[2] == (int32_t)'3');
-    CHECK_TRUE(ids[3] == (int32_t)'3');
-    CHECK_TRUE(ids[4] == (int32_t)'2');
-    CHECK_TRUE(ids[5] == (int32_t)'1');
-
-    gd_tokenizer_free(ids);
-    gd_tokenizer_destroy(tok);
-    (void)remove(corpus_path);
-    return 0;
-}
-
 int main(void)
 {
-    if (test_train_encode_decode_save_load() != 0) {
-        return 1;
-    }
-    if (test_invalid_special_policy() != 0) {
-        return 1;
-    }
-    if (test_digit_split_blocks_digit_merges() != 0) {
-        return 1;
-    }
+    const char *corpus_path = "/tmp/gd_tokenizer_test_corpus.txt";
+    const char *tokenizer_path = "/tmp/gd_tokenizer_test_tokenizer.json";
+    const char *specials[] = {"<eot>"};
+    const char *roundtrip = "hello <eot> 123 hello";
+    const char *literal_special = "hello <eot>";
+    const char corpus[] =
+        "hello hello hello <eot>\n"
+        "byte-level BPE tokenizer test 123 123 123\n"
+        "hello tokenizer tokenizer tokenizer\n";
+    gd_bpe_train_config train_cfg;
+    gd_tokenizer_config load_cfg;
+    gd_tokenizer_config no_special_cfg;
+    gd_tokenizer *tok = NULL;
+    gd_tokenizer *loaded = NULL;
+    gd_tokenizer *no_special = NULL;
+    int32_t *ids = NULL;
+    int32_t *literal_ids = NULL;
+    int n_ids = 0;
+    int n_literal_ids = 0;
+    int32_t special_id = -1;
+    int32_t bad_id = -1;
+    char *decoded = NULL;
+    uint64_t hash;
+
+    write_text_file(corpus_path, corpus);
+
+    memset(&train_cfg, 0, sizeof(train_cfg));
+    train_cfg.vocab_size = 280;
+    train_cfg.min_frequency = 1;
+    train_cfg.split_digits = 1;
+    train_cfg.n_special_tokens = 1;
+    train_cfg.special_tokens = specials;
+    train_cfg.seed = 17U;
+    CHECK_OK(gd_bpe_tokenizer_train(&corpus_path, 1, &train_cfg, &tok));
+    CHECK(gd_tokenizer_vocab_size(tok) > 256, "trained vocab includes specials/merges");
+    CHECK_OK(gd_tokenizer_id(tok, "<eot>", &special_id));
+    CHECK(special_id >= 256, "special token id follows byte vocabulary");
+    hash = gd_tokenizer_hash(tok);
+    CHECK(hash != 0U, "tokenizer hash computed");
+
+    CHECK_OK(gd_tokenizer_encode(tok, roundtrip, &ids, &n_ids));
+    CHECK(n_ids > 0, "encoded tokens produced");
+    CHECK(contains_id(ids, n_ids, special_id), "special token matched during encode");
+    CHECK_OK(gd_tokenizer_decode(tok, ids, n_ids, &decoded));
+    CHECK(strcmp(decoded, roundtrip) == 0, "decode roundtrip matches input");
+    gd_tokenizer_free(decoded);
+    decoded = NULL;
+
+    CHECK_OK(gd_bpe_tokenizer_save(tok, tokenizer_path));
+    load_cfg.split_digits = 1;
+    load_cfg.allow_special = 1;
+    CHECK_OK(gd_bpe_tokenizer_load(tokenizer_path, &load_cfg, &loaded));
+    CHECK(gd_tokenizer_vocab_size(loaded) == gd_tokenizer_vocab_size(tok), "loaded vocab size");
+    CHECK(gd_tokenizer_hash(loaded) == hash, "loaded hash");
+    CHECK_OK(gd_tokenizer_encode(loaded, roundtrip, &literal_ids, &n_literal_ids));
+    CHECK(contains_id(literal_ids, n_literal_ids, special_id), "loaded special token matched");
+    gd_tokenizer_free(literal_ids);
+    literal_ids = NULL;
+    n_literal_ids = 0;
+
+    no_special_cfg.split_digits = 1;
+    no_special_cfg.allow_special = 0;
+    CHECK_OK(gd_bpe_tokenizer_load(tokenizer_path, &no_special_cfg, &no_special));
+    CHECK_OK(gd_tokenizer_encode(no_special, literal_special, &literal_ids, &n_literal_ids));
+    CHECK(!contains_id(literal_ids, n_literal_ids, special_id), "--no-special encodes literal text");
+    CHECK_OK(gd_tokenizer_decode(no_special, literal_ids, n_literal_ids, &decoded));
+    CHECK(strcmp(decoded, literal_special) == 0, "literal special roundtrip");
+
+    CHECK_STATUS(gd_tokenizer_decode(tok, &bad_id, 1, &decoded), GD_ERR_INVALID_ARGUMENT);
+
+    gd_tokenizer_free(decoded);
+    gd_tokenizer_free(literal_ids);
+    gd_tokenizer_free(ids);
+    gd_tokenizer_destroy(no_special);
+    gd_tokenizer_destroy(loaded);
+    gd_tokenizer_destroy(tok);
+    (void)remove(tokenizer_path);
+    (void)remove(corpus_path);
+    printf("test_tokenizer: ok\n");
     return 0;
 }

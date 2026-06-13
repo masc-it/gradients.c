@@ -1,0 +1,4 @@
+# Generated op metadata for mse.
+# api shape controls generated public stubs.
+# backend omitted: implement custom backend declarations/dispatch manually.
+api=binary

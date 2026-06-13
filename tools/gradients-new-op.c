@@ -1,1223 +1,1321 @@
+#include <ctype.h>
 #include <errno.h>
-#include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
-#define GD_NEW_OP_MAX_NAME 128
-#define GD_NEW_OP_MAX_PATH 4096
-#define GD_NEW_OP_MAX_ARITY 32
+#define GD_NEW_OP_NAME_MAX 96U
+#define GD_NEW_OP_PATH_MAX 4096U
+#define GD_NEW_OP_CONTENT_MAX 32768U
+#define GD_NEW_OP_NOTES_MAX 2048U
 
-typedef struct string_builder {
-    char *data;
-    size_t len;
-    size_t cap;
-} string_builder;
+typedef struct gd_new_op_options {
+    const char *op;
+    bool binary;
+    bool no_backend;
+    bool f16_only;
+    bool f16_f32_accum;
+    bool save_stats;
+    bool reduction;
+} gd_new_op_options;
 
-typedef struct op_config {
-    char name[GD_NEW_OP_MAX_NAME];
-    char upper[GD_NEW_OP_MAX_NAME];
-    int inputs;
-    int outputs;
-    bool is_public;
-    bool diff;
-    bool custom_bwd;
-    bool cpu_only;
-    bool force;
-    bool dry_run;
-    bool run_generated;
-} op_config;
-
-static void usage(FILE *f)
+static bool gd_valid_op_name(const char *name)
 {
-    fprintf(f,
-            "usage: gradients-new-op OP_NAME [options]\n"
-            "\n"
-            "Scaffold compile-valid operator stubs. Stubs return GD_ERR_UNSUPPORTED\n"
-            "until math/meta/backward/backend implementations are filled.\n"
-            "\n"
-            "defaults:\n"
-            "  public=yes diff=yes custom_bwd=yes backends=cpu_ref+accelerated inputs=1 outputs=1\n"
-            "\n"
-            "options:\n"
-            "  --private         skip public API and public-symbol test patches\n"
-            "  --no-diff         forward-only op; skip autograd and bwd stubs\n"
-            "  --no-custom-bwd   add grad rule stub only; skip explicit *_bwd op stubs\n"
-            "  --inputs N        forward input count (default: 1)\n"
-            "  --outputs N       forward output count (default: 1)\n"
-            "  --cpu-only        skip accelerated backend stubs (Metal today)\n"
-            "  --no-generated    do not run `make generated` after scaffolding\n"
-            "  --force           overwrite existing scaffold files\n"
-            "  --dry-run         print plan without writing files or running make\n"
-            "  --help            show this help\n");
-}
-
-static void sb_free(string_builder *sb)
-{
-    if (sb != NULL) {
-        free(sb->data);
-        sb->data = NULL;
-        sb->len = 0U;
-        sb->cap = 0U;
-    }
-}
-
-static int sb_reserve(string_builder *sb, size_t need)
-{
-    char *next = NULL;
-    size_t cap = 0U;
-
-    if (sb == NULL) {
-        return 1;
-    }
-    if (need <= sb->cap) {
-        return 0;
-    }
-    cap = sb->cap == 0U ? 256U : sb->cap;
-    while (cap < need) {
-        if (cap > (size_t)-1 / 2U) {
-            return 1;
-        }
-        cap *= 2U;
-    }
-    next = (char *)realloc(sb->data, cap);
-    if (next == NULL) {
-        return 1;
-    }
-    sb->data = next;
-    sb->cap = cap;
-    return 0;
-}
-
-static int sb_append_n(string_builder *sb, const char *s, size_t n)
-{
-    if (sb == NULL || (n > 0U && s == NULL)) {
-        return 1;
-    }
-    if (n > (size_t)-1 - sb->len - 1U) {
-        return 1;
-    }
-    if (sb_reserve(sb, sb->len + n + 1U) != 0) {
-        return 1;
-    }
-    if (n > 0U) {
-        memcpy(sb->data + sb->len, s, n);
-    }
-    sb->len += n;
-    sb->data[sb->len] = '\0';
-    return 0;
-}
-
-static int sb_append(string_builder *sb, const char *s)
-{
-    return sb_append_n(sb, s, strlen(s));
-}
-
-static int sb_appendf(string_builder *sb, const char *fmt, ...)
-{
-    va_list ap;
-    va_list ap2;
-    int n = 0;
-    size_t old_len = 0U;
-
-    if (sb == NULL || fmt == NULL) {
-        return 1;
-    }
-    va_start(ap, fmt);
-    va_copy(ap2, ap);
-    n = vsnprintf(NULL, 0U, fmt, ap);
-    va_end(ap);
-    if (n < 0) {
-        va_end(ap2);
-        return 1;
-    }
-    old_len = sb->len;
-    if (sb_reserve(sb, old_len + (size_t)n + 1U) != 0) {
-        va_end(ap2);
-        return 1;
-    }
-    (void)vsnprintf(sb->data + old_len, sb->cap - old_len, fmt, ap2);
-    va_end(ap2);
-    sb->len = old_len + (size_t)n;
-    return 0;
-}
-
-static bool file_exists(const char *path)
-{
-    struct stat st;
-    return path != NULL && stat(path, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-static bool dir_exists(const char *path)
-{
-    struct stat st;
-    return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static int mkdir_p(const char *path)
-{
-    char tmp[GD_NEW_OP_MAX_PATH];
-    size_t len = 0U;
-    char *p = NULL;
-
-    if (path == NULL || path[0] == '\0') {
-        return 1;
-    }
-    len = strlen(path);
-    if (len >= sizeof(tmp)) {
-        return 1;
-    }
-    memcpy(tmp, path, len + 1U);
-    if (len > 1U && tmp[len - 1U] == '/') {
-        tmp[len - 1U] = '\0';
-    }
-    for (p = tmp + 1; *p != '\0'; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-                return 1;
-            }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-        return 1;
-    }
-    return 0;
-}
-
-static bool is_lower_snake(const char *s)
-{
-    size_t i = 0U;
-    size_t len = 0U;
+    size_t i;
     bool prev_underscore = false;
-
-    if (s == NULL) {
+    if (name == NULL || name[0] == '\0' || !islower((unsigned char)name[0])) {
         return false;
     }
-    len = strlen(s);
-    if (len == 0U || len >= GD_NEW_OP_MAX_NAME || s[0] == '_' || s[len - 1U] == '_') {
-        return false;
-    }
-    for (i = 0U; i < len; ++i) {
-        char c = s[i];
+    for (i = 0U; name[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (islower(c) || isdigit(c)) {
+            prev_underscore = false;
+            continue;
+        }
         if (c == '_') {
-            if (prev_underscore) {
+            if (prev_underscore || name[i + 1U] == '\0') {
                 return false;
             }
             prev_underscore = true;
             continue;
         }
-        prev_underscore = false;
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
-            return false;
-        }
+        return false;
+    }
+    return i < GD_NEW_OP_NAME_MAX;
+}
+
+static void gd_upper_from_name(const char *name, char *out, size_t out_size)
+{
+    size_t i;
+    if (out == NULL || out_size == 0U) {
+        return;
+    }
+    for (i = 0U; name != NULL && name[i] != '\0' && i + 1U < out_size; ++i) {
+        out[i] = (char)toupper((unsigned char)name[i]);
+    }
+    out[i] = '\0';
+}
+
+static bool gd_path_exists(const char *path)
+{
+    struct stat st;
+    return path != NULL && stat(path, &st) == 0;
+}
+
+static bool gd_dir_exists(const char *path)
+{
+    struct stat st;
+    return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int gd_mkdir_if_missing(const char *path)
+{
+    if (gd_dir_exists(path)) {
+        return 0;
+    }
+    if (mkdir(path, 0777) != 0) {
+        fprintf(stderr, "gradients-new-op: mkdir %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    printf("[create] %s/\n", path);
+    return 0;
+}
+
+static int gd_write_new_file(const char *path, const char *content)
+{
+    FILE *f;
+    size_t len;
+    if (gd_path_exists(path)) {
+        printf("[exists] %s\n", path);
+        return 0;
+    }
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "gradients-new-op: write %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    len = strlen(content);
+    if (fwrite(content, 1U, len, f) != len) {
+        fprintf(stderr, "gradients-new-op: short write %s\n", path);
+        fclose(f);
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "gradients-new-op: close %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    printf("[create] %s\n", path);
+    return 0;
+}
+
+static bool gd_make_op_dir_path(char *out, size_t out_size, const char *op)
+{
+    int n = snprintf(out, out_size, "src/ops/%s", op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_op_file_path(char *out,
+                                 size_t out_size,
+                                 const char *op,
+                                 const char *prefix,
+                                 const char *suffix)
+{
+    int n = snprintf(out, out_size, "src/ops/%s/%s%s%s", op, prefix, op, suffix);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_op_named_path(char *out, size_t out_size, const char *op, const char *filename)
+{
+    int n = snprintf(out, out_size, "src/ops/%s/%s", op, filename);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_fixed_append(char *out, size_t out_size, size_t *len, const char *text)
+{
+    size_t text_len;
+    if (out == NULL || len == NULL || text == NULL || out_size == 0U) {
+        return false;
+    }
+    text_len = strlen(text);
+    if (*len >= out_size || text_len >= out_size - *len) {
+        return false;
+    }
+    memcpy(out + *len, text, text_len + 1U);
+    *len += text_len;
+    return true;
+}
+
+static bool gd_fixed_append_note(char *out,
+                                 size_t out_size,
+                                 size_t *len,
+                                 const char *indent,
+                                 const char *text)
+{
+    return gd_fixed_append(out, out_size, len, indent) &&
+           gd_fixed_append(out, out_size, len, text) &&
+           gd_fixed_append(out, out_size, len, "\n");
+}
+
+static bool gd_make_option_notes(char *out,
+                                 size_t out_size,
+                                 const gd_new_op_options *opts,
+                                 const char *indent)
+{
+    size_t len = 0U;
+    if (out == NULL || opts == NULL || indent == NULL || out_size == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "See docs/guides/metal_tips.md before implementing Metal hot paths.")) {
+        return false;
+    }
+    if (opts->no_backend &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "Custom backend mode: generated backend stubs are omitted; add custom backend declarations/PSOs manually.")) {
+        return false;
+    }
+    if (opts->f16_only &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "F16-only: reject other dtypes in core/host validation and keep kernels dtype-specialized.")) {
+        return false;
+    }
+    if (opts->f16_f32_accum &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "F16+FP32 accumulation: keep reductions/normalization in float and store stats/losses as F32.")) {
+        return false;
+    }
+    if (opts->save_stats &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "Save-stats: save compact forward tensors with gd_autograd_record(..., saved, n_saved) for fast backward.")) {
+        return false;
+    }
+    if (opts->reduction &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "Reduction: use SIMD reductions first, then threadgroup reductions, with shape-adaptive simdgroup counts.")) {
+        return false;
     }
     return true;
 }
 
-static void make_upper(const char *name, char *out, size_t cap)
+static bool gd_make_def_content(char *out,
+                                size_t out_size,
+                                const gd_new_op_options *opts)
 {
-    size_t i = 0U;
-    size_t n = strlen(name);
-
-    if (cap == 0U) {
-        return;
+    const char *shape;
+    int n;
+    if (out == NULL || opts == NULL) {
+        return false;
     }
-    if (n >= cap) {
-        n = cap - 1U;
+    shape = opts->binary ? "binary" : "unary";
+    if (opts->no_backend) {
+        n = snprintf(out,
+                     out_size,
+                     "# Generated op metadata for %s.\n"
+                     "# api shape controls generated public stubs.\n"
+                     "# backend omitted: implement custom backend declarations/dispatch manually.\n"
+                     "api=%s\n",
+                     opts->op,
+                     shape);
+    } else {
+        n = snprintf(out,
+                     out_size,
+                     "# Generated op metadata for %s.\n"
+                     "# api/backend shape controls generated public/backend stubs.\n"
+                     "api=%s\n"
+                     "backend=%s\n",
+                     opts->op,
+                     shape,
+                     shape);
     }
-    for (i = 0U; i < n; ++i) {
-        char c = name[i];
-        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
-    }
-    out[n] = '\0';
+    return n >= 0 && (size_t)n < out_size;
 }
 
-static int parse_int_arg(const char *s, int *out)
+static bool gd_make_core_content(char *out,
+                                 size_t out_size,
+                                 const gd_new_op_options *opts,
+                                 const char *upper)
 {
-    char *end = NULL;
-    long v = 0L;
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, "   ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include <gradients/ops.h>\n"
+                 "\n"
+                 "#include \"../op_common.h\"\n"
+                 "\n"
+                 "/* Scaffold for the '%s' op.\n"
+                 "\n"
+                 "   Next steps:\n"
+                 "   1. Confirm generated public declaration in include/gradients/ops_generated.h.\n"
+                 "   2. Replace this anchor with gd_%s(...) validation/allocation/backend dispatch.\n"
+                 "   3. Record the op with gd_autograd_record(ctx, GD_OP_%s, ...).\n"
+                 "   4. Add backend implementations/tests/probes as needed.\n"
+                 "\n"
+                 "%s"
+                 "*/\n"
+                 "typedef int gd_%s_core_scaffold_anchor;\n",
+                 opts->op,
+                 opts->op,
+                 upper,
+                 notes,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
 
-    if (s == NULL || out == NULL) {
+static bool gd_make_autograd_content(char *out,
+                                     size_t out_size,
+                                     const gd_new_op_options *opts,
+                                     const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../autograd_impl.h\"\n"
+                 "\n"
+                 "/* Backward implementation notes:\n"
+                 "%s"
+                 " */\n"
+                 "static gd_status gd_%s_autograd_backward(gd_bwd_ctx *bwd,\n"
+                 "                                            const gd_tape_node *node)\n"
+                 "{\n"
+                 "    (void)bwd;\n"
+                 "    (void)node;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n"
+                 "\n"
+                 "const gd_autograd_rule gd_bwd_rule_%s = {\n"
+                 "    .kind = GD_OP_%s,\n"
+                 "    .name = \"%s\",\n"
+                 "    .backward = gd_%s_autograd_backward,\n"
+                 "};\n",
+                 notes,
+                 opts->op,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_content_custom(char *out,
+                                         size_t out_size,
+                                         const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, "   ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/metal/metal_backend_internal.h\"\n"
+                 "#include \"metal_%s_types.h\"\n"
+                 "\n"
+                 "/* Custom Metal backend capsule for '%s'.\n"
+                 "\n"
+                 "   backend= is omitted in op_%s.def. Add custom backend declarations\n"
+                 "   to src/core/backend.h and custom GD_METAL_PIPELINE entries in\n"
+                 "   src/backends/metal/backend_metal.m when implementing this op.\n"
+                 "\n"
+                 "%s"
+                 "*/\n"
+                 "typedef int gd_%s_metal_scaffold_anchor;\n",
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_content_binary(char *out,
+                                         size_t out_size,
+                                         const gd_new_op_options *opts,
+                                         const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/metal/metal_backend_internal.h\"\n"
+                 "#include \"metal_%s_types.h\"\n"
+                 "\n"
+                 "/* Metal backend scaffold for '%s'.\n"
+                 "%s"
+                 " * TODO: validate views, zero-init ABI args, encode gd_%s_kernel /\n"
+                 " * gd_%s_bcast_kernel / gd_%s_row_bcast_kernel, and dispatch inside\n"
+                 " * gd_metal_command_for_op(). Return GD_ERR_UNSUPPORTED until done.\n"
+                 " */\n"
+                 "static id<MTLComputePipelineState> gd_%s_pso(gd_backend *backend)\n"
+                 "{\n"
+                 "    return (__bridge id<MTLComputePipelineState>)backend->binary_pso[GD_OP_%s];\n"
+                 "}\n"
+                 "\n"
+                 "static id<MTLComputePipelineState> gd_%s_bcast_pso(gd_backend *backend)\n"
+                 "{\n"
+                 "    return (__bridge id<MTLComputePipelineState>)backend->binary_bcast_pso[GD_OP_%s];\n"
+                 "}\n"
+                 "\n"
+                 "static id<MTLComputePipelineState> gd_%s_row_bcast_pso(gd_backend *backend)\n"
+                 "{\n"
+                 "    return (__bridge id<MTLComputePipelineState>)backend->binary_row_bcast_pso[GD_OP_%s];\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s(gd_backend *backend,\n"
+                 "                        const gd_backend_tensor_view *x,\n"
+                 "                        const gd_backend_tensor_view *y,\n"
+                 "                        const gd_backend_tensor_view *out)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || y == NULL || out == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_%s_pso(backend);\n"
+                 "    (void)gd_%s_bcast_pso(backend);\n"
+                 "    (void)gd_%s_row_bcast_pso(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)out;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_content_unary(char *out,
+                                        size_t out_size,
+                                        const gd_new_op_options *opts,
+                                        const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/metal/metal_backend_internal.h\"\n"
+                 "#include \"metal_%s_types.h\"\n"
+                 "\n"
+                 "/* Metal backend scaffold for '%s'.\n"
+                 "%s"
+                 " * TODO: validate views, zero-init gd_metal_%s_args, encode kernels,\n"
+                 " * and dispatch inside gd_metal_command_for_op(). Return\n"
+                 " * GD_ERR_UNSUPPORTED until implemented.\n"
+                 " */\n"
+                 "static id<MTLComputePipelineState> gd_%s_pso(gd_backend *backend)\n"
+                 "{\n"
+                 "    return (__bridge id<MTLComputePipelineState>)backend->unary_pso[GD_OP_%s];\n"
+                 "}\n"
+                 "\n"
+                 "static id<MTLComputePipelineState> gd_%s_backward_pso(gd_backend *backend)\n"
+                 "{\n"
+                 "    return (__bridge id<MTLComputePipelineState>)backend->unary_backward_pso[GD_OP_%s];\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s(gd_backend *backend,\n"
+                 "                        const gd_backend_tensor_view *x,\n"
+                 "                        const gd_backend_tensor_view *y)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || y == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_%s_pso(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s_backward(gd_backend *backend,\n"
+                 "                                 const gd_backend_tensor_view *x,\n"
+                 "                                 const gd_backend_tensor_view *grad_out,\n"
+                 "                                 const gd_backend_tensor_view *grad_x)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_%s_backward_pso(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)grad_out;\n"
+                 "    (void)grad_x;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_content(char *out,
+                                  size_t out_size,
+                                  const gd_new_op_options *opts,
+                                  const char *upper)
+{
+    if (opts == NULL) {
+        return false;
+    }
+    if (opts->no_backend) {
+        return gd_make_metal_content_custom(out, out_size, opts);
+    }
+    if (opts->binary) {
+        return gd_make_metal_content_binary(out, out_size, opts, upper);
+    }
+    return gd_make_metal_content_unary(out, out_size, opts, upper);
+}
+
+static bool gd_make_metal_types_content(char *out,
+                                        size_t out_size,
+                                        const gd_new_op_options *opts,
+                                        const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (out == NULL || opts == NULL || upper == NULL) {
+        return false;
+    }
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    if (opts->binary) {
+        n = snprintf(out,
+                     out_size,
+                     "#ifndef GD_OP_%s_METAL_TYPES_H\n"
+                     "#define GD_OP_%s_METAL_TYPES_H\n"
+                     "\n"
+                     "/* Binary elementwise ops use the shared binary Metal ABI.\n"
+                     "%s"
+                     " */\n"
+                     "#include \"../_shared/binary/metal_binary_types.h\"\n"
+                     "\n"
+                     "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
+                     upper,
+                     upper,
+                     notes,
+                     upper);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    if (opts->f16_only) {
+        n = snprintf(out,
+                     out_size,
+                     "#ifndef GD_OP_%s_METAL_TYPES_H\n"
+                     "#define GD_OP_%s_METAL_TYPES_H\n"
+                     "\n"
+                     "/* Op-local Metal ABI types for %s. Keep host/Metal layouts in sync.\n"
+                     "%s"
+                     " */\n"
+                     "#include \"../../backends/metal/metal_abi.h\"\n"
+                     "\n"
+                     "typedef struct gd_metal_%s_args {\n"
+                     "    gd_metal_u64 x_offset;\n"
+                     "    gd_metal_u64 y_offset;\n"
+                     "    gd_metal_u64 grad_offset;\n"
+                     "    gd_metal_u64 count;\n"
+                     "} gd_metal_%s_args;\n"
+                     "\n"
+                     "#ifndef __METAL_VERSION__\n"
+                     "_Static_assert(sizeof(gd_metal_%s_args) == 32U, \"gd_metal_%s_args ABI mismatch\");\n"
+                     "#endif\n"
+                     "\n"
+                     "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
+                     upper,
+                     upper,
+                     opts->op,
+                     notes,
+                     opts->op,
+                     opts->op,
+                     opts->op,
+                     opts->op,
+                     upper);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#ifndef GD_OP_%s_METAL_TYPES_H\n"
+                 "#define GD_OP_%s_METAL_TYPES_H\n"
+                 "\n"
+                 "/* Op-local Metal ABI types for %s. Keep host/Metal layouts in sync.\n"
+                 "%s"
+                 " */\n"
+                 "#include \"../../backends/metal/metal_abi.h\"\n"
+                 "\n"
+                 "typedef struct gd_metal_%s_args {\n"
+                 "    gd_metal_u64 x_offset;\n"
+                 "    gd_metal_u64 y_offset;\n"
+                 "    gd_metal_u64 grad_offset;\n"
+                 "    gd_metal_u64 count;\n"
+                 "    gd_metal_u32 dtype;\n"
+                 "    gd_metal_u32 pad0;\n"
+                 "} gd_metal_%s_args;\n"
+                 "\n"
+                 "#ifndef __METAL_VERSION__\n"
+                 "_Static_assert(sizeof(gd_metal_%s_args) == 40U, \"gd_metal_%s_args ABI mismatch\");\n"
+                 "#endif\n"
+                 "\n"
+                 "#endif /* GD_OP_%s_METAL_TYPES_H */\n",
+                 upper,
+                 upper,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 upper);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_metal_kernel_content(char *out,
+                                         size_t out_size,
+                                         const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (out == NULL || opts == NULL) {
+        return false;
+    }
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, "   ")) {
+        return false;
+    }
+    if (opts->binary) {
+        n = snprintf(out,
+                     out_size,
+                     "#include <metal_stdlib>\n"
+                     "#include \"metal_%s_types.h\"\n"
+                     "#include \"../_shared/binary/metal_binary_metal.h\"\n"
+                     "\n"
+                     "using namespace metal;\n"
+                     "\n"
+                     "/* Scaffold for the '%s' binary op-local Metal kernels.\n"
+                     "\n"
+                     "   The generated Metal PSO glue expects binary ops to export:\n"
+                     "     gd_%s_kernel\n"
+                     "     gd_%s_bcast_kernel\n"
+                     "     gd_%s_row_bcast_kernel\n"
+                     "\n"
+                     "%s"
+                     "*/\n"
+                     "kernel void gd_%s_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                         device const uchar *y [[buffer(1)]],\n"
+                     "                         device uchar *out [[buffer(2)]],\n"
+                     "                         constant gd_metal_binary_args &args [[buffer(3)]],\n"
+                     "                         uint gid [[thread_position_in_grid]])\n"
+                     "{\n"
+                     "    (void)x;\n"
+                     "    (void)y;\n"
+                     "    (void)out;\n"
+                     "    (void)args;\n"
+                     "    (void)gid;\n"
+                     "}\n"
+                     "\n"
+                     "kernel void gd_%s_bcast_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                               device const uchar *y [[buffer(1)]],\n"
+                     "                               device uchar *out [[buffer(2)]],\n"
+                     "                               constant gd_metal_binary_bcast_args &args [[buffer(3)]],\n"
+                     "                               uint gid [[thread_position_in_grid]])\n"
+                     "{\n"
+                     "    (void)x;\n"
+                     "    (void)y;\n"
+                     "    (void)out;\n"
+                     "    (void)args;\n"
+                     "    (void)gid;\n"
+                     "}\n"
+                     "\n"
+                     "kernel void gd_%s_row_bcast_kernel(device const uchar *x [[buffer(0)]],\n"
+                     "                                   device const uchar *y [[buffer(1)]],\n"
+                     "                                   device uchar *out [[buffer(2)]],\n"
+                     "                                   constant gd_metal_binary_bcast_args &args [[buffer(3)]],\n"
+                     "                                   uint2 gid [[thread_position_in_grid]])\n"
+                     "{\n"
+                     "    (void)x;\n"
+                     "    (void)y;\n"
+                     "    (void)out;\n"
+                     "    (void)args;\n"
+                     "    (void)gid;\n"
+                     "}\n",
+                     opts->op,
+                     opts->op,
+                     opts->op,
+                     opts->op,
+                     opts->op,
+                     notes,
+                     opts->op,
+                     opts->op,
+                     opts->op);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include <metal_stdlib>\n"
+                 "#include \"metal_%s_types.h\"\n"
+                 "\n"
+                 "using namespace metal;\n"
+                 "\n"
+                 "/* Scaffold for the '%s' op-local Metal kernels.\n"
+                 "\n"
+                 "   The generated Metal PSO glue expects unary ops to export:\n"
+                 "     gd_%s_kernel\n"
+                 "     gd_%s_backward_kernel\n"
+                 "\n"
+                 "%s"
+                 "*/\n"
+                 "kernel void gd_%s_kernel(device const uchar *x [[buffer(0)]],\n"
+                 "                         device uchar *y [[buffer(1)]],\n"
+                 "                         constant gd_metal_%s_args &args [[buffer(2)]],\n"
+                 "                         uint gid [[thread_position_in_grid]])\n"
+                 "{\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)args;\n"
+                 "    (void)gid;\n"
+                 "}\n"
+                 "\n"
+                 "kernel void gd_%s_backward_kernel(device const uchar *x [[buffer(0)]],\n"
+                 "                                  device const uchar *grad_out [[buffer(1)]],\n"
+                 "                                  device uchar *grad_x [[buffer(2)]],\n"
+                 "                                  constant gd_metal_%s_args &args [[buffer(3)]],\n"
+                 "                                  uint gid [[thread_position_in_grid]])\n"
+                 "{\n"
+                 "    (void)x;\n"
+                 "    (void)grad_out;\n"
+                 "    (void)grad_x;\n"
+                 "    (void)args;\n"
+                 "    (void)gid;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_fwd_py_content(char *out, size_t out_size, const char *op)
+{
+    int n = snprintf(out,
+                     out_size,
+                     "# /// script\n"
+                     "# requires-python = \">=3.11\"\n"
+                     "# dependencies = [\"torch\", \"numpy\"]\n"
+                     "# ///\n"
+                     "\n"
+                     "\"\"\"Forward correctness harness template for gd_%s.\n"
+                     "\n"
+                     "Fill in a C runner that calls gd_%s, then compare its output\n"
+                     "against a PyTorch reference. Run from the repository root with:\n"
+                     "\n"
+                     "    uv run src/ops/%s/fwd.py\n"
+                     "\"\"\"\n"
+                     "\n"
+                     "from __future__ import annotations\n"
+                     "\n"
+                     "import subprocess\n"
+                     "from pathlib import Path\n"
+                     "\n"
+                     "import numpy as np\n"
+                     "import torch\n"
+                     "\n"
+                     "\n"
+                     "def repo_root() -> Path:\n"
+                     "    return Path(__file__).resolve().parents[3]\n"
+                     "\n"
+                     "\n"
+                     "def build_library(root: Path) -> None:\n"
+                     "    subprocess.run([\"make\", \"build\"], cwd=root, check=True)\n"
+                     "\n"
+                     "\n"
+                     "def main() -> None:\n"
+                     "    root = repo_root()\n"
+                     "    build_library(root)\n"
+                     "    _ = (np, torch)\n"
+                     "    print(\"TODO: implement gd_%s forward PyTorch comparison\")\n"
+                     "\n"
+                     "\n"
+                     "if __name__ == \"__main__\":\n"
+                     "    main()\n",
+                     op,
+                     op,
+                     op,
+                     op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_bwd_py_content(char *out, size_t out_size, const char *op)
+{
+    int n = snprintf(out,
+                     out_size,
+                     "# /// script\n"
+                     "# requires-python = \">=3.11\"\n"
+                     "# dependencies = [\"torch\", \"numpy\"]\n"
+                     "# ///\n"
+                     "\n"
+                     "\"\"\"Backward/autograd correctness harness template for gd_%s.\n"
+                     "\n"
+                     "Fill in a C runner that records gd_%s on the autograd tape, calls\n"
+                     "gd_backward or gd_backward_many, then compare gradients against\n"
+                     "PyTorch autograd. Run from the repository root with:\n"
+                     "\n"
+                     "    uv run src/ops/%s/bwd.py\n"
+                     "\"\"\"\n"
+                     "\n"
+                     "from __future__ import annotations\n"
+                     "\n"
+                     "import subprocess\n"
+                     "from pathlib import Path\n"
+                     "\n"
+                     "import numpy as np\n"
+                     "import torch\n"
+                     "\n"
+                     "\n"
+                     "def repo_root() -> Path:\n"
+                     "    return Path(__file__).resolve().parents[3]\n"
+                     "\n"
+                     "\n"
+                     "def build_library(root: Path) -> None:\n"
+                     "    subprocess.run([\"make\", \"build\"], cwd=root, check=True)\n"
+                     "\n"
+                     "\n"
+                     "def main() -> None:\n"
+                     "    root = repo_root()\n"
+                     "    build_library(root)\n"
+                     "    _ = (np, torch)\n"
+                     "    print(\"TODO: implement gd_%s backward PyTorch/autograd comparison\")\n"
+                     "\n"
+                     "\n"
+                     "if __name__ == \"__main__\":\n"
+                     "    main()\n",
+                     op,
+                     op,
+                     op,
+                     op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_perf_test_content(char *out,
+                                      size_t out_size,
+                                      const gd_new_op_options *opts,
+                                      const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (out == NULL || opts == NULL || upper == NULL) {
+        return false;
+    }
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "/*\n"
+                 " * Performance probe scaffold for gd_%s.\n"
+                 " *\n"
+                 " * Run from the repository root with:\n"
+                 " *   make op-perf OP=%s\n"
+                 " *\n"
+                 " * Define realistic cases, allocate one reusable model/context per case,\n"
+                 " * warm up, then report avg_ms plus FLOP/s or logical bandwidth.\n"
+                 " * Keep public API overhead in the timed path.\n"
+                 " *\n"
+                 "%s"
+                 " */\n"
+                 "\n"
+                 "#ifndef _POSIX_C_SOURCE\n"
+                 "#define _POSIX_C_SOURCE 200809L\n"
+                 "#endif\n"
+                 "\n"
+                 "#include <gradients/gradients.h>\n"
+                 "\n"
+                 "#include <stdbool.h>\n"
+                 "#include <stdint.h>\n"
+                 "#include <stdio.h>\n"
+                 "#include <stdlib.h>\n"
+                 "#include <string.h>\n"
+                 "#if defined(__APPLE__)\n"
+                 "#include <mach/mach_time.h>\n"
+                 "#else\n"
+                 "#include <time.h>\n"
+                 "#endif\n"
+                 "\n"
+                 "#define GD_%s_PERF_GIB (1024.0 * 1024.0 * 1024.0)\n"
+                 "\n"
+                 "#if defined(__APPLE__)\n"
+                 "static double perf_now_seconds(void)\n"
+                 "{\n"
+                 "    static mach_timebase_info_data_t info;\n"
+                 "    static double scale = 0.0;\n"
+                 "    if (scale == 0.0) {\n"
+                 "        if (mach_timebase_info(&info) != 0 || info.denom == 0U) {\n"
+                 "            return 0.0;\n"
+                 "        }\n"
+                 "        scale = ((double)info.numer / (double)info.denom) * 1.0e-9;\n"
+                 "    }\n"
+                 "    return (double)mach_absolute_time() * scale;\n"
+                 "}\n"
+                 "#else\n"
+                 "static double perf_now_seconds(void)\n"
+                 "{\n"
+                 "    struct timespec ts;\n"
+                 "    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {\n"
+                 "        return 0.0;\n"
+                 "    }\n"
+                 "    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;\n"
+                 "}\n"
+                 "#endif\n"
+                 "\n"
+                 "static int perf_env_int(const char *name, int fallback, int min_value, int max_value)\n"
+                 "{\n"
+                 "    const char *value = getenv(name);\n"
+                 "    char *end = NULL;\n"
+                 "    long parsed;\n"
+                 "    if (value == NULL || value[0] == '\\0') {\n"
+                 "        return fallback;\n"
+                 "    }\n"
+                 "    parsed = strtol(value, &end, 10);\n"
+                 "    if (end == value || *end != '\\0') {\n"
+                 "        return fallback;\n"
+                 "    }\n"
+                 "    if (parsed < (long)min_value) {\n"
+                 "        return min_value;\n"
+                 "    }\n"
+                 "    if (parsed > (long)max_value) {\n"
+                 "        return max_value;\n"
+                 "    }\n"
+                 "    return (int)parsed;\n"
+                 "}\n"
+                 "\n"
+                 "typedef struct perf_case {\n"
+                 "    const char *name;\n"
+                 "    int64_t rows;\n"
+                 "    int64_t cols;\n"
+                 "} perf_case;\n"
+                 "\n"
+                 "static bool perf_case_selected(const perf_case *pcase, const char *profile)\n"
+                 "{\n"
+                 "    if (profile == NULL || profile[0] == '\\0' || strcmp(profile, \"all\") == 0) {\n"
+                 "        return true;\n"
+                 "    }\n"
+                 "    if (strcmp(profile, \"smoke\") == 0) {\n"
+                 "        return strcmp(pcase->name, \"small_tail\") == 0 ||\n"
+                 "               strcmp(pcase->name, \"activation_mid\") == 0;\n"
+                 "    }\n"
+                 "    return strcmp(profile, pcase->name) == 0;\n"
+                 "}\n"
+                 "\n"
+                 "int main(void)\n"
+                 "{\n"
+                 "    static const perf_case cases[] = {\n"
+                 "        {\"small_tail\", 1, 513},\n"
+                 "        {\"activation_mid\", 4096, 768},\n"
+                 "        {\"activation_large\", 4096, 4096},\n"
+                 "    };\n"
+                 "    const char *profile = getenv(\"GD_%s_PERF_PROFILE\");\n"
+                 "    int warmup = perf_env_int(\"GD_%s_PERF_WARMUP\", 10, 0, 10000);\n"
+                 "    int iters = perf_env_int(\"GD_%s_PERF_ITERS\", 100, 1, 1000000);\n"
+                 "    double timer_start = perf_now_seconds();\n"
+                 "    double timer_elapsed;\n"
+                 "    bool ran = false;\n"
+                 "    size_t i;\n"
+                 "    timer_elapsed = perf_now_seconds() - timer_start;\n"
+                 "    printf(\"[%s] perf scaffold for gd_%s: warmup=%%d iters=%%d profile=%%s timer_overhead_ms=%%.6f\\n\",\n"
+                 "           warmup,\n"
+                 "           iters,\n"
+                 "           profile != NULL && profile[0] != '\\0' ? profile : \"all\",\n"
+                 "           timer_elapsed * 1.0e3);\n"
+                 "    printf(\"[%s] TODO: replace scaffold loop with real model allocation and timed gd_%s calls.\\n\");\n"
+                 "    printf(\"[%s] Report avg_ms plus FLOP/s for compute-bound ops or logical_GiB/s for memory-bound ops.\\n\");\n"
+                 "    (void)GD_%s_PERF_GIB;\n"
+                 "    for (i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {\n"
+                 "        size_t elems;\n"
+                 "        if (!perf_case_selected(&cases[i], profile)) {\n"
+                 "            continue;\n"
+                 "        }\n"
+                 "        ran = true;\n"
+                 "        elems = (size_t)cases[i].rows * (size_t)cases[i].cols;\n"
+                 "        printf(\"[%s][TODO] case=%%s shape=%%lldx%%lld elems=%%zu\\n\",\n"
+                 "               cases[i].name,\n"
+                 "               (long long)cases[i].rows,\n"
+                 "               (long long)cases[i].cols,\n"
+                 "               elems);\n"
+                 "    }\n"
+                 "    if (!ran) {\n"
+                 "        fprintf(stderr, \"[%s][FAIL] no cases selected for GD_%s_PERF_PROFILE=%%s\\n\",\n"
+                 "                profile != NULL ? profile : \"(null)\");\n"
+                 "        return 2;\n"
+                 "    }\n"
+                 "    return 0;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 opts->op,
+                 upper,
+                 opts->op,
+                 upper,
+                 upper,
+                 upper,
+                 upper,
+                 upper);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_readme_content(char *out,
+                                   size_t out_size,
+                                   const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, "- ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "# %s\n"
+                 "\n"
+                 "Generated op capsule scaffold. Before implementing Metal hot paths, read\n"
+                 "[Metal performance tips](../../../docs/guides/metal_tips.md).\n"
+                 "\n"
+                 "Scaffold notes:\n"
+                 "\n"
+                 "%s"
+                 "\n"
+                 "Checklist:\n"
+                 "\n"
+                 "- [ ] Public API generated in `include/gradients/ops_generated.h`\n"
+                 "- [ ] Forward validation/allocation/recording in `core_%s.c`\n"
+                 "- [ ] Backend dispatch in `metal_%s.m`\n"
+                 "- [ ] Op-local Metal ABI/kernel implementation in `metal_%s_types.h` / `metal_%s.metal`\n"
+                 "- [ ] Backward rule in `autograd_%s.c`\n"
+                 "- [ ] Forward PyTorch harness in `fwd.py`\n"
+                 "- [ ] Backward PyTorch harness in `bwd.py`\n"
+                 "- [ ] C tests under `tests/`\n"
+                 "- [ ] Op-local perf probe in `perf_test.c` (`make op-perf OP=%s`)\n",
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_sibling_tool_path(const char *argv0, const char *tool, char *out, size_t out_size)
+{
+    const char *slash;
+    size_t dir_len;
+    int n;
+    if (argv0 == NULL || tool == NULL || out == NULL || out_size == 0U) {
+        return false;
+    }
+    slash = strrchr(argv0, '/');
+    if (slash == NULL) {
+        n = snprintf(out, out_size, "%s", tool);
+        return n >= 0 && (size_t)n < out_size;
+    }
+    dir_len = (size_t)(slash - argv0);
+    if (dir_len + 1U + strlen(tool) + 1U > out_size) {
+        return false;
+    }
+    memcpy(out, argv0, dir_len);
+    out[dir_len] = '/';
+    snprintf(out + dir_len + 1U, out_size - dir_len - 1U, "%s", tool);
+    return true;
+}
+
+static bool gd_registry_stamp_path(const char *argv0, char *out, size_t out_size)
+{
+    const char *last_slash;
+    const char *prev_slash;
+    size_t build_len;
+    int n;
+    if (argv0 == NULL || out == NULL || out_size == 0U) {
+        return false;
+    }
+    last_slash = strrchr(argv0, '/');
+    if (last_slash == NULL) {
+        n = snprintf(out, out_size, "build/.ops-registry");
+        return n >= 0 && (size_t)n < out_size;
+    }
+    prev_slash = last_slash;
+    while (prev_slash > argv0 && prev_slash[-1] != '/') {
+        prev_slash -= 1;
+    }
+    if (prev_slash == argv0) {
+        n = snprintf(out, out_size, "build/.ops-registry");
+        return n >= 0 && (size_t)n < out_size;
+    }
+    build_len = (size_t)(prev_slash - argv0 - 1);
+    if (build_len + strlen("/.ops-registry") + 1U > out_size) {
+        return false;
+    }
+    memcpy(out, argv0, build_len);
+    snprintf(out + build_len, out_size - build_len, "/.ops-registry");
+    return true;
+}
+
+static int gd_run_gen_ops(const char *argv0)
+{
+    char gen_path[GD_NEW_OP_PATH_MAX];
+    char stamp_path[GD_NEW_OP_PATH_MAX];
+    char cmd[(GD_NEW_OP_PATH_MAX * 2U) + 32U];
+    int n;
+    int rc;
+    if (!gd_sibling_tool_path(argv0, "gen_ops", gen_path, sizeof(gen_path)) ||
+        !gd_registry_stamp_path(argv0, stamp_path, sizeof(stamp_path))) {
+        fprintf(stderr, "gradients-new-op: failed to resolve registry tool paths\n");
         return 1;
     }
-    errno = 0;
-    v = strtol(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0' || v < 1L || v > GD_NEW_OP_MAX_ARITY) {
+    if (!gd_path_exists(gen_path)) {
+        fprintf(stderr, "gradients-new-op: missing %s; run `make tools` first\n", gen_path);
         return 1;
     }
-    *out = (int)v;
+    n = snprintf(cmd, sizeof(cmd), "\"%s\" --stamp \"%s\"", gen_path, stamp_path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        fprintf(stderr, "gradients-new-op: gen_ops path too long\n");
+        return 1;
+    }
+    fflush(stdout);
+    rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "gradients-new-op: registry generation failed\n");
+        return 1;
+    }
     return 0;
 }
 
-static int parse_args(int argc, char **argv, op_config *cfg)
+static void gd_print_usage(const char *argv0)
 {
-    int i = 0;
-    bool have_name = false;
+    fprintf(stderr,
+            "usage: %s [options] <snake_case_op_name>\n"
+            "\n"
+            "Options:\n"
+            "  --binary          scaffold binary public API/backend shape (default unary)\n"
+            "  --unary           scaffold unary public API/backend shape\n"
+            "  --no-backend      omit generated backend= metadata for custom backend entry points\n"
+            "  --custom          alias for --no-backend\n"
+            "  --f16-only        annotate/scaffold for F16-specialized hot kernels\n"
+            "  --f16-f32-accum   annotate/scaffold for F16 inputs with FP32 accumulation\n"
+            "  --save-stats      annotate/scaffold for saved forward stats used by backward\n"
+            "  --reduction       annotate/scaffold for shape-adaptive reduction kernels\n"
+            "  --help            show this help\n",
+            argv0);
+}
 
-    if (cfg == NULL) {
+static int gd_parse_args(int argc, char **argv, gd_new_op_options *opts)
+{
+    int i;
+    if (opts == NULL) {
         return 2;
     }
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->inputs = 1;
-    cfg->outputs = 1;
-    cfg->is_public = true;
-    cfg->diff = true;
-    cfg->custom_bwd = true;
-    cfg->run_generated = true;
-
-    if (argc <= 1) {
-        usage(stderr);
-        return 2;
-    }
+    memset(opts, 0, sizeof(*opts));
     for (i = 1; i < argc; ++i) {
         const char *arg = argv[i];
-        if (strcmp(arg, "--help") == 0) {
-            usage(stdout);
-            return 0;
-        } else if (strcmp(arg, "--private") == 0) {
-            cfg->is_public = false;
-        } else if (strcmp(arg, "--no-diff") == 0) {
-            cfg->diff = false;
-            cfg->custom_bwd = false;
-        } else if (strcmp(arg, "--no-custom-bwd") == 0) {
-            cfg->custom_bwd = false;
-        } else if (strcmp(arg, "--inputs") == 0) {
-            if (i + 1 >= argc || parse_int_arg(argv[++i], &cfg->inputs) != 0) {
-                fprintf(stderr, "invalid --inputs (expected 1..%d)\n", GD_NEW_OP_MAX_ARITY);
-                return 2;
-            }
-        } else if (strcmp(arg, "--outputs") == 0) {
-            if (i + 1 >= argc || parse_int_arg(argv[++i], &cfg->outputs) != 0) {
-                fprintf(stderr, "invalid --outputs (expected 1..%d)\n", GD_NEW_OP_MAX_ARITY);
-                return 2;
-            }
-        } else if (strcmp(arg, "--cpu-only") == 0) {
-            cfg->cpu_only = true;
-        } else if (strcmp(arg, "--no-generated") == 0) {
-            cfg->run_generated = false;
-        } else if (strcmp(arg, "--force") == 0) {
-            cfg->force = true;
-        } else if (strcmp(arg, "--dry-run") == 0) {
-            cfg->dry_run = true;
-        } else if (arg[0] == '-') {
-            fprintf(stderr, "unknown option: %s\n", arg);
-            return 2;
-        } else if (!have_name) {
-            if (!is_lower_snake(arg)) {
-                fprintf(stderr, "invalid OP_NAME '%s' (use lowercase snake_case)\n", arg);
-                return 2;
-            }
-            (void)snprintf(cfg->name, sizeof(cfg->name), "%s", arg);
-            have_name = true;
-        } else {
-            fprintf(stderr, "unexpected argument: %s\n", arg);
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            return 3;
+        }
+        if (strcmp(arg, "--binary") == 0) {
+            opts->binary = true;
+            continue;
+        }
+        if (strcmp(arg, "--unary") == 0) {
+            opts->binary = false;
+            continue;
+        }
+        if (strcmp(arg, "--no-backend") == 0 || strcmp(arg, "--custom") == 0) {
+            opts->no_backend = true;
+            continue;
+        }
+        if (strcmp(arg, "--f16-only") == 0) {
+            opts->f16_only = true;
+            continue;
+        }
+        if (strcmp(arg, "--f16-f32-accum") == 0) {
+            opts->f16_f32_accum = true;
+            continue;
+        }
+        if (strcmp(arg, "--save-stats") == 0) {
+            opts->save_stats = true;
+            continue;
+        }
+        if (strcmp(arg, "--reduction") == 0) {
+            opts->reduction = true;
+            continue;
+        }
+        if (arg[0] == '-') {
+            fprintf(stderr, "gradients-new-op: unknown option '%s'\n", arg);
             return 2;
         }
+        if (opts->op != NULL) {
+            fprintf(stderr, "gradients-new-op: multiple op names provided ('%s' and '%s')\n", opts->op, arg);
+            return 2;
+        }
+        opts->op = arg;
     }
-    if (!have_name) {
-        fprintf(stderr, "missing OP_NAME\n");
+    if (opts->op == NULL) {
+        fprintf(stderr, "gradients-new-op: missing op name\n");
         return 2;
     }
-    if (!cfg->diff) {
-        cfg->custom_bwd = false;
-    }
-    make_upper(cfg->name, cfg->upper, sizeof(cfg->upper));
-    return 1;
-}
-
-static int read_file(const char *path, char **text_out, size_t *len_out)
-{
-    FILE *f = NULL;
-    long end = 0L;
-    char *text = NULL;
-    size_t nread = 0U;
-
-    if (path == NULL || text_out == NULL || len_out == NULL) {
-        return 1;
-    }
-    *text_out = NULL;
-    *len_out = 0U;
-    f = fopen(path, "rb");
-    if (f == NULL) {
-        return 1;
-    }
-    if (fseek(f, 0L, SEEK_END) != 0) {
-        (void)fclose(f);
-        return 1;
-    }
-    end = ftell(f);
-    if (end < 0L) {
-        (void)fclose(f);
-        return 1;
-    }
-    if (fseek(f, 0L, SEEK_SET) != 0) {
-        (void)fclose(f);
-        return 1;
-    }
-    text = (char *)malloc((size_t)end + 1U);
-    if (text == NULL) {
-        (void)fclose(f);
-        return 1;
-    }
-    nread = fread(text, 1U, (size_t)end, f);
-    if (nread != (size_t)end) {
-        free(text);
-        (void)fclose(f);
-        return 1;
-    }
-    if (fclose(f) != 0) {
-        free(text);
-        return 1;
-    }
-    text[(size_t)end] = '\0';
-    *text_out = text;
-    *len_out = (size_t)end;
-    return 0;
-}
-
-static int write_text_file(const char *path, const char *text, bool force, bool dry_run)
-{
-    FILE *f = NULL;
-    const char *slash = NULL;
-    char dir[GD_NEW_OP_MAX_PATH];
-    size_t dir_len = 0U;
-    size_t n = 0U;
-
-    if (path == NULL || text == NULL) {
-        return 1;
-    }
-    if (dry_run) {
-        printf("create: %s%s\n", path, file_exists(path) ? " (exists)" : "");
-        return 0;
-    }
-    if (file_exists(path) && !force) {
-        fprintf(stderr, "refusing to overwrite existing file: %s (pass --force)\n", path);
-        return 1;
-    }
-    slash = strrchr(path, '/');
-    if (slash != NULL) {
-        dir_len = (size_t)(slash - path);
-        if (dir_len >= sizeof(dir)) {
-            return 1;
-        }
-        memcpy(dir, path, dir_len);
-        dir[dir_len] = '\0';
-        if (!dir_exists(dir) && mkdir_p(dir) != 0) {
-            fprintf(stderr, "failed to create directory: %s\n", dir);
-            return 1;
-        }
-    }
-    f = fopen(path, "wb");
-    if (f == NULL) {
-        fprintf(stderr, "failed to open %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    n = strlen(text);
-    if (fwrite(text, 1U, n, f) != n) {
-        (void)fclose(f);
-        fprintf(stderr, "failed to write %s\n", path);
-        return 1;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "failed to close %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    printf("create: %s\n", path);
-    return 0;
-}
-
-static int overwrite_text_file(const char *path, const char *text)
-{
-    FILE *f = NULL;
-    size_t n = 0U;
-
-    if (path == NULL || text == NULL) {
-        return 1;
-    }
-    f = fopen(path, "wb");
-    if (f == NULL) {
-        fprintf(stderr, "failed to open %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    n = strlen(text);
-    if (fwrite(text, 1U, n, f) != n) {
-        (void)fclose(f);
-        fprintf(stderr, "failed to write %s\n", path);
-        return 1;
-    }
-    if (fclose(f) != 0) {
-        fprintf(stderr, "failed to close %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    return 0;
-}
-
-static int patch_insert_before(const char *path,
-                               const char *marker,
-                               const char *insert,
-                               const char *already_token,
-                               bool dry_run)
-{
-    char *text = NULL;
-    size_t len = 0U;
-    char *pos = NULL;
-    string_builder out = {0};
-    int rc = 1;
-
-    if (path == NULL || marker == NULL || insert == NULL || already_token == NULL) {
-        return 1;
-    }
-    if (read_file(path, &text, &len) != 0) {
-        fprintf(stderr, "failed to read patch target: %s\n", path);
-        return 1;
-    }
-    if (strstr(text, already_token) != NULL) {
-        printf("patch: %s (already contains %s)\n", path, already_token);
-        free(text);
-        return 0;
-    }
-    pos = strstr(text, marker);
-    if (pos == NULL) {
-        fprintf(stderr, "patch marker not found in %s: %s\n", path, marker);
-        free(text);
-        return 1;
-    }
-    if (dry_run) {
-        printf("patch: %s\n", path);
-        free(text);
-        return 0;
-    }
-    if (sb_append_n(&out, text, (size_t)(pos - text)) != 0 ||
-        sb_append(&out, insert) != 0 ||
-        sb_append(&out, pos) != 0) {
-        fprintf(stderr, "out of memory while patching %s\n", path);
-        goto done;
-    }
-    if (overwrite_text_file(path, out.data) != 0) {
-        goto done;
-    }
-    printf("patch: %s\n", path);
-    rc = 0;
-
-done:
-    sb_free(&out);
-    free(text);
-    return rc;
-}
-
-static int append_input_params(string_builder *sb, const op_config *cfg, bool names)
-{
-    int i = 0;
-
-    for (i = 0; i < cfg->inputs; ++i) {
-        if (sb_append(sb, ", gd_tensor *") != 0) {
-            return 1;
-        }
-        if (names) {
-            if (cfg->inputs == 1) {
-                if (sb_append(sb, "x") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, "x%d", i) != 0) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int append_output_params(string_builder *sb, const op_config *cfg, bool names)
-{
-    int i = 0;
-
-    for (i = 0; i < cfg->outputs; ++i) {
-        if (sb_append(sb, ", gd_tensor **") != 0) {
-            return 1;
-        }
-        if (names) {
-            if (cfg->outputs == 1) {
-                if (sb_append(sb, "out") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, "out%d", i) != 0) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int append_public_proto(string_builder *sb, const op_config *cfg, bool names)
-{
-    if (sb_appendf(sb, "gd_status gd_%s(gd_context *ctx", cfg->name) != 0 ||
-        append_input_params(sb, cfg, names) != 0 ||
-        append_output_params(sb, cfg, names) != 0 ||
-        sb_append(sb, ")") != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int append_gd_ref_args(string_builder *sb, const op_config *cfg)
-{
-    int i = 0;
-
-    if (sb_append(sb, "(gd_context *") != 0) {
-        return 1;
-    }
-    for (i = 0; i < cfg->inputs; ++i) {
-        if (sb_append(sb, ", gd_tensor *") != 0) {
-            return 1;
-        }
-    }
-    for (i = 0; i < cfg->outputs; ++i) {
-        if (sb_append(sb, ", gd_tensor **") != 0) {
-            return 1;
-        }
-    }
-    return sb_append(sb, ")");
-}
-
-static int build_ops_h_patch(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb, "/* Autogenerated scaffold for `%s`. TODO: document op contract after implementation. */\n", cfg->name) != 0 ||
-        append_public_proto(sb, cfg, true) != 0 ||
-        sb_append(sb, ";\n\n") != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_public_symbols_patch(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb, "GD_REF(gd_%s, gd_status, ", cfg->name) != 0 ||
-        append_gd_ref_args(sb, cfg) != 0 ||
-        sb_append(sb, ");\n") != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_registry_test_patch(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb, "    {_GD_OP_%s, \"%s\"},\n", cfg->upper, cfg->name) != 0) {
-        return 1;
-    }
-    if (cfg->custom_bwd &&
-        sb_appendf(sb, "    {_GD_OP_%s_BWD, \"%s_bwd\"},\n", cfg->upper, cfg->name) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_metal_backend_patch(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb, "    {_GD_OP_%s, \"gd_%s\"},\n", cfg->upper, cfg->name) != 0) {
-        return 1;
-    }
-    if (cfg->custom_bwd &&
-        sb_appendf(sb, "    {_GD_OP_%s_BWD, \"gd_%s_bwd\"},\n", cfg->upper, cfg->name) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_core_fwd(const op_config *cfg, string_builder *sb)
-{
-    const char *flags = NULL;
-
-    if (cfg->is_public && cfg->diff) {
-        flags = "GD_OPF_PUBLIC | GD_OPF_DIFF";
-    } else if (cfg->is_public) {
-        flags = "GD_OPF_PUBLIC";
-    } else if (cfg->diff) {
-        flags = "GD_OPF_INTERNAL | GD_OPF_DIFF";
-    } else {
-        flags = "GD_OPF_INTERNAL";
-    }
-
-    if (sb_append(sb,
-                  "#include \"../op_impl.h\"\n"
-                  "#include \"../meta_common.h\"\n") != 0) {
-        return 1;
-    }
-    if (cfg->is_public && sb_append(sb, "#include \"gradients/ops.h\"\n") != 0) {
-        return 1;
-    }
-    if (sb_appendf(sb,
-                   "\n"
-                   "#include \"../../core/internal.h\"\n"
-                   "\n"
-                   "#define GD_%s_N_INPUTS %d\n"
-                   "#define GD_%s_N_OUTPUTS %d\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement `%s` meta validation and shape inference. */\n"
-                   "static gd_status %s_meta(const gd_tensor_desc *const *inputs,\n"
-                   "                                int n_inputs,\n"
-                   "                                _gd_op_attrs *attrs,\n"
-                   "                                gd_tensor_desc *outputs,\n"
-                   "                                int *n_outputs)\n"
-                   "{\n"
-                   "    gd_status status = GD_OK;\n"
-                   "    int i = 0;\n"
-                   "\n"
-                   "    (void)attrs;\n"
-                   "    if (inputs == NULL || outputs == NULL || n_outputs == NULL) {\n"
-                   "        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"%s meta arguments are NULL\");\n"
-                   "    }\n"
-                   "    if (n_inputs != GD_%s_N_INPUTS) {\n"
-                   "        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"%s input count mismatch\");\n"
-                   "    }\n"
-                   "    if (inputs[0] == NULL) {\n"
-                   "        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"%s input desc is NULL\");\n"
-                   "    }\n"
-                   "    status = _gd_meta_set_output_count(GD_%s_N_OUTPUTS, n_outputs);\n"
-                   "    if (status != GD_OK) {\n"
-                   "        return status;\n"
-                   "    }\n"
-                   "    for (i = 0; i < GD_%s_N_OUTPUTS; ++i) {\n"
-                   "        outputs[i] = *inputs[0];\n"
-                   "    }\n"
-                   "    return GD_OK;\n"
-                   "}\n"
-                   "\n"
-                   "const _gd_op_def _gd_opdef_%s = {\n"
-                   "    .kind = _GD_OP_%s,\n"
-                   "    .name = \"%s\",\n"
-                   "    .min_inputs = GD_%s_N_INPUTS,\n"
-                   "    .max_inputs = GD_%s_N_INPUTS,\n"
-                   "    .n_outputs = GD_%s_N_OUTPUTS,\n"
-                   "    .flags = %s,\n"
-                   "    .meta = %s_meta,\n"
-                   "};\n",
-                   cfg->upper, cfg->inputs,
-                   cfg->upper, cfg->outputs,
-                   cfg->name,
-                   cfg->name,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->upper,
-                   flags,
-                   cfg->name) != 0) {
-        return 1;
-    }
-    if (cfg->is_public) {
-        int i = 0;
-        if (sb_append(sb, "\n") != 0 || append_public_proto(sb, cfg, true) != 0 ||
-            sb_append(sb, "\n{\n") != 0 ||
-            sb_appendf(sb, "    gd_tensor *inputs[GD_%s_N_INPUTS] = {", cfg->upper) != 0) {
-            return 1;
-        }
-        for (i = 0; i < cfg->inputs; ++i) {
-            if (i > 0 && sb_append(sb, ", ") != 0) {
-                return 1;
-            }
-            if (cfg->inputs == 1) {
-                if (sb_append(sb, "x") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, "x%d", i) != 0) {
-                return 1;
-            }
-        }
-        if (sb_appendf(sb, "};\n    gd_tensor *outputs[GD_%s_N_OUTPUTS] = {0};\n    gd_status status = GD_OK;\n\n",
-                       cfg->upper) != 0) {
-            return 1;
-        }
-        if (sb_append(sb, "    if (ctx == NULL") != 0) {
-            return 1;
-        }
-        for (i = 0; i < cfg->inputs; ++i) {
-            if (cfg->inputs == 1) {
-                if (sb_append(sb, " || x == NULL") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, " || x%d == NULL", i) != 0) {
-                return 1;
-            }
-        }
-        for (i = 0; i < cfg->outputs; ++i) {
-            if (cfg->outputs == 1) {
-                if (sb_append(sb, " || out == NULL") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, " || out%d == NULL", i) != 0) {
-                return 1;
-            }
-        }
-        if (sb_appendf(sb, ") {\n        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"gd_%s argument is NULL\");\n    }\n",
-                       cfg->name) != 0) {
-            return 1;
-        }
-        for (i = 0; i < cfg->outputs; ++i) {
-            if (cfg->outputs == 1) {
-                if (sb_append(sb, "    *out = NULL;\n") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, "    *out%d = NULL;\n", i) != 0) {
-                return 1;
-            }
-        }
-        if (sb_appendf(sb,
-                       "    status = _gd_emit_checked(ctx, _GD_OP_%s, inputs, GD_%s_N_INPUTS,\n"
-                       "                              NULL, outputs, GD_%s_N_OUTPUTS);\n"
-                       "    if (status != GD_OK) {\n"
-                       "        return status;\n"
-                       "    }\n",
-                       cfg->upper, cfg->upper, cfg->upper) != 0) {
-            return 1;
-        }
-        for (i = 0; i < cfg->outputs; ++i) {
-            if (cfg->outputs == 1) {
-                if (sb_append(sb, "    *out = outputs[0];\n") != 0) {
-                    return 1;
-                }
-            } else if (sb_appendf(sb, "    *out%d = outputs[%d];\n", i, i) != 0) {
-                return 1;
-            }
-        }
-        if (sb_append(sb, "    return GD_OK;\n}\n") != 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int build_core_bwd(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb,
-                   "#include \"../op_impl.h\"\n"
-                   "#include \"../meta_common.h\"\n"
-                   "\n"
-                   "#include \"../../core/internal.h\"\n"
-                   "\n"
-                   "#define GD_%s_BWD_N_INPUTS %d\n"
-                   "#define GD_%s_BWD_N_OUTPUTS %d\n"
-                   "#define GD_%s_FWD_N_OUTPUTS %d\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement `%s_bwd` meta validation and grad descs. */\n"
-                   "static gd_status %s_bwd_meta(const gd_tensor_desc *const *inputs,\n"
-                   "                                    int n_inputs,\n"
-                   "                                    _gd_op_attrs *attrs,\n"
-                   "                                    gd_tensor_desc *outputs,\n"
-                   "                                    int *n_outputs)\n"
-                   "{\n"
-                   "    gd_status status = GD_OK;\n"
-                   "    int i = 0;\n"
-                   "\n"
-                   "    (void)attrs;\n"
-                   "    if (inputs == NULL || outputs == NULL || n_outputs == NULL) {\n"
-                   "        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"%s_bwd meta arguments are NULL\");\n"
-                   "    }\n"
-                   "    if (n_inputs != GD_%s_BWD_N_INPUTS) {\n"
-                   "        return _gd_error(GD_ERR_INVALID_ARGUMENT, \"%s_bwd input count mismatch\");\n"
-                   "    }\n"
-                   "    status = _gd_meta_set_output_count(GD_%s_BWD_N_OUTPUTS, n_outputs);\n"
-                   "    if (status != GD_OK) {\n"
-                   "        return status;\n"
-                   "    }\n"
-                   "    for (i = 0; i < GD_%s_BWD_N_OUTPUTS; ++i) {\n"
-                   "        outputs[i] = *inputs[GD_%s_FWD_N_OUTPUTS + i];\n"
-                   "    }\n"
-                   "    return GD_OK;\n"
-                   "}\n"
-                   "\n"
-                   "const _gd_op_def _gd_opdef_%s_bwd = {\n"
-                   "    .kind = _GD_OP_%s_BWD,\n"
-                   "    .name = \"%s_bwd\",\n"
-                   "    .min_inputs = GD_%s_BWD_N_INPUTS,\n"
-                   "    .max_inputs = GD_%s_BWD_N_INPUTS,\n"
-                   "    .n_outputs = GD_%s_BWD_N_OUTPUTS,\n"
-                   "    .flags = GD_OPF_INTERNAL,\n"
-                   "    .meta = %s_bwd_meta,\n"
-                   "};\n",
-                   cfg->upper, cfg->inputs + cfg->outputs,
-                   cfg->upper, cfg->inputs,
-                   cfg->upper, cfg->outputs,
-                   cfg->name,
-                   cfg->name,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->upper,
-                   cfg->name) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_cpu_file(const op_config *cfg, bool bwd, string_builder *sb)
-{
-    const char *suffix = bwd ? "_bwd" : "";
-    const char *kind_suffix = bwd ? "_BWD" : "";
-    const char *part = bwd ? "CPU backward" : "CPU forward";
-
-    if (sb_appendf(sb,
-                   "#include \"../../backends/cpu_ref/cpu_op.h\"\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement `%s%s` CPU kernel in this op capsule.\n"
-                   " * Do not add new per-op kernel bodies to src/backends/cpu_ref/cpu_kernels.c. */\n"
-                   "static gd_status %s%s_run(_gd_cpu_exec *exec, const _gd_node *node)\n"
-                   "{\n"
-                   "    (void)exec;\n"
-                   "    (void)node;\n"
-                   "    return _gd_error(GD_ERR_UNSUPPORTED,\n"
-                   "                     \"Autogenerated stub: op '%s%s' %s not implemented; TODO fill src/ops/%s/cpu_%s%s.c\");\n"
-                   "}\n"
-                   "\n"
-                   "const _gd_cpu_op _gd_cpu_op_%s%s = {\n"
-                   "    .kind = _GD_OP_%s%s,\n"
-                   "    .name = \"%s%s\",\n"
-                   "    .support = _gd_cpu_support_default,\n"
-                   "    .run = %s%s_run,\n"
-                   "};\n",
-                   cfg->name, suffix,
-                   cfg->name, suffix,
-                   cfg->name, suffix, part, cfg->name, cfg->name, suffix,
-                   cfg->name, suffix,
-                   cfg->upper, kind_suffix,
-                   cfg->name, suffix,
-                   cfg->name, suffix) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_grad_file(const op_config *cfg, string_builder *sb)
-{
-    if (sb_appendf(sb,
-                   "#include \"../grad_impl.h\"\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement backward rule for `%s`. */\n"
-                   "static gd_status %s_backward(_gd_bwd_ctx *b, const _gd_node *node)\n"
-                   "{\n"
-                   "    (void)b;\n"
-                   "    (void)node;\n"
-                   "    return _gd_error(GD_ERR_UNSUPPORTED,\n"
-                   "                     \"Autogenerated stub: op '%s' backward rule not implemented; TODO fill src/ops/%s/grad_%s.c\");\n"
-                   "}\n"
-                   "\n"
-                   "const _gd_bwd_rule _gd_bwd_rule_%s = {\n"
-                   "    .op = _GD_OP_%s,\n"
-                   "    .fn = %s_backward,\n"
-                   "    .unsupported_reason = NULL,\n"
-                   "};\n",
-                   cfg->name,
-                   cfg->name,
-                   cfg->name, cfg->name, cfg->name,
-                   cfg->name,
-                   cfg->upper,
-                   cfg->name) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_metal_host(const op_config *cfg, bool bwd, string_builder *sb)
-{
-    const char *suffix = bwd ? "_bwd" : "";
-    const char *kind_suffix = bwd ? "_BWD" : "";
-    const char *part = bwd ? "Metal backward" : "Metal forward";
-
-    if (sb_appendf(sb,
-                   "#import \"../../backends/metal/metal_op.h\"\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement `%s%s` Metal encoder. */\n"
-                   "static gd_status %s%s_encode(_gd_metal_encode_ctx *ctx)\n"
-                   "{\n"
-                   "    (void)ctx;\n"
-                   "    return _gd_error(GD_ERR_UNSUPPORTED,\n"
-                   "                     \"Autogenerated stub: op '%s%s' %s not implemented; TODO fill src/ops/%s/metal_%s%s.m\");\n"
-                   "}\n"
-                   "\n"
-                   "const _gd_metal_op _gd_metal_op_%s%s = {\n"
-                   "    .kind = _GD_OP_%s%s,\n"
-                   "    .name = \"%s%s\",\n"
-                   "    .support = _gd_metal_support_default,\n"
-                   "    .encode = %s%s_encode,\n"
-                   "};\n",
-                   cfg->name, suffix,
-                   cfg->name, suffix,
-                   cfg->name, suffix, part, cfg->name, cfg->name, suffix,
-                   cfg->name, suffix,
-                   cfg->upper, kind_suffix,
-                   cfg->name, suffix,
-                   cfg->name, suffix) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int build_metal_shader(const op_config *cfg, bool bwd, string_builder *sb)
-{
-    const char *suffix = bwd ? "_bwd" : "";
-
-    if (sb_appendf(sb,
-                   "#include \"metal_common.metal\"\n"
-                   "\n"
-                   "/* Autogenerated scaffold. TODO: implement `gd_%s%s` Metal shader.\n"
-                   " * Host encoder currently returns GD_ERR_UNSUPPORTED, so this kernel is not called. */\n"
-                   "kernel void gd_%s%s(uint gid [[thread_position_in_grid]])\n"
-                   "{\n"
-                   "    (void)gid;\n"
-                   "}\n",
-                   cfg->name, suffix,
-                   cfg->name, suffix) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int write_built_file(const char *path,
-                            int (*builder)(const op_config *, string_builder *),
-                            const op_config *cfg)
-{
-    string_builder sb = {0};
-    int rc = 1;
-
-    if (builder(cfg, &sb) != 0) {
-        fprintf(stderr, "failed to build template for %s\n", path);
-        goto done;
-    }
-    if (write_text_file(path, sb.data, cfg->force, cfg->dry_run) != 0) {
-        goto done;
-    }
-    rc = 0;
-
-done:
-    sb_free(&sb);
-    return rc;
-}
-
-static int build_cpu_fwd_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_cpu_file(cfg, false, sb);
-}
-
-static int build_cpu_bwd_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_cpu_file(cfg, true, sb);
-}
-
-static int build_metal_fwd_host_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_metal_host(cfg, false, sb);
-}
-
-static int build_metal_bwd_host_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_metal_host(cfg, true, sb);
-}
-
-static int build_metal_fwd_shader_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_metal_shader(cfg, false, sb);
-}
-
-static int build_metal_bwd_shader_wrapper(const op_config *cfg, string_builder *sb)
-{
-    return build_metal_shader(cfg, true, sb);
-}
-
-static int scaffold_files(const op_config *cfg)
-{
-    char dir[GD_NEW_OP_MAX_PATH];
-    char path[GD_NEW_OP_MAX_PATH];
-
-    (void)snprintf(dir, sizeof(dir), "src/ops/%s", cfg->name);
-    if (!cfg->dry_run && mkdir_p(dir) != 0) {
-        fprintf(stderr, "failed to create op directory: %s\n", dir);
-        return 1;
-    }
-
-    (void)snprintf(path, sizeof(path), "%s/core_%s_fwd.c", dir, cfg->name);
-    if (write_built_file(path, build_core_fwd, cfg) != 0) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/cpu_%s_fwd.c", dir, cfg->name);
-    if (write_built_file(path, build_cpu_fwd_wrapper, cfg) != 0) {
-        return 1;
-    }
-    if (cfg->diff) {
-        (void)snprintf(path, sizeof(path), "%s/grad_%s.c", dir, cfg->name);
-        if (write_built_file(path, build_grad_file, cfg) != 0) {
-            return 1;
-        }
-    }
-    if (cfg->custom_bwd) {
-        (void)snprintf(path, sizeof(path), "%s/core_%s_bwd.c", dir, cfg->name);
-        if (write_built_file(path, build_core_bwd, cfg) != 0) {
-            return 1;
-        }
-        (void)snprintf(path, sizeof(path), "%s/cpu_%s_bwd.c", dir, cfg->name);
-        if (write_built_file(path, build_cpu_bwd_wrapper, cfg) != 0) {
-            return 1;
-        }
-    }
-    if (!cfg->cpu_only) {
-        (void)snprintf(path, sizeof(path), "%s/metal_%s_fwd.m", dir, cfg->name);
-        if (write_built_file(path, build_metal_fwd_host_wrapper, cfg) != 0) {
-            return 1;
-        }
-        (void)snprintf(path, sizeof(path), "%s/metal_%s_fwd.metal", dir, cfg->name);
-        if (write_built_file(path, build_metal_fwd_shader_wrapper, cfg) != 0) {
-            return 1;
-        }
-        if (cfg->custom_bwd) {
-            (void)snprintf(path, sizeof(path), "%s/metal_%s_bwd.m", dir, cfg->name);
-            if (write_built_file(path, build_metal_bwd_host_wrapper, cfg) != 0) {
-                return 1;
-            }
-            (void)snprintf(path, sizeof(path), "%s/metal_%s_bwd.metal", dir, cfg->name);
-            if (write_built_file(path, build_metal_bwd_shader_wrapper, cfg) != 0) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int apply_patch_from_builder(const char *path,
-                                    const char *marker,
-                                    const char *already_token,
-                                    int (*builder)(const op_config *, string_builder *),
-                                    const op_config *cfg)
-{
-    string_builder sb = {0};
-    int rc = 1;
-
-    if (builder(cfg, &sb) != 0) {
-        fprintf(stderr, "failed to build patch for %s\n", path);
-        goto done;
-    }
-    if (patch_insert_before(path, marker, sb.data, already_token, cfg->dry_run) != 0) {
-        goto done;
-    }
-    rc = 0;
-
-done:
-    sb_free(&sb);
-    return rc;
-}
-
-static int patch_repo(const op_config *cfg)
-{
-    char token[GD_NEW_OP_MAX_NAME + 32];
-
-    if (cfg->is_public) {
-        (void)snprintf(token, sizeof(token), "gd_%s(", cfg->name);
-        if (apply_patch_from_builder("include/gradients/ops.h",
-                                     "gd_status gd_backward(gd_context *ctx, gd_tensor *loss);",
-                                     token,
-                                     build_ops_h_patch,
-                                     cfg) != 0) {
-            return 1;
-        }
-        (void)snprintf(token, sizeof(token), "GD_REF(gd_%s", cfg->name);
-        if (apply_patch_from_builder("tests/test_public_symbols.c",
-                                     "/* module.h */",
-                                     token,
-                                     build_public_symbols_patch,
-                                     cfg) != 0) {
-            return 1;
-        }
-    }
-
-    (void)snprintf(token, sizeof(token), "_GD_OP_%s", cfg->upper);
-    if (apply_patch_from_builder("tests/test_op_registry.c",
-                                 "};\n\nstatic int test_registry_contents",
-                                 token,
-                                 build_registry_test_patch,
-                                 cfg) != 0) {
-        return 1;
-    }
-
-    if (!cfg->cpu_only) {
-        if (apply_patch_from_builder("src/backends/metal/backend.m",
-                                     "};\n\n/* Kernels not mapped 1:1 to an op",
-                                     token,
-                                     build_metal_backend_patch,
-                                     cfg) != 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void print_summary(const op_config *cfg)
-{
-    printf("new op: %s\n", cfg->name);
-    printf("  public: %s\n", cfg->is_public ? "yes" : "no");
-    printf("  diff: %s\n", cfg->diff ? "yes" : "no");
-    printf("  custom_bwd: %s\n", cfg->custom_bwd ? "yes" : "no");
-    printf("  inputs: %d\n", cfg->inputs);
-    printf("  outputs: %d\n", cfg->outputs);
-    printf("  backends: cpu_ref%s\n", cfg->cpu_only ? "" : ", metal");
-    printf("  generated: %s\n", cfg->run_generated && !cfg->dry_run ? "run make generated" : "skip");
-}
-
-static int run_make_generated(void)
-{
-    int rc = 0;
-
-    printf("run: make generated\n");
-    rc = system("make generated");
-    if (rc != 0) {
-        fprintf(stderr, "make generated failed\n");
-        return 1;
+    if (!gd_valid_op_name(opts->op)) {
+        fprintf(stderr,
+                "gradients-new-op: invalid op name '%s' (use snake_case: [a-z][a-z0-9_]*, no trailing/double underscores)\n",
+                opts->op);
+        return 2;
     }
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    op_config cfg;
-    int parsed = 0;
+    gd_new_op_options opts;
+    int parse_rc;
+    char upper[GD_NEW_OP_NAME_MAX];
+    char op_dir[GD_NEW_OP_PATH_MAX];
+    char def_path[GD_NEW_OP_PATH_MAX];
+    char core_path[GD_NEW_OP_PATH_MAX];
+    char autograd_path[GD_NEW_OP_PATH_MAX];
+    char metal_path[GD_NEW_OP_PATH_MAX];
+    char metal_types_path[GD_NEW_OP_PATH_MAX];
+    char metal_kernel_path[GD_NEW_OP_PATH_MAX];
+    char fwd_path[GD_NEW_OP_PATH_MAX];
+    char bwd_path[GD_NEW_OP_PATH_MAX];
+    char perf_path[GD_NEW_OP_PATH_MAX];
+    char readme_path[GD_NEW_OP_PATH_MAX];
+    char content[GD_NEW_OP_CONTENT_MAX];
 
-    setvbuf(stdout, NULL, _IONBF, 0);
-    parsed = parse_args(argc, argv, &cfg);
-
-    if (parsed == 0) {
+    parse_rc = gd_parse_args(argc, argv, &opts);
+    if (parse_rc == 3) {
+        gd_print_usage(argv[0]);
         return 0;
     }
-    if (parsed != 1) {
-        return parsed;
+    if (parse_rc != 0) {
+        gd_print_usage(argv[0]);
+        return parse_rc;
     }
-
-    print_summary(&cfg);
-    if (scaffold_files(&cfg) != 0) {
+    gd_upper_from_name(opts.op, upper, sizeof(upper));
+    if (!gd_make_op_dir_path(op_dir, sizeof(op_dir), opts.op) ||
+        !gd_make_op_file_path(def_path, sizeof(def_path), opts.op, "op_", ".def") ||
+        !gd_make_op_file_path(core_path, sizeof(core_path), opts.op, "core_", ".c") ||
+        !gd_make_op_file_path(autograd_path, sizeof(autograd_path), opts.op, "autograd_", ".c") ||
+        !gd_make_op_file_path(metal_path, sizeof(metal_path), opts.op, "metal_", ".m") ||
+        !gd_make_op_file_path(metal_types_path, sizeof(metal_types_path), opts.op, "metal_", "_types.h") ||
+        !gd_make_op_file_path(metal_kernel_path, sizeof(metal_kernel_path), opts.op, "metal_", ".metal") ||
+        !gd_make_op_named_path(fwd_path, sizeof(fwd_path), opts.op, "fwd.py") ||
+        !gd_make_op_named_path(bwd_path, sizeof(bwd_path), opts.op, "bwd.py") ||
+        !gd_make_op_named_path(perf_path, sizeof(perf_path), opts.op, "perf_test.c") ||
+        !gd_make_op_named_path(readme_path, sizeof(readme_path), opts.op, "README.md")) {
+        fprintf(stderr, "gradients-new-op: generated path too long\n");
         return 1;
     }
-    if (patch_repo(&cfg) != 0) {
+    if (gd_mkdir_if_missing("src/ops") != 0 || gd_mkdir_if_missing(op_dir) != 0) {
         return 1;
     }
-    if (cfg.run_generated && !cfg.dry_run) {
-        if (run_make_generated() != 0) {
-            return 1;
-        }
+    if (!gd_make_def_content(content, sizeof(content), &opts) ||
+        gd_write_new_file(def_path, content) != 0) {
+        return 1;
     }
-    printf("next: fill TODO stubs, then run `make build` and focused tests\n");
+    if (!gd_make_core_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(core_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_autograd_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(autograd_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_metal_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(metal_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_metal_types_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(metal_types_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_metal_kernel_content(content, sizeof(content), &opts) ||
+        gd_write_new_file(metal_kernel_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_fwd_py_content(content, sizeof(content), opts.op) ||
+        gd_write_new_file(fwd_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_bwd_py_content(content, sizeof(content), opts.op) ||
+        gd_write_new_file(bwd_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_perf_test_content(content, sizeof(content), &opts, upper) ||
+        gd_write_new_file(perf_path, content) != 0) {
+        return 1;
+    }
+    if (!gd_make_readme_content(content, sizeof(content), &opts) ||
+        gd_write_new_file(readme_path, content) != 0) {
+        return 1;
+    }
+    if (gd_run_gen_ops(argv[0]) != 0) {
+        return 1;
+    }
+    printf("[done] registered op '%s' as GD_OP_%s\n", opts.op, upper);
     return 0;
 }

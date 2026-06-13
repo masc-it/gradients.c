@@ -1,6 +1,9 @@
 build*/
 .env
 
-data/
+data*/
 
+gd_main_*
 __pycache__
+checkpoints*/
+.DS_Store

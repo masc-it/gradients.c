@@ -1,0 +1,197 @@
+#ifndef GD_METAL_BACKEND_INTERNAL_H
+#define GD_METAL_BACKEND_INTERNAL_H
+
+#import <Metal/Metal.h>
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "../../core/backend.h"
+#include "../../ops/op_kind.h"
+
+struct gd_backend {
+    void *device;
+    void *queue;
+    void *fill_pso;
+    void *rand_uniform_pso;
+    void *matmul_pso;
+    void *linear_pso;
+    void *matmul_reg_pso;
+    void *linear_reg_pso;
+    void *matmul_nt_pso;
+    void *matmul_tn_pso;
+    void *matmul_nt_reg_pso;
+    void *matmul_tn_reg_pso;
+    void *matmul_tn_split8_pso;
+    void *mps_matmul_kernel;
+    void *reduce_rows_pso;
+    void *accumulate_pso;
+    void *scale_pso;
+    void *amp_begin_step_pso;
+    void *amp_finish_step_pso;
+    void *amp_fill_scale_pso;
+    void *amp_scale_pso;
+    void *amp_unscale_pso;
+    void *grad_norm_stage_pso;
+    void *grad_clip_finalize_pso;
+    void *unary_pso[GD_OP_COUNT];
+    void *unary_backward_pso[GD_OP_COUNT];
+    void *sigmoid_f32_pso;
+    void *sigmoid_backward_f32_pso;
+    void *sigmoid_backward_saved_f16_pso;
+    void *sigmoid_backward_saved_f32_pso;
+    void *tanh_f32_pso;
+    void *tanh_backward_f32_pso;
+    void *tanh_backward_saved_f16_pso;
+    void *tanh_backward_saved_f32_pso;
+    void *dropout_forward_f16_pso;
+    void *dropout_forward_f32_pso;
+    void *dropout_add_forward_f16_pso;
+    void *dropout_backward_recompute_f16_pso;
+    void *dropout_backward_recompute_f32_pso;
+    void *dropout_backward_mask_f16_pso;
+    void *dropout_backward_mask_f32_pso;
+    void *rope_f16_pso;
+    void *rope_f32_pso;
+    void *rope_full_f16_pso;
+    void *rope_full_f32_pso;
+    void *rope_backward_f16_pso;
+    void *rope_backward_f32_pso;
+    void *qkv_split_rope_forward_f16_pso;
+    void *qkv_split_rope_backward_f16_pso;
+    void *binary_pso[GD_OP_COUNT];
+    void *binary_bcast_pso[GD_OP_COUNT];
+    void *binary_row_bcast_pso[GD_OP_COUNT];
+    void *binary_reduce_pso;
+    void *binary_reduce_suffix_pso;
+    void *mul_backward_direct_pso;
+    void *mul_reduce_suffix_pso;
+    void *mul_reduce_suffix_small_pso;
+    void *reduce_contiguous_f16_to_f16_pso;
+    void *reduce_contiguous_f16_to_f32_pso;
+    void *reduce_contiguous_f32_to_f32_pso;
+    void *reduce_contiguous_f32_to_f16_pso;
+    void *reduce_axis_f16_pso;
+    void *reduce_axis_f32_pso;
+    void *reduce_axis_last_f16_pso;
+    void *reduce_axis_last_f32_pso;
+    void *broadcast_axis_f16_pso;
+    void *broadcast_axis_f32_pso;
+    void *broadcast_axis_last_f16_pso;
+    void *broadcast_axis_last_f32_pso;
+    void *broadcast_to_f16_pso;
+    void *broadcast_to_f32_pso;
+    void *broadcast_scalar_f16_pso;
+    void *broadcast_scalar_f32_pso;
+    void *broadcast_scalar_f32_to_f16_pso;
+    void *cross_entropy_loss_f16_pso;
+    void *cross_entropy_loss_stats_f16_pso;
+    void *cross_entropy_backward_f16_pso;
+    void *cross_entropy_backward_stats_f16_pso;
+    void *lm_cross_entropy_online_update_f16_pso;
+    void *lm_cross_entropy_finalize_f32_pso;
+    void *lm_cross_entropy_reduce_normalize_f32_pso;
+    void *lm_cross_entropy_backward_chunk_f16_pso;
+    void *mse_forward_f16_pso;
+    void *mse_forward_f32_pso;
+    void *mse_backward_f16_pso;
+    void *mse_backward_f32_pso;
+    void *huber_forward_f16_pso;
+    void *huber_forward_f32_pso;
+    void *huber_backward_f16_pso;
+    void *huber_backward_f32_pso;
+    void *powlu_forward_f16_pso;
+    void *powlu_backward_f16_pso;
+    void *powlu_split_forward_f16_pso;
+    void *powlu_split_backward_f16_pso;
+    void *swiglu_forward_f16_pso;
+    void *swiglu_backward_f16_pso;
+    void *swiglu_split_forward_f16_pso;
+    void *swiglu_split_backward_f16_pso;
+    void *embedding_forward_f16_pso;
+    void *embedding_forward_f32_pso;
+    void *embedding_forward_vec16_f16_pso;
+    void *embedding_forward_vec16_f32_pso;
+    void *embedding_zero_f32_pso;
+    void *embedding_backward_scatter_f16_pso;
+    void *embedding_backward_scatter_f32_pso;
+    void *embedding_cast_f32_to_f16_pso;
+    void *rms_norm_forward_f16_pso;
+    void *rms_norm_forward_stats_f16_pso;
+    void *rms_norm_forward_f32_pso;
+    void *rms_norm_forward_stats_f32_pso;
+    void *rms_norm_inv_f16_pso;
+    void *rms_norm_inv_f32_pso;
+    void *rms_norm_backward_f16_pso;
+    void *rms_norm_backward_stats_f16_pso;
+    void *rms_norm_backward_f32_pso;
+    void *rms_norm_backward_stats_f32_pso;
+    void *rms_norm_wgrad_stage_stats_f16_pso;
+    void *rms_norm_wgrad_stage_stats_f32_pso;
+    void *rms_norm_wgrad_stage_stats_f16_rb128_pso;
+    void *rms_norm_wgrad_stage_stats_f32_rb128_pso;
+    void *rms_norm_wgrad_reduce_f16_pso;
+    void *rms_norm_wgrad_reduce_f32_pso;
+    void *concat_to_full_u8_pso;
+    void *concat_to_full_u16_pso;
+    void *concat_to_full_u32_pso;
+    void *concat_from_full_u8_pso;
+    void *concat_from_full_u16_pso;
+    void *concat_from_full_u32_pso;
+    void *split_from_full_u8_pso;
+    void *split_from_full_u16_pso;
+    void *split_from_full_u32_pso;
+    void *split_to_full_u8_pso;
+    void *split_to_full_u16_pso;
+    void *split_to_full_u32_pso;
+    void *split_from_full_vec16_pso;
+    void *split_to_full_vec16_pso;
+    void *permute_u8_pso;
+    void *permute_u16_pso;
+    void *permute_u32_pso;
+    void *permute_block_u8_pso;
+    void *permute_block_u16_pso;
+    void *permute_block_u32_pso;
+    void *permute_suffix16_pso;
+    void *permute_hwc_to_chw_u8_pso;
+    void *permute_hwc_to_chw_u16_pso;
+    void *permute_hwc_to_chw_u32_pso;
+    void *permute_chw_to_hwc_u8_pso;
+    void *permute_chw_to_hwc_u16_pso;
+    void *permute_chw_to_hwc_u32_pso;
+    void *permute_transpose_u8_pso;
+    void *permute_transpose_u16_pso;
+    void *permute_transpose_u32_pso;
+    void *sdpa_varlen_pso;
+    void *sdpa_varlen_prefix_window_dh64_f16_pso;
+    void *sdpa_varlen_prefix_window_dh64_f16_stats_pso;
+    void *sdpa_varlen_bwd_stats_pso;
+    void *sdpa_varlen_bwd_pso;
+    void *sdpa_varlen_bwd_dkv_pso;
+    void *sdpa_varlen_bwd_stats_dq_dh64_f16_pso;
+    void *sdpa_varlen_bwd_saved_stats_dq_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_split_dh64_f16_pso;
+    void *sdpa_varlen_bwd_dkv_reduce_f16_pso;
+    void *sdpa_decode_pso;
+    void *sdpa_decode_tq1_dh64_f16_pso;
+    void *kv_cache_append_pso;
+    void *kv_cache_append_packed_pso;
+    void *adamw_prepare_pso;
+    void *adamw_pso;
+    void *adamw_commit_pso;
+    void *active_command_buffer;
+    bool scope_active;
+};
+
+struct gd_backend_buffer {
+    void *buffer;
+    size_t nbytes;
+};
+
+gd_status gd_metal_command_for_op(gd_backend *backend,
+                                  id<MTLCommandBuffer> *out_command_buffer,
+                                  bool *out_immediate);
+gd_status gd_metal_finish_immediate(id<MTLCommandBuffer> command_buffer, bool immediate);
+
+#endif /* GD_METAL_BACKEND_INTERNAL_H */

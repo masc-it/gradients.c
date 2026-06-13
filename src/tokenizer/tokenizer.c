@@ -1,4 +1,4 @@
-#include "gradients/tokenizer.h"
+#include <gradients/tokenizer.h>
 
 /*
  * Native byte-level BPE tokenizer for gradients.c.
@@ -6,7 +6,6 @@
  * (data/tiktoken/src/lib.rs) while keeping runtime dependency-free C.
  */
 
-#include "../core/internal.h"
 #include "tokenizer_internal.h"
 
 #include <ctype.h>
@@ -75,12 +74,12 @@ gd_status gd_memdup_bytes(const uint8_t *src, size_t len, uint8_t **out)
 {
     uint8_t *dst;
     if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer memdup output is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer memdup output is null");
     }
     *out = NULL;
     dst = (uint8_t *)gd_xmalloc(len);
     if (dst == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer allocation failed");
     }
     if (len > 0U) {
         memcpy(dst, src, len);
@@ -93,15 +92,15 @@ gd_status gd_memdup_cstr(const uint8_t *src, size_t len, char **out)
 {
     char *dst;
     if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer string output is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer string output is null");
     }
     *out = NULL;
     if (len >= SIZE_MAX) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer string too large");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer string too large");
     }
     dst = (char *)gd_xmalloc(len + 1U);
     if (dst == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer string allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer string allocation failed");
     }
     if (len > 0U) {
         memcpy(dst, src, len);
@@ -181,12 +180,12 @@ gd_status gd_tokenizer_create_empty(int split_digits,
     gd_tokenizer *tok;
     gd_status status;
     if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer output is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer output is null");
     }
     *out = NULL;
     tok = (gd_tokenizer *)calloc(1U, sizeof(gd_tokenizer));
     if (tok == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer allocation failed");
     }
     tok->split_digits = split_digits != 0 ? 1 : 0;
     tok->allow_special = allow_special != 0 ? 1 : 0;
@@ -214,16 +213,16 @@ static gd_status gd_tokenizer_reserve_tokens(gd_tokenizer *tok, int needed)
     new_cap = tok->token_cap == 0 ? 512 : tok->token_cap;
     while (new_cap < needed) {
         if (new_cap > INT_MAX / 2) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab too large");
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab too large");
         }
         new_cap *= 2;
     }
     if (gd_mul_overflows_size((size_t)new_cap, sizeof(gd_bpe_token))) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab allocation overflow");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab allocation overflow");
     }
     new_tokens = (gd_bpe_token *)realloc(tok->tokens, (size_t)new_cap * sizeof(gd_bpe_token));
     if (new_tokens == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab allocation failed");
     }
     memset(&new_tokens[tok->token_cap], 0,
            (size_t)(new_cap - tok->token_cap) * sizeof(gd_bpe_token));
@@ -243,22 +242,22 @@ static gd_status gd_tokenizer_reserve_specials(gd_tokenizer *tok, int needed)
     new_cap = tok->special_cap == 0 ? 8 : tok->special_cap;
     while (new_cap < needed) {
         if (new_cap > INT_MAX / 2) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "too many special tokens");
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many special tokens");
         }
         new_cap *= 2;
     }
     if (gd_mul_overflows_size((size_t)new_cap, sizeof(char *)) ||
         gd_mul_overflows_size((size_t)new_cap, sizeof(int32_t))) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "special token allocation overflow");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "special token allocation overflow");
     }
     new_texts = (char **)realloc(tok->special_texts, (size_t)new_cap * sizeof(char *));
     if (new_texts == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "special token allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "special token allocation failed");
     }
     tok->special_texts = new_texts;
     new_ids = (int32_t *)realloc(tok->special_ids, (size_t)new_cap * sizeof(int32_t));
     if (new_ids == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "special id allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "special id allocation failed");
     }
     tok->special_ids = new_ids;
     tok->special_cap = new_cap;
@@ -277,10 +276,10 @@ gd_status gd_tokenizer_add_token(gd_tokenizer *tok,
     gd_status status;
 
     if (tok == NULL || bytes == NULL || len == 0U) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer token");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer token");
     }
     if (tok->n_tokens == INT32_MAX) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab exceeds int32");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer vocab exceeds int32");
     }
     status = gd_tokenizer_reserve_tokens(tok, tok->n_tokens + 1);
     if (status != GD_OK) {
@@ -301,7 +300,7 @@ gd_status gd_tokenizer_add_token(gd_tokenizer *tok,
     if (is_special != 0) {
         char *text = NULL;
         if (tok->n_specials == GD_BPE_MAX_SPECIALS) {
-            return _gd_error(GD_ERR_INVALID_ARGUMENT, "too many special tokens");
+            return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "too many special tokens");
         }
         status = gd_tokenizer_reserve_specials(tok, tok->n_specials + 1);
         if (status != GD_OK) {
@@ -359,7 +358,8 @@ static size_t gd_match_special(const char **specials,
     int i;
     for (i = 0; i < n_specials; ++i) {
         size_t slen;
-        if (specials[i] == NULL) {
+        if (specials[i] == NULL || specials[i][0] == '\0' ||
+            (uint8_t)specials[i][0] != data[pos]) {
             continue;
         }
         slen = strlen(specials[i]);
@@ -407,14 +407,26 @@ gd_status gd_pretokenize(const uint8_t *data,
                                 gd_special_piece_cb special_cb,
                                 void *user)
 {
+    uint8_t special_initials[256];
+    int has_specials = 0;
     size_t i = 0U;
     if (data == NULL || normal_cb == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid pretokenizer input");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid pretokenizer input");
+    }
+    memset(special_initials, 0, sizeof(special_initials));
+    if (allow_special != 0 && specials != NULL && n_specials > 0) {
+        int s;
+        for (s = 0; s < n_specials; ++s) {
+            if (specials[s] != NULL && specials[s][0] != '\0') {
+                special_initials[(uint8_t)specials[s][0]] = 1U;
+                has_specials = 1;
+            }
+        }
     }
     while (i < len) {
         size_t match_len = 0U;
         int32_t special_id = -1;
-        if (allow_special != 0) {
+        if (has_specials != 0 && special_initials[data[i]] != 0U) {
             match_len = gd_match_special(specials, special_ids, n_specials, data, len, i,
                                          &special_id);
         }
@@ -441,37 +453,40 @@ gd_status gd_pretokenize(const uint8_t *data,
             if (data[i] == (uint8_t)' ' && i + 1U < len &&
                 gd_ascii_is_space(data[i + 1U]) == 0 &&
                 !(split_digits != 0 && gd_ascii_is_digit(data[i + 1U]) != 0) &&
-                (allow_special == 0 || gd_match_special(specials,
-                                                         special_ids,
-                                                         n_specials,
-                                                         data,
-                                                         len,
-                                                         i + 1U,
-                                                         NULL) == 0U)) {
+                (has_specials == 0 || special_initials[data[i + 1U]] == 0U ||
+                 gd_match_special(specials,
+                                  special_ids,
+                                  n_specials,
+                                  data,
+                                  len,
+                                  i + 1U,
+                                  NULL) == 0U)) {
                 gd_pretok_class cls;
                 i += 1U;
                 cls = gd_pretok_classify(data[i]);
                 while (i < len && gd_pretok_classify(data[i]) == cls &&
                        !(split_digits != 0 && gd_ascii_is_digit(data[i]) != 0) &&
-                       (allow_special == 0 || gd_match_special(specials,
-                                                               special_ids,
-                                                               n_specials,
-                                                               data,
-                                                               len,
-                                                               i,
-                                                               NULL) == 0U)) {
+                       (has_specials == 0 || special_initials[data[i]] == 0U ||
+                        gd_match_special(specials,
+                                         special_ids,
+                                         n_specials,
+                                         data,
+                                         len,
+                                         i,
+                                         NULL) == 0U)) {
                     i += 1U;
                 }
             } else {
                 i += 1U;
                 while (i < len && gd_ascii_is_space(data[i]) != 0 &&
-                       (allow_special == 0 || gd_match_special(specials,
-                                                               special_ids,
-                                                               n_specials,
-                                                               data,
-                                                               len,
-                                                               i,
-                                                               NULL) == 0U)) {
+                       (has_specials == 0 || special_initials[data[i]] == 0U ||
+                        gd_match_special(specials,
+                                         special_ids,
+                                         n_specials,
+                                         data,
+                                         len,
+                                         i,
+                                         NULL) == 0U)) {
                     i += 1U;
                 }
             }
@@ -489,13 +504,14 @@ gd_status gd_pretokenize(const uint8_t *data,
             i += 1U;
             while (i < len && gd_pretok_classify(data[i]) == cls &&
                    !(split_digits != 0 && gd_ascii_is_digit(data[i]) != 0) &&
-                   (allow_special == 0 || gd_match_special(specials,
-                                                           special_ids,
-                                                           n_specials,
-                                                           data,
-                                                           len,
-                                                           i,
-                                                           NULL) == 0U)) {
+                   (has_specials == 0 || special_initials[data[i]] == 0U ||
+                    gd_match_special(specials,
+                                     special_ids,
+                                     n_specials,
+                                     data,
+                                     len,
+                                     i,
+                                     NULL) == 0U)) {
                 i += 1U;
             }
             {
@@ -535,7 +551,7 @@ gd_status gd_tokenizer_id(gd_tokenizer *tok, const char *special, int32_t *id_ou
 {
     int i;
     if (tok == NULL || special == NULL || id_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer id arguments");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer id arguments");
     }
     for (i = 0; i < tok->n_specials; ++i) {
         if (strcmp(tok->special_texts[i], special) == 0) {
@@ -543,7 +559,7 @@ gd_status gd_tokenizer_id(gd_tokenizer *tok, const char *special, int32_t *id_ou
             return GD_OK;
         }
     }
-    return _gd_error(GD_ERR_INVALID_ARGUMENT, "unknown special token");
+    return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "unknown special token");
 }
 
 int gd_tokenizer_vocab_size(const gd_tokenizer *tok)

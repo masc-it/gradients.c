@@ -1,1439 +1,358 @@
-#include "gradients/gradients.h"
+#include <gradients/gradients.h>
 
-#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define MAX_ELEMS 256
-
-#define CHECK_OK(expr)                                                            \
-    do {                                                                          \
-        gd_status status_ = (expr);                                               \
-        if (status_ != GD_OK) {                                                   \
-            fprintf(stderr, "%s failed: %s\n", #expr, gd_last_error());          \
-            return 1;                                                             \
-        }                                                                         \
+#define CHECK(cond, msg)                                                        \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "test_autograd failed: %s (%s:%d)\n", (msg),     \
+                    __FILE__, __LINE__);                                       \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-#define CHECK_TRUE(expr)                                                          \
-    do {                                                                          \
-        if (!(expr)) {                                                            \
-            fprintf(stderr, "%s failed\n", #expr);                              \
-            return 1;                                                             \
-        }                                                                         \
-    } while (0)
+#define CHECK_OK(expr) CHECK((expr) == GD_OK, #expr)
 
-typedef gd_status (*build_fn)(gd_context *ctx, void *user, gd_tensor **loss_out);
-
-static int64_t tensor_numel(gd_tensor *t)
+static float abs_f32(float x)
 {
-    int64_t n = 1;
-    int i = 0;
-    for (i = 0; i < gd_tensor_ndim(t); ++i) {
-        n *= gd_tensor_size(t, i);
-    }
-    return n;
+    return x < 0.0f ? -x : x;
 }
 
-/* Finite-difference gradcheck for a scalar loss built by `build`. */
-static int gradcheck(gd_context *ctx,
-                     build_fn build,
-                     void *user,
-                     gd_tensor **inputs,
-                     int n_inputs,
-                     const char *name)
+static uint16_t f32_to_f16_bits(float value)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_graph *g = NULL;
-    gd_tensor *loss = NULL;
-    const float h = 1e-3F;
-    int i = 0;
-
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(build(ctx, user, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-
-    for (i = 0; i < n_inputs; ++i) {
-        gd_tensor *grad = NULL;
-        float analytic[MAX_ELEMS];
-        float orig[MAX_ELEMS];
-        int64_t numel = tensor_numel(inputs[i]);
-        int64_t j = 0;
-
-        CHECK_TRUE(numel <= MAX_ELEMS);
-        CHECK_OK(gd_tensor_grad(inputs[i], &grad));
-        CHECK_TRUE(grad != NULL);
-        CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, analytic, (size_t)numel * sizeof(float)));
-        CHECK_OK(gd_tensor_copy_to_cpu(ctx, inputs[i], orig, (size_t)numel * sizeof(float)));
-
-        for (j = 0; j < numel; ++j) {
-            float lossp = 0.0F;
-            float lossm = 0.0F;
-            float numeric = 0.0F;
-            float diff = 0.0F;
-            float tol = 0.0F;
-            float saved = orig[j];
-
-            orig[j] = saved + h;
-            CHECK_OK(gd_tensor_copy_from_cpu(ctx, inputs[i], orig, (size_t)numel * sizeof(float)));
-            CHECK_OK(gd_graph_run(g));
-            CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &lossp, sizeof(lossp)));
-
-            orig[j] = saved - h;
-            CHECK_OK(gd_tensor_copy_from_cpu(ctx, inputs[i], orig, (size_t)numel * sizeof(float)));
-            CHECK_OK(gd_graph_run(g));
-            CHECK_OK(gd_tensor_copy_to_cpu(ctx, loss, &lossm, sizeof(lossm)));
-
-            orig[j] = saved;
-            CHECK_OK(gd_tensor_copy_from_cpu(ctx, inputs[i], orig, (size_t)numel * sizeof(float)));
-
-            numeric = (lossp - lossm) / (2.0F * h);
-            diff = fabsf(numeric - analytic[j]);
-            tol = 2e-2F * (1.0F + fabsf(numeric));
-            if (diff > tol) {
-                fprintf(stderr, "%s input %d elem %lld: analytic=%g numeric=%g\n",
-                        name, i, (long long)j, (double)analytic[j], (double)numeric);
-                gd_tensor_release(loss);
-                (void)gd_graph_reset(g);
-                (void)gd_graph_destroy(g);
-                return 1;
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    uint32_t sign;
+    int32_t exp;
+    uint32_t mant;
+    uint32_t out_exp;
+    uint32_t out_mant;
+    v.f = value;
+    sign = (v.u >> 16) & 0x8000U;
+    exp = (int32_t)((v.u >> 23) & 0xffU) - 127;
+    mant = v.u & 0x7fffffU;
+    if (((v.u >> 23) & 0xffU) == 0xffU) {
+        return (uint16_t)(sign | (mant == 0U ? 0x7c00U : 0x7e00U));
+    }
+    if (exp > 15) {
+        return (uint16_t)(sign | 0x7c00U);
+    }
+    if (exp < -14) {
+        uint32_t shifted;
+        uint32_t remainder;
+        uint32_t halfway;
+        int32_t shift = -14 - exp;
+        if (shift > 24) {
+            return (uint16_t)sign;
+        }
+        mant |= 0x800000U;
+        shifted = mant >> (uint32_t)(shift + 13);
+        remainder = mant & ((1U << (uint32_t)(shift + 13)) - 1U);
+        halfway = 1U << (uint32_t)(shift + 12);
+        if (remainder > halfway || (remainder == halfway && (shifted & 1U) != 0U)) {
+            shifted += 1U;
+        }
+        return (uint16_t)(sign | shifted);
+    }
+    out_exp = (uint32_t)(exp + 15);
+    out_mant = mant >> 13;
+    {
+        uint32_t remainder = mant & 0x1fffU;
+        if (remainder > 0x1000U || (remainder == 0x1000U && (out_mant & 1U) != 0U)) {
+            out_mant += 1U;
+            if (out_mant == 0x400U) {
+                out_mant = 0U;
+                out_exp += 1U;
+                if (out_exp >= 31U) {
+                    return (uint16_t)(sign | 0x7c00U);
+                }
             }
         }
     }
-
-    gd_tensor_release(loss);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    return 0;
+    return (uint16_t)(sign | (out_exp << 10) | out_mant);
 }
 
-typedef struct two_in {
-    gd_tensor *a;
-    gd_tensor *b;
-} two_in;
-
-static gd_status build_add_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
+static float f16_bits_to_f32(uint16_t bits)
 {
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_add(ctx, t->a, t->b, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_add_bcast_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user; /* a:[2,3], b:[3] -> broadcast add -> sum all */
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_add(ctx, t->a, t->b, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, &r); /* [2,3]->[3] */
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out); /* ->scalar */
-    gd_tensor_release(r);
-    return status;
-}
-
-static gd_status build_mul_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_mul(ctx, t->a, t->b, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_square_mean(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user; /* uses only a; y = a*a; loss = mean(y) -> grad 2a/n */
-    gd_tensor *y = NULL;
-    gd_status status = gd_mul(ctx, t->a, t->a, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_mean(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_scale_relu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *s = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_scale(ctx, t->a, 1.5F, &s);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_relu(ctx, s, &r);
-    gd_tensor_release(s);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out);
-    gd_tensor_release(r);
-    return status;
-}
-
-static gd_status build_reshape_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user; /* a:[4]; y=a*a; r=reshape([2,2]); loss=sum sum -> scalar */
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_tensor *s = NULL;
-    int64_t shape[2] = {2, 2};
-    gd_status status = gd_mul(ctx, t->a, t->a, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_reshape(y, 2, shape, &r);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, &s); /* [2,2]->[2] */
-    gd_tensor_release(r);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, s, 0, false, loss_out);
-    gd_tensor_release(s);
-    return status;
-}
-
-static gd_status build_silu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_silu(ctx, t->a, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_powlu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_powlu(ctx, t->a, t->b, 3.0F, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_powlu_m2_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_powlu(ctx, t->a, t->b, 2.0F, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_gelu_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_gelu(ctx, t->a, false, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_gelu_tanh_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_status status = gd_gelu(ctx, t->a, true, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, loss_out);
-    gd_tensor_release(y);
-    return status;
-}
-
-static gd_status build_transpose_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user; /* a:[2,3] -> transpose [3,2] -> gelu -> sum -> scalar */
-    gd_tensor *tr = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    int perm[2] = {1, 0};
-    gd_status status = gd_transpose(ctx, t->a, perm, 2, &tr);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_gelu(ctx, tr, false, &y); /* nonlinearity: grad not constant */
-    gd_tensor_release(tr);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 1, false, &r); /* [3,2]->[3] */
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out);
-    gd_tensor_release(r);
-    return status;
-}
-
-typedef struct emb_in {
-    gd_tensor *table;
-    gd_tensor *ids;
-} emb_in;
-
-typedef struct rope_in {
-    gd_tensor *x;
-    gd_tensor *pos;
-} rope_in;
-
-typedef struct sdpa_in {
-    gd_tensor *q;
-    gd_tensor *k;
-    gd_tensor *v;
-    gd_tensor *bias; /* optional additive bias (constant; tests q/k/v grads) */
-    bool causal;
-    int prefix_len;
-    int sliding_window;
-} sdpa_in;
-
-typedef struct sdpa_varlen_in {
-    gd_tensor *q;
-    gd_tensor *k;
-    gd_tensor *v;
-    gd_tensor *cu;
-    bool causal;
-    int prefix_len;
-    int sliding_window;
-    int max_seqlen;
-} sdpa_varlen_in;
-
-static gd_status build_sdpa_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    sdpa_in *s = user; /* q[1,3,2,4], k/v[1,3,1,4] (GQA) -> sdpa -> reshape -> mean */
-    gd_sdpa_config cfg = {0};
-    gd_tensor *y = NULL;
-    gd_tensor *fl = NULL;
-    int64_t flat[1] = {24};
-    gd_status status = GD_OK;
-
-    cfg.causal = s->causal;
-    cfg.prefix_len = s->prefix_len;
-    cfg.sliding_window = s->sliding_window;
-    status = gd_sdpa(ctx, s->q, s->k, s->v, s->bias, &cfg, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_reshape(y, 1, flat, &fl);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_mean(ctx, fl, 0, false, loss_out);
-    gd_tensor_release(fl);
-    return status;
-}
-
-static gd_status build_sdpa_varlen_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    sdpa_varlen_in *s = user;
-    gd_sdpa_varlen_config cfg = {0};
-    gd_tensor *y = NULL;
-    gd_tensor *fl = NULL;
-    int64_t flat[1] = {10};
-    gd_status status = GD_OK;
-
-    cfg.causal = s->causal;
-    cfg.prefix_len = s->prefix_len;
-    cfg.sliding_window = s->sliding_window;
-    cfg.max_seqlen = s->max_seqlen;
-    status = gd_sdpa_varlen(ctx, s->q, s->k, s->v, s->cu, &cfg, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_reshape(y, 1, flat, &fl);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_mean(ctx, fl, 0, false, loss_out);
-    gd_tensor_release(fl);
-    return status;
-}
-
-static gd_status build_rope_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    rope_in *r = user; /* x:[1,2,2,4] (grad) -> rope -> gelu -> reshape[16] -> mean */
-    gd_tensor *y = NULL;
-    gd_tensor *gel = NULL;
-    gd_tensor *fl = NULL;
-    int64_t flat[1] = {16};
-    gd_status status = gd_rope(ctx, r->x, r->pos, NULL, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_gelu(ctx, y, false, &gel);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_reshape(gel, 1, flat, &fl);
-    gd_tensor_release(gel);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_mean(ctx, fl, 0, false, loss_out);
-    gd_tensor_release(fl);
-    return status;
-}
-
-static gd_status build_embedding_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    emb_in *e = user; /* table:[V,d] (grad), ids -> emb[N,d] -> sum -> scalar */
-    gd_tensor *emb = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_embedding(ctx, e->table, e->ids, &emb);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, emb, 1, false, &r); /* [N,d]->[N] */
-    gd_tensor_release(emb);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out);
-    gd_tensor_release(r);
-    return status;
-}
-
-static gd_status build_rms_norm_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user; /* a:[2,3] (x, grad), b:[3] (weight, grad) -> rms_norm -> mean */
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_rms_norm(ctx, t->a, t->b, 1e-5F, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 1, false, &r); /* [2,3]->[2] */
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out);
-    gd_tensor_release(r);
-    return status;
-}
-
-static gd_status build_matmul_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    two_in *t = user;
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_matmul(ctx, t->a, t->b, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, &r); /* [m,n]->[n] */
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, r, 0, false, loss_out); /* ->scalar */
-    gd_tensor_release(r);
-    return status;
-}
-
-typedef struct mm_cfg {
-    gd_tensor *a;
-    gd_tensor *b;
-    bool trans_a;
-    bool trans_b;
-} mm_cfg;
-
-static gd_status build_matmul_ex_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    mm_cfg *c = user;
-    gd_matmul_desc desc = {c->trans_a, c->trans_b, {GD_DTYPE_F32, GD_DTYPE_F32}};
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_matmul_ex(ctx, &desc, c->a, c->b, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, &r);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    /* reduce remaining dims to scalar */
-    while (gd_tensor_ndim(r) > 0) {
-        gd_tensor *next = NULL;
-        status = gd_sum(ctx, r, 0, false, &next);
-        gd_tensor_release(r);
-        if (status != GD_OK) {
-            return status;
+    uint32_t sign = ((uint32_t)bits & 0x8000U) << 16;
+    uint32_t exp = ((uint32_t)bits >> 10) & 0x1fU;
+    uint32_t mant = (uint32_t)bits & 0x3ffU;
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    if (exp == 0U) {
+        if (mant == 0U) {
+            v.u = sign;
+            return v.f;
         }
-        r = next;
-    }
-    *loss_out = r;
-    return GD_OK;
-}
-
-typedef struct lin_cfg {
-    gd_tensor *x;
-    gd_tensor *w;
-    gd_tensor *bias;
-    bool trans_w;
-} lin_cfg;
-
-static gd_status build_linear_sum(gd_context *ctx, void *user, gd_tensor **loss_out)
-{
-    lin_cfg *c = user;
-    gd_linear_desc desc = {c->trans_w, {GD_DTYPE_F32, GD_DTYPE_F32}};
-    gd_tensor *y = NULL;
-    gd_tensor *r = NULL;
-    gd_status status = gd_linear_ex(ctx, &desc, c->x, c->w, c->bias, &y);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_sum(ctx, y, 0, false, &r);
-    gd_tensor_release(y);
-    if (status != GD_OK) {
-        return status;
-    }
-    while (gd_tensor_ndim(r) > 0) {
-        gd_tensor *next = NULL;
-        status = gd_sum(ctx, r, 0, false, &next);
-        gd_tensor_release(r);
-        if (status != GD_OK) {
-            return status;
+        while ((mant & 0x400U) == 0U) {
+            mant <<= 1U;
+            exp -= 1U;
         }
-        r = next;
+        mant &= 0x3ffU;
+        exp += 1U;
+    } else if (exp == 31U) {
+        v.u = sign | 0x7f800000U | (mant << 13);
+        return v.f;
     }
-    *loss_out = r;
-    return GD_OK;
+    v.u = sign | ((exp + (127U - 15U)) << 23) | (mant << 13);
+    return v.f;
 }
 
-typedef struct ce_in {
-    gd_tensor *logits;
-    gd_tensor *targets;
-    bool has_ignore_index;
-    int ignore_index;
-} ce_in;
-
-static gd_status build_ce(gd_context *ctx, void *user, gd_tensor **loss_out)
+static void fill_seq(uint16_t *dst, uint32_t count, float scale, float bias)
 {
-    ce_in *t = user;
-    if (t->has_ignore_index) {
-        gd_cross_entropy_desc desc;
-        desc.class_dim = 1;
-        desc.has_ignore_index = true;
-        desc.ignore_index = t->ignore_index;
-        return gd_cross_entropy_ex(ctx, &desc, t->logits, t->targets, loss_out);
+    uint32_t i;
+    for (i = 0U; i < count; ++i) {
+        float v = bias + scale * (float)((int32_t)(i % 17U) - 8);
+        dst[i] = f32_to_f16_bits(v);
     }
-    return gd_cross_entropy(ctx, t->logits, t->targets, 1, loss_out);
 }
 
-typedef struct lmce_in {
-    gd_tensor *hidden;
-    gd_tensor *weight;
-    gd_tensor *targets;
-    bool has_ignore_index;
-    int ignore_index;
-} lmce_in;
-
-static gd_status build_lmce(gd_context *ctx, void *user, gd_tensor **loss_out)
+static void matmul_nn(const uint16_t *a,
+                      const uint16_t *b,
+                      uint32_t m,
+                      uint32_t k,
+                      uint32_t n,
+                      uint16_t *out)
 {
-    lmce_in *t = user;
-    if (t->has_ignore_index) {
-        gd_lm_cross_entropy_desc desc;
-        desc.has_ignore_index = true;
-        desc.ignore_index = t->ignore_index;
-        return gd_lm_cross_entropy_ex(ctx, &desc, t->hidden, t->weight, t->targets, loss_out);
+    uint32_t i;
+    uint32_t j;
+    uint32_t p;
+    for (i = 0U; i < m; ++i) {
+        for (j = 0U; j < n; ++j) {
+            float sum = 0.0f;
+            for (p = 0U; p < k; ++p) {
+                sum += f16_bits_to_f32(a[i * k + p]) * f16_bits_to_f32(b[p * n + j]);
+            }
+            out[i * n + j] = f32_to_f16_bits(sum);
+        }
     }
-    return gd_lm_cross_entropy(ctx, t->hidden, t->weight, t->targets, loss_out);
 }
 
-typedef struct mlp_in {
-    gd_tensor *x;
-    gd_tensor *w1;
-    gd_tensor *w2;
-    gd_tensor *targets;
-} mlp_in;
-
-static gd_status build_mlp(gd_context *ctx, void *user, gd_tensor **loss_out)
+static void matmul_nt(const uint16_t *a,
+                      const uint16_t *b,
+                      uint32_t m,
+                      uint32_t k,
+                      uint32_t n,
+                      uint16_t *out)
 {
-    mlp_in *m = user;
-    gd_tensor *h = NULL;
-    gd_tensor *a = NULL;
-    gd_tensor *logits = NULL;
-    gd_status status = gd_linear(ctx, m->x, m->w1, NULL, &h);
-    if (status != GD_OK) {
-        return status;
+    uint32_t i;
+    uint32_t j;
+    uint32_t p;
+    for (i = 0U; i < m; ++i) {
+        for (j = 0U; j < n; ++j) {
+            float sum = 0.0f;
+            for (p = 0U; p < k; ++p) {
+                sum += f16_bits_to_f32(a[i * k + p]) * f16_bits_to_f32(b[j * k + p]);
+            }
+            out[i * n + j] = f32_to_f16_bits(sum);
+        }
     }
-    status = gd_relu(ctx, h, &a);
-    gd_tensor_release(h);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_linear(ctx, a, m->w2, NULL, &logits);
-    gd_tensor_release(a);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_cross_entropy(ctx, logits, m->targets, 1, loss_out);
-    gd_tensor_release(logits);
-    return status;
 }
 
-static int test_f16_cast_leaf_grad(gd_context *ctx)
+static void matmul_tn(const uint16_t *a,
+                      const uint16_t *b,
+                      uint32_t m,
+                      uint32_t k,
+                      uint32_t n,
+                      uint16_t *out)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t s4[1] = {4};
-    uint16_t half_data[4] = {0x3c00U, 0x4000U, 0xc200U, 0x4400U};
-    float grad_data[4] = {0};
-    gd_tensor_desc desc;
-    gd_tensor *p = NULL;
-    gd_tensor *pf = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-    int i = 0;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s4, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &p));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, p, half_data, sizeof(half_data)));
-    CHECK_OK(gd_tensor_set_requires_grad(p, true));
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_cast(ctx, p, GD_DTYPE_F32, &pf));
-    CHECK_OK(gd_mean(ctx, pf, 0, false, &loss));
-    CHECK_TRUE(gd_tensor_dtype(loss) == GD_DTYPE_F32);
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(p, &grad));
-    CHECK_TRUE(grad != NULL);
-    CHECK_TRUE(gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, grad_data, sizeof(grad_data)));
-    for (i = 0; i < 4; ++i) {
-        CHECK_TRUE(fabsf(grad_data[i] - 0.25F) <= 1.0e-6F);
+    uint32_t i;
+    uint32_t j;
+    uint32_t p;
+    for (i = 0U; i < k; ++i) {
+        for (j = 0U; j < n; ++j) {
+            float sum = 0.0f;
+            for (p = 0U; p < m; ++p) {
+                sum += f16_bits_to_f32(a[p * k + i]) * f16_bits_to_f32(b[p * n + j]);
+            }
+            out[i * n + j] = f32_to_f16_bits(sum);
+        }
     }
-    gd_tensor_release(loss);
-    gd_tensor_release(pf);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(p);
-    return 0;
 }
 
-static int test_f16_linear_leaf_grads(gd_context *ctx)
+static void add_f16(const uint16_t *a, const uint16_t *b, uint32_t count, uint16_t *out)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t s22[2] = {2, 2};
-    int64_t s2[1] = {2};
-    uint16_t xh[4] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U};
-    uint16_t wh[4] = {0x3c00U, 0x0000U, 0x0000U, 0x3c00U};
-    uint16_t bh[2] = {0x0000U, 0x0000U};
-    float gw[4] = {0};
-    float gb[2] = {0};
-    gd_tensor_desc desc;
-    gd_tensor *x = NULL;
-    gd_tensor *w = NULL;
-    gd_tensor *bias = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *yf = NULL;
-    gd_tensor *m0 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, s22, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &x));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
-    CHECK_OK(gd_tensor_set_requires_grad(x, true));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &w));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wh, sizeof(wh)));
-    CHECK_OK(gd_tensor_set_requires_grad(w, true));
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s2, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &bias));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, bias, bh, sizeof(bh)));
-    CHECK_OK(gd_tensor_set_requires_grad(bias, true));
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_linear(ctx, x, w, bias, &y));
-    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
-    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
-    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(w, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gw, sizeof(gw)));
-    CHECK_TRUE(fabsf(gw[0] - 1.0F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gw[1] - 1.0F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gw[2] - 1.5F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gw[3] - 1.5F) <= 1.0e-6F);
-    CHECK_OK(gd_tensor_grad(bias, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gb, sizeof(gb)));
-    CHECK_TRUE(fabsf(gb[0] - 0.5F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gb[1] - 0.5F) <= 1.0e-6F);
-    gd_tensor_release(loss);
-    gd_tensor_release(m0);
-    gd_tensor_release(yf);
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(bias);
-    gd_tensor_release(w);
-    gd_tensor_release(x);
-    return 0;
-}
-
-static int test_f16_embedding_leaf_grad(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t ts[2] = {3, 2};
-    int64_t ids_s[1] = {2};
-    uint16_t table_data[6] = {0x3c00U, 0x4000U, 0x4200U,
-                              0x4400U, 0x4500U, 0x4600U};
-    int32_t ids_data[2] = {0, 2};
-    float gt[6] = {0};
-    gd_tensor_desc desc;
-    gd_tensor *table = NULL;
-    gd_tensor *ids = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *yf = NULL;
-    gd_tensor *m0 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, ts, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &table));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, table, table_data, sizeof(table_data)));
-    CHECK_OK(gd_tensor_set_requires_grad(table, true));
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, ids_s, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &ids));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, ids, ids_data, sizeof(ids_data)));
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_embedding(ctx, table, ids, &y));
-    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
-    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
-    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(table, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gt, sizeof(gt)));
-    CHECK_TRUE(fabsf(gt[0] - 0.25F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gt[1] - 0.25F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gt[2]) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gt[3]) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gt[4] - 0.25F) <= 1.0e-6F);
-    CHECK_TRUE(fabsf(gt[5] - 0.25F) <= 1.0e-6F);
-    gd_tensor_release(loss);
-    gd_tensor_release(m0);
-    gd_tensor_release(yf);
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(ids);
-    gd_tensor_release(table);
-    return 0;
-}
-
-static int test_f16_rms_norm_weight_grad(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t xs[2] = {2, 2};
-    int64_t ws[1] = {2};
-    uint16_t xh[4] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U};
-    uint16_t wh[2] = {0x3c00U, 0x3c00U};
-    float gw[2] = {0};
-    gd_tensor_desc desc;
-    gd_tensor *x = NULL;
-    gd_tensor *w = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *yf = NULL;
-    gd_tensor *m0 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 2, xs, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &x));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, ws, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &w));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, w, wh, sizeof(wh)));
-    CHECK_OK(gd_tensor_set_requires_grad(w, true));
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_rms_norm(ctx, x, w, 1.0e-5F, &y));
-    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
-    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
-    CHECK_OK(gd_mean(ctx, m0, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(w, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gw, sizeof(gw)));
-    CHECK_TRUE(isfinite(gw[0]) && isfinite(gw[1]));
-    gd_tensor_release(loss);
-    gd_tensor_release(m0);
-    gd_tensor_release(yf);
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(w);
-    gd_tensor_release(x);
-    return 0;
-}
-
-static int test_f16_activation_backwards(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t s4[1] = {4};
-    uint16_t xh[4] = {0xbc00U, 0x3800U, 0x3c00U, 0x4000U};
-    uint16_t zh[4] = {0xb800U, 0x3800U, 0x3c00U, 0x4200U};
-    float gx[4] = {0};
-    float gz[4] = {0};
-    gd_tensor_desc desc;
-    gd_tensor *x = NULL;
-    gd_tensor *z = NULL;
-    gd_tensor *relu = NULL;
-    gd_tensor *silu = NULL;
-    gd_tensor *gelu = NULL;
-    gd_tensor *powlu = NULL;
-    gd_tensor *rf = NULL;
-    gd_tensor *sf = NULL;
-    gd_tensor *gf = NULL;
-    gd_tensor *pf = NULL;
-    gd_tensor *lr = NULL;
-    gd_tensor *ls = NULL;
-    gd_tensor *lg = NULL;
-    gd_tensor *lp = NULL;
-    gd_tensor *a = NULL;
-    gd_tensor *b = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 1, s4, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &x));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
-    CHECK_OK(gd_tensor_set_requires_grad(x, true));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &z));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, z, zh, sizeof(zh)));
-    CHECK_OK(gd_tensor_set_requires_grad(z, true));
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_relu(ctx, x, &relu));
-    CHECK_OK(gd_silu(ctx, x, &silu));
-    CHECK_OK(gd_gelu(ctx, x, false, &gelu));
-    CHECK_OK(gd_powlu(ctx, x, z, 3.0F, &powlu));
-    CHECK_OK(gd_cast(ctx, relu, GD_DTYPE_F32, &rf));
-    CHECK_OK(gd_cast(ctx, silu, GD_DTYPE_F32, &sf));
-    CHECK_OK(gd_cast(ctx, gelu, GD_DTYPE_F32, &gf));
-    CHECK_OK(gd_cast(ctx, powlu, GD_DTYPE_F32, &pf));
-    CHECK_OK(gd_mean(ctx, rf, 0, false, &lr));
-    CHECK_OK(gd_mean(ctx, sf, 0, false, &ls));
-    CHECK_OK(gd_mean(ctx, gf, 0, false, &lg));
-    CHECK_OK(gd_mean(ctx, pf, 0, false, &lp));
-    CHECK_OK(gd_add(ctx, lr, ls, &a));
-    CHECK_OK(gd_add(ctx, lg, lp, &b));
-    CHECK_OK(gd_add(ctx, a, b, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(x, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gx, sizeof(gx)));
-    CHECK_OK(gd_tensor_grad(z, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gz, sizeof(gz)));
-    CHECK_TRUE(isfinite(gx[0]) && isfinite(gx[1]) && isfinite(gx[2]) && isfinite(gx[3]));
-    CHECK_TRUE(isfinite(gz[0]) && isfinite(gz[1]) && isfinite(gz[2]) && isfinite(gz[3]));
-    gd_tensor_release(loss);
-    gd_tensor_release(b);
-    gd_tensor_release(a);
-    gd_tensor_release(lp);
-    gd_tensor_release(lg);
-    gd_tensor_release(ls);
-    gd_tensor_release(lr);
-    gd_tensor_release(pf);
-    gd_tensor_release(gf);
-    gd_tensor_release(sf);
-    gd_tensor_release(rf);
-    gd_tensor_release(powlu);
-    gd_tensor_release(gelu);
-    gd_tensor_release(silu);
-    gd_tensor_release(relu);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(z);
-    gd_tensor_release(x);
-    return 0;
-}
-
-static int test_f16_rope_backward(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t xs[3] = {2, 1, 4};
-    int64_t ps[1] = {2};
-    uint16_t xh[8] = {0x3c00U, 0x4000U, 0x4200U, 0x4400U,
-                      0x3800U, 0xbc00U, 0xc000U, 0x3c00U};
-    int32_t pos[2] = {0, 1};
-    float gx[8] = {0};
-    gd_tensor_desc xdesc;
-    gd_tensor_desc pdesc;
-    gd_rope_config cfg = {0};
-    gd_tensor *x = NULL;
-    gd_tensor *p = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *yf = NULL;
-    gd_tensor *m0 = NULL;
-    gd_tensor *m1 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *grad = NULL;
-    gd_graph *g = NULL;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F16, cpu, 3, xs, &xdesc));
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, ps, &pdesc));
-    CHECK_OK(gd_tensor_empty(ctx, &xdesc, &x));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, x, xh, sizeof(xh)));
-    CHECK_OK(gd_tensor_set_requires_grad(x, true));
-    CHECK_OK(gd_tensor_empty(ctx, &pdesc, &p));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, p, pos, sizeof(pos)));
-    cfg.theta = 10000.0F;
-    cfg.n_dims = 4;
-    cfg.interleaved = false;
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_rope(ctx, x, p, &cfg, &y));
-    CHECK_OK(gd_cast(ctx, y, GD_DTYPE_F32, &yf));
-    CHECK_OK(gd_mean(ctx, yf, 0, false, &m0));
-    CHECK_OK(gd_mean(ctx, m0, 0, false, &m1));
-    CHECK_OK(gd_mean(ctx, m1, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(x, &grad));
-    CHECK_TRUE(grad != NULL && gd_tensor_dtype(grad) == GD_DTYPE_F32);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, grad, gx, sizeof(gx)));
-    CHECK_TRUE(isfinite(gx[0]) && isfinite(gx[7]));
-    gd_tensor_release(loss);
-    gd_tensor_release(m1);
-    gd_tensor_release(m0);
-    gd_tensor_release(yf);
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(p);
-    gd_tensor_release(x);
-    return 0;
-}
-
-static gd_status make_grad_input(gd_context *ctx, int ndim, const int64_t *sizes,
-                                 const float *data, gd_tensor **out)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_tensor_desc desc;
-    int64_t numel = 1;
-    int i = 0;
-    gd_status status = gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, ndim, sizes, &desc);
-    if (status != GD_OK) {
-        return status;
+    uint32_t i;
+    for (i = 0U; i < count; ++i) {
+        out[i] = f32_to_f16_bits(f16_bits_to_f32(a[i]) + f16_bits_to_f32(b[i]));
     }
-    status = gd_tensor_empty(ctx, &desc, out);
-    if (status != GD_OK) {
-        return status;
+}
+
+static void reduce_rows(const uint16_t *x, uint32_t rows, uint32_t cols, uint16_t *out)
+{
+    uint32_t i;
+    uint32_t j;
+    for (j = 0U; j < cols; ++j) {
+        float sum = 0.0f;
+        for (i = 0U; i < rows; ++i) {
+            sum += f16_bits_to_f32(x[i * cols + j]);
+        }
+        out[j] = f32_to_f16_bits(sum);
     }
-    for (i = 0; i < ndim; ++i) {
-        numel *= sizes[i];
+}
+
+static gd_memory_config autograd_config(void)
+{
+    gd_memory_config cfg;
+    cfg.params_bytes = 65536U;
+    cfg.state_bytes = 8192U;
+    cfg.scratch_slot_bytes = 262144U;
+    cfg.data_slot_bytes = 4096U;
+    cfg.scratch_slots = 2U;
+    cfg.data_slots = 2U;
+    cfg.default_alignment = 256U;
+    return cfg;
+}
+
+static void test_fanout_many_loss(gd_context *ctx)
+{
+    enum { M = 4, K = 7, N = 6, P = 5, Q = 3 };
+    const int64_t x_shape[2] = {M, K};
+    const int64_t w_shape[2] = {K, N};
+    const int64_t v_shape[2] = {N, P};
+    const int64_t b_shape[1] = {P};
+    const int64_t u_shape[2] = {N, Q};
+    const int64_t g1_shape[2] = {M, P};
+    const int64_t g2_shape[2] = {M, Q};
+    uint16_t x_data[M * K];
+    uint16_t w_data[K * N];
+    uint16_t v_data[N * P];
+    uint16_t b_data[P];
+    uint16_t u_data[N * Q];
+    uint16_t g1_data[M * P];
+    uint16_t g2_data[M * Q];
+    uint16_t got[M * K > K * N ? M * K : K * N];
+    uint16_t y_ref[M * N];
+    uint16_t dy1[M * N];
+    uint16_t dy2[M * N];
+    uint16_t dy[M * N];
+    uint16_t dx_ref[M * K];
+    uint16_t dw_ref[K * N];
+    uint16_t dv_ref[N * P];
+    uint16_t db_ref[P];
+    uint16_t du_ref[N * Q];
+    gd_tensor x;
+    gd_tensor w;
+    gd_tensor v;
+    gd_tensor b;
+    gd_tensor u;
+    gd_tensor g1;
+    gd_tensor g2;
+    gd_tensor y;
+    gd_tensor z1;
+    gd_tensor z2;
+    gd_tensor dx;
+    gd_tensor dw;
+    gd_tensor dv;
+    gd_tensor db;
+    gd_tensor du;
+    const gd_tensor *outputs[2];
+    const gd_tensor *grad_outputs[2];
+    uint32_t i;
+
+    fill_seq(x_data, M * K, 0.0125f, 0.02f);
+    fill_seq(w_data, K * N, -0.009f, 0.01f);
+    fill_seq(v_data, N * P, 0.007f, -0.015f);
+    fill_seq(b_data, P, 0.02f, 0.0f);
+    fill_seq(u_data, N * Q, -0.011f, 0.018f);
+    fill_seq(g1_data, M * P, 0.013f, -0.004f);
+    fill_seq(g2_data, M * Q, -0.017f, 0.006f);
+
+    matmul_nn(x_data, w_data, M, K, N, y_ref);
+    matmul_nt(g1_data, v_data, M, P, N, dy1);
+    matmul_nt(g2_data, u_data, M, Q, N, dy2);
+    add_f16(dy2, dy1, M * N, dy);
+    matmul_nt(dy, w_data, M, N, K, dx_ref);
+    matmul_tn(x_data, dy, M, K, N, dw_ref);
+    matmul_tn(y_ref, g1_data, M, N, P, dv_ref);
+    reduce_rows(g1_data, M, P, db_ref);
+    matmul_tn(y_ref, g2_data, M, N, Q, du_ref);
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, x_shape), 256U, &x));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, w_shape), 256U, &w));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, v_shape), 256U, &v));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, b_shape), 256U, &b));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, u_shape), 256U, &u));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, g1_shape), 256U, &g1));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, g2_shape), 256U, &g2));
+    CHECK_OK(gd_tensor_write(ctx, &x, x_data, sizeof(x_data)));
+    CHECK_OK(gd_tensor_write(ctx, &w, w_data, sizeof(w_data)));
+    CHECK_OK(gd_tensor_write(ctx, &v, v_data, sizeof(v_data)));
+    CHECK_OK(gd_tensor_write(ctx, &b, b_data, sizeof(b_data)));
+    CHECK_OK(gd_tensor_write(ctx, &u, u_data, sizeof(u_data)));
+    CHECK_OK(gd_tensor_write(ctx, &g1, g1_data, sizeof(g1_data)));
+    CHECK_OK(gd_tensor_write(ctx, &g2, g2_data, sizeof(g2_data)));
+    CHECK_OK(gd_context_seal_params(ctx));
+
+    x.requires_grad = true;
+    w.requires_grad = true;
+    v.requires_grad = true;
+    b.requires_grad = true;
+    u.requires_grad = true;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_matmul(ctx, &x, &w, &y));
+    CHECK_OK(gd_linear(ctx, &y, &v, &b, &z1));
+    CHECK_OK(gd_matmul(ctx, &y, &u, &z2));
+    outputs[0] = &z1;
+    outputs[1] = &z2;
+    grad_outputs[0] = &g1;
+    grad_outputs[1] = &g2;
+    CHECK_OK(gd_backward_many(ctx, 2U, outputs, grad_outputs));
+    CHECK_OK(gd_tensor_grad(ctx, &x, &dx));
+    CHECK_OK(gd_tensor_grad(ctx, &w, &dw));
+    CHECK_OK(gd_tensor_grad(ctx, &v, &dv));
+    CHECK_OK(gd_tensor_grad(ctx, &b, &db));
+    CHECK_OK(gd_tensor_grad(ctx, &u, &du));
+    CHECK_OK(gd_end_step(ctx));
+
+    memset(got, 0, sizeof(got));
+    CHECK_OK(gd_tensor_read(ctx, &dx, got, sizeof(dx_ref)));
+    for (i = 0U; i < M * K; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - f16_bits_to_f32(dx_ref[i])) <= 0.03f,
+              "autograd dx close");
     }
-    status = gd_tensor_copy_from_cpu(ctx, *out, data, (size_t)numel * sizeof(float));
-    if (status != GD_OK) {
-        return status;
+    memset(got, 0, sizeof(got));
+    CHECK_OK(gd_tensor_read(ctx, &dw, got, sizeof(dw_ref)));
+    for (i = 0U; i < K * N; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - f16_bits_to_f32(dw_ref[i])) <= 0.03f,
+              "autograd dw close");
     }
-    return gd_tensor_set_requires_grad(*out, true);
+    CHECK_OK(gd_tensor_read(ctx, &dv, got, sizeof(dv_ref)));
+    for (i = 0U; i < N * P; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - f16_bits_to_f32(dv_ref[i])) <= 0.03f,
+              "autograd dv close");
+    }
+    CHECK_OK(gd_tensor_read(ctx, &db, got, sizeof(db_ref)));
+    for (i = 0U; i < P; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - f16_bits_to_f32(db_ref[i])) <= 0.03f,
+              "autograd db close");
+    }
+    CHECK_OK(gd_tensor_read(ctx, &du, got, sizeof(du_ref)));
+    for (i = 0U; i < N * Q; ++i) {
+        CHECK(abs_f32(f16_bits_to_f32(got[i]) - f16_bits_to_f32(du_ref[i])) <= 0.03f,
+              "autograd du close");
+    }
 }
 
 int main(void)
 {
     gd_context *ctx = NULL;
-    int64_t s4[1] = {4};
-    int64_t a2[2] = {2, 3};
-    int64_t b2[2] = {3, 2};
-    int64_t l2[2] = {2, 3};
-    float da[4] = {-1.0F, 0.5F, 2.0F, -3.0F};
-    float db[4] = {0.7F, -1.2F, 0.3F, 1.1F};
-    float ma[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
-    float mb[6] = {1.0F, -1.0F, 0.5F, 0.25F, -0.75F, 0.2F};
-    float logits[6] = {0.2F, -0.5F, 1.0F, -1.0F, 0.3F, 0.8F};
-
-    CHECK_OK(gd_context_create(&ctx));
-    CHECK_TRUE(test_f16_cast_leaf_grad(ctx) == 0);
-    CHECK_TRUE(test_f16_linear_leaf_grads(ctx) == 0);
-    CHECK_TRUE(test_f16_embedding_leaf_grad(ctx) == 0);
-    CHECK_TRUE(test_f16_rms_norm_weight_grad(ctx) == 0);
-    CHECK_TRUE(test_f16_activation_backwards(ctx) == 0);
-    CHECK_TRUE(test_f16_rope_backward(ctx) == 0);
-
-    {
-        two_in t = {0};
-        gd_tensor *in[2];
-        CHECK_OK(make_grad_input(ctx, 1, s4, da, &t.a));
-        CHECK_OK(make_grad_input(ctx, 1, s4, db, &t.b));
-        in[0] = t.a;
-        in[1] = t.b;
-        CHECK_TRUE(gradcheck(ctx, build_add_sum, &t, in, 2, "add") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_mul_sum, &t, in, 2, "mul") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_square_mean, &t, in, 1, "square_mean") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_scale_relu_sum, &t, in, 1, "scale_relu") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_silu_sum, &t, in, 1, "silu") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_powlu_sum, &t, in, 2, "powlu") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_powlu_m2_sum, &t, in, 2, "powlu_m2") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_gelu_sum, &t, in, 1, "gelu") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_gelu_tanh_sum, &t, in, 1, "gelu_tanh") == 0);
-        CHECK_TRUE(gradcheck(ctx, build_reshape_sum, &t, in, 1, "reshape") == 0);
-        gd_tensor_release(t.a);
-        gd_tensor_release(t.b);
+    gd_memory_config cfg = autograd_config();
+    gd_status st = gd_context_create(&cfg, &ctx);
+    if (st == GD_ERR_UNSUPPORTED) {
+        printf("test_autograd: skipped (no supported GPU backend)\n");
+        return 0;
     }
-
-    {
-        /* transpose: a[2,3] -> [3,2] */
-        two_in t = {0};
-        gd_tensor *in[1];
-        int64_t s23[2] = {2, 3};
-        float adata[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
-        CHECK_OK(make_grad_input(ctx, 2, s23, adata, &t.a));
-        in[0] = t.a;
-        CHECK_TRUE(gradcheck(ctx, build_transpose_sum, &t, in, 1, "transpose") == 0);
-        gd_tensor_release(t.a);
-    }
-
-    {
-        /* rms_norm: x[2,3] (grad) + weight[3] (grad). */
-        two_in t = {0};
-        gd_tensor *in[2];
-        int64_t s23[2] = {2, 3};
-        int64_t s3[1] = {3};
-        float xd[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
-        float wd[3] = {1.0F, 0.5F, -0.8F};
-        CHECK_OK(make_grad_input(ctx, 2, s23, xd, &t.a));
-        CHECK_OK(make_grad_input(ctx, 1, s3, wd, &t.b));
-        in[0] = t.a;
-        in[1] = t.b;
-        CHECK_TRUE(gradcheck(ctx, build_rms_norm_sum, &t, in, 2, "rms_norm") == 0);
-        gd_tensor_release(t.a);
-        gd_tensor_release(t.b);
-    }
-
-    {
-        /* embedding: table[5,4] (grad) gathered by ids[6] with repeats. */
-        emb_in e = {0};
-        gd_tensor *in[1];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc idesc;
-        int64_t vs[2] = {5, 4};
-        int64_t is[1] = {6};
-        float tdata[20];
-        int32_t ids[6] = {0, 2, 2, 4, 1, 2};
-        int k = 0;
-        for (k = 0; k < 20; ++k) {
-            tdata[k] = 0.1F * (float)(k - 10);
-        }
-        CHECK_OK(make_grad_input(ctx, 2, vs, tdata, &e.table));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, is, &idesc));
-        CHECK_OK(gd_tensor_empty(ctx, &idesc, &e.ids));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, e.ids, ids, sizeof(ids)));
-        in[0] = e.table;
-        CHECK_TRUE(gradcheck(ctx, build_embedding_sum, &e, in, 1, "embedding") == 0);
-        gd_tensor_release(e.table);
-        gd_tensor_release(e.ids);
-    }
-
-    {
-        /* rope: x[1,2,2,4] (grad) with positions {0,1}. */
-        rope_in r = {0};
-        gd_tensor *in[1];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc pdesc;
-        int64_t xs[4] = {1, 2, 2, 4};
-        int64_t ps[2] = {1, 2};
-        float xd[16];
-        int32_t pid[2] = {0, 1};
-        int k = 0;
-        for (k = 0; k < 16; ++k) {
-            xd[k] = 0.2F * (float)(k - 8);
-        }
-        CHECK_OK(make_grad_input(ctx, 4, xs, xd, &r.x));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 2, ps, &pdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &pdesc, &r.pos));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, r.pos, pid, sizeof(pid)));
-        in[0] = r.x;
-        CHECK_TRUE(gradcheck(ctx, build_rope_sum, &r, in, 1, "rope") == 0);
-        gd_tensor_release(r.x);
-        gd_tensor_release(r.pos);
-    }
-
-    {
-        /* sdpa with GQA: q[1,3,2,4], k/v[1,3,1,4]; dense and causal. */
-        sdpa_in s = {0};
-        gd_tensor *in[3];
-        int64_t qs[4] = {1, 3, 2, 4};
-        int64_t ks[4] = {1, 3, 1, 4};
-        float qd[24];
-        float kd[12];
-        float vd[12];
-        int j = 0;
-        for (j = 0; j < 24; ++j) {
-            qd[j] = 0.15F * (float)((j % 7) - 3);
-        }
-        for (j = 0; j < 12; ++j) {
-            kd[j] = 0.2F * (float)((j % 5) - 2);
-            vd[j] = 0.1F * (float)((j % 4) - 1);
-        }
-        CHECK_OK(make_grad_input(ctx, 4, qs, qd, &s.q));
-        CHECK_OK(make_grad_input(ctx, 4, ks, kd, &s.k));
-        CHECK_OK(make_grad_input(ctx, 4, ks, vd, &s.v));
-        in[0] = s.q;
-        in[1] = s.k;
-        in[2] = s.v;
-        s.causal = false;
-        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa") == 0);
-        s.causal = true;
-        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_causal") == 0);
-        s.prefix_len = 2;
-        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_prefix") == 0);
-        s.sliding_window = 1;
-        CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_prefix_window") == 0);
-        s.sliding_window = 0;
-        s.prefix_len = 0;
-        {
-            /* additive bias broadcast over [B,Hq,Tq,Tk] = [1,1,3,3]; verifies
-             * q/k/v grads are correct in the presence of a bias term. */
-            gd_device cpu = {GD_DEVICE_CPU, 0};
-            gd_tensor_desc bdesc;
-            int64_t bs[4] = {1, 1, 3, 3};
-            float bd[9] = {0.0F, -1e9F, -1e9F, 0.0F, 0.0F, -1e9F, 0.2F, -0.1F, 0.3F};
-            CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 4, bs, &bdesc));
-            CHECK_OK(gd_tensor_empty(ctx, &bdesc, &s.bias));
-            CHECK_OK(gd_tensor_copy_from_cpu(ctx, s.bias, bd, sizeof(bd)));
-            s.causal = false;
-            CHECK_TRUE(gradcheck(ctx, build_sdpa_sum, &s, in, 3, "sdpa_bias") == 0);
-            gd_tensor_release(s.bias);
-            s.bias = NULL;
-        }
-        gd_tensor_release(s.q);
-        gd_tensor_release(s.k);
-        gd_tensor_release(s.v);
-    }
-
-    {
-        /* packed sdpa_varlen: two sequences, lengths 3 and 2, prefix+window. */
-        sdpa_varlen_in s = {0};
-        gd_tensor *in[3];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc cdesc;
-        int64_t xs[3] = {5, 1, 2};
-        int64_t cs[1] = {3};
-        float qd[10] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F,
-                        0.7F, -0.8F, 0.9F, 1.0F};
-        float kd[10] = {0.2F, 0.1F, -0.3F, 0.5F, 0.4F, -0.6F,
-                        0.8F, -0.7F, 0.9F, -1.0F};
-        float vd[10] = {-0.1F, 0.2F, -0.4F, 0.6F, 0.3F, -0.5F,
-                        0.7F, 0.9F, -0.8F, 1.0F};
-        int32_t cu[3] = {0, 3, 5};
-        CHECK_OK(make_grad_input(ctx, 3, xs, qd, &s.q));
-        CHECK_OK(make_grad_input(ctx, 3, xs, kd, &s.k));
-        CHECK_OK(make_grad_input(ctx, 3, xs, vd, &s.v));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, cs, &cdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &cdesc, &s.cu));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, s.cu, cu, sizeof(cu)));
-        in[0] = s.q;
-        in[1] = s.k;
-        in[2] = s.v;
-        s.causal = true;
-        s.prefix_len = 1;
-        s.sliding_window = 2;
-        s.max_seqlen = 3;
-        CHECK_TRUE(gradcheck(ctx, build_sdpa_varlen_sum, &s, in, 3, "sdpa_varlen") == 0);
-        gd_tensor_release(s.cu);
-        gd_tensor_release(s.q);
-        gd_tensor_release(s.k);
-        gd_tensor_release(s.v);
-    }
-
-    {
-        two_in t = {0};
-        gd_tensor *in[2];
-        CHECK_OK(make_grad_input(ctx, 2, a2, ma, &t.a));
-        CHECK_OK(make_grad_input(ctx, 2, b2, mb, &t.b));
-        in[0] = t.a;
-        in[1] = t.b;
-        CHECK_TRUE(gradcheck(ctx, build_matmul_sum, &t, in, 2, "matmul") == 0);
-        gd_tensor_release(t.a);
-        gd_tensor_release(t.b);
-    }
-
-    {
-        two_in t = {0};
-        gd_tensor *in[2];
-        int64_t s23[2] = {2, 3};
-        int64_t s3[1] = {3};
-        float adata[6] = {0.5F, -1.0F, 2.0F, 0.25F, -0.5F, 1.5F};
-        float bdata[3] = {1.0F, -2.0F, 0.5F};
-        CHECK_OK(make_grad_input(ctx, 2, s23, adata, &t.a));
-        CHECK_OK(make_grad_input(ctx, 1, s3, bdata, &t.b));
-        in[0] = t.a;
-        in[1] = t.b;
-        CHECK_TRUE(gradcheck(ctx, build_add_bcast_sum, &t, in, 2, "add_broadcast") == 0);
-        gd_tensor_release(t.a);
-        gd_tensor_release(t.b);
-    }
-
-    {
-        /* transposed matmul: a[3,2]^T @ b[3,4] -> [2,4] */
-        mm_cfg c = {0};
-        gd_tensor *in[2];
-        int64_t at[2] = {3, 2};
-        int64_t bt[2] = {3, 4};
-        float ad[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
-        float bd[12];
-        int k = 0;
-        for (k = 0; k < 12; ++k) {
-            bd[k] = 0.1F * (float)(k - 6);
-        }
-        CHECK_OK(make_grad_input(ctx, 2, at, ad, &c.a));
-        CHECK_OK(make_grad_input(ctx, 2, bt, bd, &c.b));
-        c.trans_a = true;
-        c.trans_b = false;
-        in[0] = c.a;
-        in[1] = c.b;
-        CHECK_TRUE(gradcheck(ctx, build_matmul_ex_sum, &c, in, 2, "matmul_trans_a") == 0);
-        gd_tensor_release(c.a);
-        gd_tensor_release(c.b);
-    }
-
-    {
-        /* batched matmul with broadcast: a[2,2,3] @ b[3,4] -> [2,2,4] */
-        mm_cfg c = {0};
-        gd_tensor *in[2];
-        int64_t as[3] = {2, 2, 3};
-        int64_t bs[2] = {3, 4};
-        float ad[12];
-        float bd[12];
-        int k = 0;
-        for (k = 0; k < 12; ++k) {
-            ad[k] = 0.05F * (float)(k - 6);
-            bd[k] = 0.1F * (float)(6 - k);
-        }
-        CHECK_OK(make_grad_input(ctx, 3, as, ad, &c.a));
-        CHECK_OK(make_grad_input(ctx, 2, bs, bd, &c.b));
-        c.trans_a = false;
-        c.trans_b = false;
-        in[0] = c.a;
-        in[1] = c.b;
-        CHECK_TRUE(gradcheck(ctx, build_matmul_ex_sum, &c, in, 2, "matmul_batched_bcast") == 0);
-        gd_tensor_release(c.a);
-        gd_tensor_release(c.b);
-    }
-
-    {
-        /* linear with trans_w (tied-LM-head style): x[2,3], w[4,3], bias[4] */
-        lin_cfg c = {0};
-        gd_tensor *in[3];
-        int64_t xs[2] = {2, 3};
-        int64_t ws[2] = {4, 3};
-        int64_t bs[1] = {4};
-        float xd[6] = {0.2F, -0.1F, 0.4F, -0.3F, 0.5F, 0.1F};
-        float wd[12];
-        float bd[4] = {0.1F, -0.2F, 0.3F, -0.4F};
-        int k = 0;
-        for (k = 0; k < 12; ++k) {
-            wd[k] = 0.08F * (float)(k - 6);
-        }
-        CHECK_OK(make_grad_input(ctx, 2, xs, xd, &c.x));
-        CHECK_OK(make_grad_input(ctx, 2, ws, wd, &c.w));
-        CHECK_OK(make_grad_input(ctx, 1, bs, bd, &c.bias));
-        c.trans_w = true;
-        in[0] = c.x;
-        in[1] = c.w;
-        in[2] = c.bias;
-        CHECK_TRUE(gradcheck(ctx, build_linear_sum, &c, in, 3, "linear_trans_w") == 0);
-        gd_tensor_release(c.x);
-        gd_tensor_release(c.w);
-        gd_tensor_release(c.bias);
-    }
-
-    {
-        ce_in t = {0};
-        gd_tensor *in[1];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc tdesc;
-        int32_t targets[2] = {2, 0};
-        CHECK_OK(make_grad_input(ctx, 2, l2, logits, &t.logits));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
-        in[0] = t.logits;
-        CHECK_TRUE(gradcheck(ctx, build_ce, &t, in, 1, "cross_entropy") == 0);
-        gd_tensor_release(t.logits);
-        gd_tensor_release(t.targets);
-    }
-
-    {
-        ce_in t = {0};
-        gd_tensor *in[1];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc tdesc;
-        int32_t targets[2] = {2, -100};
-        CHECK_OK(make_grad_input(ctx, 2, l2, logits, &t.logits));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
-        t.has_ignore_index = true;
-        t.ignore_index = -100;
-        in[0] = t.logits;
-        CHECK_TRUE(gradcheck(ctx, build_ce, &t, in, 1, "cross_entropy_ignore") == 0);
-        gd_tensor_release(t.logits);
-        gd_tensor_release(t.targets);
-    }
-
-    {
-        lmce_in t = {0};
-        gd_tensor *in[2];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc tdesc;
-        int64_t hs[2] = {2, 3};
-        int64_t ws[2] = {4, 3};
-        int32_t targets[2] = {2, 0};
-        float hd[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
-        float wd[12] = {0.05F, -0.03F, 0.07F, 0.11F, -0.13F, 0.17F,
-                        -0.19F, 0.23F, -0.29F, 0.31F, -0.37F, 0.41F};
-        CHECK_OK(make_grad_input(ctx, 2, hs, hd, &t.hidden));
-        CHECK_OK(make_grad_input(ctx, 2, ws, wd, &t.weight));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
-        in[0] = t.hidden;
-        in[1] = t.weight;
-        CHECK_TRUE(gradcheck(ctx, build_lmce, &t, in, 2, "lm_cross_entropy") == 0);
-        gd_tensor_release(t.hidden);
-        gd_tensor_release(t.weight);
-        gd_tensor_release(t.targets);
-    }
-
-    {
-        lmce_in t = {0};
-        gd_tensor *in[2];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc tdesc;
-        int64_t hs[2] = {2, 3};
-        int64_t ws[2] = {4, 3};
-        int32_t targets[2] = {2, -100};
-        float hd[6] = {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F};
-        float wd[12] = {0.05F, -0.03F, 0.07F, 0.11F, -0.13F, 0.17F,
-                        -0.19F, 0.23F, -0.29F, 0.31F, -0.37F, 0.41F};
-        CHECK_OK(make_grad_input(ctx, 2, hs, hd, &t.hidden));
-        CHECK_OK(make_grad_input(ctx, 2, ws, wd, &t.weight));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &t.targets));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, t.targets, targets, sizeof(targets)));
-        t.has_ignore_index = true;
-        t.ignore_index = -100;
-        in[0] = t.hidden;
-        in[1] = t.weight;
-        CHECK_TRUE(gradcheck(ctx, build_lmce, &t, in, 2, "lm_cross_entropy_ignore") == 0);
-        gd_tensor_release(t.hidden);
-        gd_tensor_release(t.weight);
-        gd_tensor_release(t.targets);
-    }
-
-    {
-        mlp_in m = {0};
-        gd_tensor *in[3];
-        gd_device cpu = {GD_DEVICE_CPU, 0};
-        gd_tensor_desc tdesc;
-        int32_t targets[2] = {1, 0};
-        int64_t xs[2] = {2, 3};
-        int64_t w1s[2] = {3, 4};
-        int64_t w2s[2] = {4, 2};
-        float xd[6] = {0.1F, 0.2F, -0.3F, 0.4F, -0.1F, 0.5F};
-        float w1[12];
-        float w2[8];
-        int k = 0;
-        for (k = 0; k < 12; ++k) {
-            w1[k] = 0.1F * (float)(k - 6);
-        }
-        for (k = 0; k < 8; ++k) {
-            w2[k] = 0.05F * (float)(k - 4);
-        }
-        CHECK_OK(make_grad_input(ctx, 2, xs, xd, &m.x));
-        CHECK_OK(make_grad_input(ctx, 2, w1s, w1, &m.w1));
-        CHECK_OK(make_grad_input(ctx, 2, w2s, w2, &m.w2));
-        CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 1, (int64_t[]){2}, &tdesc));
-        CHECK_OK(gd_tensor_empty(ctx, &tdesc, &m.targets));
-        CHECK_OK(gd_tensor_copy_from_cpu(ctx, m.targets, targets, sizeof(targets)));
-        in[0] = m.x;
-        in[1] = m.w1;
-        in[2] = m.w2;
-        CHECK_TRUE(gradcheck(ctx, build_mlp, &m, in, 3, "mlp") == 0);
-        gd_tensor_release(m.x);
-        gd_tensor_release(m.w1);
-        gd_tensor_release(m.w2);
-        gd_tensor_release(m.targets);
-    }
-
+    CHECK_OK(st);
+    test_fanout_many_loss(ctx);
     gd_context_destroy(ctx);
-    printf("autograd gradcheck ok\n");
+    printf("test_autograd: ok\n");
     return 0;
 }

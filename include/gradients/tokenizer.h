@@ -1,7 +1,7 @@
 #ifndef GRADIENTS_TOKENIZER_H
 #define GRADIENTS_TOKENIZER_H
 
-#include "gradients/status.h"
+#include <gradients/status.h>
 
 #include <stdint.h>
 

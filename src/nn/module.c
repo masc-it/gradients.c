@@ -1,613 +1,1028 @@
-#include "gradients/module.h"
+#include <gradients/module.h>
+#include <gradients/ops.h>
+
+#include "../core/memory_internal.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "gradients/ops.h"
-
-#include "../core/internal.h"
-#include "../core/tensor_internal.h"
-
-typedef struct module_param {
-    char *name;
-    gd_tensor *tensor;
-} module_param;
-
-typedef struct module_child {
-    char *name;
-    gd_module *module;
-} module_child;
-
-struct gd_module {
-    gd_context *ctx;
-    char *type_name;
-    module_param *params;
-    int n_params;
-    int param_cap;
-    module_child *children;
-    int n_children;
-    int child_cap;
-    gd_tensor **flat;   /* cached deduped parameter list */
-    int n_flat;
-};
-
-static char *dup_string(const char *s)
+static gd_status gd_module_set_error(gd_context *ctx,
+                                     gd_status status,
+                                     const char *message)
 {
-    size_t len = 0U;
-    char *copy = NULL;
-
-    if (s == NULL) {
-        s = "";
-    }
-    len = strlen(s);
-    copy = malloc(len + 1U);
-    if (copy != NULL) {
-        memcpy(copy, s, len + 1U);
-    }
-    return copy;
+    return ctx != NULL ? gd_context_set_error(ctx, status, message) : status;
 }
 
-gd_status gd_module_create(gd_context *ctx, const char *type_name, gd_module **out)
+static gd_status gd_module_copy_name(char dst[GD_MODULE_NAME_MAX], const char *name)
 {
-    gd_module *module = NULL;
-
-    if (ctx == NULL || type_name == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_create argument is NULL");
+    size_t i;
+    if (dst == NULL || name == NULL || name[0] == '\0') {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    *out = NULL;
-
-    module = calloc(1U, sizeof(*module));
-    if (module == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module");
+    for (i = 0U; i + 1U < GD_MODULE_NAME_MAX && name[i] != '\0'; ++i) {
+        dst[i] = name[i];
     }
-    module->ctx = ctx;
-    module->type_name = dup_string(type_name);
-    if (module->type_name == NULL) {
-        free(module);
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module type name");
+    if (name[i] != '\0') {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-
-    *out = module;
-    _gd_set_last_error(GD_OK, NULL);
+    dst[i] = '\0';
     return GD_OK;
 }
 
-void gd_module_destroy(gd_module *module)
+static bool gd_module_names_equal(const char *a, const char *b)
 {
-    int i = 0;
+    return strncmp(a, b, GD_MODULE_NAME_MAX) == 0;
+}
 
+static bool gd_module_has_entry_name(const gd_module *module, const char *name)
+{
+    uint32_t i;
+    if (module == NULL || name == NULL) {
+        return false;
+    }
+    for (i = 0U; i < module->param_count; ++i) {
+        if (gd_module_names_equal(module->params[i].name, name)) {
+            return true;
+        }
+    }
+    for (i = 0U; i < module->buffer_count; ++i) {
+        if (gd_module_names_equal(module->buffers[i].name, name)) {
+            return true;
+        }
+    }
+    for (i = 0U; i < module->child_count; ++i) {
+        if (gd_module_names_equal(module->children[i].name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static gd_status gd_module_grow_array(void **items,
+                                      uint32_t *capacity,
+                                      uint32_t count,
+                                      size_t elem_size)
+{
+    void *grown;
+    uint32_t new_capacity;
+    if (items == NULL || capacity == NULL || elem_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (count < *capacity) {
+        return GD_OK;
+    }
+    new_capacity = *capacity == 0U ? 4U : *capacity * 2U;
+    if (new_capacity <= *capacity || (size_t)new_capacity > SIZE_MAX / elem_size) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    grown = realloc(*items, (size_t)new_capacity * elem_size);
+    if (grown == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    memset((unsigned char *)grown + (size_t)(*capacity) * elem_size,
+           0,
+           (size_t)(new_capacity - *capacity) * elem_size);
+    *items = grown;
+    *capacity = new_capacity;
+    return GD_OK;
+}
+
+static gd_status gd_module_reserve_param(gd_module *module)
+{
+    return gd_module_grow_array((void **)&module->params,
+                                &module->param_capacity,
+                                module->param_count,
+                                sizeof(module->params[0]));
+}
+
+static gd_status gd_module_reserve_buffer(gd_module *module)
+{
+    return gd_module_grow_array((void **)&module->buffers,
+                                &module->buffer_capacity,
+                                module->buffer_count,
+                                sizeof(module->buffers[0]));
+}
+
+static gd_status gd_module_reserve_child(gd_module *module)
+{
+    return gd_module_grow_array((void **)&module->children,
+                                &module->child_capacity,
+                                module->child_count,
+                                sizeof(module->children[0]));
+}
+
+static bool gd_module_wildcard_match(const char *pattern, const char *text)
+{
+    const char *star = NULL;
+    const char *retry = NULL;
+    if (pattern == NULL || text == NULL) {
+        return false;
+    }
+    while (*text != '\0') {
+        if (*pattern == '*') {
+            star = pattern++;
+            retry = text;
+        } else if (*pattern == *text) {
+            pattern++;
+            text++;
+        } else if (star != NULL) {
+            pattern = star + 1;
+            retry++;
+            text = retry;
+        } else {
+            return false;
+        }
+    }
+    while (*pattern == '*') {
+        pattern++;
+    }
+    return *pattern == '\0';
+}
+
+static uint64_t gd_module_hash_string(const char *text)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    if (text == NULL) {
+        return hash;
+    }
+    while (*text != '\0') {
+        hash ^= (uint64_t)(unsigned char)*text;
+        hash *= 1099511628211ULL;
+        text++;
+    }
+    return hash;
+}
+
+static uint64_t gd_module_mix_seed(uint64_t seed, const char *path)
+{
+    uint64_t hash = gd_module_hash_string(path);
+    return seed ^ (hash + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U));
+}
+
+static gd_status gd_module_join_path(const char *prefix,
+                                     const char *name,
+                                     char out[GD_MODULE_PATH_MAX])
+{
+    int n;
+    if (name == NULL || name[0] == '\0' || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (prefix == NULL || prefix[0] == '\0') {
+        n = snprintf(out, GD_MODULE_PATH_MAX, "%s", name);
+    } else {
+        n = snprintf(out, GD_MODULE_PATH_MAX, "%s.%s", prefix, name);
+    }
+    if (n < 0 || (size_t)n >= GD_MODULE_PATH_MAX) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return GD_OK;
+}
+
+static bool gd_tensor_same_param_identity(const gd_tensor *a, const gd_tensor *b)
+{
+    uint32_t i;
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    if (a == b) {
+        return true;
+    }
+    if (a->dtype != b->dtype || a->rank != b->rank || a->storage.buffer != b->storage.buffer ||
+        a->storage.offset != b->storage.offset || a->storage.nbytes != b->storage.nbytes ||
+        a->view_offset != b->view_offset) {
+        return false;
+    }
+    for (i = 0U; i < a->rank; ++i) {
+        if (a->shape[i] != b->shape[i] || a->strides[i] != b->strides[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static gd_status gd_param_set_append(gd_param_set *set,
+                                     const char path[GD_MODULE_PATH_MAX],
+                                     gd_tensor *tensor,
+                                     int32_t group_index,
+                                     float lr_mult,
+                                     float weight_decay,
+                                     bool trainable)
+{
+    gd_status st;
+    gd_param_ref *item;
+    if (set == NULL || path == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_module_grow_array((void **)&set->items,
+                              &set->capacity,
+                              set->count,
+                              sizeof(set->items[0]));
+    if (st != GD_OK) {
+        return st;
+    }
+    item = &set->items[set->count];
+    memset(item, 0, sizeof(*item));
+    (void)snprintf(item->path, sizeof(item->path), "%s", path);
+    item->tensor = tensor;
+    item->group_index = group_index;
+    item->lr_mult = lr_mult;
+    item->weight_decay = weight_decay;
+    item->trainable = trainable;
+    set->count += 1U;
+    return GD_OK;
+}
+
+static bool gd_param_set_contains_tensor(const gd_param_set *set, const gd_tensor *tensor)
+{
+    uint32_t i;
+    if (set == NULL || tensor == NULL) {
+        return false;
+    }
+    for (i = 0U; i < set->count; ++i) {
+        if (gd_tensor_same_param_identity(set->items[i].tensor, tensor)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int32_t gd_module_select_group(const char *path,
+                                      const gd_param_group *groups,
+                                      uint32_t group_count)
+{
+    uint32_t i;
+    if (path == NULL || groups == NULL) {
+        return -1;
+    }
+    for (i = 0U; i < group_count; ++i) {
+        if (groups[i].match != NULL && gd_module_wildcard_match(groups[i].match, path)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static gd_status gd_module_collect_params_impl(const gd_module *module,
+                                               const char *prefix,
+                                               const gd_param_group *groups,
+                                               uint32_t group_count,
+                                               gd_param_set *out)
+{
+    uint32_t i;
+    gd_status st;
+    char child_path[GD_MODULE_PATH_MAX];
+    if (module == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < module->param_count; ++i) {
+        char param_path[GD_MODULE_PATH_MAX];
+        int32_t group_index;
+        float lr_mult = 1.0f;
+        float weight_decay = 0.0f;
+        bool trainable;
+        gd_module_param_entry *entry = &module->params[i];
+        if (entry->tensor == NULL || gd_param_set_contains_tensor(out, entry->tensor)) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, entry->name, param_path);
+        if (st != GD_OK) {
+            return st;
+        }
+        group_index = gd_module_select_group(param_path, groups, group_count);
+        trainable = entry->trainable && entry->tensor->requires_grad;
+        if (group_index >= 0) {
+            lr_mult = groups[(uint32_t)group_index].lr_mult;
+            weight_decay = groups[(uint32_t)group_index].weight_decay;
+            if (!groups[(uint32_t)group_index].trainable) {
+                trainable = false;
+            }
+        }
+        st = gd_param_set_append(out,
+                                 param_path,
+                                 entry->tensor,
+                                 group_index,
+                                 lr_mult,
+                                 weight_decay,
+                                 trainable);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    for (i = 0U; i < module->child_count; ++i) {
+        const gd_module_child_entry *child = &module->children[i];
+        if (child->module == NULL) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, child->name, child_path);
+        if (st != GD_OK) {
+            return st;
+        }
+        st = gd_module_collect_params_impl(child->module,
+                                           child_path,
+                                           groups,
+                                           group_count,
+                                           out);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_module_apply_trainable(gd_module *module,
+                                           const char *prefix,
+                                           const char *pattern,
+                                           bool trainable)
+{
+    uint32_t i;
+    gd_status st;
+    if (module == NULL || pattern == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < module->param_count; ++i) {
+        char param_path[GD_MODULE_PATH_MAX];
+        gd_module_param_entry *entry = &module->params[i];
+        st = gd_module_join_path(prefix, entry->name, param_path);
+        if (st != GD_OK) {
+            return st;
+        }
+        if (gd_module_wildcard_match(pattern, param_path)) {
+            entry->trainable = trainable;
+            if (entry->tensor != NULL) {
+                entry->tensor->requires_grad = trainable;
+            }
+        }
+    }
+    for (i = 0U; i < module->child_count; ++i) {
+        char child_path[GD_MODULE_PATH_MAX];
+        gd_module_child_entry *child = &module->children[i];
+        if (child->module == NULL) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, child->name, child_path);
+        if (st != GD_OK) {
+            return st;
+        }
+        st = gd_module_apply_trainable(child->module, child_path, pattern, trainable);
+        if (st != GD_OK) {
+            return st;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_module_init_tensor(gd_context *ctx,
+                                       gd_arena_kind arena,
+                                       const gd_tensor_spec *spec,
+                                       const gd_init_spec *init,
+                                       gd_tensor *out)
+{
+    gd_init_spec actual_init;
+    if (ctx == NULL || spec == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    actual_init = init != NULL ? *init : gd_init_empty();
+    switch (actual_init.kind) {
+    case GD_INIT_EMPTY:
+        return gd_tensor_empty(ctx,
+                               arena,
+                               spec->dtype,
+                               gd_shape_make(spec->rank, spec->shape),
+                               spec->alignment,
+                               out);
+    case GD_INIT_ZERO:
+        return gd_tensor_zeros(ctx,
+                               arena,
+                               spec->dtype,
+                               gd_shape_make(spec->rank, spec->shape),
+                               spec->alignment,
+                               out);
+    case GD_INIT_ONE:
+        return gd_tensor_ones(ctx,
+                              arena,
+                              spec->dtype,
+                              gd_shape_make(spec->rank, spec->shape),
+                              spec->alignment,
+                              out);
+    case GD_INIT_RAND_UNIFORM:
+        return gd_tensor_rand_uniform(ctx,
+                                      arena,
+                                      spec->dtype,
+                                      gd_shape_make(spec->rank, spec->shape),
+                                      spec->alignment,
+                                      actual_init.seed,
+                                      actual_init.low,
+                                      actual_init.high,
+                                      out);
+    default:
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid tensor init kind");
+    }
+}
+
+gd_tensor_spec gd_tensor_spec_make(gd_dtype dtype,
+                                   gd_shape shape,
+                                   size_t alignment)
+{
+    gd_tensor_spec spec;
+    uint32_t i;
+    memset(&spec, 0, sizeof(spec));
+    spec.dtype = dtype;
+    spec.rank = shape.rank;
+    spec.alignment = alignment;
+    if (shape.rank <= GD_MAX_DIMS) {
+        for (i = 0U; i < shape.rank; ++i) {
+            spec.shape[i] = shape.dims[i];
+        }
+    }
+    return spec;
+}
+
+gd_linear_layer_config gd_linear_layer_config_make(int64_t in_features,
+                                                   int64_t out_features,
+                                                   gd_dtype dtype,
+                                                   uint64_t seed)
+{
+    gd_linear_layer_config config;
+    memset(&config, 0, sizeof(config));
+    config.in_features = in_features;
+    config.out_features = out_features;
+    config.dtype = dtype;
+    config.use_bias = true;
+    config.transposed_weight = false;
+    config.alignment = 256U;
+    config.seed = seed;
+    config.weight_low = -0.02f;
+    config.weight_high = 0.02f;
+    return config;
+}
+
+gd_linear_layer_config gd_linear_layer_config_build(int64_t in_features,
+                                                    int64_t out_features,
+                                                    gd_dtype dtype)
+{
+    return gd_linear_layer_config_make(in_features, out_features, dtype, 0U);
+}
+
+gd_status gd_module_init(gd_context *ctx, gd_module *module, const char *name)
+{
+    gd_status st;
+    if (module == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(module, 0, sizeof(*module));
+    st = gd_module_copy_name(module->name, name);
+    if (st != GD_OK) {
+        memset(module, 0, sizeof(*module));
+        return gd_module_set_error(ctx, st, "invalid module name");
+    }
+    module->training = true;
+    return GD_OK;
+}
+
+gd_status gd_module_init_child(gd_context *ctx,
+                               gd_module *parent,
+                               const char *name,
+                               gd_module *child)
+{
+    gd_status st;
+    if (parent == NULL || child == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_module_init(ctx, child, name);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_module_add_child(parent, name, child);
+    if (st != GD_OK) {
+        gd_module_deinit(child);
+        return gd_module_set_error(ctx, st, "failed to add child module");
+    }
+    return GD_OK;
+}
+
+void gd_module_deinit(gd_module *module)
+{
+    uint32_t i;
     if (module == NULL) {
         return;
     }
-    for (i = 0; i < module->n_params; ++i) {
-        gd_tensor_release(module->params[i].tensor);
-        free(module->params[i].name);
-    }
-    for (i = 0; i < module->n_children; ++i) {
-        gd_module_destroy(module->children[i].module);
-        free(module->children[i].name);
+    for (i = 0U; i < module->child_count; ++i) {
+        if (module->children[i].module != NULL &&
+            module->children[i].module->parent == module) {
+            module->children[i].module->parent = NULL;
+        }
     }
     free(module->params);
+    free(module->buffers);
     free(module->children);
-    free(module->flat);
-    free(module->type_name);
-    free(module);
-    _gd_set_last_error(GD_OK, NULL);
+    memset(module, 0, sizeof(*module));
 }
 
-gd_status gd_module_param(gd_module *module, const char *name, gd_tensor *param)
+gd_status gd_module_add_param(gd_module *module, const char *name, gd_tensor *tensor)
 {
-    gd_status status = GD_OK;
-    char *name_copy = NULL;
-
-    if (module == NULL || name == NULL || param == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_param argument is NULL");
+    gd_status st;
+    char copied[GD_MODULE_NAME_MAX];
+    gd_module_param_entry *entry;
+    if (module == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (gd_tensor_storage(param) == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "module parameters must be materialized");
+    st = gd_module_copy_name(copied, name);
+    if (st != GD_OK) {
+        return st;
     }
-
-    if (module->n_params == module->param_cap) {
-        int new_cap = module->param_cap == 0 ? 8 : module->param_cap * 2;
-        module_param *grown = realloc(module->params, (size_t)new_cap * sizeof(*grown));
-        if (grown == NULL) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to grow module params");
-        }
-        module->params = grown;
-        module->param_cap = new_cap;
+    if (gd_module_has_entry_name(module, copied)) {
+        return GD_ERR_BAD_STATE;
     }
-
-    name_copy = dup_string(name);
-    if (name_copy == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to copy param name");
+    st = gd_module_reserve_param(module);
+    if (st != GD_OK) {
+        return st;
     }
-    status = gd_tensor_retain(param);
-    if (status != GD_OK) {
-        free(name_copy);
-        return status;
-    }
-
-    module->params[module->n_params].name = name_copy;
-    module->params[module->n_params].tensor = param;
-    module->n_params += 1;
-    _gd_set_last_error(GD_OK, NULL);
+    entry = &module->params[module->param_count];
+    memset(entry, 0, sizeof(*entry));
+    (void)snprintf(entry->name, sizeof(entry->name), "%s", copied);
+    entry->tensor = tensor;
+    entry->trainable = true;
+    tensor->requires_grad = true;
+    module->param_count += 1U;
     return GD_OK;
 }
 
-gd_status gd_module_child(gd_module *module, const char *name, gd_module *child)
+gd_status gd_module_add_buffer(gd_module *module, const char *name, gd_tensor *tensor)
 {
-    char *name_copy = NULL;
-
-    if (module == NULL || name == NULL || child == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_child argument is NULL");
+    gd_status st;
+    char copied[GD_MODULE_NAME_MAX];
+    gd_module_buffer_entry *entry;
+    if (module == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (child == module) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "module cannot be its own child");
+    st = gd_module_copy_name(copied, name);
+    if (st != GD_OK) {
+        return st;
     }
-
-    if (module->n_children == module->child_cap) {
-        int new_cap = module->child_cap == 0 ? 4 : module->child_cap * 2;
-        module_child *grown = realloc(module->children, (size_t)new_cap * sizeof(*grown));
-        if (grown == NULL) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to grow module children");
-        }
-        module->children = grown;
-        module->child_cap = new_cap;
+    if (gd_module_has_entry_name(module, copied)) {
+        return GD_ERR_BAD_STATE;
     }
-
-    name_copy = dup_string(name);
-    if (name_copy == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to copy child name");
+    st = gd_module_reserve_buffer(module);
+    if (st != GD_OK) {
+        return st;
     }
-
-    /* Ownership of the child transfers to the parent. */
-    module->children[module->n_children].name = name_copy;
-    module->children[module->n_children].module = child;
-    module->n_children += 1;
-    _gd_set_last_error(GD_OK, NULL);
+    entry = &module->buffers[module->buffer_count];
+    memset(entry, 0, sizeof(*entry));
+    (void)snprintf(entry->name, sizeof(entry->name), "%s", copied);
+    entry->tensor = tensor;
+    tensor->requires_grad = false;
+    module->buffer_count += 1U;
     return GD_OK;
 }
 
-static gd_status param_extent(gd_tensor *t, size_t *offset_out, size_t *nbytes_out)
+gd_status gd_module_add_child(gd_module *parent, const char *name, gd_module *child)
 {
-    const gd_tensor_desc *desc = _gd_tensor_desc_ptr(t);
-
-    if (desc == NULL) {
-        return _gd_error(GD_ERR_INTERNAL, "parameter has no descriptor");
+    gd_status st;
+    char copied[GD_MODULE_NAME_MAX];
+    gd_module_child_entry *entry;
+    if (parent == NULL || child == NULL || parent == child) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    *offset_out = (size_t)desc->storage_offset_bytes;
-    return gd_tensor_desc_nbytes(desc, nbytes_out, NULL);
+    st = gd_module_copy_name(copied, name);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (gd_module_has_entry_name(parent, copied) || child->parent != NULL) {
+        return GD_ERR_BAD_STATE;
+    }
+    st = gd_module_reserve_child(parent);
+    if (st != GD_OK) {
+        return st;
+    }
+    entry = &parent->children[parent->child_count];
+    memset(entry, 0, sizeof(*entry));
+    (void)snprintf(entry->name, sizeof(entry->name), "%s", copied);
+    entry->module = child;
+    child->parent = parent;
+    child->training = parent->training;
+    parent->child_count += 1U;
+    return GD_OK;
 }
 
-static int same_parameter(gd_tensor *a, gd_tensor *b)
+gd_status gd_module_param(gd_context *ctx,
+                          gd_module *module,
+                          const char *name,
+                          const gd_tensor_spec *spec,
+                          const gd_init_spec *init,
+                          gd_tensor *out)
 {
-    size_t a_off = 0U;
-    size_t b_off = 0U;
-    size_t a_nb = 0U;
-    size_t b_nb = 0U;
-
-    if (gd_tensor_storage(a) != gd_tensor_storage(b)) {
-        return 0;
+    gd_status st;
+    if (ctx == NULL || module == NULL || spec == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (param_extent(a, &a_off, &a_nb) != GD_OK || param_extent(b, &b_off, &b_nb) != GD_OK) {
-        return 0;
+    st = gd_module_init_tensor(ctx, GD_ARENA_PARAMS, spec, init, out);
+    if (st != GD_OK) {
+        return st;
     }
-    return a_off == b_off && a_nb == b_nb;
+    st = gd_module_add_param(module, name, out);
+    if (st != GD_OK) {
+        return gd_module_set_error(ctx, st, "failed to register module parameter");
+    }
+    return GD_OK;
 }
 
-static gd_status collect(gd_module *module,
-                         gd_tensor ***arr,
-                         int *count,
-                         int *cap)
+gd_status gd_module_buffer(gd_context *ctx,
+                           gd_module *module,
+                           const char *name,
+                           const gd_tensor_spec *spec,
+                           const gd_init_spec *init,
+                           gd_tensor *out)
 {
-    int i = 0;
+    gd_status st;
+    if (ctx == NULL || module == NULL || spec == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_module_init_tensor(ctx, GD_ARENA_PARAMS, spec, init, out);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_module_add_buffer(module, name, out);
+    if (st != GD_OK) {
+        return gd_module_set_error(ctx, st, "failed to register module buffer");
+    }
+    return GD_OK;
+}
 
-    for (i = 0; i < module->n_params; ++i) {
-        gd_tensor *t = module->params[i].tensor;
-        int j = 0;
-        int duplicate = 0;
+void gd_module_set_training(gd_module *module, bool training)
+{
+    uint32_t i;
+    if (module == NULL) {
+        return;
+    }
+    module->training = training;
+    for (i = 0U; i < module->child_count; ++i) {
+        gd_module_set_training(module->children[i].module, training);
+    }
+}
 
-        for (j = 0; j < *count; ++j) {
-            if (same_parameter((*arr)[j], t)) {
-                duplicate = 1;
-                break;
-            }
-        }
-        if (duplicate) {
+gd_status gd_module_freeze(gd_module *module, const char *pattern)
+{
+    if (module == NULL || pattern == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_module_apply_trainable(module, module->name, pattern, false);
+}
+
+gd_status gd_module_unfreeze(gd_module *module, const char *pattern)
+{
+    if (module == NULL || pattern == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_module_apply_trainable(module, module->name, pattern, true);
+}
+
+static gd_status gd_module_init_param_tensor(gd_context *ctx,
+                                             gd_tensor *tensor,
+                                             const char *path,
+                                             const gd_init_spec *init)
+{
+    if (ctx == NULL || tensor == NULL || init == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    switch (init->kind) {
+    case GD_INIT_EMPTY:
+        return GD_OK;
+    case GD_INIT_ZERO:
+        return gd_tensor_zero_(ctx, tensor);
+    case GD_INIT_ONE:
+        return gd_tensor_one_(ctx, tensor);
+    case GD_INIT_RAND_UNIFORM:
+        return gd_tensor_rand_uniform_(ctx,
+                                       tensor,
+                                       gd_module_mix_seed(init->seed, path),
+                                       init->low,
+                                       init->high);
+    default:
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid module param init kind");
+    }
+}
+
+static gd_status gd_module_init_params_impl(gd_context *ctx,
+                                            gd_module *module,
+                                            const char *prefix,
+                                            const char *pattern,
+                                            const gd_init_spec *init)
+{
+    uint32_t i;
+    gd_status st;
+    if (ctx == NULL || module == NULL || init == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0U; i < module->param_count; ++i) {
+        char param_path[GD_MODULE_PATH_MAX];
+        gd_module_param_entry *entry = &module->params[i];
+        if (entry->tensor == NULL) {
             continue;
         }
-        if (*count == *cap) {
-            int new_cap = *cap == 0 ? 8 : *cap * 2;
-            gd_tensor **grown = realloc(*arr, (size_t)new_cap * sizeof(*grown));
-            if (grown == NULL) {
-                return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to grow parameter list");
+        st = gd_module_join_path(prefix, entry->name, param_path);
+        if (st != GD_OK) {
+            return gd_module_set_error(ctx, st, "module param init path too long");
+        }
+        if (pattern == NULL || gd_module_wildcard_match(pattern, param_path)) {
+            st = gd_module_init_param_tensor(ctx, entry->tensor, param_path, init);
+            if (st != GD_OK) {
+                return st;
             }
-            *arr = grown;
-            *cap = new_cap;
         }
-        (*arr)[*count] = t;
-        *count += 1;
     }
-
-    for (i = 0; i < module->n_children; ++i) {
-        gd_status status = collect(module->children[i].module, arr, count, cap);
-        if (status != GD_OK) {
-            return status;
+    for (i = 0U; i < module->child_count; ++i) {
+        char child_path[GD_MODULE_PATH_MAX];
+        gd_module_child_entry *child = &module->children[i];
+        if (child->module == NULL) {
+            continue;
+        }
+        st = gd_module_join_path(prefix, child->name, child_path);
+        if (st != GD_OK) {
+            return gd_module_set_error(ctx, st, "module child init path too long");
+        }
+        st = gd_module_init_params_impl(ctx, child->module, child_path, pattern, init);
+        if (st != GD_OK) {
+            return st;
         }
     }
     return GD_OK;
 }
 
-gd_status gd_module_parameters(gd_module *module, gd_tensor ***params_out, int *n_out)
+gd_status gd_module_init_params_uniform(gd_context *ctx,
+                                        gd_module *module,
+                                        const char *pattern,
+                                        float low,
+                                        float high,
+                                        uint64_t seed)
 {
-    gd_status status = GD_OK;
-    gd_tensor **arr = NULL;
-    int count = 0;
-    int cap = 0;
-
-    if (module == NULL || params_out == NULL || n_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_parameters argument is NULL");
-    }
-    *params_out = NULL;
-    *n_out = 0;
-
-    status = collect(module, &arr, &count, &cap);
-    if (status != GD_OK) {
-        free(arr);
-        return status;
-    }
-
-    free(module->flat);
-    module->flat = arr;
-    module->n_flat = count;
-
-    *params_out = module->flat;
-    *n_out = module->n_flat;
-    _gd_set_last_error(GD_OK, NULL);
-    return GD_OK;
-}
-
-gd_status gd_module_zero_grad(gd_context *ctx, gd_module *module)
-{
-    gd_status status = GD_OK;
-    gd_tensor **params = NULL;
-    int n = 0;
-
+    gd_init_spec init;
     if (ctx == NULL || module == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_zero_grad argument is NULL");
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    status = gd_module_parameters(module, &params, &n);
-    if (status != GD_OK) {
-        return status;
+    if (!(low <= high)) {
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid module uniform init range");
     }
-    return gd_zero_grad(ctx, params, n);
+    init = gd_init_rand_uniform(seed, low, high);
+    return gd_module_init_params_impl(ctx, module, module->name, pattern, &init);
 }
 
-typedef struct named_param {
-    char *name;
-    gd_tensor *tensor;
-    int seen;
-} named_param;
-
-static const unsigned char module_magic[8] = {'G', 'D', 'M', 'O', 'D', '1', 0, 0};
-
-static gd_status write_all(FILE *f, const void *data, size_t nbytes)
+gd_status gd_module_init_params_zero(gd_context *ctx,
+                                     gd_module *module,
+                                     const char *pattern)
 {
-    if (nbytes == 0U) {
+    gd_init_spec init;
+    if (ctx == NULL || module == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    init = gd_init_zero();
+    return gd_module_init_params_impl(ctx, module, module->name, pattern, &init);
+}
+
+gd_param_group gd_param_group_build(const char *name,
+                                    const char *match,
+                                    float lr_mult,
+                                    float weight_decay,
+                                    bool trainable)
+{
+    gd_param_group group;
+    group.name = name;
+    group.match = match;
+    group.lr_mult = lr_mult;
+    group.weight_decay = weight_decay;
+    group.trainable = trainable;
+    return group;
+}
+
+void gd_param_set_init(gd_param_set *set)
+{
+    if (set != NULL) {
+        memset(set, 0, sizeof(*set));
+    }
+}
+
+void gd_param_set_free(gd_param_set *set)
+{
+    if (set == NULL) {
+        return;
+    }
+    free(set->items);
+    memset(set, 0, sizeof(*set));
+}
+
+gd_status gd_module_parameters(gd_context *ctx,
+                               const gd_module *module,
+                               gd_param_set *out)
+{
+    return gd_module_collect_params(ctx, module, NULL, 0U, out);
+}
+
+gd_status gd_module_collect_params(gd_context *ctx,
+                                   const gd_module *module,
+                                   const gd_param_group *groups,
+                                   uint32_t group_count,
+                                   gd_param_set *out)
+{
+    gd_status st;
+    if (module == NULL || out == NULL || (group_count > 0U && groups == NULL)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    gd_param_set_init(out);
+    st = gd_module_collect_params_impl(module, module->name, groups, group_count, out);
+    if (st != GD_OK) {
+        gd_param_set_free(out);
+        return gd_module_set_error(ctx, st, "failed to collect module parameters");
+    }
+    return GD_OK;
+}
+
+gd_status gd_module_list_init_child(gd_context *ctx,
+                                    gd_module *parent,
+                                    const char *name,
+                                    gd_module_list *list,
+                                    uint32_t count)
+{
+    gd_status st;
+    if (parent == NULL || list == NULL || count == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(list, 0, sizeof(*list));
+    list->items = (gd_module **)calloc(count, sizeof(list->items[0]));
+    if (list->items == NULL) {
+        return gd_module_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "module list allocation failed");
+    }
+    list->count = count;
+    st = gd_module_init_child(ctx, parent, name, &list->mod);
+    if (st != GD_OK) {
+        free(list->items);
+        memset(list, 0, sizeof(*list));
+        return st;
+    }
+    return GD_OK;
+}
+
+gd_status gd_module_list_set(gd_module_list *list, uint32_t index, gd_module *child)
+{
+    gd_status st;
+    char name[GD_MODULE_NAME_MAX];
+    int n;
+    if (list == NULL || child == NULL || index >= list->count) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (list->items[index] != NULL && list->items[index] != child) {
+        return GD_ERR_BAD_STATE;
+    }
+    if (list->items[index] == child) {
         return GD_OK;
     }
-    if (fwrite(data, 1U, nbytes, f) != nbytes) {
-        return _gd_error(GD_ERR_IO, "failed to write module checkpoint");
+    n = snprintf(name, sizeof(name), "%u", index);
+    if (n < 0 || (size_t)n >= sizeof(name)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_module_add_child(&list->mod, name, child);
+    if (st != GD_OK) {
+        return st;
+    }
+    list->items[index] = child;
+    return GD_OK;
+}
+
+void gd_module_list_deinit(gd_module_list *list)
+{
+    if (list == NULL) {
+        return;
+    }
+    gd_module_deinit(&list->mod);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+gd_status gd_module_dict_init_child(gd_context *ctx,
+                                    gd_module *parent,
+                                    const char *name,
+                                    gd_module_dict *dict)
+{
+    if (parent == NULL || dict == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(dict, 0, sizeof(*dict));
+    return gd_module_init_child(ctx, parent, name, &dict->mod);
+}
+
+gd_status gd_module_dict_set(gd_module_dict *dict, const char *name, gd_module *child)
+{
+    if (dict == NULL || child == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    return gd_module_add_child(&dict->mod, name, child);
+}
+
+void gd_module_dict_deinit(gd_module_dict *dict)
+{
+    if (dict == NULL) {
+        return;
+    }
+    gd_module_deinit(&dict->mod);
+    memset(dict, 0, sizeof(*dict));
+}
+
+gd_status gd_linear_layer_init(gd_context *ctx,
+                               gd_linear_layer *layer,
+                               const char *name,
+                               const gd_linear_layer_config *config)
+{
+    gd_status st;
+    gd_tensor_spec weight_spec;
+    gd_tensor_spec bias_spec;
+    gd_init_spec weight_init;
+    gd_init_spec bias_init;
+    int64_t weight_shape[2];
+    int64_t bias_shape[1];
+    if (ctx == NULL || layer == NULL || config == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (config->in_features <= 0 || config->out_features <= 0 ||
+        (config->dtype != GD_DTYPE_F16 && config->dtype != GD_DTYPE_BF16 &&
+         config->dtype != GD_DTYPE_F32)) {
+        return gd_module_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid linear layer config");
+    }
+    memset(layer, 0, sizeof(*layer));
+    st = gd_module_init(ctx, &layer->mod, name);
+    if (st != GD_OK) {
+        return st;
+    }
+    layer->in_features = config->in_features;
+    layer->out_features = config->out_features;
+    layer->has_bias = config->use_bias;
+    layer->weight_transposed = config->transposed_weight;
+    weight_shape[0] = config->transposed_weight ? config->out_features : config->in_features;
+    weight_shape[1] = config->transposed_weight ? config->in_features : config->out_features;
+    weight_spec = gd_tensor_spec_make(config->dtype, gd_shape_make(2U, weight_shape), config->alignment);
+    weight_init = gd_init_rand_uniform(config->seed, config->weight_low, config->weight_high);
+    st = gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &weight_init, &layer->weight);
+    if (st != GD_OK) {
+        gd_module_deinit(&layer->mod);
+        return st;
+    }
+    if (config->use_bias) {
+        bias_shape[0] = config->out_features;
+        bias_spec = gd_tensor_spec_make(config->dtype, gd_shape_make(1U, bias_shape), config->alignment);
+        bias_init = gd_init_zero();
+        st = gd_module_param(ctx, &layer->mod, "bias", &bias_spec, &bias_init, &layer->bias);
+        if (st != GD_OK) {
+            gd_module_deinit(&layer->mod);
+            return st;
+        }
     }
     return GD_OK;
 }
 
-static gd_status read_all(FILE *f, void *data, size_t nbytes)
+gd_status gd_linear_layer_init_child(gd_context *ctx,
+                                     gd_module *parent,
+                                     const char *name,
+                                     gd_linear_layer *layer,
+                                     const gd_linear_layer_config *config)
 {
-    if (nbytes == 0U) {
-        return GD_OK;
+    gd_status st;
+    if (parent == NULL || layer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (fread(data, 1U, nbytes, f) != nbytes) {
-        return _gd_error(GD_ERR_IO, "failed to read module checkpoint");
+    st = gd_linear_layer_init(ctx, layer, name, config);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_module_add_child(parent, name, &layer->mod);
+    if (st != GD_OK) {
+        gd_linear_layer_deinit(layer);
+        return gd_module_set_error(ctx, st, "failed to add linear layer child");
     }
     return GD_OK;
 }
 
-static char *join_name(const char *prefix, const char *name)
+void gd_linear_layer_deinit(gd_linear_layer *layer)
 {
-    size_t prefix_len = prefix == NULL ? 0U : strlen(prefix);
-    size_t name_len = strlen(name);
-    size_t total = prefix_len + (prefix_len > 0U ? 1U : 0U) + name_len;
-    char *out = malloc(total + 1U);
-
-    if (out == NULL) {
-        return NULL;
+    if (layer == NULL) {
+        return;
     }
-    if (prefix_len > 0U) {
-        memcpy(out, prefix, prefix_len);
-        out[prefix_len] = '.';
-        memcpy(out + prefix_len + 1U, name, name_len + 1U);
-    } else {
-        memcpy(out, name, name_len + 1U);
-    }
-    return out;
+    gd_module_deinit(&layer->mod);
+    memset(layer, 0, sizeof(*layer));
 }
 
-static gd_status named_push(named_param **arr,
-                            int *count,
-                            int *cap,
-                            char *name,
-                            gd_tensor *tensor)
+gd_status gd_linear_layer_forward(gd_context *ctx,
+                                  gd_linear_layer *layer,
+                                  const gd_tensor *x,
+                                  gd_tensor *out)
 {
-    if (*count == *cap) {
-        int new_cap = *cap == 0 ? 16 : *cap * 2;
-        named_param *grown = realloc(*arr, (size_t)new_cap * sizeof(*grown));
-        if (grown == NULL) {
-            free(name);
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to grow named parameter list");
-        }
-        *arr = grown;
-        *cap = new_cap;
+    if (layer == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    (*arr)[*count].name = name;
-    (*arr)[*count].tensor = tensor;
-    (*arr)[*count].seen = 0;
-    *count += 1;
-    return GD_OK;
-}
-
-static gd_status collect_named(gd_module *module,
-                               const char *prefix,
-                               named_param **arr,
-                               int *count,
-                               int *cap)
-{
-    int i = 0;
-
-    for (i = 0; i < module->n_params; ++i) {
-        char *full = join_name(prefix, module->params[i].name);
-        gd_status status;
-        if (full == NULL) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate parameter name");
-        }
-        status = named_push(arr, count, cap, full, module->params[i].tensor);
-        if (status != GD_OK) {
-            return status;
-        }
+    if (layer->weight_transposed) {
+        return gd_linear_transposed_weight(ctx,
+                                           x,
+                                           &layer->weight,
+                                           layer->has_bias ? &layer->bias : NULL,
+                                           out);
     }
-    for (i = 0; i < module->n_children; ++i) {
-        char *child_prefix = join_name(prefix, module->children[i].name);
-        gd_status status;
-        if (child_prefix == NULL) {
-            return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate child prefix");
-        }
-        status = collect_named(module->children[i].module, child_prefix, arr, count, cap);
-        free(child_prefix);
-        if (status != GD_OK) {
-            return status;
-        }
-    }
-    return GD_OK;
-}
-
-static void named_free(named_param *arr, int count)
-{
-    int i = 0;
-    for (i = 0; i < count; ++i) {
-        free(arr[i].name);
-    }
-    free(arr);
-}
-
-static named_param *find_named(named_param *arr, int count, const char *name)
-{
-    int i = 0;
-    for (i = 0; i < count; ++i) {
-        if (strcmp(arr[i].name, name) == 0) {
-            return &arr[i];
-        }
-    }
-    return NULL;
-}
-
-gd_status gd_module_save(gd_module *module, const char *path)
-{
-    gd_status status = GD_OK;
-    named_param *params = NULL;
-    int n_params = 0;
-    int cap = 0;
-    FILE *f = NULL;
-    uint32_t version = 1U;
-    uint32_t count32 = 0U;
-    int i = 0;
-
-    if (module == NULL || path == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_save argument is NULL");
-    }
-    status = collect_named(module, NULL, &params, &n_params, &cap);
-    if (status != GD_OK) {
-        named_free(params, n_params);
-        return status;
-    }
-    if (n_params < 0) {
-        named_free(params, n_params);
-        return _gd_error(GD_ERR_INVALID_STATE, "invalid module parameter count");
-    }
-    count32 = (uint32_t)n_params;
-    f = fopen(path, "wb");
-    if (f == NULL) {
-        named_free(params, n_params);
-        return _gd_error(GD_ERR_IO, "failed to open module checkpoint for write");
-    }
-    status = write_all(f, module_magic, sizeof(module_magic));
-    if (status == GD_OK) {
-        status = write_all(f, &version, sizeof(version));
-    }
-    if (status == GD_OK) {
-        status = write_all(f, &count32, sizeof(count32));
-    }
-
-    for (i = 0; i < n_params && status == GD_OK; ++i) {
-        const gd_tensor_desc *desc = _gd_tensor_desc_ptr(params[i].tensor);
-        size_t nbytes = 0U;
-        uint64_t nbytes64 = 0U;
-        uint32_t name_len = (uint32_t)strlen(params[i].name);
-        uint32_t dtype = (uint32_t)desc->dtype;
-        int32_t ndim = (int32_t)desc->ndim;
-        void *buf = NULL;
-
-        status = gd_tensor_desc_nbytes(desc, &nbytes, NULL);
-        if (status != GD_OK) {
-            break;
-        }
-        nbytes64 = (uint64_t)nbytes;
-        buf = malloc(nbytes);
-        if (buf == NULL) {
-            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module save buffer");
-            break;
-        }
-        status = gd_tensor_copy_to_cpu(module->ctx, params[i].tensor, buf, nbytes);
-        if (status == GD_OK) { status = write_all(f, &name_len, sizeof(name_len)); }
-        if (status == GD_OK) { status = write_all(f, params[i].name, name_len); }
-        if (status == GD_OK) { status = write_all(f, &dtype, sizeof(dtype)); }
-        if (status == GD_OK) { status = write_all(f, &ndim, sizeof(ndim)); }
-        if (status == GD_OK) { status = write_all(f, desc->sizes, sizeof(desc->sizes)); }
-        if (status == GD_OK) { status = write_all(f, &nbytes64, sizeof(nbytes64)); }
-        if (status == GD_OK) { status = write_all(f, buf, nbytes); }
-        free(buf);
-    }
-
-    if (fclose(f) != 0 && status == GD_OK) {
-        status = _gd_error(GD_ERR_IO, "failed to close module checkpoint");
-    }
-    named_free(params, n_params);
-    return status;
-}
-
-gd_status gd_module_load(gd_module *module, const char *path, bool strict)
-{
-    gd_status status = GD_OK;
-    named_param *params = NULL;
-    int n_params = 0;
-    int cap = 0;
-    FILE *f = NULL;
-    unsigned char magic[8];
-    uint32_t version = 0U;
-    uint32_t file_count = 0U;
-    uint32_t entry = 0U;
-
-    if (module == NULL || path == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_module_load argument is NULL");
-    }
-    status = collect_named(module, NULL, &params, &n_params, &cap);
-    if (status != GD_OK) {
-        named_free(params, n_params);
-        return status;
-    }
-    f = fopen(path, "rb");
-    if (f == NULL) {
-        named_free(params, n_params);
-        return _gd_error(GD_ERR_IO, "failed to open module checkpoint for read");
-    }
-    status = read_all(f, magic, sizeof(magic));
-    if (status == GD_OK && memcmp(magic, module_magic, sizeof(module_magic)) != 0) {
-        status = _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid module checkpoint magic");
-    }
-    if (status == GD_OK) { status = read_all(f, &version, sizeof(version)); }
-    if (status == GD_OK && version != 1U) {
-        status = _gd_error(GD_ERR_UNSUPPORTED, "unsupported module checkpoint version");
-    }
-    if (status == GD_OK) { status = read_all(f, &file_count, sizeof(file_count)); }
-
-    for (entry = 0U; entry < file_count && status == GD_OK; ++entry) {
-        uint32_t name_len = 0U;
-        char *name = NULL;
-        uint32_t dtype = 0U;
-        int32_t ndim = 0;
-        int64_t sizes[GD_MAX_DIMS];
-        uint64_t nbytes64 = 0U;
-        size_t nbytes = 0U;
-        void *buf = NULL;
-        named_param *target = NULL;
-
-        memset(sizes, 0, sizeof(sizes));
-        status = read_all(f, &name_len, sizeof(name_len));
-        if (status != GD_OK) { break; }
-        name = malloc((size_t)name_len + 1U);
-        if (name == NULL) {
-            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module entry name");
-            break;
-        }
-        status = read_all(f, name, name_len);
-        name[name_len] = '\0';
-        if (status == GD_OK) { status = read_all(f, &dtype, sizeof(dtype)); }
-        if (status == GD_OK) { status = read_all(f, &ndim, sizeof(ndim)); }
-        if (status == GD_OK) { status = read_all(f, sizes, sizeof(sizes)); }
-        if (status == GD_OK) { status = read_all(f, &nbytes64, sizeof(nbytes64)); }
-        if (status != GD_OK) {
-            free(name);
-            break;
-        }
-        if (nbytes64 > (uint64_t)SIZE_MAX) {
-            free(name);
-            status = _gd_error(GD_ERR_INVALID_ARGUMENT, "module tensor is too large");
-            break;
-        }
-        nbytes = (size_t)nbytes64;
-        buf = malloc(nbytes);
-        if (buf == NULL) {
-            free(name);
-            status = _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate module load buffer");
-            break;
-        }
-        status = read_all(f, buf, nbytes);
-        if (status == GD_OK) {
-            target = find_named(params, n_params, name);
-            if (target == NULL) {
-                if (strict) {
-                    status = _gd_error(GD_ERR_INVALID_ARGUMENT,
-                                       "module checkpoint contains unknown parameter");
-                }
-            } else {
-                const gd_tensor_desc *desc = _gd_tensor_desc_ptr(target->tensor);
-                size_t expected_nbytes = 0U;
-                int dim = 0;
-                status = gd_tensor_desc_nbytes(desc, &expected_nbytes, NULL);
-                if (status == GD_OK && ((uint32_t)desc->dtype != dtype ||
-                                        (int32_t)desc->ndim != ndim ||
-                                        expected_nbytes != nbytes)) {
-                    status = _gd_error(GD_ERR_SHAPE, "module checkpoint tensor metadata mismatch");
-                }
-                for (dim = 0; status == GD_OK && dim < desc->ndim; ++dim) {
-                    if (desc->sizes[dim] != sizes[dim]) {
-                        status = _gd_error(GD_ERR_SHAPE,
-                                           "module checkpoint tensor shape mismatch");
-                    }
-                }
-                if (status == GD_OK) {
-                    status = gd_tensor_copy_from_cpu(module->ctx, target->tensor, buf, nbytes);
-                    target->seen = 1;
-                }
-            }
-        }
-        free(buf);
-        free(name);
-    }
-    if (status == GD_OK && strict) {
-        int i = 0;
-        for (i = 0; i < n_params; ++i) {
-            if (!params[i].seen) {
-                status = _gd_error(GD_ERR_INVALID_ARGUMENT,
-                                   "module checkpoint missing parameter");
-                break;
-            }
-        }
-    }
-    if (fclose(f) != 0 && status == GD_OK) {
-        status = _gd_error(GD_ERR_IO, "failed to close module checkpoint");
-    }
-    named_free(params, n_params);
-    return status;
+    return gd_linear(ctx, x, &layer->weight, layer->has_bias ? &layer->bias : NULL, out);
 }

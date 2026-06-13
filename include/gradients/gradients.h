@@ -1,20 +1,18 @@
-#ifndef GRADIENTS_H
-#define GRADIENTS_H
+#ifndef GRADIENTS_GRADIENTS_H
+#define GRADIENTS_GRADIENTS_H
 
-#include "gradients/status.h"
-#include "gradients/device.h"
-#include "gradients/dtype.h"
-#include "gradients/context.h"
-#include "gradients/quant.h"
-#include "gradients/tensor.h"
-#include "gradients/graph.h"
-#include "gradients/ops.h"
-#include "gradients/module.h"
-#include "gradients/nn.h"
-#include "gradients/optim.h"
-#include "gradients/tokenizer.h"
-#include "gradients/dataset.h"
-#include "gradients/dataloader.h"
-#include "gradients/dataset_vlm.h"
+#include <gradients/status.h>
+#include <gradients/memory.h>
+#include <gradients/tensor.h>
+#include <gradients/transfer.h>
+#include <gradients/dataset.h>
+#include <gradients/dataloader.h>
+#include <gradients/ops.h>
+#include <gradients/autograd.h>
+#include <gradients/module.h>
+#include <gradients/optimizer.h>
+#include <gradients/trainer.h>
+#include <gradients/tokenizer.h>
+#include <gradients/metrics.h>
 
-#endif /* GRADIENTS_H */
+#endif /* GRADIENTS_GRADIENTS_H */

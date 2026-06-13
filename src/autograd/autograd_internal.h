@@ -1,57 +1,112 @@
-#ifndef GRADIENTS_AUTOGRAD_INTERNAL_H
-#define GRADIENTS_AUTOGRAD_INTERNAL_H
+#ifndef GD_AUTOGRAD_INTERNAL_H
+#define GD_AUTOGRAD_INTERNAL_H
 
-#include "gradients/context.h"
-#include "gradients/status.h"
-#include "gradients/tensor.h"
+#include <stdbool.h>
+#include <stdint.h>
 
-#include "../graph/graph_internal.h"
-#include "../ops/op_impl.h"
+#include <gradients/autograd.h>
+#include <gradients/status.h>
+#include <gradients/tensor.h>
 
-typedef struct _gd_bwd_ctx {
+#include "../ops/op_kind.h"
+
+typedef struct gd_autograd_state gd_autograd_state;
+
+typedef struct gd_tape_ref {
+    gd_tensor tensor;
+    uint64_t id;
+    uint32_t version;
+} gd_tape_ref;
+
+typedef struct gd_tape_node {
+    gd_op_kind op;
+    uint32_t first_input;
+    uint16_t n_inputs;
+    uint32_t first_output;
+    uint16_t n_outputs;
+    uint32_t first_saved;
+    uint16_t n_saved;
+    uint32_t attrs_offset;
+    uint32_t attrs_size;
+} gd_tape_node;
+
+typedef struct gd_grad_slot {
+    uint64_t tensor_id;
+    gd_tensor grad;
+    bool occupied;
+} gd_grad_slot;
+
+typedef struct gd_live_span_slot {
+    gd_span span;
+    uint32_t refs;
+} gd_live_span_slot;
+
+struct gd_autograd_state {
+    bool recording;
+    bool user_enabled;
+    gd_tape_node *nodes;
+    uint32_t n_nodes;
+    uint32_t cap_nodes;
+    gd_tape_ref *refs;
+    uint32_t n_refs;
+    uint32_t cap_refs;
+    unsigned char *attrs;
+    uint32_t attrs_used;
+    uint32_t attrs_cap;
+    gd_grad_slot *grads;
+    uint32_t n_grads;
+    uint32_t cap_grads;
+    gd_live_span_slot *live_spans;
+    uint32_t n_live_spans;
+    uint32_t cap_live_spans;
+};
+
+typedef struct gd_bwd_ctx {
     gd_context *ctx;
-    gd_graph *graph;
-    int n_values;
-    gd_tensor **fwd;   /* cached forward value handles (virtual owned or external borrowed) */
-    gd_tensor **grad;  /* accumulated gradient handles (owned) */
-    gd_tensor *ones;   /* scalar seed (owned) */
-} _gd_bwd_ctx;
+    gd_autograd_state *tape;
+} gd_bwd_ctx;
 
-typedef gd_status (*_gd_bwd_rule_fn)(_gd_bwd_ctx *b, const _gd_node *node);
+typedef gd_status (*gd_bwd_fn)(gd_bwd_ctx *bwd, const gd_tape_node *node);
 
-typedef struct _gd_bwd_rule {
-    _gd_op_kind op;
-    _gd_bwd_rule_fn fn;
-    const char *unsupported_reason;
-} _gd_bwd_rule;
+typedef struct gd_autograd_rule {
+    gd_op_kind kind;
+    const char *name;
+    gd_bwd_fn backward;
+} gd_autograd_rule;
 
-const _gd_bwd_rule *_gd_bwd_rule_for(_gd_op_kind op);
+const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind);
 
-gd_context *_gd_bwd_context(_gd_bwd_ctx *b);
-gd_graph *_gd_bwd_graph(_gd_bwd_ctx *b);
-const gd_tensor_desc *_gd_bwd_value_desc(_gd_bwd_ctx *b, int value_id);
+gd_status gd_autograd_record(gd_context *ctx,
+                             gd_op_kind op,
+                             const gd_tensor *const *inputs,
+                             uint16_t n_inputs,
+                             gd_tensor *const *outputs,
+                             uint16_t n_outputs,
+                             const void *attrs,
+                             uint32_t attrs_size,
+                             const gd_tensor *const *saved,
+                             uint16_t n_saved);
 
-gd_status _gd_bwd_fwd(_gd_bwd_ctx *b, int value_id, gd_tensor **out);
-gd_tensor *_gd_bwd_grad(_gd_bwd_ctx *b, int value_id);
+const gd_tensor *gd_tape_input(const gd_autograd_state *tape,
+                               const gd_tape_node *node,
+                               uint16_t index);
+const gd_tensor *gd_tape_output(const gd_autograd_state *tape,
+                                const gd_tape_node *node,
+                                uint16_t index);
+const gd_tensor *gd_tape_saved(const gd_autograd_state *tape,
+                               const gd_tape_node *node,
+                               uint16_t index);
+const void *gd_tape_attrs(const gd_autograd_state *tape,
+                          const gd_tape_node *node,
+                          uint32_t expected_size);
 
-gd_status _gd_bwd_accumulate(_gd_bwd_ctx *b, int value_id, gd_tensor *contrib);
-gd_status _gd_bwd_accumulate_broadcast(_gd_bwd_ctx *b, int value_id, gd_tensor *grad);
+bool gd_autograd_get_grad(gd_bwd_ctx *bwd, uint64_t tensor_id, gd_tensor *out_grad);
+bool gd_autograd_steal_grad_if_absent(gd_bwd_ctx *bwd,
+                                      uint64_t from_tensor_id,
+                                      uint64_t to_tensor_id,
+                                      gd_tensor *out_grad);
+gd_status gd_autograd_accumulate(gd_bwd_ctx *bwd,
+                                 uint64_t tensor_id,
+                                 const gd_tensor *contrib);
 
-gd_status _gd_bwd_emit(_gd_bwd_ctx *b,
-                       _gd_op_kind op,
-                       gd_tensor **inputs,
-                       int n_inputs,
-                       const _gd_op_attrs *attrs,
-                       const gd_tensor_desc *out_desc,
-                       gd_tensor **out);
-
-gd_status _gd_bwd_emit_multi(_gd_bwd_ctx *b,
-                             _gd_op_kind op,
-                             gd_tensor **inputs,
-                             int n_inputs,
-                             const _gd_op_attrs *attrs,
-                             const gd_tensor_desc *out_descs,
-                             int n_outputs,
-                             gd_tensor **outs);
-
-#endif /* GRADIENTS_AUTOGRAD_INTERNAL_H */
+#endif /* GD_AUTOGRAD_INTERNAL_H */

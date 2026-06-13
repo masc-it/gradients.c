@@ -5,137 +5,150 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "gradients/device.h"
-#include "gradients/dtype.h"
-#include "gradients/quant.h"
-#include "gradients/status.h"
+#include <gradients/memory.h>
+#include <gradients/status.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define GD_MAX_DIMS 8
+#define GD_MAX_DIMS 8U
+#ifndef GD_ARRAY_LEN
+#define GD_ARRAY_LEN(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))
+#endif
 
-typedef struct gd_context gd_context;
-typedef struct gd_storage gd_storage;
-typedef struct gd_tensor gd_tensor;
+typedef struct gd_shape {
+    uint32_t rank;
+    int64_t dims[GD_MAX_DIMS];
+} gd_shape;
+
+#define GD_SHAPE(...)                                                         \
+    ((gd_shape){                                                              \
+        (uint32_t)(sizeof((int64_t[]){__VA_ARGS__}) / sizeof(int64_t)),       \
+        {__VA_ARGS__}                                                         \
+    })
+#define GD_SCALAR_SHAPE ((gd_shape){0U, {0}})
+
+static inline gd_shape gd_shape_make(uint32_t rank, const int64_t *dims)
+{
+    gd_shape shape;
+    uint32_t i;
+    shape.rank = rank;
+    for (i = 0U; i < GD_MAX_DIMS; ++i) {
+        shape.dims[i] = 0;
+    }
+    if (dims != NULL) {
+        uint32_t n = rank < GD_MAX_DIMS ? rank : GD_MAX_DIMS;
+        for (i = 0U; i < n; ++i) {
+            shape.dims[i] = dims[i];
+        }
+    }
+    return shape;
+}
+
+typedef enum gd_dtype {
+    GD_DTYPE_INVALID = 0,
+    GD_DTYPE_F16 = 1,
+    GD_DTYPE_BF16 = 2,
+    GD_DTYPE_F32 = 3,
+    GD_DTYPE_I32 = 4,
+    GD_DTYPE_U8 = 5,
+} gd_dtype;
+
+typedef enum gd_device {
+    GD_DEVICE_INVALID = 0,
+    GD_DEVICE_GPU = 1,
+} gd_device;
 
 typedef enum gd_layout {
     GD_LAYOUT_STRIDED = 0,
-    GD_LAYOUT_CONTIGUOUS,
-    GD_LAYOUT_CHANNELS_LAST,
-    GD_LAYOUT_PACKED_QUANT,
-    GD_LAYOUT_BLOCKED,
-    GD_LAYOUT_BACKEND_OPAQUE
 } gd_layout;
 
-typedef enum gd_memory_kind {
-    GD_MEM_HOST = 0,
-    GD_MEM_DEVICE,
-    GD_MEM_PINNED_HOST,
-    GD_MEM_UNIFIED
-} gd_memory_kind;
-
-typedef struct gd_storage_desc {
-    gd_device device;
-    gd_memory_kind memory;
-    size_t nbytes;
-    size_t alignment;
-} gd_storage_desc;
-
-typedef struct gd_tensor_desc {
+/* Tensor descriptors are caller-owned metadata. Tensor bytes live in arena storage. */
+typedef struct gd_tensor {
+    uint64_t id;
+    uint32_t version;
     gd_dtype dtype;
     gd_device device;
     gd_layout layout;
-    int ndim;
-    int64_t sizes[GD_MAX_DIMS];
+    uint32_t rank;
+    int64_t shape[GD_MAX_DIMS];
     int64_t strides[GD_MAX_DIMS];
-    int64_t storage_offset_bytes;
-    const gd_quant_desc *quant;
-} gd_tensor_desc;
+    gd_span storage;
+    size_t view_offset;
+    bool is_view;
+    bool requires_grad;
+    bool is_leaf;
+} gd_tensor;
 
-gd_status gd_tensor_desc_contiguous(gd_dtype dtype,
-                                    gd_device device,
-                                    int ndim,
-                                    const int64_t *sizes,
-                                    gd_tensor_desc *out);
-
-gd_status gd_tensor_desc_nbytes(const gd_tensor_desc *desc,
-                                size_t *nbytes_out,
-                                size_t *alignment_out);
-
-gd_status gd_storage_create(gd_context *ctx,
-                            const gd_storage_desc *desc,
-                            gd_storage **out);
-gd_status gd_storage_retain(gd_storage *storage);
-void gd_storage_release(gd_storage *storage);
-gd_status gd_storage_data_cpu(gd_storage *storage, void **out);
-gd_status gd_storage_copy_from_cpu(gd_context *ctx,
-                                   gd_storage *dst,
-                                   size_t dst_offset,
-                                   const void *src,
-                                   size_t nbytes);
-gd_status gd_storage_copy_to_cpu(gd_context *ctx,
-                                 gd_storage *src,
-                                 size_t src_offset,
-                                 void *dst,
-                                 size_t nbytes);
-size_t gd_storage_nbytes(const gd_storage *storage);
-gd_device gd_storage_device(const gd_storage *storage);
+size_t gd_dtype_size(gd_dtype dtype);
+const char *gd_dtype_name(gd_dtype dtype);
 
 gd_status gd_tensor_empty(gd_context *ctx,
-                          const gd_tensor_desc *desc,
-                          gd_tensor **out);
-gd_status gd_tensor_from_storage(gd_context *ctx,
-                                 gd_storage *storage,
-                                 const gd_tensor_desc *desc,
-                                 gd_tensor **out);
-gd_status gd_tensor_retain(gd_tensor *tensor);
-void gd_tensor_release(gd_tensor *tensor);
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          gd_shape shape,
+                          size_t alignment,
+                          gd_tensor *out);
+gd_status gd_tensor_zeros(gd_context *ctx,
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          gd_shape shape,
+                          size_t alignment,
+                          gd_tensor *out);
+gd_status gd_tensor_ones(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         gd_shape shape,
+                         size_t alignment,
+                         gd_tensor *out);
+gd_status gd_tensor_rand(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         gd_shape shape,
+                         size_t alignment,
+                         uint64_t seed,
+                         gd_tensor *out);
+gd_status gd_tensor_rand_uniform(gd_context *ctx,
+                                 gd_arena_kind arena,
+                                 gd_dtype dtype,
+                                 gd_shape shape,
+                                 size_t alignment,
+                                 uint64_t seed,
+                                 float low,
+                                 float high,
+                                 gd_tensor *out);
 
-/* Raw byte transfer helpers. Buffers must already use tensor dtype/layout bytes;
- * no numeric dtype conversion is performed. Use gd_cast for typed conversion. */
-gd_status gd_tensor_copy_from_cpu(gd_context *ctx,
-                                  gd_tensor *dst,
-                                  const void *src,
-                                  size_t nbytes);
-gd_status gd_tensor_copy_to_cpu(gd_context *ctx,
-                                gd_tensor *src,
-                                void *dst,
-                                size_t nbytes);
-
-int gd_tensor_ndim(const gd_tensor *tensor);
-int64_t gd_tensor_size(const gd_tensor *tensor, int dim);
-int64_t gd_tensor_stride(const gd_tensor *tensor, int dim);
-gd_dtype gd_tensor_dtype(const gd_tensor *tensor);
-gd_device gd_tensor_device(const gd_tensor *tensor);
-gd_layout gd_tensor_layout(const gd_tensor *tensor);
-gd_storage *gd_tensor_storage(const gd_tensor *tensor);
-const gd_quant_desc *gd_tensor_quant(const gd_tensor *tensor);
-
-gd_status gd_tensor_view(gd_tensor *base,
-                         const gd_tensor_desc *view_desc,
-                         gd_tensor **out);
-gd_status gd_tensor_reshape(gd_tensor *tensor,
-                            int ndim,
-                            const int64_t *sizes,
-                            gd_tensor **out);
-gd_status gd_tensor_transpose(gd_tensor *tensor,
-                              int d0,
-                              int d1,
-                              gd_tensor **out);
-gd_status gd_tensor_slice(gd_tensor *tensor,
-                          int dim,
+gd_status gd_tensor_slice(gd_context *ctx,
+                          const gd_tensor *base,
+                          uint32_t dim,
                           int64_t start,
-                          int64_t len,
-                          gd_tensor **out);
-gd_status gd_tensor_contiguous(gd_context *ctx,
-                               gd_tensor *tensor,
-                               gd_tensor **out);
+                          int64_t length,
+                          gd_tensor *out);
 
-gd_status gd_tensor_set_requires_grad(gd_tensor *tensor, bool requires_grad);
-bool gd_tensor_requires_grad(const gd_tensor *tensor);
-gd_status gd_tensor_grad(gd_tensor *tensor, gd_tensor **grad_out);
+/* Allocates packed output storage/descriptor. Data materialization is backend op work. */
+gd_status gd_tensor_contiguous(gd_context *ctx,
+                               gd_arena_kind arena,
+                               const gd_tensor *src,
+                               size_t alignment,
+                               gd_tensor *out);
+
+gd_status gd_tensor_zero_(gd_context *ctx, gd_tensor *tensor);
+gd_status gd_tensor_one_(gd_context *ctx, gd_tensor *tensor);
+gd_status gd_tensor_rand_(gd_context *ctx, gd_tensor *tensor, uint64_t seed);
+gd_status gd_tensor_rand_uniform_(gd_context *ctx,
+                                  gd_tensor *tensor,
+                                  uint64_t seed,
+                                  float low,
+                                  float high);
+
+bool gd_tensor_is_contiguous(const gd_tensor *tensor);
+size_t gd_tensor_storage_offset(const gd_tensor *tensor);
+
+gd_status gd_tensor_numel(const gd_tensor *tensor, int64_t *out_numel);
+gd_status gd_tensor_logical_nbytes(const gd_tensor *tensor, size_t *out_nbytes);
+gd_status gd_tensor_item(gd_context *ctx, const gd_tensor *src, float *out);
+gd_status gd_tensor_validate(gd_context *ctx, const gd_tensor *tensor);
 
 #ifdef __cplusplus
 }

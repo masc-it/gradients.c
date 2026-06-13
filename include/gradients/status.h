@@ -7,21 +7,18 @@ extern "C" {
 
 typedef enum gd_status {
     GD_OK = 0,
-    GD_ERR_INVALID_ARGUMENT,
-    GD_ERR_OUT_OF_MEMORY,
-    GD_ERR_UNSUPPORTED,
-    GD_ERR_BACKEND,
-    GD_ERR_DTYPE,
-    GD_ERR_SHAPE,
-    GD_ERR_DEVICE,
-    GD_ERR_INVALID_STATE,
-    GD_ERR_IO,
-    GD_ERR_INTERNAL
+    GD_ERR_INVALID_ARGUMENT = -1,
+    GD_ERR_OUT_OF_MEMORY = -2,
+    GD_ERR_FROZEN = -3,
+    GD_ERR_BUSY = -4,
+    GD_ERR_BAD_STATE = -5,
+    GD_ERR_UNSUPPORTED = -6,
+    GD_ERR_INTERNAL = -7,
+    GD_ERR_NOT_IMPLEMENTED = -8,
+    GD_ERR_IO = -9,
 } gd_status;
 
-const char *gd_status_name(gd_status status);
-const char *gd_status_message(gd_status status);
-const char *gd_last_error(void);
+const char *gd_status_string(gd_status status);
 
 #ifdef __cplusplus
 }

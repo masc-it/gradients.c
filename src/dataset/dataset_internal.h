@@ -1,33 +1,48 @@
-#ifndef GRADIENTS_DATASET_INTERNAL_H
-#define GRADIENTS_DATASET_INTERNAL_H
+#ifndef GD_DATASET_INTERNAL_H
+#define GD_DATASET_INTERNAL_H
+
+#include <gradients/dataset.h>
 
 #include <stdint.h>
-#include <stddef.h>
-#include <stdio.h>
 
-#include "gradients/dataset.h"
+typedef uint64_t (*gd_dataset_num_samples_fn)(const void *impl);
+typedef void (*gd_dataset_destroy_fn)(void *impl);
 
-#define GD_DS_MAX_PATH 4096U
+typedef struct gd_dataset_ops {
+    const char *name;
+    gd_dataset_num_samples_fn num_samples;
+    gd_dataset_destroy_fn destroy;
+} gd_dataset_ops;
 
-typedef struct gd_ds_i32_vec {
-    int32_t *data;
-    uint64_t len;
-    uint64_t cap;
-} gd_ds_i32_vec;
+typedef struct gd_sample_field {
+    char name[GD_GDDS_FIELD_NAME_MAX];
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS];
+    const void *data;
+    size_t nbytes;
+    size_t capacity_nbytes;
+    void *owned_data;
+    int writable;
+} gd_sample_field;
 
-gd_status gd_ds_read_file(const char *path, char **text_out, size_t *len_out);
-gd_status gd_ds_mkdir_p(const char *path);
-gd_status gd_ds_join_path(const char *dir, const char *name, char **out);
-gd_status gd_ds_write_header(FILE *f,
-                              gd_gdtok_dtype dtype,
-                              uint32_t vocab_size,
-                              uint32_t block_len,
-                              uint64_t n_tokens,
-                              uint64_t n_samples,
-                              uint64_t tokenizer_hash);
-gd_status gd_ds_write_payload(FILE *f,
-                               const gd_ds_i32_vec *tokens,
-                               uint64_t n_tokens,
-                               gd_gdtok_dtype dtype);
+struct gd_sample {
+    int n_fields;
+    gd_sample_field *fields;
+};
 
-#endif /* GRADIENTS_DATASET_INTERNAL_H */
+gd_status gd_dataset_create(const gd_dataset_ops *ops,
+                            void *impl,
+                            gd_dataset **out);
+const void *gd_dataset_const_data(const gd_dataset *dataset);
+
+gd_status gd_sample_init_from_gdds_fields(gd_sample *sample,
+                                          const gd_gdds_field_info *fields,
+                                          int n_fields,
+                                          int allocate_fixed);
+void gd_sample_reset_from_gdds_fields(gd_sample *sample,
+                                      const gd_gdds_field_info *fields,
+                                      int n_fields);
+void gd_sample_deinit(gd_sample *sample);
+
+#endif /* GD_DATASET_INTERNAL_H */

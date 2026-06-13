@@ -1,111 +1,149 @@
 #ifndef GRADIENTS_DATASET_H
 #define GRADIENTS_DATASET_H
 
-#include "gradients/status.h"
-
+#include <stddef.h>
 #include <stdint.h>
+
+#include <gradients/status.h>
+#include <gradients/tensor.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define GD_GDTOK_MAGIC "GDTOKv1"
-#define GD_GDTOK_VERSION 1U
-#define GD_GDTOK_HEADER_SIZE 64U
+#define GD_GDDS_MAGIC "GDDSv1"
+#define GD_GDDS_RECORD_MAGIC "GDDR"
+#define GD_GDDS_VERSION 1U
+#define GD_GDDS_HEADER_SIZE 128U
+#define GD_GDDS_FIELD_NAME_MAX 64U
+#define GD_GDDS_FIELD_DESC_SIZE 160U
+#define GD_GDDS_INDEX_ENTRY_SIZE 16U
+#define GD_GDDS_RECORD_HEADER_SIZE 20U
+#define GD_GDDS_RECORD_FIELD_DESC_SIZE 88U
+#define GD_GDDS_MAX_FIELDS 256U
 
 typedef struct gd_dataset gd_dataset;
+typedef struct gd_sample gd_sample;
 
-typedef gd_status (*gd_dataset_get_u64_fn)(const void *impl,
-                                           const char *key,
-                                           uint64_t *out);
-typedef uint64_t (*gd_dataset_num_samples_fn)(const void *impl);
-typedef uint64_t (*gd_dataset_fingerprint_fn)(const void *impl);
-typedef void (*gd_dataset_destroy_fn)(void *impl);
-
-typedef struct gd_dataset_ops {
-    const char *name;
-    gd_dataset_num_samples_fn num_samples;
-    gd_dataset_fingerprint_fn fingerprint;
-    gd_dataset_get_u64_fn get_u64;
-    gd_dataset_destroy_fn destroy;
-} gd_dataset_ops;
-
-gd_status gd_dataset_create(const gd_dataset_ops *ops,
-                            void *impl,
-                            gd_dataset **out);
 void gd_dataset_destroy(gd_dataset *dataset);
+
 const char *gd_dataset_name(const gd_dataset *dataset);
-void *gd_dataset_data(gd_dataset *dataset);
-const void *gd_dataset_const_data(const gd_dataset *dataset);
 uint64_t gd_dataset_num_samples(const gd_dataset *dataset);
-uint64_t gd_dataset_fingerprint(const gd_dataset *dataset);
-gd_status gd_dataset_get_u64(const gd_dataset *dataset,
-                             const char *key,
-                             uint64_t *out);
 
-typedef enum gd_gdtok_dtype {
-    GD_GDTOK_DTYPE_U16 = 1,
-    GD_GDTOK_DTYPE_U32 = 2
-} gd_gdtok_dtype;
+typedef enum gd_gdds_collate_mode {
+    GD_GDDS_COLLATE_STACK = 0,
+    GD_GDDS_COLLATE_PAD_LONGEST = 1,
+    GD_GDDS_COLLATE_PACKED_SEQUENCE = 2,
+    GD_GDDS_COLLATE_GENERATED = 3,
+} gd_gdds_collate_mode;
 
-typedef struct gd_gdtok_header {
-    uint32_t version;
-    uint32_t header_size;
-    gd_gdtok_dtype dtype;
-    uint32_t vocab_size;
-    uint32_t block_len;
-    uint64_t n_tokens;
-    uint64_t n_samples;
-    uint64_t tokenizer_hash;
-    uint64_t payload_offset;
-} gd_gdtok_header;
+typedef enum gd_gdds_generated_kind {
+    GD_GDDS_GENERATED_NONE = 0,
+    GD_GDDS_GENERATED_LENGTHS = 1,
+    GD_GDDS_GENERATED_MASK = 2,
+    GD_GDDS_GENERATED_CU_SEQLENS = 3,
+    GD_GDDS_GENERATED_POSITIONS = 4,
+    GD_GDDS_GENERATED_CU_SEQLENS_FROM_LENGTHS = 5,
+} gd_gdds_generated_kind;
 
-typedef struct gd_dataset_build_config {
-    const char *tokenizer_path;
-    const char **input_paths;
-    int n_input_paths;
-    const char *output_dir;
-    int block_len;
-    double train_ratio;
-    double val_ratio;
-    uint64_t seed;
-    int wrap_plain_text;
-    int no_shuffle_split;
-    const char *im_start;
-    const char *im_end;
-} gd_dataset_build_config;
+typedef struct gd_gdds_field_info {
+    char name[GD_GDDS_FIELD_NAME_MAX];
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS]; /* -1 in the on-disk schema means variable. */
+    gd_gdds_collate_mode collate;
+    gd_gdds_generated_kind generated;
+    int ragged_dim;    /* -1 for fixed-shape/generated fields; currently 0 for varlen. */
+    int source_field;  /* source schema field for generated outputs, else -1. */
+    uint64_t pad_value_bits; /* little-endian scalar bytes for pad_longest. */
+} gd_gdds_field_info;
 
-typedef struct gd_dataset_split_result {
-    char *shard_path;
-    char *metadata_path;
-    int *record_indices;
-    int n_record_indices;
-    uint64_t n_tokens_total;
-    uint64_t n_tokens_written;
-    uint64_t n_samples;
-    uint64_t dropped_tail_tokens;
-} gd_dataset_split_result;
+typedef struct gd_gdds_sample_field {
+    char name[GD_GDDS_FIELD_NAME_MAX];
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS];
+    const void *data; /* mmap-backed; valid until dataset is destroyed. */
+    size_t nbytes;
+} gd_gdds_sample_field;
 
-typedef struct gd_dataset_build_result {
-    int n_records_total;
-    gd_dataset_split_result train;
-    gd_dataset_split_result val;
-} gd_dataset_build_result;
+/* Sample-level field schema exposed by a transformed dataset. Shapes do not
+   include the dataloader batch dimension; use -1 for the leading ragged
+   dimension with pad_longest/packed_sequence. */
+typedef struct gd_dataset_field_spec {
+    const char *name;
+    gd_dtype dtype;
+    int rank;
+    int64_t shape[GD_MAX_DIMS];
+    gd_gdds_collate_mode collate;
+    gd_gdds_generated_kind generated;
+    int ragged_dim;
+    int source_field;
+    uint64_t pad_value_bits;
+} gd_dataset_field_spec;
 
-gd_status gd_dataset_build(const gd_dataset_build_config *cfg,
-                           gd_dataset_build_result *result_out);
+/* PyTorch-style dataset transform: called as part of sample fetching before
+   dataloader collation. Callbacks run on dataloader worker threads, so user_data
+   must remain valid for the dataset lifetime and be thread-safe for the chosen
+   worker count. */
+typedef gd_status (*gd_dataset_transform_fn)(const gd_sample *src,
+                                             gd_sample *dst,
+                                             void *user_data);
 
-void gd_dataset_build_result_clear(gd_dataset_build_result *result);
+typedef struct gd_dataset_transform_config {
+    gd_dataset_transform_fn transform; /* NULL => identity/raw dataset. */
+    void *user_data;
+    const gd_dataset_field_spec *output_fields; /* Required when transform != NULL. */
+    int n_output_fields;
+} gd_dataset_transform_config;
 
-gd_status gd_gdtok_read_header(const char *path, gd_gdtok_header *out);
+gd_status gd_dataset_open_gdds(const char **paths,
+                               int n_paths,
+                               gd_dataset **out);
+gd_status gd_dataset_open_gdds_with_transform(const char **paths,
+                                              int n_paths,
+                                              const gd_dataset_transform_config *transform,
+                                              gd_dataset **out);
+gd_status gd_dataset_open_gdds_file(const char *path, gd_dataset **out);
+gd_status gd_dataset_open_gdds_file_with_transform(const char *path,
+                                                   const gd_dataset_transform_config *transform,
+                                                   gd_dataset **out);
+gd_status gd_dataset_open_gdds_split(const char *dir,
+                                     const char *split,
+                                     gd_dataset **out);
+gd_status gd_dataset_open_gdds_split_with_transform(const char *dir,
+                                                    const char *split,
+                                                    const gd_dataset_transform_config *transform,
+                                                    gd_dataset **out);
 
-gd_status gd_dataset_open_gdtok(const char **paths,
-                                int n_paths,
-                                gd_dataset **out);
-gd_status gd_gdtok_dataset_read_lm_sample(const gd_dataset *dataset,
-                                          uint64_t sample_index,
-                                          int32_t *tokens,
-                                          int32_t *targets);
+int gd_gdds_dataset_field_count(const gd_dataset *dataset);
+int gd_gdds_dataset_field_index(const gd_dataset *dataset, const char *name);
+gd_status gd_gdds_dataset_field_info(const gd_dataset *dataset,
+                                     int field_index,
+                                     gd_gdds_field_info *out);
+gd_status gd_gdds_dataset_read_field(const gd_dataset *dataset,
+                                     uint64_t sample_index,
+                                     int field_index,
+                                     gd_gdds_sample_field *out);
+
+int gd_sample_field_count(const gd_sample *sample);
+int gd_sample_field_index(const gd_sample *sample, const char *name);
+const char *gd_sample_field_name(const gd_sample *sample, int field_index);
+gd_dtype gd_sample_field_dtype(const gd_sample *sample, int field_index);
+int gd_sample_field_rank(const gd_sample *sample, int field_index);
+int64_t gd_sample_field_dim(const gd_sample *sample, int field_index, int dim_index);
+size_t gd_sample_field_nbytes(const gd_sample *sample, int field_index);
+const void *gd_sample_field_data(const gd_sample *sample, int field_index);
+void *gd_sample_mutable_field_data(gd_sample *sample, int field_index);
+gd_status gd_sample_resize_field(gd_sample *sample,
+                                 int field_index,
+                                 gd_dtype dtype,
+                                 int rank,
+                                 const int64_t *shape);
+gd_status gd_sample_copy_field(gd_sample *dst,
+                               int dst_field_index,
+                               const gd_sample *src,
+                               int src_field_index);
 
 #ifdef __cplusplus
 }

@@ -1,290 +1,260 @@
-#include "gradients/gradients.h"
+#include <gradients/gradients.h>
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define CHECK_OK(expr)                                                            \
-    do {                                                                          \
-        gd_status status_ = (expr);                                               \
-        if (status_ != GD_OK) {                                                   \
-            fprintf(stderr, "%s failed: %s\n", #expr, gd_last_error());          \
-            return 1;                                                             \
-        }                                                                         \
+#define CHECK(cond, msg)                                                        \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "test_tensor failed: %s (%s:%d)\n", (msg),        \
+                    __FILE__, __LINE__);                                       \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-#define CHECK_STATUS(expr, expected)                                               \
-    do {                                                                          \
-        gd_status status_ = (expr);                                               \
-        if (status_ != (expected)) {                                               \
-            fprintf(stderr, "%s got %s expected %s; last_error=%s\n",             \
-                    #expr,                                                        \
-                    gd_status_name(status_),                                      \
-                    gd_status_name(expected),                                     \
-                    gd_last_error());                                             \
-            return 1;                                                             \
-        }                                                                         \
-    } while (0)
+#define CHECK_OK(expr) CHECK((expr) == GD_OK, #expr)
+#define CHECK_STATUS(expr, status) CHECK((expr) == (status), #expr)
 
-#define CHECK_TRUE(expr)                                                          \
-    do {                                                                          \
-        if (!(expr)) {                                                            \
-            fprintf(stderr, "%s failed\n", #expr);                              \
-            return 1;                                                             \
-        }                                                                         \
-    } while (0)
-
-static int floats_equal(const float *a, const float *b, size_t n)
+static gd_memory_config tensor_config(void)
 {
-    size_t i = 0U;
-
-    for (i = 0U; i < n; ++i) {
-        if (a[i] != b[i]) {
-            return 0;
-        }
-    }
-    return 1;
+    gd_memory_config cfg;
+    cfg.params_bytes = 8192U;
+    cfg.state_bytes = 8192U;
+    cfg.scratch_slot_bytes = 8192U;
+    cfg.data_slot_bytes = 4096U;
+    cfg.scratch_slots = 2U;
+    cfg.data_slots = 2U;
+    cfg.default_alignment = 256U;
+    return cfg;
 }
 
-static int test_storage(gd_context *ctx)
+static void test_params_tensor(gd_context *ctx)
 {
-    gd_storage_desc desc = {{GD_DEVICE_CPU, 0}, GD_MEM_HOST, 32U, 16U};
-    gd_storage_desc bad_desc = {{GD_DEVICE_CPU, 0}, GD_MEM_HOST, 0U, 0U};
-    gd_storage *storage = NULL;
-    void *data = NULL;
-    uint8_t src[4] = {1U, 2U, 3U, 4U};
-    uint8_t dst[4] = {0U, 0U, 0U, 0U};
-    gd_device cpu = {GD_DEVICE_CPU, 0};
+    const int64_t shape[2] = {4, 8};
+    const int64_t bad_shape[1] = {-1};
+    const int64_t fill_shape[1] = {4};
+    const int64_t scalar_shape[1] = {1};
+    gd_tensor param;
+    gd_tensor view;
+    gd_tensor zeros;
+    gd_tensor ones;
+    gd_tensor scalar_f16;
+    gd_tensor scalar_f32;
+    gd_tensor scalar_i32;
+    gd_tensor rand_a;
+    gd_tensor rand_b;
+    gd_tensor bad;
+    gd_memory_stats before;
+    gd_memory_stats after;
+    int64_t numel;
+    size_t nbytes;
+    uint16_t zero_bits[4] = {1U, 1U, 1U, 1U};
+    uint16_t scalar_f16_bits = 0xc000U;
+    int32_t scalar_i32_value = 42;
+    float one_values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float scalar_f32_value = 3.25f;
+    float scalar_item = 0.0f;
+    float rand_values_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rand_values_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    CHECK_STATUS(gd_storage_create(NULL, &desc, &storage), GD_ERR_INVALID_ARGUMENT);
-    CHECK_STATUS(gd_storage_create(ctx, NULL, &storage), GD_ERR_INVALID_ARGUMENT);
-    CHECK_STATUS(gd_storage_create(ctx, &bad_desc, &storage), GD_ERR_INVALID_ARGUMENT);
-
-    bad_desc = (gd_storage_desc){{GD_DEVICE_CPU, 1}, GD_MEM_HOST, 32U, 0U};
-    CHECK_STATUS(gd_storage_create(ctx, &bad_desc, &storage), GD_ERR_UNSUPPORTED);
-    bad_desc = (gd_storage_desc){{GD_DEVICE_CPU, 0}, GD_MEM_DEVICE, 32U, 0U};
-    CHECK_STATUS(gd_storage_create(ctx, &bad_desc, &storage), GD_ERR_UNSUPPORTED);
-    bad_desc = (gd_storage_desc){{GD_DEVICE_CPU, 0}, GD_MEM_HOST, 32U, 24U};
-    CHECK_STATUS(gd_storage_create(ctx, &bad_desc, &storage), GD_ERR_INVALID_ARGUMENT);
-
-    CHECK_OK(gd_storage_create(ctx, &desc, &storage));
-    CHECK_TRUE(storage != NULL);
-    CHECK_TRUE(gd_storage_nbytes(storage) == 32U);
-    CHECK_TRUE(gd_device_equal(gd_storage_device(storage), cpu));
-    CHECK_OK(gd_storage_data_cpu(storage, &data));
-    CHECK_TRUE(data != NULL);
-    CHECK_TRUE(((uintptr_t)data % 16U) == 0U);
-
-    CHECK_OK(gd_storage_copy_from_cpu(ctx, storage, 4U, src, sizeof(src)));
-    CHECK_OK(gd_storage_copy_to_cpu(ctx, storage, 4U, dst, sizeof(dst)));
-    CHECK_TRUE(memcmp(src, dst, sizeof(src)) == 0);
-    CHECK_STATUS(gd_storage_copy_from_cpu(ctx, storage, 31U, src, 2U),
+    CHECK(gd_dtype_size(GD_DTYPE_F16) == 2U, "f16 dtype size");
+    CHECK(gd_dtype_size(GD_DTYPE_F32) == 4U, "f32 dtype size");
+    CHECK_OK(gd_memory_stats_query(ctx, &before));
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, bad_shape), 64U, &bad),
                  GD_ERR_INVALID_ARGUMENT);
-    CHECK_STATUS(gd_storage_copy_to_cpu(ctx, storage, 31U, dst, 2U),
-                 GD_ERR_INVALID_ARGUMENT);
-    CHECK_STATUS(gd_storage_data_cpu(NULL, &data), GD_ERR_INVALID_ARGUMENT);
+    CHECK_OK(gd_memory_stats_query(ctx, &after));
+    CHECK(before.params.offset == after.params.offset, "bad tensor shape does not allocate");
+    gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_storage_retain(storage));
-    gd_storage_release(storage);
-    gd_storage_release(storage);
-    return 0;
-}
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 64U, &param));
+    CHECK(param.dtype == GD_DTYPE_F16 && param.device == GD_DEVICE_GPU, "param dtype/device");
+    CHECK(param.storage.arena == GD_ARENA_PARAMS && param.storage.slot == -1, "param arena metadata");
+    CHECK(param.storage.offset % 64U == 0U, "param storage alignment");
+    CHECK(param.shape[0] == 4 && param.shape[1] == 8, "param shape");
+    CHECK(param.strides[0] == 8 && param.strides[1] == 1, "param compact strides");
+    CHECK(gd_tensor_is_contiguous(&param), "param contiguous");
+    CHECK_OK(gd_tensor_numel(&param, &numel));
+    CHECK(numel == 32, "param numel");
+    CHECK_OK(gd_tensor_logical_nbytes(&param, &nbytes));
+    CHECK(nbytes == 64U, "param logical nbytes");
+    CHECK(gd_tensor_storage_offset(&param) == param.storage.offset, "param view offset zero");
+    CHECK_OK(gd_tensor_validate(ctx, &param));
 
-static int test_tensor_create_copy(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t sizes[2] = {2, 3};
-    gd_tensor_desc desc;
-    gd_tensor *tensor = NULL;
-    float src[6] = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
-    float dst[6] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-    size_t nbytes = 0U;
-    size_t alignment = 0U;
-    gd_tensor *grad = NULL;
+    CHECK_OK(gd_tensor_zeros(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, fill_shape), 64U, &zeros));
+    CHECK_OK(gd_tensor_read(ctx, &zeros, zero_bits, sizeof(zero_bits)));
+    CHECK(zero_bits[0] == 0U && zero_bits[1] == 0U && zero_bits[2] == 0U && zero_bits[3] == 0U,
+          "zeros initializes f16 storage");
 
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 2, sizes, &desc));
-    CHECK_TRUE(desc.layout == GD_LAYOUT_CONTIGUOUS);
-    CHECK_TRUE(desc.strides[0] == 3);
-    CHECK_TRUE(desc.strides[1] == 1);
-    CHECK_OK(gd_tensor_desc_nbytes(&desc, &nbytes, &alignment));
-    CHECK_TRUE(nbytes == sizeof(src));
-    CHECK_TRUE(alignment == sizeof(float));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, &ones));
+    CHECK_OK(gd_tensor_read(ctx, &ones, one_values, sizeof(one_values)));
+    CHECK(one_values[0] == 1.0f && one_values[1] == 1.0f &&
+          one_values[2] == 1.0f && one_values[3] == 1.0f,
+          "ones initializes f32 storage");
 
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &tensor));
-    CHECK_TRUE(tensor != NULL);
-    CHECK_TRUE(gd_tensor_ndim(tensor) == 2);
-    CHECK_TRUE(gd_tensor_size(tensor, 0) == 2);
-    CHECK_TRUE(gd_tensor_size(tensor, 1) == 3);
-    CHECK_TRUE(gd_tensor_stride(tensor, 0) == 3);
-    CHECK_TRUE(gd_tensor_stride(tensor, 1) == 1);
-    CHECK_TRUE(gd_tensor_dtype(tensor) == GD_DTYPE_F32);
-    CHECK_TRUE(gd_tensor_layout(tensor) == GD_LAYOUT_CONTIGUOUS);
-    CHECK_TRUE(gd_device_equal(gd_tensor_device(tensor), cpu));
-    CHECK_TRUE(gd_tensor_storage(tensor) != NULL);
-    CHECK_TRUE(gd_tensor_quant(tensor) == NULL);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, scalar_shape), 64U, &scalar_f16));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_f16, &scalar_f16_bits, sizeof(scalar_f16_bits)));
+    CHECK_OK(gd_tensor_item(ctx, &scalar_f16, &scalar_item));
+    CHECK(scalar_item == -2.0f, "tensor item converts f16 scalar to f32");
 
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, tensor, src, sizeof(src)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, tensor, dst, sizeof(dst)));
-    CHECK_TRUE(floats_equal(src, dst, 6U));
-    CHECK_STATUS(gd_tensor_copy_to_cpu(ctx, tensor, dst, sizeof(dst) + 4U),
-                 GD_ERR_INVALID_ARGUMENT);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, scalar_shape), 64U, &scalar_f32));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_f32, &scalar_f32_value, sizeof(scalar_f32_value)));
+    CHECK_OK(gd_tensor_item(ctx, &scalar_f32, &scalar_item));
+    CHECK(scalar_item == 3.25f, "tensor item reads f32 scalar");
 
-    CHECK_OK(gd_tensor_set_requires_grad(tensor, true));
-    CHECK_TRUE(gd_tensor_requires_grad(tensor));
-    CHECK_OK(gd_tensor_grad(tensor, &grad));
-    CHECK_TRUE(grad == NULL);
-    CHECK_OK(gd_tensor_set_requires_grad(tensor, false));
-    CHECK_TRUE(!gd_tensor_requires_grad(tensor));
+    CHECK_STATUS(gd_tensor_item(ctx, &ones, &scalar_item), GD_ERR_INVALID_ARGUMENT);
+    gd_context_clear_error(ctx);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, scalar_shape), 64U, &scalar_i32));
+    CHECK_OK(gd_tensor_write(ctx, &scalar_i32, &scalar_i32_value, sizeof(scalar_i32_value)));
+    CHECK_STATUS(gd_tensor_item(ctx, &scalar_i32, &scalar_item), GD_ERR_UNSUPPORTED);
+    gd_context_clear_error(ctx);
 
-    gd_tensor_release(tensor);
-    return 0;
-}
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1234U, -1.0f, 1.0f, &rand_a));
+    CHECK_OK(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1234U, -1.0f, 1.0f, &rand_b));
+    CHECK_OK(gd_tensor_read(ctx, &rand_a, rand_values_a, sizeof(rand_values_a)));
+    CHECK_OK(gd_tensor_read(ctx, &rand_b, rand_values_b, sizeof(rand_values_b)));
+    CHECK(memcmp(rand_values_a, rand_values_b, sizeof(rand_values_a)) == 0,
+          "rand_uniform deterministic for same seed");
+    CHECK(rand_values_a[0] >= -1.0f && rand_values_a[0] <= 1.0f &&
+          rand_values_a[1] >= -1.0f && rand_values_a[1] <= 1.0f &&
+          rand_values_a[2] >= -1.0f && rand_values_a[2] <= 1.0f &&
+          rand_values_a[3] >= -1.0f && rand_values_a[3] <= 1.0f,
+          "rand_uniform stays in requested range");
 
-static int test_tensor_views(gd_context *ctx)
-{
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t sizes[2] = {2, 3};
-    int64_t reshape_sizes[2] = {3, 2};
-    gd_tensor_desc desc;
-    gd_tensor *base = NULL;
-    gd_tensor *reshaped = NULL;
-    gd_tensor *transposed = NULL;
-    gd_tensor *slice = NULL;
-    gd_tensor *same = NULL;
-    gd_tensor *contig = NULL;
-    float src[6] = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
-    float slice_out[3] = {0.0F, 0.0F, 0.0F};
-    float expected_slice[3] = {4.0F, 5.0F, 6.0F};
-    float contig_out[6] = {0};
-    float expected_contig[6] = {1.0F, 4.0F, 2.0F, 5.0F, 3.0F, 6.0F};
-    int ci = 0;
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 2, sizes, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &base));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, base, src, sizeof(src)));
-
-    CHECK_OK(gd_tensor_reshape(base, 2, reshape_sizes, &reshaped));
-    CHECK_TRUE(gd_tensor_size(reshaped, 0) == 3);
-    CHECK_TRUE(gd_tensor_size(reshaped, 1) == 2);
-    CHECK_TRUE(gd_tensor_stride(reshaped, 0) == 2);
-    CHECK_TRUE(gd_tensor_stride(reshaped, 1) == 1);
-    CHECK_TRUE(gd_tensor_storage(reshaped) == gd_tensor_storage(base));
-
-    CHECK_OK(gd_tensor_transpose(base, 0, 1, &transposed));
-    CHECK_TRUE(gd_tensor_size(transposed, 0) == 3);
-    CHECK_TRUE(gd_tensor_size(transposed, 1) == 2);
-    CHECK_TRUE(gd_tensor_stride(transposed, 0) == 1);
-    CHECK_TRUE(gd_tensor_stride(transposed, 1) == 3);
-    CHECK_TRUE(gd_tensor_layout(transposed) == GD_LAYOUT_STRIDED);
-    CHECK_STATUS(gd_tensor_copy_to_cpu(ctx, transposed, slice_out, sizeof(slice_out)),
+    CHECK_OK(gd_memory_stats_query(ctx, &before));
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, fill_shape), 64U, 1U, 0.0f, 1.0f, &bad),
                  GD_ERR_UNSUPPORTED);
+    CHECK_OK(gd_memory_stats_query(ctx, &after));
+    CHECK(before.params.offset == after.params.offset,
+          "unsupported rand dtype does not allocate");
+    gd_context_clear_error(ctx);
+    CHECK_STATUS(gd_tensor_rand_uniform(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32, gd_shape_make(1U, fill_shape), 64U, 1U, 2.0f, 1.0f, &bad),
+                 GD_ERR_INVALID_ARGUMENT);
+    CHECK_OK(gd_memory_stats_query(ctx, &after));
+    CHECK(before.params.offset == after.params.offset,
+          "invalid rand range does not allocate");
+    gd_context_clear_error(ctx);
 
-    /* materialize the strided transpose into a contiguous copy */
-    CHECK_OK(gd_tensor_contiguous(ctx, transposed, &contig));
-    CHECK_TRUE(contig != transposed);
-    CHECK_TRUE(gd_tensor_layout(contig) == GD_LAYOUT_CONTIGUOUS);
-    CHECK_TRUE(gd_tensor_size(contig, 0) == 3 && gd_tensor_size(contig, 1) == 2);
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, contig, contig_out, sizeof(contig_out)));
-    for (ci = 0; ci < 6; ++ci) {
-        CHECK_TRUE(contig_out[ci] == expected_contig[ci]);
-    }
-    gd_tensor_release(contig);
+    CHECK_OK(gd_tensor_slice(ctx, &param, 0U, 1, 2, &view));
+    CHECK(view.is_view, "slice is view");
+    CHECK(view.storage.buffer == param.storage.buffer, "slice shares storage buffer");
+    CHECK(view.storage.offset == param.storage.offset, "slice shares allocation offset");
+    CHECK(view.view_offset == 16U, "slice view offset");
+    CHECK(view.shape[0] == 2 && view.shape[1] == 8, "slice shape");
+    CHECK(gd_tensor_storage_offset(&view) == param.storage.offset + 16U, "slice storage offset");
+    CHECK_OK(gd_tensor_validate(ctx, &view));
 
-    CHECK_OK(gd_tensor_slice(base, 0, 1, 1, &slice));
-    CHECK_TRUE(gd_tensor_size(slice, 0) == 1);
-    CHECK_TRUE(gd_tensor_size(slice, 1) == 3);
-    CHECK_TRUE(gd_tensor_layout(slice) == GD_LAYOUT_CONTIGUOUS);
-    gd_tensor_release(base);
-    base = NULL;
+    CHECK_STATUS(gd_tensor_slice(ctx, &param, 1U, 7, 4, &bad), GD_ERR_INVALID_ARGUMENT);
+    CHECK(bad.storage.nbytes == 0U, "bad slice does not publish descriptor");
+    gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, slice, slice_out, sizeof(slice_out)));
-    CHECK_TRUE(floats_equal(slice_out, expected_slice, 3U));
-    CHECK_OK(gd_tensor_contiguous(ctx, slice, &same));
-    CHECK_TRUE(same == slice);
-
-    gd_tensor_release(same);
-    gd_tensor_release(slice);
-    gd_tensor_release(transposed);
-    gd_tensor_release(reshaped);
-    return 0;
+    CHECK_OK(gd_context_seal_params(ctx));
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(2U, shape), 64U, &bad),
+                 GD_ERR_FROZEN);
+    gd_context_clear_error(ctx);
 }
 
-static int test_bad_tensor_descs(gd_context *ctx)
+static void test_scope_tensor_views(gd_context *ctx)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t sizes[2] = {2, 3};
-    int64_t bad_sizes[2] = {2, 0};
-    gd_tensor_desc desc;
-    gd_tensor_desc bad_desc;
-    gd_storage_desc storage_desc = {cpu, GD_MEM_HOST, 4U, 0U};
-    gd_storage *storage = NULL;
-    gd_tensor *tensor = NULL;
-    gd_quant_desc *fake_quant = (gd_quant_desc *)(uintptr_t)1U;
-    size_t nbytes = 0U;
+    const int64_t token_shape[2] = {2, 16};
+    const int64_t hidden_shape[3] = {2, 14, 32};
+    const int64_t scratch_fill_shape[1] = {4};
+    gd_tensor tokens;
+    gd_tensor hidden;
+    gd_tensor suffix;
+    gd_tensor compact;
+    gd_tensor scratch_ones;
+    gd_memory_stats stats;
+    uint64_t heap_before;
+    int32_t hidden_slot;
+    uint64_t hidden_generation;
+    float scratch_fill[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    CHECK_STATUS(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 2, NULL, &desc),
-                 GD_ERR_INVALID_ARGUMENT);
-    CHECK_STATUS(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 9, sizes, &desc),
-                 GD_ERR_SHAPE);
-    CHECK_STATUS(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 2, bad_sizes, &desc),
-                 GD_ERR_SHAPE);
+    CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden),
+                 GD_ERR_BAD_STATE);
+    gd_context_clear_error(ctx);
 
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_F32, cpu, 2, sizes, &desc));
-    bad_desc = desc;
-    bad_desc.dtype = GD_DTYPE_INVALID;
-    CHECK_STATUS(gd_tensor_desc_nbytes(&bad_desc, &nbytes, NULL), GD_ERR_DTYPE);
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    heap_before = gd_debug_heap_alloc_count();
+    gd_debug_set_heap_guard(true);
 
-    bad_desc = desc;
-    bad_desc.layout = GD_LAYOUT_CHANNELS_LAST;
-    CHECK_STATUS(gd_tensor_desc_nbytes(&bad_desc, &nbytes, NULL), GD_ERR_UNSUPPORTED);
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_DATA, GD_DTYPE_I32, gd_shape_make(2U, token_shape), 64U, &tokens));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F16, gd_shape_make(3U, hidden_shape), 64U, &hidden));
+    CHECK_OK(gd_tensor_ones(ctx, GD_ARENA_SCRATCH, GD_DTYPE_F32, gd_shape_make(1U, scratch_fill_shape), 64U, &scratch_ones));
+    hidden_slot = hidden.storage.slot;
+    hidden_generation = hidden.storage.generation;
+    CHECK(tokens.storage.arena == GD_ARENA_DATA, "tokens live in data arena");
+    CHECK(hidden.storage.arena == GD_ARENA_SCRATCH, "hidden lives in scratch arena");
+    CHECK(hidden.strides[0] == 448 && hidden.strides[1] == 32 && hidden.strides[2] == 1,
+          "hidden compact strides");
+    CHECK_OK(gd_tensor_slice(ctx, &hidden, 1U, 6, 8, &suffix));
+    CHECK(suffix.view_offset == 384U, "suffix view offset");
+    CHECK(!gd_tensor_is_contiguous(&suffix), "suffix slice is non-contiguous");
+    CHECK(suffix.storage.buffer == hidden.storage.buffer, "suffix shares hidden storage");
+    CHECK_OK(gd_tensor_contiguous(ctx, GD_ARENA_SCRATCH, &suffix, 64U, &compact));
+    CHECK(gd_tensor_is_contiguous(&compact), "explicit contiguous output compact");
+    CHECK(!compact.is_view, "contiguous output owns allocation span");
+    CHECK(compact.storage.offset != hidden.storage.offset, "contiguous output storage distinct");
+    CHECK(compact.shape[0] == 2 && compact.shape[1] == 8 && compact.shape[2] == 32,
+          "contiguous output shape");
+    CHECK(compact.strides[0] == 256 && compact.strides[1] == 32 && compact.strides[2] == 1,
+          "contiguous output strides");
+    CHECK_OK(gd_tensor_validate(ctx, &compact));
+    CHECK_OK(gd_tensor_read(ctx, &scratch_ones, scratch_fill, sizeof(scratch_fill)));
+    CHECK(scratch_fill[0] == 1.0f && scratch_fill[1] == 1.0f &&
+          scratch_fill[2] == 1.0f && scratch_fill[3] == 1.0f,
+          "active-scope read flushes queued ones fill");
 
-    bad_desc = desc;
-    bad_desc.layout = GD_LAYOUT_PACKED_QUANT;
-    bad_desc.dtype = GD_DTYPE_QUANTIZED;
-    bad_desc.quant = fake_quant;
-    CHECK_STATUS(gd_tensor_desc_nbytes(&bad_desc, &nbytes, NULL), GD_ERR_UNSUPPORTED);
+    gd_debug_set_heap_guard(false);
+    CHECK(gd_debug_heap_alloc_count() == heap_before, "tensor hot path does not heap allocate");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_tensor_read(ctx, &scratch_ones, scratch_fill, sizeof(scratch_fill)));
+    CHECK(scratch_fill[0] == 1.0f && scratch_fill[1] == 1.0f &&
+          scratch_fill[2] == 1.0f && scratch_fill[3] == 1.0f,
+          "scoped ones fill commits at gd_end_step");
 
-    bad_desc = desc;
-    bad_desc.quant = fake_quant;
-    CHECK_STATUS(gd_tensor_desc_nbytes(&bad_desc, &nbytes, NULL), GD_ERR_DTYPE);
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) != hidden_slot,
+          "second scope uses next scratch slot");
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_storage_create(ctx, &storage_desc, &storage));
-    CHECK_STATUS(gd_tensor_from_storage(ctx, storage, &desc, &tensor),
-                 GD_ERR_INVALID_ARGUMENT);
-    gd_storage_release(storage);
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK(gd_debug_current_ring_slot(ctx, GD_ARENA_SCRATCH) == hidden_slot,
+          "third scope reuses original scratch slot");
+    CHECK(gd_debug_ring_slot_generation(ctx, GD_ARENA_SCRATCH, (uint32_t)hidden_slot) > hidden_generation,
+          "scratch generation bumped on reuse");
+    CHECK_STATUS(gd_tensor_validate(ctx, &hidden), GD_ERR_BAD_STATE);
+    gd_context_clear_error(ctx);
+    CHECK_OK(gd_end_step(ctx));
 
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &tensor));
-    CHECK_STATUS(gd_tensor_set_requires_grad(tensor, true), GD_OK);
-    gd_tensor_release(tensor);
-
-    CHECK_OK(gd_tensor_desc_contiguous(GD_DTYPE_I32, cpu, 2, sizes, &desc));
-    CHECK_OK(gd_tensor_empty(ctx, &desc, &tensor));
-    CHECK_STATUS(gd_tensor_set_requires_grad(tensor, true), GD_ERR_DTYPE);
-    gd_tensor_release(tensor);
-    return 0;
+    CHECK_OK(gd_memory_stats_query(ctx, &stats));
+    CHECK(stats.scratch.max_slot_watermark >= compact.storage.offset + compact.storage.nbytes,
+          "scratch watermark includes compact tensor");
 }
 
 int main(void)
 {
     gd_context *ctx = NULL;
+    gd_memory_config cfg = tensor_config();
+    gd_memory_stats stats;
 
-    CHECK_OK(gd_context_create(&ctx));
-    if (test_storage(ctx) != 0) {
-        gd_context_destroy(ctx);
-        return 1;
+    {
+        gd_status st = gd_context_create(&cfg, &ctx);
+        if (st == GD_ERR_UNSUPPORTED) {
+            printf("test_tensor: skipped (no supported GPU backend)\n");
+            return 0;
+        }
+        CHECK_OK(st);
     }
-    if (test_tensor_create_copy(ctx) != 0) {
-        gd_context_destroy(ctx);
-        return 1;
-    }
-    if (test_tensor_views(ctx) != 0) {
-        gd_context_destroy(ctx);
-        return 1;
-    }
-    if (test_bad_tensor_descs(ctx) != 0) {
-        gd_context_destroy(ctx);
-        return 1;
-    }
+    CHECK(ctx != NULL, "context created");
+    test_params_tensor(ctx);
+    test_scope_tensor_views(ctx);
+    CHECK_OK(gd_memory_stats_query(ctx, &stats));
+    printf("test_tensor: params=%zu scratch_watermark=%zu backend_waits=%" PRIu64 "\n",
+           stats.params.watermark, stats.scratch.max_slot_watermark, stats.backend_waits);
     gd_context_destroy(ctx);
+    printf("test_tensor: ok\n");
     return 0;
 }

@@ -1,397 +1,268 @@
-#include "gradients/gradients.h"
+#include <gradients/gradients.h>
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define CHECK_OK(expr)                                                            \
-    do {                                                                          \
-        gd_status status_ = (expr);                                               \
-        if (status_ != GD_OK) {                                                   \
-            fprintf(stderr, "%s failed: %s\n", #expr, gd_last_error());          \
-            return 1;                                                             \
-        }                                                                         \
+#define CHECK(cond, msg)                                                       \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            fprintf(stderr, "test_concat failed: %s (%s:%d)\n", (msg),        \
+                    __FILE__, __LINE__);                                       \
+            exit(1);                                                           \
+        }                                                                      \
     } while (0)
 
-#define CHECK_STATUS(expr, expected)                                               \
-    do {                                                                          \
-        gd_status status_ = (expr);                                               \
-        if (status_ != (expected)) {                                               \
-            fprintf(stderr, "%s got %s expected %s; last_error=%s\n",             \
-                    #expr, gd_status_name(status_), gd_status_name(expected),      \
-                    gd_last_error());                                             \
-            return 1;                                                             \
-        }                                                                         \
-    } while (0)
+#define CHECK_OK(expr) CHECK((expr) == GD_OK, #expr)
+#define CHECK_STATUS(expr, status) CHECK((expr) == (status), #expr)
 
-#define CHECK_TRUE(expr)                                                           \
-    do {                                                                          \
-        if (!(expr)) {                                                            \
-            fprintf(stderr, "%s failed at %s:%d\n", #expr, __FILE__, __LINE__);  \
-            return 1;                                                             \
-        }                                                                         \
-    } while (0)
-
-static gd_status make_tensor(gd_context *ctx,
-                             gd_dtype dtype,
-                             int ndim,
-                             const int64_t *sizes,
-                             gd_tensor **out)
+static float abs_f32(float x)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    gd_tensor_desc desc;
-    gd_status status = gd_tensor_desc_contiguous(dtype, cpu, ndim, sizes, &desc);
-
-    if (status != GD_OK) {
-        return status;
-    }
-    return gd_tensor_empty(ctx, &desc, out);
+    return x < 0.0f ? -x : x;
 }
 
-static int check_shape(gd_tensor *t, int ndim, const int64_t *sizes)
+static void check_close(float have, float want, float tol, const char *msg)
 {
-    int i = 0;
-
-    CHECK_TRUE(gd_tensor_ndim(t) == ndim);
-    for (i = 0; i < ndim; ++i) {
-        CHECK_TRUE(gd_tensor_size(t, i) == sizes[i]);
+    if (abs_f32(have - want) > tol) {
+        fprintf(stderr,
+                "test_concat failed: %s have=%.8f want=%.8f tol=%.8f\n",
+                msg,
+                (double)have,
+                (double)want,
+                (double)tol);
+        exit(1);
     }
-    return 0;
 }
 
-static int close_to(float a, float b)
+static size_t align_up(size_t value, size_t alignment)
 {
-    return fabsf(a - b) <= 1e-5F;
+    return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
-static int arrays_close(const float *got, const float *want, int n)
+static gd_memory_config concat_config(size_t bytes)
 {
-    int i = 0;
-
-    for (i = 0; i < n; ++i) {
-        if (!close_to(got[i], want[i])) {
-            fprintf(stderr, "mismatch at %d: got=%g want=%g\n",
-                    i, (double)got[i], (double)want[i]);
-            return 0;
-        }
-    }
-    return 1;
+    gd_memory_config cfg = gd_memory_config_default();
+    cfg.params_bytes = align_up(bytes * 6U + 1024U * 1024U, 4096U);
+    cfg.state_bytes = 1024U * 1024U;
+    cfg.scratch_slot_bytes = align_up(bytes * 12U + 1024U * 1024U, 4096U);
+    cfg.data_slot_bytes = 1024U * 1024U;
+    cfg.scratch_slots = 3U;
+    cfg.data_slots = 2U;
+    cfg.default_alignment = 256U;
+    return cfg;
 }
 
-static int test_concat_forward_cpu(gd_context *ctx)
+static void test_concat_f32_axis1_forward_backward(void)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t a_shape[3] = {2, 2, 3};
-    int64_t b_shape[3] = {2, 1, 3};
-    int64_t c_shape[3] = {2, 3, 3};
-    int64_t y_shape[3] = {2, 6, 3};
-    float a_data[12];
-    float b_data[6];
-    float c_data[18];
-    float got[36];
-    float want[36];
-    gd_tensor *a = NULL;
-    gd_tensor *b = NULL;
-    gd_tensor *c = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *inputs[3];
-    gd_graph *g = NULL;
-    int i = 0;
-    int bi = 0;
+    const int64_t a_shape[2] = {2, 2};
+    const int64_t b_shape[2] = {2, 3};
+    const float a_data[4] = {1.0f, 2.0f, 6.0f, 7.0f};
+    const float b_data[6] = {3.0f, 4.0f, 5.0f, 8.0f, 9.0f, 10.0f};
+    const float grad_data[10] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+                                 6.0f, 7.0f, 8.0f, 9.0f, 10.0f};
+    const float want[10] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+                            6.0f, 7.0f, 8.0f, 9.0f, 10.0f};
+    const float want_da[4] = {1.0f, 2.0f, 6.0f, 7.0f};
+    const float want_db[6] = {3.0f, 4.0f, 5.0f, 8.0f, 9.0f, 10.0f};
+    gd_memory_config cfg = concat_config(sizeof(want) * 4U);
+    gd_context *ctx = NULL;
+    gd_tensor a;
+    gd_tensor b;
+    gd_tensor grad;
+    gd_tensor out;
+    gd_tensor grads[2];
+    const gd_tensor *inputs[2];
+    float got[10];
+    uint32_t i;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(2U, a_shape), a_data, 4U, false, &a));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(2U, b_shape), b_data, 6U, false, &b));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(2U, (const int64_t[]){2, 5}), grad_data, 10U, false, &grad));
+    CHECK_OK(gd_context_seal_params(ctx));
+    inputs[0] = &a;
+    inputs[1] = &b;
 
-    for (i = 0; i < 12; ++i) {
-        a_data[i] = (float)i;
-    }
-    for (i = 0; i < 6; ++i) {
-        b_data[i] = (float)(100 + i);
-    }
-    for (i = 0; i < 18; ++i) {
-        c_data[i] = (float)(200 + i);
-    }
-    for (bi = 0; bi < 2; ++bi) {
-        memcpy(&want[(bi * 6 + 0) * 3], &a_data[(bi * 2) * 3], 6U * sizeof(float));
-        memcpy(&want[(bi * 6 + 2) * 3], &b_data[bi * 3], 3U * sizeof(float));
-        memcpy(&want[(bi * 6 + 3) * 3], &c_data[(bi * 3) * 3], 9U * sizeof(float));
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, gd_batch_empty()));
+    CHECK_OK(gd_concat(ctx, inputs, 2U, 1, &out));
+    CHECK(out.rank == 2U && out.shape[0] == 2 && out.shape[1] == 5, "axis1 output shape");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &out, got, 10U));
+    for (i = 0U; i < 10U; ++i) {
+        check_close(got[i], want[i], 1.0e-6f, "f32 concat axis1 forward");
     }
 
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, a_shape, &a));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, b_shape, &b));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, c_shape, &c));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, a, a_data, sizeof(a_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, b, b_data, sizeof(b_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, c, c_data, sizeof(c_data)));
-    inputs[0] = a;
-    inputs[1] = b;
-    inputs[2] = c;
-
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_concat(ctx, inputs, 3, 1, &y));
-    CHECK_TRUE(check_shape(y, 3, y_shape) == 0);
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y, got, sizeof(got)));
-    CHECK_TRUE(arrays_close(got, want, 36));
-
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(c);
-    gd_tensor_release(b);
-    gd_tensor_release(a);
-    return 0;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_concat_backward(ctx, &grad, inputs, 2U, 1, grads));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &grads[0], got, 4U));
+    for (i = 0U; i < 4U; ++i) {
+        check_close(got[i], want_da[i], 1.0e-6f, "f32 concat direct da");
+    }
+    CHECK_OK(gd_tensor_read_f32(ctx, &grads[1], got, 6U));
+    for (i = 0U; i < 6U; ++i) {
+        check_close(got[i], want_db[i], 1.0e-6f, "f32 concat direct db");
+    }
+    gd_context_destroy(ctx);
 }
 
-static int test_concat_i32_and_invalid_cpu(gd_context *ctx)
+static void test_concat_f16_axis0_and_u8(void)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t a_shape[2] = {1, 2};
-    int64_t b_shape[2] = {2, 2};
-    int64_t bad_shape[2] = {2, 3};
-    int64_t y_shape[2] = {3, 2};
-    int32_t a_data[2] = {1, 2};
-    int32_t b_data[4] = {3, 4, 5, 6};
-    int32_t got[6];
-    int32_t want[6] = {1, 2, 3, 4, 5, 6};
-    gd_tensor *a = NULL;
-    gd_tensor *b = NULL;
-    gd_tensor *bad_shape_t = NULL;
-    gd_tensor *bad = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *inputs[2];
-    gd_graph *g = NULL;
+    const int64_t f16_a_shape[2] = {2, 2};
+    const int64_t f16_b_shape[2] = {1, 2};
+    const int64_t u8_a_shape[1] = {3};
+    const int64_t u8_b_shape[1] = {2};
+    const float f16_a[4] = {0.5f, 1.5f, 2.5f, 3.5f};
+    const float f16_b[2] = {4.5f, 5.5f};
+    const float f16_want[6] = {0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f};
+    const uint8_t u8_a[3] = {1U, 2U, 3U};
+    const uint8_t u8_b[2] = {4U, 5U};
+    const uint8_t u8_want[5] = {1U, 2U, 3U, 4U, 5U};
+    gd_memory_config cfg = concat_config(4096U);
+    gd_context *ctx = NULL;
+    gd_tensor a;
+    gd_tensor b;
+    gd_tensor ua;
+    gd_tensor ub;
+    gd_tensor out;
+    const gd_tensor *inputs[2];
+    float got_f32[6];
+    uint8_t got_u8[5];
+    uint32_t i;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(2U, f16_a_shape), f16_a, 4U, false, &a));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16,
+                                gd_shape_make(2U, f16_b_shape), f16_b, 2U, false, &b));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_U8,
+                             gd_shape_make(1U, u8_a_shape), 256U, &ua));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_U8,
+                             gd_shape_make(1U, u8_b_shape), 256U, &ub));
+    CHECK_OK(gd_tensor_write(ctx, &ua, u8_a, sizeof(u8_a)));
+    CHECK_OK(gd_tensor_write(ctx, &ub, u8_b, sizeof(u8_b)));
+    CHECK_OK(gd_context_seal_params(ctx));
 
-    CHECK_STATUS(gd_concat(ctx, inputs, 0, 0, &bad), GD_ERR_INVALID_ARGUMENT);
-    CHECK_TRUE(bad == NULL);
+    inputs[0] = &a;
+    inputs[1] = &b;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, gd_batch_empty()));
+    CHECK_OK(gd_concat(ctx, inputs, 2U, 0, &out));
+    CHECK(out.rank == 2U && out.shape[0] == 3 && out.shape[1] == 2, "f16 axis0 output shape");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &out, got_f32, 6U));
+    for (i = 0U; i < 6U; ++i) {
+        check_close(got_f32[i], f16_want[i], 1.0e-3f, "f16 concat axis0 forward");
+    }
 
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 2, a_shape, &a));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 2, b_shape, &b));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_I32, 2, bad_shape, &bad_shape_t));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, a, a_data, sizeof(a_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, b, b_data, sizeof(b_data)));
-    inputs[0] = a;
-    inputs[1] = b;
-
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_concat(ctx, inputs, 2, 0, &y));
-    CHECK_TRUE(check_shape(y, 2, y_shape) == 0);
-    inputs[1] = bad_shape_t;
-    CHECK_STATUS(gd_concat(ctx, inputs, 2, 0, &bad), GD_ERR_SHAPE);
-    CHECK_TRUE(bad == NULL);
-    inputs[1] = b;
-    CHECK_STATUS(gd_concat(ctx, inputs, 2, 2, &bad), GD_ERR_SHAPE);
-    CHECK_TRUE(bad == NULL);
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, y, got, sizeof(got)));
-    CHECK_TRUE(memcmp(got, want, sizeof(want)) == 0);
-
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(bad_shape_t);
-    gd_tensor_release(b);
-    gd_tensor_release(a);
-    return 0;
+    inputs[0] = &ua;
+    inputs[1] = &ub;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, gd_batch_empty()));
+    CHECK_OK(gd_concat(ctx, inputs, 2U, -1, &out));
+    CHECK(out.rank == 1U && out.shape[0] == 5, "u8 output shape");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read(ctx, &out, got_u8, sizeof(got_u8)));
+    for (i = 0U; i < 5U; ++i) {
+        CHECK(got_u8[i] == u8_want[i], "u8 concat forward");
+    }
+    gd_context_destroy(ctx);
 }
 
-static int test_concat_backward_cpu(gd_context *ctx)
+static void test_concat_rank3_negative_axis(void)
 {
-    gd_device cpu = {GD_DEVICE_CPU, 0};
-    int64_t a_shape[3] = {2, 2, 3};
-    int64_t b_shape[3] = {2, 1, 3};
-    int64_t c_shape[3] = {2, 3, 3};
-    float a_data[12];
-    float b_data[6];
-    float c_data[18];
-    float ga[12];
-    float gb[6];
-    float gc[18];
-    gd_tensor *a = NULL;
-    gd_tensor *b = NULL;
-    gd_tensor *c = NULL;
-    gd_tensor *y = NULL;
-    gd_tensor *s0 = NULL;
-    gd_tensor *s1 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *a_grad = NULL;
-    gd_tensor *b_grad = NULL;
-    gd_tensor *c_grad = NULL;
-    gd_tensor *inputs[3];
-    gd_graph *g = NULL;
-    int i = 0;
-
-    for (i = 0; i < 12; ++i) {
-        a_data[i] = (float)i * 0.01F;
+    const int64_t a_shape[3] = {2, 3, 1};
+    const int64_t b_shape[3] = {2, 3, 2};
+    const float a_data[6] = {1.0f, 4.0f, 7.0f, 10.0f, 13.0f, 16.0f};
+    const float b_data[12] = {2.0f, 3.0f, 5.0f, 6.0f, 8.0f, 9.0f,
+                              11.0f, 12.0f, 14.0f, 15.0f, 17.0f, 18.0f};
+    const float want[18] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+                            7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f,
+                            13.0f, 14.0f, 15.0f, 16.0f, 17.0f, 18.0f};
+    gd_memory_config cfg = concat_config(sizeof(want) * 4U);
+    gd_context *ctx = NULL;
+    gd_tensor a;
+    gd_tensor b;
+    gd_tensor out;
+    const gd_tensor *inputs[2];
+    float got[18];
+    uint32_t i;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(3U, a_shape), a_data, 6U, false, &a));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(3U, b_shape), b_data, 12U, false, &b));
+    CHECK_OK(gd_context_seal_params(ctx));
+    inputs[0] = &a;
+    inputs[1] = &b;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_EVAL, gd_batch_empty()));
+    CHECK_OK(gd_concat(ctx, inputs, 2U, -1, &out));
+    CHECK(out.rank == 3U && out.shape[0] == 2 && out.shape[1] == 3 && out.shape[2] == 3,
+          "rank3 output shape");
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &out, got, 18U));
+    for (i = 0U; i < 18U; ++i) {
+        check_close(got[i], want[i], 1.0e-6f, "rank3 concat forward");
     }
-    for (i = 0; i < 6; ++i) {
-        b_data[i] = (float)i * 0.02F;
-    }
-    for (i = 0; i < 18; ++i) {
-        c_data[i] = (float)i * 0.03F;
-    }
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, a_shape, &a));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, b_shape, &b));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, c_shape, &c));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, a, a_data, sizeof(a_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, b, b_data, sizeof(b_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, c, c_data, sizeof(c_data)));
-    CHECK_OK(gd_tensor_set_requires_grad(a, true));
-    CHECK_OK(gd_tensor_set_requires_grad(b, true));
-    CHECK_OK(gd_tensor_set_requires_grad(c, true));
-    inputs[0] = a;
-    inputs[1] = b;
-    inputs[2] = c;
-
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_concat(ctx, inputs, 3, -2, &y));
-    CHECK_OK(gd_sum(ctx, y, 2, false, &s0));
-    CHECK_OK(gd_sum(ctx, s0, 1, false, &s1));
-    CHECK_OK(gd_sum(ctx, s1, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, cpu));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_grad(a, &a_grad));
-    CHECK_OK(gd_tensor_grad(b, &b_grad));
-    CHECK_OK(gd_tensor_grad(c, &c_grad));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, a_grad, ga, sizeof(ga)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, b_grad, gb, sizeof(gb)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, c_grad, gc, sizeof(gc)));
-    for (i = 0; i < 12; ++i) {
-        CHECK_TRUE(close_to(ga[i], 1.0F));
-    }
-    for (i = 0; i < 6; ++i) {
-        CHECK_TRUE(close_to(gb[i], 1.0F));
-    }
-    for (i = 0; i < 18; ++i) {
-        CHECK_TRUE(close_to(gc[i], 1.0F));
-    }
-
-    gd_tensor_release(loss);
-    gd_tensor_release(s1);
-    gd_tensor_release(s0);
-    gd_tensor_release(y);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(c);
-    gd_tensor_release(b);
-    gd_tensor_release(a);
-    return 0;
+    gd_context_destroy(ctx);
 }
 
-static int test_concat_slice_f16_metal(gd_context *ctx)
+static void test_concat_autograd(void)
 {
-    gd_device metal = {GD_DEVICE_METAL, 0};
-    int64_t a_shape[3] = {2, 2, 3};
-    int64_t b_shape[3] = {2, 1, 3};
-    int64_t cat_shape[3] = {2, 3, 3};
-    int64_t slice_shape[3] = {2, 2, 3};
-    float a_data[12];
-    float b_data[6];
-    float got[12];
-    float want[12] = {3, 4, 5, 20, 21, 22, 9, 10, 11, 23, 24, 25};
-    float ga[12];
-    float gb[6];
-    gd_tensor *a = NULL;
-    gd_tensor *b = NULL;
-    gd_tensor *ah = NULL;
-    gd_tensor *bh = NULL;
-    gd_tensor *cat = NULL;
-    gd_tensor *slice = NULL;
-    gd_tensor *slice_f = NULL;
-    gd_tensor *s0 = NULL;
-    gd_tensor *s1 = NULL;
-    gd_tensor *loss = NULL;
-    gd_tensor *a_grad = NULL;
-    gd_tensor *b_grad = NULL;
-    gd_tensor *inputs[2];
-    gd_graph *g = NULL;
-    int i = 0;
-
-    if (gd_synchronize(ctx, metal) != GD_OK) {
-        gd_last_error();
-        printf("test_concat: metal skipped\n");
-        return 0;
+    const int64_t a_shape[2] = {2, 2};
+    const int64_t b_shape[2] = {2, 3};
+    const float a_data[4] = {1.0f, 2.0f, 6.0f, 7.0f};
+    const float b_data[6] = {3.0f, 4.0f, 5.0f, 8.0f, 9.0f, 10.0f};
+    gd_memory_config cfg = concat_config(4096U);
+    gd_context *ctx = NULL;
+    gd_tensor a;
+    gd_tensor b;
+    gd_tensor out;
+    gd_tensor loss;
+    gd_tensor da;
+    gd_tensor db;
+    const gd_tensor *inputs[2];
+    float got[6];
+    uint32_t i;
+    CHECK_OK(gd_context_create(&cfg, &ctx));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(2U, a_shape), a_data, 4U, true, &a));
+    CHECK_OK(gd_tensor_from_f32(ctx, GD_ARENA_PARAMS, GD_DTYPE_F32,
+                                gd_shape_make(2U, b_shape), b_data, 6U, true, &b));
+    CHECK_OK(gd_context_seal_params(ctx));
+    inputs[0] = &a;
+    inputs[1] = &b;
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_concat(ctx, inputs, 2U, 1, &out));
+    CHECK_OK(gd_reduce_sum(ctx, &out, &loss));
+    CHECK_OK(gd_backward(ctx, &loss, NULL));
+    CHECK_OK(gd_tensor_grad(ctx, &a, &da));
+    CHECK_OK(gd_tensor_grad(ctx, &b, &db));
+    CHECK_OK(gd_end_step(ctx));
+    CHECK_OK(gd_synchronize(ctx));
+    CHECK_OK(gd_tensor_read_f32(ctx, &da, got, 4U));
+    for (i = 0U; i < 4U; ++i) {
+        check_close(got[i], 1.0f, 1.0e-6f, "concat autograd da");
     }
-    for (i = 0; i < 12; ++i) {
-        a_data[i] = (float)i;
+    CHECK_OK(gd_tensor_read_f32(ctx, &db, got, 6U));
+    for (i = 0U; i < 6U; ++i) {
+        check_close(got[i], 1.0f, 1.0e-6f, "concat autograd db");
     }
-    for (i = 0; i < 6; ++i) {
-        b_data[i] = (float)(20 + i);
-    }
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, a_shape, &a));
-    CHECK_OK(make_tensor(ctx, GD_DTYPE_F32, 3, b_shape, &b));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, a, a_data, sizeof(a_data)));
-    CHECK_OK(gd_tensor_copy_from_cpu(ctx, b, b_data, sizeof(b_data)));
-    CHECK_OK(gd_tensor_set_requires_grad(a, true));
-    CHECK_OK(gd_tensor_set_requires_grad(b, true));
-
-    CHECK_OK(gd_graph_create(ctx, &g));
-    CHECK_OK(gd_graph_begin(ctx, g));
-    CHECK_OK(gd_cast(ctx, a, GD_DTYPE_F16, &ah));
-    CHECK_OK(gd_cast(ctx, b, GD_DTYPE_F16, &bh));
-    inputs[0] = ah;
-    inputs[1] = bh;
-    CHECK_OK(gd_concat(ctx, inputs, 2, 1, &cat));
-    CHECK_TRUE(gd_tensor_dtype(cat) == GD_DTYPE_F16);
-    CHECK_TRUE(check_shape(cat, 3, cat_shape) == 0);
-    CHECK_OK(gd_slice(ctx, cat, 1, 1, 2, &slice));
-    CHECK_TRUE(gd_tensor_dtype(slice) == GD_DTYPE_F16);
-    CHECK_TRUE(check_shape(slice, 3, slice_shape) == 0);
-    CHECK_OK(gd_cast(ctx, slice, GD_DTYPE_F32, &slice_f));
-    CHECK_OK(gd_sum(ctx, slice_f, 2, false, &s0));
-    CHECK_OK(gd_sum(ctx, s0, 1, false, &s1));
-    CHECK_OK(gd_sum(ctx, s1, 0, false, &loss));
-    CHECK_OK(gd_backward(ctx, loss));
-    CHECK_OK(gd_graph_end(ctx));
-    CHECK_OK(gd_graph_compile(g, metal));
-    CHECK_OK(gd_graph_run(g));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, slice_f, got, sizeof(got)));
-    CHECK_TRUE(arrays_close(got, want, 12));
-    CHECK_OK(gd_tensor_grad(a, &a_grad));
-    CHECK_OK(gd_tensor_grad(b, &b_grad));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, a_grad, ga, sizeof(ga)));
-    CHECK_OK(gd_tensor_copy_to_cpu(ctx, b_grad, gb, sizeof(gb)));
-    for (i = 0; i < 12; ++i) {
-        int t = (i / 3) % 2;
-        float want_grad = t == 1 ? 1.0F : 0.0F;
-        CHECK_TRUE(close_to(ga[i], want_grad));
-    }
-    for (i = 0; i < 6; ++i) {
-        CHECK_TRUE(close_to(gb[i], 1.0F));
-    }
-
-    gd_tensor_release(loss);
-    gd_tensor_release(s1);
-    gd_tensor_release(s0);
-    gd_tensor_release(slice_f);
-    gd_tensor_release(slice);
-    gd_tensor_release(cat);
-    gd_tensor_release(bh);
-    gd_tensor_release(ah);
-    CHECK_OK(gd_graph_reset(g));
-    CHECK_OK(gd_graph_destroy(g));
-    gd_tensor_release(b);
-    gd_tensor_release(a);
-    return 0;
+    gd_context_destroy(ctx);
 }
 
 int main(void)
 {
-    gd_context *ctx = NULL;
-
-    CHECK_OK(gd_context_create(&ctx));
-    if (test_concat_forward_cpu(ctx) != 0 || test_concat_i32_and_invalid_cpu(ctx) != 0 ||
-        test_concat_backward_cpu(ctx) != 0 || test_concat_slice_f16_metal(ctx) != 0) {
-        gd_context_destroy(ctx);
-        return 1;
-    }
-    gd_context_destroy(ctx);
+    test_concat_f32_axis1_forward_backward();
+    test_concat_f16_axis0_and_u8();
+    test_concat_rank3_negative_axis();
+    test_concat_autograd();
+    printf("test_concat: ok\n");
     return 0;
 }

@@ -1,7 +1,7 @@
 #ifndef GRADIENTS_TOKENIZER_INTERNAL_H
 #define GRADIENTS_TOKENIZER_INTERNAL_H
 
-#include "gradients/tokenizer.h"
+#include <gradients/tokenizer.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -107,6 +107,12 @@ struct gd_tokenizer {
 
 typedef gd_status (*gd_normal_piece_cb)(const uint8_t *bytes, size_t len, void *user);
 typedef gd_status (*gd_special_piece_cb)(int32_t id, void *user);
+
+static inline gd_status gd_tokenizer_error(gd_status status, const char *message)
+{
+    (void)message;
+    return status;
+}
 
 uint64_t gd_hash_mix_u64(uint64_t h, uint64_t v);
 uint64_t gd_hash_bytes(const uint8_t *bytes, size_t len);

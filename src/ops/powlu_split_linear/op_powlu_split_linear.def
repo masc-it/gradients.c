@@ -1,0 +1,3 @@
+# Custom op metadata for powlu_split_linear.
+# Public/backend entry points are implemented manually because the op takes
+# x12, weight, optional bias, and PoWLU m.

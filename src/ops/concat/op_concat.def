@@ -1,0 +1,2 @@
+# Custom variadic public/backend signature; this file registers GD_OP_CONCAT.
+# Prototypes are declared manually in include/gradients/ops.h and src/core/backend.h.

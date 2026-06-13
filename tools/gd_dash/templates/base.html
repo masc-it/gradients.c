@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" class="h-full bg-slate-950 text-slate-100">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}gradients.c metrics{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: {
+              50: '#eef7ff',
+              100: '#d9ecff',
+              500: '#256d9b',
+              700: '#16496f',
+              900: '#0b2f4a',
+              950: '#071f33'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+  <style>
+    *:focus { outline: none !important; box-shadow: none !important; }
+    body { background: #020617; }
+    .uplot { background: transparent; color: #cbd5e1; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .uplot .u-title { color: #e2e8f0; }
+    .uplot .u-label { color: #94a3b8; }
+    .uplot .u-axis path, .uplot .u-axis line { stroke: #1e3a5f; }
+    .uplot .u-grid { stroke: rgba(30, 58, 95, 0.65); }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body class="min-h-full font-sans antialiased">
+  {% block body %}{% endblock %}
+</body>
+</html>

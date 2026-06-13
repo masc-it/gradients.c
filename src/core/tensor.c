@@ -1,957 +1,732 @@
-#include "gradients/graph.h"
-#include "gradients/tensor.h"
+#include <gradients/tensor.h>
 
-#include <stdbool.h>
+#include "backend.h"
+#include "dtype_internal.h"
+#include "memory_internal.h"
+
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
-#include "internal.h"
-#include "refcount.h"
-#include "storage_internal.h"
-#include "tensor_internal.h"
-#include "../backends/backend.h"
-#include "../graph/graph_internal.h"
-
-static gd_status checked_mul_size(size_t a, size_t b, size_t *out)
+size_t gd_dtype_size(gd_dtype dtype)
 {
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "checked_mul_size out is NULL");
+    switch (dtype) {
+    case GD_DTYPE_F16:
+    case GD_DTYPE_BF16:
+        return 2U;
+    case GD_DTYPE_F32:
+    case GD_DTYPE_I32:
+        return 4U;
+    case GD_DTYPE_U8:
+        return 1U;
+    case GD_DTYPE_INVALID:
+    default:
+        return 0U;
     }
-    if (a != 0U && b > SIZE_MAX / a) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "size overflow");
+}
+
+const char *gd_dtype_name(gd_dtype dtype)
+{
+    switch (dtype) {
+    case GD_DTYPE_F16:
+        return "f16";
+    case GD_DTYPE_BF16:
+        return "bf16";
+    case GD_DTYPE_F32:
+        return "f32";
+    case GD_DTYPE_I32:
+        return "i32";
+    case GD_DTYPE_U8:
+        return "u8";
+    case GD_DTYPE_INVALID:
+    default:
+        return "invalid";
+    }
+}
+
+static bool gd_i64_mul_overflow(int64_t a, int64_t b, int64_t *out)
+{
+    if (a < 0 || b < 0 || out == NULL) {
+        return true;
+    }
+    if (a != 0 && b > INT64_MAX / a) {
+        return true;
     }
     *out = a * b;
-    return GD_OK;
+    return false;
 }
 
-static gd_status checked_add_size(size_t a, size_t b, size_t *out)
+static bool gd_i64_add_overflow(int64_t a, int64_t b, int64_t *out)
 {
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "checked_add_size out is NULL");
+    if (a < 0 || b < 0 || out == NULL) {
+        return true;
     }
-    if (b > SIZE_MAX - a) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "size overflow");
+    if (b > INT64_MAX - a) {
+        return true;
     }
     *out = a + b;
-    return GD_OK;
+    return false;
 }
 
-static gd_status checked_mul_i64(int64_t a, int64_t b, int64_t *out)
+static gd_status gd_shape_numel(uint32_t rank, const int64_t *shape, int64_t *out_numel)
 {
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "checked_mul_i64 out is NULL");
+    uint32_t i;
+    int64_t n = 1;
+    if (rank > GD_MAX_DIMS || out_numel == NULL || (rank > 0U && shape == NULL)) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (a < 0 || b < 0 || (a != 0 && b > INT64_MAX / a)) {
-        return _gd_error(GD_ERR_SHAPE, "int64 multiplication overflow");
-    }
-    *out = a * b;
-    return GD_OK;
-}
-
-static gd_status checked_add_i64(int64_t a, int64_t b, int64_t *out)
-{
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "checked_add_i64 out is NULL");
-    }
-    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) {
-        return _gd_error(GD_ERR_SHAPE, "int64 addition overflow");
-    }
-    *out = a + b;
-    return GD_OK;
-}
-
-static gd_status tensor_numel_desc(const gd_tensor_desc *desc, size_t *out)
-{
-    gd_status status = GD_OK;
-    size_t numel = 1U;
-    int i = 0;
-
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tensor_numel_desc out is NULL");
-    }
-    for (i = 0; i < desc->ndim; ++i) {
-        status = checked_mul_size(numel, (size_t)desc->sizes[i], &numel);
-        if (status != GD_OK) {
-            return status;
+    for (i = 0; i < rank; ++i) {
+        if (shape[i] <= 0) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        if (gd_i64_mul_overflow(n, shape[i], &n)) {
+            return GD_ERR_OUT_OF_MEMORY;
         }
     }
-    *out = numel;
+    *out_numel = n;
     return GD_OK;
 }
 
-static gd_status validate_tensor_desc(const gd_tensor_desc *desc)
+static gd_status gd_shape_storage_nbytes(gd_dtype dtype,
+                                         uint32_t rank,
+                                         const int64_t *shape,
+                                         size_t *out_nbytes)
 {
-    int i = 0;
+    int64_t numel;
+    size_t elem_size;
+    gd_status st;
+    if (out_nbytes == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    elem_size = gd_dtype_size(dtype);
+    if (elem_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_shape_numel(rank, shape, &numel);
+    if (st != GD_OK) {
+        return st;
+    }
+    if ((uint64_t)numel > (uint64_t)(SIZE_MAX / elem_size)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *out_nbytes = (size_t)numel * elem_size;
+    return GD_OK;
+}
 
-    if (desc == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tensor desc is NULL");
+static void gd_tensor_set_contiguous_strides(gd_tensor *tensor)
+{
+    uint32_t i;
+    int64_t stride = 1;
+    if (tensor == NULL) {
+        return;
     }
-    if (desc->ndim < 0 || desc->ndim > GD_MAX_DIMS) {
-        return _gd_error(GD_ERR_SHAPE, "tensor ndim is out of range");
+    for (i = tensor->rank; i > 0U; --i) {
+        uint32_t dim = i - 1U;
+        tensor->strides[dim] = stride;
+        stride *= tensor->shape[dim];
     }
-    if (desc->dtype == GD_DTYPE_INVALID) {
-        return _gd_error(GD_ERR_DTYPE, "tensor dtype is invalid");
+}
+
+static gd_status gd_tensor_logical_span_from_allocation(const gd_tensor *tensor,
+                                                        size_t *out_nbytes)
+{
+    uint32_t i;
+    int64_t max_elem_offset = 0;
+    size_t elem_size;
+    if (tensor == NULL || out_nbytes == NULL || tensor->rank > GD_MAX_DIMS) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (desc->dtype == GD_DTYPE_QUANTIZED && desc->quant == NULL) {
-        return _gd_error(GD_ERR_DTYPE, "quantized tensor requires quant desc");
+    elem_size = gd_dtype_size(tensor->dtype);
+    if (elem_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (desc->dtype != GD_DTYPE_QUANTIZED && desc->quant != NULL) {
-        return _gd_error(GD_ERR_DTYPE, "non-quantized tensor cannot have quant desc");
-    }
-    if (desc->layout != GD_LAYOUT_CONTIGUOUS && desc->layout != GD_LAYOUT_STRIDED &&
-        desc->layout != GD_LAYOUT_CHANNELS_LAST && desc->layout != GD_LAYOUT_PACKED_QUANT &&
-        desc->layout != GD_LAYOUT_BLOCKED && desc->layout != GD_LAYOUT_BACKEND_OPAQUE) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "unknown tensor layout");
-    }
-    if (desc->storage_offset_bytes < 0) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "negative storage offset is not supported");
-    }
-    for (i = 0; i < desc->ndim; ++i) {
-        if (desc->sizes[i] <= 0) {
-            return _gd_error(GD_ERR_SHAPE, "tensor dimensions must be positive");
+    for (i = 0; i < tensor->rank; ++i) {
+        int64_t term;
+        if (tensor->shape[i] <= 0 || tensor->strides[i] < 0) {
+            return GD_ERR_INVALID_ARGUMENT;
         }
-        if (desc->layout != GD_LAYOUT_PACKED_QUANT && desc->strides[i] < 0) {
-            return _gd_error(GD_ERR_SHAPE, "negative strides are not supported");
+        if (gd_i64_mul_overflow(tensor->shape[i] - 1, tensor->strides[i], &term) ||
+            gd_i64_add_overflow(max_elem_offset, term, &max_elem_offset)) {
+            return GD_ERR_OUT_OF_MEMORY;
         }
+    }
+    if ((uint64_t)max_elem_offset > (uint64_t)(SIZE_MAX / elem_size)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    {
+        size_t bytes = (size_t)max_elem_offset * elem_size;
+        if (bytes > SIZE_MAX - elem_size || tensor->view_offset > SIZE_MAX - bytes - elem_size) {
+            return GD_ERR_OUT_OF_MEMORY;
+        }
+        *out_nbytes = tensor->view_offset + bytes + elem_size;
     }
     return GD_OK;
 }
 
-static bool desc_is_contiguous_strides(const gd_tensor_desc *desc)
+bool gd_tensor_is_contiguous(const gd_tensor *tensor)
 {
-    int i = 0;
-    int64_t expected = 1;
-
-    if (desc == NULL || desc->layout == GD_LAYOUT_PACKED_QUANT ||
-        desc->layout == GD_LAYOUT_BACKEND_OPAQUE || desc->layout == GD_LAYOUT_BLOCKED ||
-        desc->layout == GD_LAYOUT_CHANNELS_LAST) {
+    uint32_t i;
+    int64_t stride = 1;
+    if (tensor == NULL || tensor->rank > GD_MAX_DIMS) {
         return false;
     }
-
-    for (i = desc->ndim - 1; i >= 0; --i) {
-        if (desc->sizes[i] != 1 && desc->strides[i] != expected) {
+    for (i = tensor->rank; i > 0U; --i) {
+        uint32_t dim = i - 1U;
+        if (tensor->shape[dim] <= 0 || tensor->strides[dim] != stride) {
             return false;
         }
-        if (desc->sizes[i] > 1) {
-            if (expected > INT64_MAX / desc->sizes[i]) {
-                return false;
-            }
-            expected *= desc->sizes[i];
+        if (tensor->shape[dim] != 0 && stride > INT64_MAX / tensor->shape[dim]) {
+            return false;
         }
+        stride *= tensor->shape[dim];
     }
     return true;
 }
 
-static gd_status make_tensor_from_storage(gd_storage *storage,
-                                          const gd_tensor_desc *desc,
-                                          gd_tensor **out)
+size_t gd_tensor_storage_offset(const gd_tensor *tensor)
 {
-    gd_status status = GD_OK;
-    gd_tensor *tensor = NULL;
-    size_t required = 0U;
-    size_t alignment = 0U;
-    const gd_storage_desc *storage_desc = NULL;
+    if (tensor == NULL || tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return 0U;
+    }
+    return tensor->storage.offset + tensor->view_offset;
+}
 
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tensor out is NULL");
-    }
-    *out = NULL;
-    if (storage == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "storage is NULL");
-    }
-
-    status = gd_tensor_desc_nbytes(desc, &required, &alignment);
-    if (status != GD_OK) {
-        return status;
-    }
-    (void)alignment;
-
-    storage_desc = _gd_storage_desc(storage);
-    if (storage_desc == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "storage desc is NULL");
-    }
-    if (!gd_device_equal(storage_desc->device, desc->device)) {
-        return _gd_error(GD_ERR_DEVICE, "tensor device must match storage device");
-    }
-    if (required > _gd_storage_nbytes(storage)) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "storage is too small for tensor desc");
-    }
-
-    tensor = calloc(1U, sizeof(*tensor));
+gd_status gd_tensor_numel(const gd_tensor *tensor, int64_t *out_numel)
+{
     if (tensor == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate tensor");
+        return GD_ERR_INVALID_ARGUMENT;
     }
+    return gd_shape_numel(tensor->rank, tensor->shape, out_numel);
+}
 
-    status = gd_storage_retain(storage);
-    if (status != GD_OK) {
-        free(tensor);
-        return status;
+gd_status gd_tensor_logical_nbytes(const gd_tensor *tensor, size_t *out_nbytes)
+{
+    int64_t numel;
+    size_t elem_size;
+    gd_status st;
+    if (tensor == NULL || out_nbytes == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-
-    _gd_refcount_init(&tensor->refcount);
-    tensor->desc = *desc;
-    tensor->storage = storage;
-    tensor->graph = NULL;
-    tensor->value_id = -1;
-
-    *out = tensor;
-    _gd_set_last_error(GD_OK, NULL);
+    elem_size = gd_dtype_size(tensor->dtype);
+    if (elem_size == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_numel(tensor, &numel);
+    if (st != GD_OK) {
+        return st;
+    }
+    if ((uint64_t)numel > (uint64_t)(SIZE_MAX / elem_size)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *out_nbytes = (size_t)numel * elem_size;
     return GD_OK;
 }
 
-gd_status gd_tensor_desc_contiguous(gd_dtype dtype,
-                                    gd_device device,
-                                    int ndim,
-                                    const int64_t *sizes,
-                                    gd_tensor_desc *out)
+gd_status gd_tensor_item(gd_context *ctx, const gd_tensor *src, float *out)
 {
-    gd_status status = GD_OK;
-    int i = 0;
-    int64_t stride = 1;
-
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_desc_contiguous out is NULL");
+    gd_backend *backend;
+    gd_status st;
+    int64_t numel;
+    size_t offset;
+    if (out != NULL) {
+        *out = 0.0f;
     }
-    if (ndim < 0 || ndim > GD_MAX_DIMS) {
-        return _gd_error(GD_ERR_SHAPE, "ndim is out of range");
+    if (ctx == NULL || src == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (ndim > 0 && sizes == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "sizes is NULL");
+    st = gd_tensor_validate(ctx, src);
+    if (st != GD_OK) {
+        return st;
     }
-
-    memset(out, 0, sizeof(*out));
-    out->dtype = dtype;
-    out->device = device;
-    out->layout = GD_LAYOUT_CONTIGUOUS;
-    out->ndim = ndim;
-    out->storage_offset_bytes = 0;
-    out->quant = NULL;
-
-    for (i = 0; i < ndim; ++i) {
-        if (sizes[i] <= 0) {
-            return _gd_error(GD_ERR_SHAPE, "sizes must be positive");
+    st = gd_tensor_numel(src, &numel);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor item invalid shape");
+    }
+    if (numel != 1) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor item requires exactly one element");
+    }
+    if (src->dtype != GD_DTYPE_F16 && src->dtype != GD_DTYPE_F32) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED, "tensor item supports f16 and f32 tensors");
+    }
+    if (src->storage.offset > SIZE_MAX - src->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor item invalid descriptor");
+    }
+    st = gd_context_wait_for_span(ctx, &src->storage);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_context_flush_backend(ctx);
+    if (st != GD_OK) {
+        return st;
+    }
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || src->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor item missing backend buffer");
+    }
+    offset = src->storage.offset + src->view_offset;
+    if (src->dtype == GD_DTYPE_F16) {
+        uint16_t bits = 0U;
+        st = gd_backend_download(backend,
+                                 (gd_backend_buffer *)src->storage.buffer,
+                                 offset,
+                                 &bits,
+                                 sizeof(bits));
+        if (st != GD_OK) {
+            return gd_context_set_error(ctx, st, "backend tensor item download failed");
         }
-        out->sizes[i] = sizes[i];
+        *out = gd_f16_bits_to_f32(bits);
+        return GD_OK;
     }
-
-    for (i = ndim - 1; i >= 0; --i) {
-        out->strides[i] = stride;
-        if (i > 0) {
-            status = checked_mul_i64(stride, out->sizes[i], &stride);
-            if (status != GD_OK) {
-                return status;
-            }
+    {
+        float value = 0.0f;
+        st = gd_backend_download(backend,
+                                 (gd_backend_buffer *)src->storage.buffer,
+                                 offset,
+                                 &value,
+                                 sizeof(value));
+        if (st != GD_OK) {
+            return gd_context_set_error(ctx, st, "backend tensor item download failed");
         }
+        *out = value;
     }
-
-    return validate_tensor_desc(out);
+    return GD_OK;
 }
 
-gd_status gd_tensor_desc_nbytes(const gd_tensor_desc *desc,
-                                size_t *nbytes_out,
-                                size_t *alignment_out)
+gd_status gd_tensor_validate(gd_context *ctx, const gd_tensor *tensor)
 {
-    gd_status status = GD_OK;
-    size_t elem_size = 0U;
-    size_t max_elem_offset = 0U;
-    size_t total = 0U;
-    int i = 0;
+    size_t logical_span;
+    gd_status st;
+    if (ctx == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (tensor->device != GD_DEVICE_GPU || tensor->layout != GD_LAYOUT_STRIDED ||
+        tensor->rank > GD_MAX_DIMS || gd_dtype_size(tensor->dtype) == 0U) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid tensor descriptor");
+    }
+    st = gd_context_validate_span(ctx, &tensor->storage, "tensor storage is stale");
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_logical_span_from_allocation(tensor, &logical_span);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "invalid tensor shape or strides");
+    }
+    if (logical_span > tensor->storage.nbytes) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE,
+                                    "tensor logical span exceeds allocation");
+    }
+    return GD_OK;
+}
 
-    if (nbytes_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "nbytes_out is NULL");
+static gd_status gd_tensor_count(const gd_tensor *tensor, size_t *out_count)
+{
+    int64_t numel;
+    gd_status st;
+    if (tensor == NULL || out_count == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    *nbytes_out = 0U;
-    if (alignment_out != NULL) {
-        *alignment_out = 0U;
+    st = gd_tensor_numel(tensor, &numel);
+    if (st != GD_OK) {
+        return st;
     }
+    if ((uint64_t)numel > (uint64_t)SIZE_MAX) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *out_count = (size_t)numel;
+    return GD_OK;
+}
 
-    status = validate_tensor_desc(desc);
-    if (status != GD_OK) {
-        return status;
+static bool gd_dtype_one_pattern(gd_dtype dtype, uint32_t *out_pattern)
+{
+    if (out_pattern == NULL) {
+        return false;
     }
-    if (desc->layout == GD_LAYOUT_PACKED_QUANT || desc->dtype == GD_DTYPE_QUANTIZED) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "packed quant sizing is not implemented yet");
+    switch (dtype) {
+    case GD_DTYPE_F16:
+        *out_pattern = 0x00003c00U;
+        return true;
+    case GD_DTYPE_BF16:
+        *out_pattern = 0x00003f80U;
+        return true;
+    case GD_DTYPE_F32:
+        *out_pattern = 0x3f800000U;
+        return true;
+    case GD_DTYPE_I32:
+    case GD_DTYPE_U8:
+        *out_pattern = 1U;
+        return true;
+    case GD_DTYPE_INVALID:
+    default:
+        return false;
     }
-    if (desc->layout == GD_LAYOUT_CHANNELS_LAST || desc->layout == GD_LAYOUT_BLOCKED ||
-        desc->layout == GD_LAYOUT_BACKEND_OPAQUE) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "layout sizing is not implemented for this layout");
-    }
+}
 
-    elem_size = gd_dtype_sizeof(desc->dtype);
-    if (elem_size == 0U) {
-        return _gd_error(GD_ERR_DTYPE, "dtype has no fixed element size");
-    }
+static bool gd_dtype_rand_supported(gd_dtype dtype)
+{
+    return dtype == GD_DTYPE_F16 || dtype == GD_DTYPE_BF16 || dtype == GD_DTYPE_F32;
+}
 
-    if (desc->layout == GD_LAYOUT_CONTIGUOUS) {
-        status = tensor_numel_desc(desc, &total);
-        if (status != GD_OK) {
-            return status;
-        }
-        status = checked_mul_size(total, elem_size, &total);
-        if (status != GD_OK) {
-            return status;
-        }
-    } else {
-        for (i = 0; i < desc->ndim; ++i) {
-            size_t dim_extent = 0U;
-            size_t stride = 0U;
-            size_t offset = 0U;
-
-            dim_extent = (size_t)(desc->sizes[i] - 1);
-            stride = (size_t)desc->strides[i];
-            status = checked_mul_size(dim_extent, stride, &offset);
-            if (status != GD_OK) {
-                return status;
-            }
-            status = checked_add_size(max_elem_offset, offset, &max_elem_offset);
-            if (status != GD_OK) {
-                return status;
-            }
-        }
-        status = checked_add_size(max_elem_offset, 1U, &total);
-        if (status != GD_OK) {
-            return status;
-        }
-        status = checked_mul_size(total, elem_size, &total);
-        if (status != GD_OK) {
-            return status;
-        }
+static gd_status gd_tensor_fill_pattern(gd_context *ctx, gd_tensor *tensor, uint32_t pattern)
+{
+    gd_backend *backend;
+    gd_status st;
+    size_t count;
+    size_t elem_size;
+    size_t offset;
+    if (ctx == NULL || tensor == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-
-    status = checked_add_size((size_t)desc->storage_offset_bytes, total, &total);
-    if (status != GD_OK) {
-        return status;
+    st = gd_tensor_validate(ctx, tensor);
+    if (st != GD_OK) {
+        return st;
     }
-
-    *nbytes_out = total;
-    if (alignment_out != NULL) {
-        *alignment_out = elem_size;
+    if (!gd_tensor_is_contiguous(tensor)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor fill requires contiguous tensor");
     }
-    _gd_set_last_error(GD_OK, NULL);
+    st = gd_context_wait_for_span(ctx, &tensor->storage);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_count(tensor, &count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor fill invalid shape");
+    }
+    elem_size = gd_dtype_size(tensor->dtype);
+    if (elem_size == 0U || tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor fill invalid descriptor");
+    }
+    offset = tensor->storage.offset + tensor->view_offset;
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || tensor->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor fill missing backend buffer");
+    }
+    st = gd_backend_fill(backend,
+                         (gd_backend_buffer *)tensor->storage.buffer,
+                         offset,
+                         count,
+                         elem_size,
+                         pattern);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend tensor fill failed");
+    }
+    tensor->version += 1U;
+    if (tensor->version == 0U) {
+        tensor->version = 1U;
+    }
+    return GD_OK;
+}
+
+static gd_status gd_tensor_alloc_then_zero_or_one(gd_context *ctx,
+                                                  gd_arena_kind arena,
+                                                  gd_dtype dtype,
+                                                  gd_shape shape,
+                                                  size_t alignment,
+                                                  bool one,
+                                                  gd_tensor *out)
+{
+    gd_tensor tensor;
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_tensor_empty(ctx, arena, dtype, shape, alignment, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = one ? gd_tensor_one_(ctx, &tensor) : gd_tensor_zero_(ctx, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = tensor;
     return GD_OK;
 }
 
 gd_status gd_tensor_empty(gd_context *ctx,
-                          const gd_tensor_desc *desc,
-                          gd_tensor **out)
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          gd_shape shape,
+                          size_t alignment,
+                          gd_tensor *out)
 {
-    gd_status status = GD_OK;
-    gd_storage_desc storage_desc;
-    gd_storage *storage = NULL;
-    size_t nbytes = 0U;
-    size_t alignment = 0U;
-
-    if (ctx == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_empty ctx is NULL");
+    gd_tensor tensor;
+    size_t nbytes;
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
     }
-    if (out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_empty out is NULL");
+    if (ctx == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    *out = NULL;
-
-    status = gd_tensor_desc_nbytes(desc, &nbytes, &alignment);
-    if (status != GD_OK) {
-        return status;
+    st = gd_shape_storage_nbytes(dtype, shape.rank, shape.dims, &nbytes);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "invalid tensor allocation shape");
     }
-
-    {
-        _gd_backend *backend = _gd_context_backend(ctx, desc->device);
-        gd_memory_kind memory = GD_MEM_HOST;
-        if (backend == NULL) {
-            return _gd_error(GD_ERR_UNSUPPORTED, "no backend registered for tensor device");
-        }
-        memory = backend->caps.default_memory;
-        storage_desc = (gd_storage_desc){desc->device, memory, nbytes, alignment};
+    memset(&tensor, 0, sizeof(tensor));
+    st = gd_context_next_tensor_id(ctx, &tensor.id);
+    if (st != GD_OK) {
+        return st;
     }
-    status = gd_storage_create(ctx, &storage_desc, &storage);
-    if (status != GD_OK) {
-        return status;
+    tensor.version = 0U;
+    tensor.dtype = dtype;
+    tensor.device = GD_DEVICE_GPU;
+    tensor.layout = GD_LAYOUT_STRIDED;
+    tensor.rank = shape.rank;
+    if (shape.rank > 0U) {
+        memcpy(tensor.shape, shape.dims, (size_t)shape.rank * sizeof(tensor.shape[0]));
     }
-
-    status = make_tensor_from_storage(storage, desc, out);
-    gd_storage_release(storage);
-    return status;
-}
-
-gd_status gd_tensor_from_storage(gd_context *ctx,
-                                 gd_storage *storage,
-                                 const gd_tensor_desc *desc,
-                                 gd_tensor **out)
-{
-    if (ctx == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "ctx is NULL");
+    gd_tensor_set_contiguous_strides(&tensor);
+    st = gd_context_alloc_span(ctx, arena, nbytes, alignment, &tensor.storage);
+    if (st != GD_OK) {
+        return st;
     }
-    return make_tensor_from_storage(storage, desc, out);
-}
-
-gd_status gd_tensor_retain(gd_tensor *tensor)
-{
-    gd_status status = GD_OK;
-
-    if (tensor == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_retain tensor is NULL");
+    tensor.view_offset = 0U;
+    tensor.is_view = false;
+    tensor.requires_grad = false;
+    tensor.is_leaf = true;
+    st = gd_tensor_validate(ctx, &tensor);
+    if (st != GD_OK) {
+        return st;
     }
-    status = _gd_refcount_retain(&tensor->refcount);
-    if (status != GD_OK) {
-        return _gd_error(status, "cannot retain released tensor");
-    }
-    _gd_set_last_error(GD_OK, NULL);
+    *out = tensor;
     return GD_OK;
 }
 
-void gd_tensor_release(gd_tensor *tensor)
+gd_status gd_tensor_zeros(gd_context *ctx,
+                          gd_arena_kind arena,
+                          gd_dtype dtype,
+                          gd_shape shape,
+                          size_t alignment,
+                          gd_tensor *out)
 {
-    if (tensor == NULL) {
-        return;
-    }
-
-    if (_gd_refcount_release(&tensor->refcount) != 0) {
-        gd_tensor_release(tensor->grad);
-        gd_storage_release(tensor->storage);
-        if (tensor->graph != NULL) {
-            _gd_graph_note_virtual_tensor_release(tensor->graph, tensor);
-        }
-        free(tensor->name);
-        free(tensor);
-    }
-
-    _gd_set_last_error(GD_OK, NULL);
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, shape, alignment, false, out);
 }
 
-gd_status gd_tensor_copy_from_cpu(gd_context *ctx,
-                                  gd_tensor *dst,
-                                  const void *src,
-                                  size_t nbytes)
+gd_status gd_tensor_ones(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         gd_shape shape,
+                         size_t alignment,
+                         gd_tensor *out)
 {
-    size_t offset = 0U;
-
-    if (ctx == NULL || dst == NULL || src == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "copy_from_cpu argument is NULL");
-    }
-    if (dst->storage == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "destination tensor is virtual");
-    }
-    if (!desc_is_contiguous_strides(&dst->desc)) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "copy_from_cpu requires contiguous tensor");
-    }
-    offset = (size_t)dst->desc.storage_offset_bytes;
-    if (offset > _gd_storage_nbytes(dst->storage) ||
-        nbytes > _gd_storage_nbytes(dst->storage) - offset) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "copy_from_cpu byte count exceeds storage");
-    }
-
-    return gd_storage_copy_from_cpu(ctx, dst->storage, offset, src, nbytes);
+    return gd_tensor_alloc_then_zero_or_one(ctx, arena, dtype, shape, alignment, true, out);
 }
 
-gd_status gd_tensor_copy_to_cpu(gd_context *ctx,
-                                gd_tensor *src,
-                                void *dst,
-                                size_t nbytes)
+gd_status gd_tensor_rand(gd_context *ctx,
+                         gd_arena_kind arena,
+                         gd_dtype dtype,
+                         gd_shape shape,
+                         size_t alignment,
+                         uint64_t seed,
+                         gd_tensor *out)
 {
-    size_t offset = 0U;
-
-    if (ctx == NULL || src == NULL || dst == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "copy_to_cpu argument is NULL");
-    }
-    if (src->storage == NULL) {
-        gd_status status = GD_OK;
-        const gd_tensor_desc *vdesc = NULL;
-        gd_storage *vstorage = NULL;
-        size_t voffset = 0U;
-        size_t need = 0U;
-        size_t align = 0U;
-
-        if (src->graph == NULL) {
-            return _gd_error(GD_ERR_INVALID_STATE, "tensor has no storage or graph");
-        }
-        status = _gd_graph_value_storage(src->graph, src->value_id, true, &vstorage, &voffset,
-                                         &vdesc);
-        if (status != GD_OK) {
-            return status;
-        }
-        status = gd_tensor_desc_nbytes(vdesc, &need, &align);
-        if (status != GD_OK) {
-            return status;
-        }
-        if (nbytes > need) {
-            return _gd_error(GD_ERR_INVALID_ARGUMENT, "copy_to_cpu byte count exceeds value");
-        }
-        /* Backend-routed download (blocking); no host-pointer assumption. */
-        return gd_storage_copy_to_cpu(ctx, vstorage, voffset, dst, nbytes);
-    }
-    if (!desc_is_contiguous_strides(&src->desc)) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "copy_to_cpu requires contiguous tensor");
-    }
-    offset = (size_t)src->desc.storage_offset_bytes;
-    if (offset > _gd_storage_nbytes(src->storage) ||
-        nbytes > _gd_storage_nbytes(src->storage) - offset) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "copy_to_cpu byte count exceeds storage");
-    }
-
-    return gd_storage_copy_to_cpu(ctx, src->storage, offset, dst, nbytes);
+    return gd_tensor_rand_uniform(ctx, arena, dtype, shape, alignment,
+                                  seed, 0.0f, 1.0f, out);
 }
 
-gd_status gd_tensor_view(gd_tensor *base,
-                         const gd_tensor_desc *view_desc,
-                         gd_tensor **out)
+gd_status gd_tensor_rand_uniform(gd_context *ctx,
+                                 gd_arena_kind arena,
+                                 gd_dtype dtype,
+                                 gd_shape shape,
+                                 size_t alignment,
+                                 uint64_t seed,
+                                 float low,
+                                 float high,
+                                 gd_tensor *out)
 {
-    if (base == NULL || view_desc == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_view argument is NULL");
+    gd_tensor tensor;
+    gd_status st;
+    size_t unused_nbytes;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
     }
-    *out = NULL;
-    if (base->storage == NULL) {
-        /* Virtual (graph) tensor: record a functional reshape into the new
-         * contiguous shape. Values are immutable, so this is observationally a
-         * zero-copy view. Only element-order-preserving (contiguous, equal
-         * numel) views are representable in v1. */
-        size_t base_numel = 0U;
-        size_t view_numel = 0U;
-
-        if (base->graph == NULL) {
-            return _gd_error(GD_ERR_INVALID_STATE, "virtual tensor has no graph");
-        }
-        if (view_desc->dtype != base->desc.dtype) {
-            return _gd_error(GD_ERR_DTYPE, "view dtype must match base dtype");
-        }
-        if (!gd_device_equal(view_desc->device, base->desc.device)) {
-            return _gd_error(GD_ERR_DEVICE, "view device must match base device");
-        }
-        if (view_desc->quant != base->desc.quant) {
-            return _gd_error(GD_ERR_DTYPE, "view quant descriptor must match base");
-        }
-        if (!desc_is_contiguous_strides(view_desc)) {
-            return _gd_error(GD_ERR_UNSUPPORTED,
-                             "only contiguous views of virtual tensors are supported");
-        }
-        if (tensor_numel_desc(&base->desc, &base_numel) != GD_OK ||
-            tensor_numel_desc(view_desc, &view_numel) != GD_OK) {
-            return _gd_error(GD_ERR_SHAPE, "failed to compute view element count");
-        }
-        if (base_numel != view_numel) {
-            return _gd_error(GD_ERR_SHAPE, "view must preserve element count");
-        }
-        return _gd_graph_emit(base->graph, _GD_OP_COPY, &base, 1, NULL, view_desc, out);
+    if (ctx == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (view_desc->dtype != base->desc.dtype) {
-        return _gd_error(GD_ERR_DTYPE, "view dtype must match base dtype");
+    if (!gd_dtype_rand_supported(dtype)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires floating dtype");
     }
-    if (!gd_device_equal(view_desc->device, base->desc.device)) {
-        return _gd_error(GD_ERR_DEVICE, "view device must match base device");
+    if (!(low <= high)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid range");
     }
-    if (view_desc->quant != base->desc.quant) {
-        return _gd_error(GD_ERR_DTYPE, "view quant descriptor must match base");
+    st = gd_shape_storage_nbytes(dtype, shape.rank, shape.dims, &unused_nbytes);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "invalid tensor rand shape");
     }
-    return make_tensor_from_storage(base->storage, view_desc, out);
+    st = gd_tensor_empty(ctx, arena, dtype, shape, alignment, &tensor);
+    if (st != GD_OK) {
+        return st;
+    }
+    st = gd_tensor_rand_uniform_(ctx, &tensor, seed, low, high);
+    if (st != GD_OK) {
+        return st;
+    }
+    *out = tensor;
+    return GD_OK;
 }
 
-gd_status gd_tensor_reshape(gd_tensor *tensor,
-                            int ndim,
-                            const int64_t *sizes,
-                            gd_tensor **out)
-{
-    gd_status status = GD_OK;
-    gd_tensor_desc desc;
-    size_t old_numel = 0U;
-    size_t new_numel = 0U;
-
-    if (tensor == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_reshape argument is NULL");
-    }
-    *out = NULL;
-    if (!desc_is_contiguous_strides(&tensor->desc)) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "reshape requires contiguous-compatible tensor");
-    }
-
-    status = tensor_numel_desc(&tensor->desc, &old_numel);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_desc_contiguous(tensor->desc.dtype,
-                                       tensor->desc.device,
-                                       ndim,
-                                       sizes,
-                                       &desc);
-    if (status != GD_OK) {
-        return status;
-    }
-    desc.storage_offset_bytes = tensor->desc.storage_offset_bytes;
-    desc.quant = tensor->desc.quant;
-    status = tensor_numel_desc(&desc, &new_numel);
-    if (status != GD_OK) {
-        return status;
-    }
-    if (old_numel != new_numel) {
-        return _gd_error(GD_ERR_SHAPE, "reshape must preserve element count");
-    }
-
-    return gd_tensor_view(tensor, &desc, out);
-}
-
-gd_status gd_tensor_transpose(gd_tensor *tensor,
-                              int d0,
-                              int d1,
-                              gd_tensor **out)
-{
-    gd_tensor_desc desc;
-    int64_t tmp = 0;
-
-    if (tensor == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_transpose argument is NULL");
-    }
-    *out = NULL;
-    if (d0 < 0) {
-        d0 += tensor->desc.ndim;
-    }
-    if (d1 < 0) {
-        d1 += tensor->desc.ndim;
-    }
-    if (d0 < 0 || d0 >= tensor->desc.ndim || d1 < 0 || d1 >= tensor->desc.ndim) {
-        return _gd_error(GD_ERR_SHAPE, "transpose dims are out of range");
-    }
-
-    desc = tensor->desc;
-    tmp = desc.sizes[d0];
-    desc.sizes[d0] = desc.sizes[d1];
-    desc.sizes[d1] = tmp;
-    tmp = desc.strides[d0];
-    desc.strides[d0] = desc.strides[d1];
-    desc.strides[d1] = tmp;
-    desc.layout = desc_is_contiguous_strides(&desc) ? GD_LAYOUT_CONTIGUOUS : GD_LAYOUT_STRIDED;
-
-    return gd_tensor_view(tensor, &desc, out);
-}
-
-gd_status gd_tensor_slice(gd_tensor *tensor,
-                          int dim,
+gd_status gd_tensor_slice(gd_context *ctx,
+                          const gd_tensor *base,
+                          uint32_t dim,
                           int64_t start,
-                          int64_t len,
-                          gd_tensor **out)
+                          int64_t length,
+                          gd_tensor *out)
 {
-    gd_status status = GD_OK;
-    gd_tensor_desc desc;
-    int64_t offset_elems = 0;
-    int64_t offset_bytes = 0;
-    size_t elem_size = 0U;
-
-    if (tensor == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_slice argument is NULL");
+    gd_tensor view;
+    gd_status st;
+    size_t elem_size;
+    int64_t elem_delta;
+    size_t byte_delta;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
     }
-    *out = NULL;
-    if (dim < 0) {
-        dim += tensor->desc.ndim;
+    if (ctx == NULL || base == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (dim < 0 || dim >= tensor->desc.ndim) {
-        return _gd_error(GD_ERR_SHAPE, "slice dim is out of range");
+    st = gd_tensor_validate(ctx, base);
+    if (st != GD_OK) {
+        return st;
     }
-    if (start < 0 || len <= 0 || start > tensor->desc.sizes[dim] ||
-        len > tensor->desc.sizes[dim] - start) {
-        return _gd_error(GD_ERR_SHAPE, "slice range is invalid");
+    if (dim >= base->rank || start < 0 || length <= 0 ||
+        start > base->shape[dim] || length > base->shape[dim] - start) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "invalid tensor slice range");
     }
-
-    elem_size = gd_dtype_sizeof(tensor->desc.dtype);
-    if (elem_size == 0U) {
-        return _gd_error(GD_ERR_DTYPE, "slice requires fixed-size dtype");
+    elem_size = gd_dtype_size(base->dtype);
+    if (gd_i64_mul_overflow(start, base->strides[dim], &elem_delta) ||
+        (uint64_t)elem_delta > (uint64_t)(SIZE_MAX / elem_size)) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "tensor slice offset overflow");
     }
-
-    desc = tensor->desc;
-    desc.sizes[dim] = len;
-    status = checked_mul_i64(start, tensor->desc.strides[dim], &offset_elems);
-    if (status != GD_OK) {
-        return status;
+    byte_delta = (size_t)elem_delta * elem_size;
+    if (base->view_offset > SIZE_MAX - byte_delta) {
+        return gd_context_set_error(ctx, GD_ERR_OUT_OF_MEMORY, "tensor slice offset overflow");
     }
-    status = checked_mul_i64(offset_elems, (int64_t)elem_size, &offset_bytes);
-    if (status != GD_OK) {
-        return status;
+    view = *base;
+    st = gd_context_next_tensor_id(ctx, &view.id);
+    if (st != GD_OK) {
+        return st;
     }
-    status = checked_add_i64(desc.storage_offset_bytes, offset_bytes, &desc.storage_offset_bytes);
-    if (status != GD_OK) {
-        return status;
+    view.version = 0U;
+    view.shape[dim] = length;
+    view.view_offset = base->view_offset + byte_delta;
+    view.is_view = true;
+    view.is_leaf = false;
+    st = gd_tensor_validate(ctx, &view);
+    if (st != GD_OK) {
+        return st;
     }
-    desc.layout = desc_is_contiguous_strides(&desc) ? GD_LAYOUT_CONTIGUOUS : GD_LAYOUT_STRIDED;
-
-    return gd_tensor_view(tensor, &desc, out);
+    *out = view;
+    return GD_OK;
 }
 
 gd_status gd_tensor_contiguous(gd_context *ctx,
-                               gd_tensor *tensor,
-                               gd_tensor **out)
+                               gd_arena_kind arena,
+                               const gd_tensor *src,
+                               size_t alignment,
+                               gd_tensor *out)
 {
-    gd_status status = GD_OK;
-    gd_tensor_desc desc;
-    gd_tensor *result = NULL;
-    const unsigned char *src_base = NULL;
-    unsigned char *dst_base = NULL;
-    size_t elem = 0U;
-    int64_t numel = 1;
-    int64_t i = 0;
-    int d = 0;
-
-    if (ctx == NULL || tensor == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "gd_tensor_contiguous argument is NULL");
+    gd_status st;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
     }
-    *out = NULL;
-
-    if (desc_is_contiguous_strides(&tensor->desc)) {
-        if (gd_tensor_retain(tensor) != GD_OK) {
-            return _gd_error(GD_ERR_INVALID_STATE, "failed to retain contiguous tensor");
-        }
-        *out = tensor;
-        _gd_set_last_error(GD_OK, NULL);
-        return GD_OK;
+    if (ctx == NULL || src == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
     }
-
-    /* Non-contiguous: eagerly gather a fresh contiguous copy of materialized data.
-     * Virtual (graph-produced) values are always contiguous, so they never reach
-     * here; only strided materialized views (transpose/slice) do. */
-    if (tensor->storage == NULL) {
-        return _gd_error(GD_ERR_UNSUPPORTED,
-                         "cannot materialize a non-contiguous virtual tensor");
+    st = gd_tensor_validate(ctx, src);
+    if (st != GD_OK) {
+        return st;
     }
-    if (tensor->desc.dtype == GD_DTYPE_QUANTIZED) {
-        return _gd_error(GD_ERR_UNSUPPORTED, "contiguous copy of packed quant is not supported");
+    st = gd_tensor_empty(ctx, arena, src->dtype, gd_shape_make(src->rank, src->shape), alignment, out);
+    if (st != GD_OK) {
+        return st;
     }
-    elem = gd_dtype_sizeof(tensor->desc.dtype);
-    if (elem == 0U) {
-        return _gd_error(GD_ERR_DTYPE, "contiguous copy requires a fixed-size dtype");
-    }
-
-    status = gd_tensor_desc_contiguous(tensor->desc.dtype, tensor->desc.device,
-                                      tensor->desc.ndim, tensor->desc.sizes, &desc);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_empty(ctx, &desc, &result);
-    if (status != GD_OK) {
-        return status;
-    }
-
-    {
-        void *src_host = NULL;
-        void *dst_host = NULL;
-
-        /* Strided gather indexes host memory directly, so both sides must be
-         * host-visible. Device-backed strided copies belong to a graph op. */
-        status = gd_storage_data_cpu(tensor->storage, &src_host);
-        if (status != GD_OK) {
-            gd_tensor_release(result);
-            return status;
-        }
-        status = gd_storage_data_cpu(result->storage, &dst_host);
-        if (status != GD_OK) {
-            gd_tensor_release(result);
-            return status;
-        }
-        src_base = (const unsigned char *)src_host +
-                   (size_t)tensor->desc.storage_offset_bytes;
-        dst_base = dst_host;
-    }
-
-    for (d = 0; d < tensor->desc.ndim; ++d) {
-        numel *= tensor->desc.sizes[d];
-    }
-    for (i = 0; i < numel; ++i) {
-        int64_t rem = i;
-        int64_t src_off = 0;
-        for (d = tensor->desc.ndim - 1; d >= 0; --d) {
-            int64_t coord = rem % tensor->desc.sizes[d];
-            rem /= tensor->desc.sizes[d];
-            src_off += coord * tensor->desc.strides[d];
-        }
-        memcpy(dst_base + (size_t)i * elem, src_base + (size_t)src_off * elem, elem);
-    }
-
-    *out = result;
-    _gd_set_last_error(GD_OK, NULL);
+    out->requires_grad = src->requires_grad;
+    out->is_leaf = false;
     return GD_OK;
 }
 
-gd_status _gd_tensor_create_virtual(gd_graph *graph,
-                                    int value_id,
-                                    const gd_tensor_desc *desc,
-                                    gd_tensor **out)
+gd_status gd_tensor_zero_(gd_context *ctx, gd_tensor *tensor)
 {
-    gd_status status = GD_OK;
-    gd_tensor *tensor = NULL;
+    return gd_tensor_fill_pattern(ctx, tensor, 0U);
+}
 
-    if (graph == NULL || desc == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT,
-                         "_gd_tensor_create_virtual argument is NULL");
-    }
-    if (value_id < 0) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "value id must be nonnegative");
-    }
-    *out = NULL;
-
-    status = validate_tensor_desc(desc);
-    if (status != GD_OK) {
-        return status;
-    }
-
-    tensor = calloc(1U, sizeof(*tensor));
+gd_status gd_tensor_one_(gd_context *ctx, gd_tensor *tensor)
+{
+    uint32_t pattern;
     if (tensor == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "failed to allocate virtual tensor");
+        return GD_ERR_INVALID_ARGUMENT;
     }
-
-    _gd_refcount_init(&tensor->refcount);
-    tensor->desc = *desc;
-    tensor->storage = NULL;
-    tensor->graph = graph;
-    tensor->value_id = value_id;
-
-    status = _gd_graph_note_virtual_tensor_create(graph, tensor);
-    if (status != GD_OK) {
-        free(tensor);
-        return status;
+    if (!gd_dtype_one_pattern(tensor->dtype, &pattern)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor one invalid dtype");
     }
-
-    *out = tensor;
-    _gd_set_last_error(GD_OK, NULL);
-    return GD_OK;
+    return gd_tensor_fill_pattern(ctx, tensor, pattern);
 }
 
-bool _gd_tensor_is_virtual(const gd_tensor *tensor)
+gd_status gd_tensor_rand_(gd_context *ctx, gd_tensor *tensor, uint64_t seed)
 {
-    return tensor != NULL && tensor->storage == NULL && tensor->graph != NULL;
+    return gd_tensor_rand_uniform_(ctx, tensor, seed, 0.0f, 1.0f);
 }
 
-int _gd_tensor_value_id(const gd_tensor *tensor)
+gd_status gd_tensor_rand_uniform_(gd_context *ctx,
+                                  gd_tensor *tensor,
+                                  uint64_t seed,
+                                  float low,
+                                  float high)
 {
-    return tensor == NULL ? -1 : tensor->value_id;
-}
-
-gd_graph *_gd_tensor_graph(const gd_tensor *tensor)
-{
-    return tensor == NULL ? NULL : tensor->graph;
-}
-
-gd_status _gd_tensor_materialize_from_graph(gd_context *ctx, gd_tensor *tensor)
-{
-    gd_status status = GD_OK;
-    const gd_tensor_desc *vdesc = NULL;
-    gd_storage *vstorage = NULL;
-    size_t voffset = 0U;
-    gd_storage_desc storage_desc;
-    gd_storage *storage = NULL;
-    void *storage_data = NULL;
-    size_t nbytes = 0U;
-    size_t alignment = 0U;
-    gd_graph *graph = NULL;
-
+    gd_backend *backend;
+    gd_status st;
+    size_t count;
+    size_t offset;
     if (ctx == NULL || tensor == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT,
-                         "_gd_tensor_materialize_from_graph argument is NULL");
+        return GD_ERR_INVALID_ARGUMENT;
     }
-    if (tensor->storage != NULL) {
-        return GD_OK;
+    if (!gd_dtype_rand_supported(tensor->dtype)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires floating dtype");
     }
-    if (tensor->graph == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "virtual tensor has no graph");
+    if (!(low <= high)) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid range");
     }
-
-    status = _gd_graph_value_storage(tensor->graph, tensor->value_id, true, &vstorage, &voffset,
-                                     &vdesc);
-    if (status != GD_OK) {
-        return status;
+    st = gd_tensor_validate(ctx, tensor);
+    if (st != GD_OK) {
+        return st;
     }
-    status = gd_tensor_desc_nbytes(vdesc, &nbytes, &alignment);
-    if (status != GD_OK) {
-        return status;
+    if (!gd_tensor_is_contiguous(tensor)) {
+        return gd_context_set_error(ctx, GD_ERR_UNSUPPORTED,
+                                    "tensor rand requires contiguous tensor");
     }
-
-    storage_desc = (gd_storage_desc){vdesc->device, GD_MEM_HOST, nbytes, alignment};
-    status = gd_storage_create(ctx, &storage_desc, &storage);
-    if (status != GD_OK) {
-        return status;
+    st = gd_context_wait_for_span(ctx, &tensor->storage);
+    if (st != GD_OK) {
+        return st;
     }
-    /* Fill the new host storage by downloading the value through the backend. */
-    status = gd_storage_data_cpu(storage, &storage_data);
-    if (status != GD_OK) {
-        gd_storage_release(storage);
-        return status;
+    st = gd_tensor_count(tensor, &count);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "tensor rand invalid shape");
     }
-    status = gd_storage_copy_to_cpu(ctx, vstorage, voffset, storage_data, nbytes);
-    if (status != GD_OK) {
-        gd_storage_release(storage);
-        return status;
+    if (tensor->storage.offset > SIZE_MAX - tensor->view_offset) {
+        return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "tensor rand invalid descriptor");
     }
-
-    graph = tensor->graph;
-    tensor->desc = *vdesc;
-    tensor->storage = storage;
-    tensor->graph = NULL;
-    tensor->value_id = -1;
-    _gd_graph_note_virtual_tensor_release(graph, tensor);
-
-    _gd_set_last_error(GD_OK, NULL);
+    offset = tensor->storage.offset + tensor->view_offset;
+    backend = gd_context_backend(ctx);
+    if (backend == NULL || tensor->storage.buffer == NULL) {
+        return gd_context_set_error(ctx, GD_ERR_BAD_STATE, "tensor rand missing backend buffer");
+    }
+    st = gd_backend_rand_uniform(backend,
+                                 (gd_backend_buffer *)tensor->storage.buffer,
+                                 offset,
+                                 count,
+                                 (uint32_t)tensor->dtype,
+                                 seed,
+                                 low,
+                                 high);
+    if (st != GD_OK) {
+        return gd_context_set_error(ctx, st, "backend tensor rand failed");
+    }
+    tensor->version += 1U;
+    if (tensor->version == 0U) {
+        tensor->version = 1U;
+    }
     return GD_OK;
-}
-
-bool _gd_tensor_is_contiguous(const gd_tensor *tensor)
-{
-    return tensor != NULL && desc_is_contiguous_strides(&tensor->desc);
-}
-
-gd_status _gd_tensor_ensure_grad(gd_context *ctx, gd_tensor *tensor, gd_tensor **grad_out)
-{
-    gd_status status = GD_OK;
-    gd_tensor_desc desc;
-    gd_tensor *grad = NULL;
-
-    if (ctx == NULL || tensor == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "ensure_grad argument is NULL");
-    }
-    if (!tensor->requires_grad) {
-        return _gd_error(GD_ERR_INVALID_STATE, "tensor does not require grad");
-    }
-    if (tensor->storage == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "grad slot requires a materialized leaf");
-    }
-    if (tensor->grad != NULL) {
-        if (grad_out != NULL) {
-            *grad_out = tensor->grad;
-        }
-        return GD_OK;
-    }
-
-    status = gd_tensor_desc_contiguous(GD_DTYPE_F32, tensor->desc.device, tensor->desc.ndim,
-                                      tensor->desc.sizes, &desc);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tensor_empty(ctx, &desc, &grad);
-    if (status != GD_OK) {
-        return status;
-    }
-    tensor->grad = grad;
-    if (grad_out != NULL) {
-        *grad_out = grad;
-    }
-    _gd_set_last_error(GD_OK, NULL);
-    return GD_OK;
-}
-
-gd_status _gd_tensor_zero(gd_tensor *tensor)
-{
-    void *data = NULL;
-
-    if (tensor == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "zero tensor is NULL");
-    }
-    if (tensor->storage == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "cannot zero a virtual tensor");
-    }
-    data = _gd_storage_data_mut(tensor->storage);
-    if (data == NULL) {
-        return _gd_error(GD_ERR_INVALID_STATE, "tensor storage has no data");
-    }
-    memset((unsigned char *)data + (size_t)tensor->desc.storage_offset_bytes, 0,
-           _gd_storage_nbytes(tensor->storage) - (size_t)tensor->desc.storage_offset_bytes);
-    _gd_set_last_error(GD_OK, NULL);
-    return GD_OK;
-}
-
-const gd_tensor_desc *_gd_tensor_desc_ptr(const gd_tensor *tensor)
-{
-    return tensor == NULL ? NULL : &tensor->desc;
 }

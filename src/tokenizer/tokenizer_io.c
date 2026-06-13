@@ -1,7 +1,5 @@
 #include "tokenizer_internal.h"
 
-#include "../core/internal.h"
-
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -51,11 +49,11 @@ gd_status gd_bpe_tokenizer_save(gd_tokenizer *tok, const char *tokenizer_path)
     int i;
 
     if (tok == NULL || tokenizer_path == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer save arguments");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer save arguments");
     }
     f = fopen(tokenizer_path, "wb");
     if (f == NULL) {
-        return _gd_error(GD_ERR_IO, "failed to open tokenizer output");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to open tokenizer output");
     }
     fprintf(f, "{\n");
     fprintf(f, "  \"format\": \"gd-bpe-tokenizer-v1\",\n");
@@ -84,7 +82,7 @@ gd_status gd_bpe_tokenizer_save(gd_tokenizer *tok, const char *tokenizer_path)
     fprintf(f, "  ]\n");
     fprintf(f, "}\n");
     if (fclose(f) != 0) {
-        return _gd_error(GD_ERR_IO, "failed to close tokenizer output");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to close tokenizer output");
     }
     return GD_OK;
 }
@@ -100,13 +98,13 @@ static gd_status gd_parse_int_field(const char *line, const char *field, int *ou
     char *end = NULL;
     long v;
     if (p == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer int field");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer int field");
     }
     p += strlen(field);
     errno = 0;
     v = strtol(p, &end, 10);
     if (errno != 0 || end == p || v < INT_MIN || v > INT_MAX) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer int field");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer int field");
     }
     *out = (int)v;
     return GD_OK;
@@ -139,30 +137,30 @@ static gd_status gd_parse_hex_field(const char *line,
     size_t i;
 
     if (p == NULL || bytes_out == NULL || len_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer hex field");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer hex field");
     }
     *bytes_out = NULL;
     *len_out = 0U;
     p += strlen(field);
     q = strchr(p, '"');
     if (q == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "unterminated tokenizer hex field");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "unterminated tokenizer hex field");
     }
     hex_len = (size_t)(q - p);
     if ((hex_len % 2U) != 0U) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer hex length");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer hex length");
     }
     len = hex_len / 2U;
     bytes = (uint8_t *)gd_xmalloc(len);
     if (bytes == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer hex allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer hex allocation failed");
     }
     for (i = 0U; i < len; ++i) {
         int hi = gd_hex_value(p[2U * i]);
         int lo = gd_hex_value(p[2U * i + 1U]);
         if (hi < 0 || lo < 0) {
             free(bytes);
-            return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer hex byte");
+            return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer hex byte");
         }
         bytes[i] = (uint8_t)((hi << 4) | lo);
     }
@@ -181,13 +179,13 @@ static gd_status gd_parse_json_text_field(const char *line,
     size_t len = 0U;
 
     if (p == NULL || text_out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer text field");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "missing tokenizer text field");
     }
     *text_out = NULL;
     p += strlen(field);
     text = (char *)gd_xmalloc(cap);
     if (text == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text allocation failed");
     }
     while (*p != '\0' && *p != '"') {
         char c = *p;
@@ -195,7 +193,7 @@ static gd_status gd_parse_json_text_field(const char *line,
             ++p;
             if (*p == '\0') {
                 free(text);
-                return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer escape");
+                return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer escape");
             }
             if (*p == 'n') {
                 c = '\n';
@@ -207,20 +205,20 @@ static gd_status gd_parse_json_text_field(const char *line,
                 c = *p;
             } else {
                 free(text);
-                return _gd_error(GD_ERR_UNSUPPORTED, "unsupported tokenizer JSON escape");
+                return gd_tokenizer_error(GD_ERR_UNSUPPORTED, "unsupported tokenizer JSON escape");
             }
         }
         if (len + 1U >= cap) {
             char *new_text;
             if (cap > SIZE_MAX / 2U) {
                 free(text);
-                return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text too large");
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text too large");
             }
             cap *= 2U;
             new_text = (char *)realloc(text, cap);
             if (new_text == NULL) {
                 free(text);
-                return _gd_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text allocation failed");
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "tokenizer text allocation failed");
             }
             text = new_text;
         }
@@ -230,7 +228,7 @@ static gd_status gd_parse_json_text_field(const char *line,
     }
     if (*p != '"') {
         free(text);
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "unterminated tokenizer text");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "unterminated tokenizer text");
     }
     text[len] = '\0';
     *text_out = text;
@@ -249,7 +247,7 @@ gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
     gd_status status;
 
     if (tokenizer_path == NULL || out == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer load arguments");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "invalid tokenizer load arguments");
     }
     *out = NULL;
     if (cfg != NULL) {
@@ -258,7 +256,7 @@ gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
     }
     f = fopen(tokenizer_path, "rb");
     if (f == NULL) {
-        return _gd_error(GD_ERR_IO, "failed to open tokenizer file");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to open tokenizer file");
     }
     status = gd_tokenizer_create_empty(split_digits, allow_special, &tok);
     if (status != GD_OK) {
@@ -287,7 +285,7 @@ gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
             if (id != tok->n_tokens) {
                 gd_tokenizer_destroy(tok);
                 fclose(f);
-                return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer ids must be contiguous");
+                return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer ids must be contiguous");
             }
             if (strstr(line, "\"kind\":\"special\"") != NULL) {
                 status = gd_parse_json_text_field(line, "\"text\":\"", &text);
@@ -342,7 +340,7 @@ gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
                     free(bytes);
                     gd_tokenizer_destroy(tok);
                     fclose(f);
-                    return _gd_error(GD_ERR_INVALID_ARGUMENT, "byte token must have len 1");
+                    return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "byte token must have len 1");
                 }
                 status = gd_tokenizer_add_token(tok, bytes, len, 0, -1, -1, NULL);
                 free(bytes);
@@ -357,15 +355,15 @@ gd_status gd_bpe_tokenizer_load(const char *tokenizer_path,
     if (ferror(f) != 0) {
         gd_tokenizer_destroy(tok);
         fclose(f);
-        return _gd_error(GD_ERR_IO, "failed to read tokenizer file");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to read tokenizer file");
     }
     if (fclose(f) != 0) {
         gd_tokenizer_destroy(tok);
-        return _gd_error(GD_ERR_IO, "failed to close tokenizer file");
+        return gd_tokenizer_error(GD_ERR_IO, "failed to close tokenizer file");
     }
     if (tok->n_tokens < GD_BPE_N_BYTES) {
         gd_tokenizer_destroy(tok);
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "tokenizer missing byte vocabulary");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "tokenizer missing byte vocabulary");
     }
     gd_tokenizer_recompute_hash(tok);
     *out = tok;

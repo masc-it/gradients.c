@@ -1,0 +1,2 @@
+# Custom op metadata for swiglu_split_linear.
+# Public/backend entry points are implemented manually because the op takes x12, weight, and optional bias.

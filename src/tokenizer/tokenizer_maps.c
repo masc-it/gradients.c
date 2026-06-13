@@ -1,7 +1,5 @@
 #include "tokenizer_internal.h"
 
-#include "../core/internal.h"
-
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,12 +18,12 @@ gd_status gd_pair_map_init(gd_pair_map *map, size_t requested_cap)
 {
     size_t cap;
     if (map == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "pair map is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "pair map is null");
     }
     cap = gd_next_pow2(requested_cap);
     map->entries = (gd_pair_entry *)calloc(cap, sizeof(gd_pair_entry));
     if (map->entries == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "pair map allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "pair map allocation failed");
     }
     map->cap = cap;
     map->size = 0U;
@@ -130,12 +128,12 @@ gd_status gd_bytes_map_init(gd_bytes_map *map, size_t requested_cap)
 {
     size_t cap;
     if (map == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "bytes map is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "bytes map is null");
     }
     cap = gd_next_pow2(requested_cap);
     map->entries = (gd_bytes_entry *)calloc(cap, sizeof(gd_bytes_entry));
     if (map->entries == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "bytes map allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "bytes map allocation failed");
     }
     map->cap = cap;
     map->size = 0U;
@@ -251,12 +249,12 @@ gd_status gd_word_map_init(gd_word_map *map, size_t requested_cap)
 {
     size_t cap;
     if (map == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "word map is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "word map is null");
     }
     cap = gd_next_pow2(requested_cap);
     map->entries = (gd_word_map_entry *)calloc(cap, sizeof(gd_word_map_entry));
     if (map->entries == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "word map allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "word map allocation failed");
     }
     map->cap = cap;
     map->size = 0U;
@@ -345,12 +343,12 @@ gd_status gd_pair_stats_init(gd_pair_stats *stats, size_t requested_cap)
 {
     size_t cap;
     if (stats == NULL) {
-        return _gd_error(GD_ERR_INVALID_ARGUMENT, "pair stats is null");
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "pair stats is null");
     }
     cap = gd_next_pow2(requested_cap);
     stats->entries = (gd_pair_stat_entry *)calloc(cap, sizeof(gd_pair_stat_entry));
     if (stats->entries == NULL) {
-        return _gd_error(GD_ERR_OUT_OF_MEMORY, "pair stats allocation failed");
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "pair stats allocation failed");
     }
     stats->cap = cap;
     stats->size = 0U;

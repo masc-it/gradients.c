@@ -1,7 +1,4 @@
 ROOT := ../..
-BUILD_DIR := $(ROOT)/build
-LIB := $(BUILD_DIR)/libgradients.a
-METALLIB := $(BUILD_DIR)/gradients.metallib
 BIN := gd_main_mlp_mnist
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.mnist_gdds.stamp
@@ -13,6 +10,7 @@ PYTHON ?= python3
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
+include ../common.mk
 LDLIBS := -pthread -lm
 
 ifeq ($(UNAME_S),Darwin)
@@ -34,9 +32,6 @@ endif
 
 all: $(BIN)
 
-build-lib:
-	$(MAKE) -C $(ROOT) build
-
 data: $(DATA_STAMP)
 
 $(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py
@@ -51,7 +46,7 @@ $(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py
 		touch '$(DATA_STAMP)'; \
 	fi
 
-$(BIN): main.c build-lib $(DATA_STAMP)
+$(BIN): main.c $(LIB) $(DATA_STAMP)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(LIB) $(LDLIBS) -o $@
 
 run: $(BIN)

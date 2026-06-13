@@ -1,4 +1,5 @@
 #include "gpt_lm_shared.h"
+#include "gd_progress.h"
 
 #include <errno.h>
 #include <math.h>
@@ -518,8 +519,8 @@ static gd_status create_gdds_loader(gd_context *ctx,
     }
     *out = NULL;
     cfg = gd_dataloader_config_default(batch_size);
-    cfg.num_workers = 1;
-    cfg.prefetch_factor = 2;
+    cfg.num_workers = 2;
+    cfg.prefetch_factor = 4;
     st = gd_dataloader_create(ctx, dataset, sampler, &cfg, out);
     if (st != GD_OK) {
         return st;
@@ -578,8 +579,10 @@ static gd_adamw_config gpt_adamw_config(float lr, float weight_decay)
 static gd_amp_config gpt_amp_config(void)
 {
     gd_amp_config config = gd_amp_config_default();
-    config.init_scale = 8192.0f;
-    config.growth_interval = 1000U;
+    config.init_scale = 65536.0f;
+    config.growth_factor = 2.0f;
+    config.backoff_factor = 0.5f;
+    config.growth_interval = 2000U;
     return config;
 }
 
@@ -651,6 +654,47 @@ static gd_status gpt_eval_loss_fn(const gd_eval_batch_step *step,
     return gpt_lm_forward_batch(step->ctx, run->model, step->batch, 0U, loss_out);
 }
 
+typedef struct gpt_report_state {
+    gd_progress progress;
+    float last_train_loss;
+    float last_eval_loss;
+    size_t best_epoch;
+    bool has_train_loss;
+    bool has_eval_loss;
+    bool has_best_epoch;
+} gpt_report_state;
+
+static void gpt_report_summary(gpt_report_state *report)
+{
+    char train_loss[32];
+    char eval_loss[32];
+    char best_epoch[32];
+    if (report == NULL) {
+        return;
+    }
+    if (report->has_train_loss) {
+        (void)snprintf(train_loss, sizeof(train_loss), "%.6f", (double)report->last_train_loss);
+    } else {
+        (void)snprintf(train_loss, sizeof(train_loss), "n/a");
+    }
+    if (report->has_eval_loss) {
+        (void)snprintf(eval_loss, sizeof(eval_loss), "%.6f", (double)report->last_eval_loss);
+    } else {
+        (void)snprintf(eval_loss, sizeof(eval_loss), "n/a");
+    }
+    if (report->has_best_epoch) {
+        (void)snprintf(best_epoch, sizeof(best_epoch), "%zu", report->best_epoch);
+    } else {
+        (void)snprintf(best_epoch, sizeof(best_epoch), "n/a");
+    }
+    gd_progress_rowf(&report->progress,
+                     4U,
+                     "last_train_loss=%s last_eval_loss=%s last_best_epoch=%s",
+                     train_loss,
+                     eval_loss,
+                     best_epoch);
+}
+
 static void train_one_batch(gd_context *ctx,
                             gpt_lm *model,
                             gd_dataloader *loader,
@@ -659,6 +703,7 @@ static void train_one_batch(gd_context *ctx,
                             const gd_lr_scheduler_config *lr_config,
                             const gpt_config *config,
                             const gpt_generation_tokenizer *generation_tokenizer,
+                            gpt_report_state *report,
                             gd_metrics_logger *metrics,
                             size_t global_step,
                             size_t total_steps,
@@ -669,9 +714,11 @@ static void train_one_batch(gd_context *ctx,
                             size_t *last_report_step)
 {
     const size_t current_step = global_step + 1U;
-    const int report = config->report_every > 0 &&
-                       (global_step == 0U || current_step % (size_t)config->report_every == 0U ||
-                        current_step == total_steps);
+    const int epoch_complete = epoch_step == steps_per_epoch;
+    const int should_report = config->report_every > 0 &&
+                              (global_step == 0U || epoch_complete ||
+                               current_step % (size_t)config->report_every == 0U ||
+                               current_step == total_steps);
     const gd_train_batch_config step_config = {
         .loader = loader,
         .optimizer = optimizer,
@@ -680,9 +727,9 @@ static void train_one_batch(gd_context *ctx,
         .global_step = (uint64_t)global_step,
         .grad_clip_norm = config->grad_clip_norm,
         .prefetch_next = true,
-        .read_loss_value = report != 0,
-        .read_grad_norm = report != 0 && config->grad_clip_norm > 0.0f,
-        .sync_scaler = report != 0,
+        .read_loss_value = should_report != 0,
+        .read_grad_norm = should_report != 0 && config->grad_clip_norm > 0.0f,
+        .sync_scaler = should_report != 0,
     };
     gpt_batch_user step_user = {
         .model = model,
@@ -690,7 +737,7 @@ static void train_one_batch(gd_context *ctx,
     gd_train_batch_result step_result;
     TRY(ctx, gd_train_batch(ctx, &step_config, gpt_train_loss_fn, &step_user, &step_result));
 
-    if (report) {
+    if (should_report) {
         float grad_norm = 0.0f;
         char grad_norm_text[64];
         double now;
@@ -699,13 +746,13 @@ static void train_one_batch(gd_context *ctx,
         size_t tokens;
         double batches_per_sec;
         double tokens_per_sec;
+        const float train_loss = step_result.has_loss_value ? step_result.loss_value : 0.0f;
         if (config->grad_clip_norm > 0.0f) {
             grad_norm = step_result.has_grad_norm ? step_result.grad_norm : 0.0f;
             (void)snprintf(grad_norm_text,
                            sizeof(grad_norm_text),
-                           " grad_norm=%.4g clip=%.3g",
-                           (double)grad_norm,
-                           (double)config->grad_clip_norm);
+                           " grad_norm=%.4g",
+                           (double)grad_norm);
         } else {
             (void)snprintf(grad_norm_text, sizeof(grad_norm_text), " grad_norm=off");
         }
@@ -715,20 +762,39 @@ static void train_one_batch(gd_context *ctx,
         tokens = batches * (size_t)config->batch_size * (size_t)GPT_CONTEXT_LENGTH;
         batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
         tokens_per_sec = elapsed > 0.0 ? (double)tokens / elapsed : 0.0;
-        printf("epoch=%zu/%d batch=%zu/%zu step=%zu/%zu loss=%.6f lr=%.6g%s batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s\n",
-               epoch,
-               config->epochs,
-               epoch_step,
-               steps_per_epoch,
-               current_step,
-               total_steps,
-               (double)(step_result.has_loss_value ? step_result.loss_value : 0.0f),
-               (double)(step_result.has_lr ? step_result.lr : 0.0f),
-               grad_norm_text,
-               batches_per_sec,
-               tokens_per_sec,
-               (double)(step_result.has_amp_state ? step_result.amp_scale : gd_amp_scaler_scale(scaler)),
-               step_result.has_amp_state && step_result.found_inf ? " found_inf" : "");
+        if (report != NULL) {
+            if (epoch_complete) {
+                report->last_train_loss = train_loss;
+                report->has_train_loss = true;
+            }
+            gd_progress_rowf(&report->progress, 0U, "");
+            gd_progress_row_append_bar(&report->progress,
+                                       0U,
+                                       "train",
+                                       (uint64_t)current_step,
+                                       (uint64_t)total_steps);
+            gd_progress_row_appendf(&report->progress,
+                                    0U,
+                                    " epoch=%zu/%d batch=%zu/%zu",
+                                    epoch,
+                                    config->epochs,
+                                    epoch_step,
+                                    steps_per_epoch);
+            gd_progress_rowf(&report->progress,
+                             1U,
+                             "loss=%.6f lr=%.6g%s batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s",
+                             (double)train_loss,
+                             (double)(step_result.has_lr ? step_result.lr : 0.0f),
+                             grad_norm_text,
+                             batches_per_sec,
+                             tokens_per_sec,
+                             (double)(step_result.has_amp_state ?
+                                          step_result.amp_scale :
+                                          gd_amp_scaler_scale(scaler)),
+                             step_result.has_amp_state && step_result.found_inf ? " found_inf" : "");
+            gpt_report_summary(report);
+            gd_progress_render(&report->progress);
+        }
         if (metrics != NULL) {
             const gd_metrics_field fields[] = {
                 gd_metrics_u64("epoch", (uint64_t)epoch),
@@ -736,7 +802,7 @@ static void train_one_batch(gd_context *ctx,
                 gd_metrics_u64("steps_per_epoch", (uint64_t)steps_per_epoch),
                 gd_metrics_u64("step", (uint64_t)current_step),
                 gd_metrics_u64("total_steps", (uint64_t)total_steps),
-                gd_metrics_f64("loss", (double)(step_result.has_loss_value ? step_result.loss_value : 0.0f)),
+                gd_metrics_f64("loss", (double)train_loss),
                 gd_metrics_f64("lr", (double)(step_result.has_lr ? step_result.lr : 0.0f)),
                 gd_metrics_bool("grad_clip_enabled", config->grad_clip_norm > 0.0f),
                 gd_metrics_f64("grad_norm", (double)grad_norm),
@@ -757,6 +823,9 @@ static void train_one_batch(gd_context *ctx,
 
     if (config->generate_every_n_steps > 0 &&
         (current_step % (size_t)config->generate_every_n_steps) == 0U) {
+        if (report != NULL) {
+            gd_progress_finish(&report->progress);
+        }
         if (generation_tokenizer != NULL) {
             gpt_generate_vowels_with_tokenizer(ctx, model, config, current_step, generation_tokenizer);
         } else {
@@ -1309,6 +1378,7 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                           const gd_lr_scheduler_config *lr_config,
                                           gd_dataset *val_dataset,
                                           const gpt_config *config,
+                                          gpt_report_state *report,
                                           gd_metrics_logger *metrics,
                                           size_t epoch,
                                           size_t global_step,
@@ -1327,16 +1397,32 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
     if (val_dataset == NULL) {
         return false;
     }
+    if (report != NULL) {
+        gd_progress_rowf(&report->progress,
+                         2U,
+                         "eval epoch=%zu step=%zu running...",
+                         epoch,
+                         global_step);
+        gd_progress_rowf(&report->progress, 3U, "checkpoint best=pending latest=pending");
+        gpt_report_summary(report);
+        gd_progress_render(&report->progress);
+    }
     val_loss = evaluate_gpt_loss(ctx, model, val_dataset, config);
     if (out_val_loss != NULL) {
         *out_val_loss = val_loss;
     }
-    printf("validation: epoch=%zu step=%zu val_loss=%.6f", epoch, global_step, (double)val_loss);
     if (isfinite(val_loss) && best_val_loss != NULL && val_loss < *best_val_loss) {
-        printf(" improved=%.6f", (double)*best_val_loss);
         *best_val_loss = val_loss;
         improved = true;
         if (config->save_best) {
+            if (report != NULL) {
+                gd_progress_rowf(&report->progress,
+                                 3U,
+                                 "checkpoint best=saving path=%s latest=pending",
+                                 config->checkpoint_path);
+                gpt_report_summary(report);
+                gd_progress_render(&report->progress);
+            }
             gpt_save_checkpoint_bundle(ctx,
                                        model,
                                        optimizer,
@@ -1344,7 +1430,7 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                        lr_config,
                                        config,
                                        config->checkpoint_path,
-                                       "saved",
+                                       NULL,
                                        epoch,
                                        global_step,
                                        0U,
@@ -1377,7 +1463,6 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
         };
         (void)gd_metrics_logger_log_event(metrics, "eval", fields, GD_ARRAY_LEN(fields));
     }
-    printf("\n");
     return true;
 }
 
@@ -1402,10 +1487,23 @@ static void train_gpt(gd_context *ctx,
                                             0U;
     size_t start_epoch = resume_state != NULL && resume_state->loaded ? resume_state->epoch + 1U : 1U;
     size_t epoch;
+    gpt_report_state report;
     gpt_generation_tokenizer generation_tokenizer;
     const gpt_generation_tokenizer *generation_tokenizer_ptr = NULL;
     float best_val_loss = resume_state != NULL && resume_state->loaded ? resume_state->best_val_loss : INFINITY;
 
+    memset(&report, 0, sizeof(report));
+    report.last_train_loss = NAN;
+    report.last_eval_loss = NAN;
+    gd_progress_init(&report.progress, stdout);
+    if (!gd_progress_set_row_count(&report.progress, 5U)) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "progress rows", __LINE__);
+    }
+    gd_progress_rowf(&report.progress, 0U, "train pending");
+    gd_progress_rowf(&report.progress, 1U, "train metrics pending");
+    gd_progress_rowf(&report.progress, 2U, "eval pending");
+    gd_progress_rowf(&report.progress, 3U, "checkpoint pending");
+    gpt_report_summary(&report);
     memset(&generation_tokenizer, 0, sizeof(generation_tokenizer));
     if (config->generate_every_n_steps > 0) {
         gpt_generation_tokenizer_init(ctx, config, &generation_tokenizer);
@@ -1442,6 +1540,7 @@ static void train_gpt(gd_context *ctx,
                             lr_config,
                             config,
                             generation_tokenizer_ptr,
+                            &report,
                             metrics,
                             global_step,
                             total_steps,
@@ -1466,6 +1565,7 @@ static void train_gpt(gd_context *ctx,
                                                       lr_config,
                                                       val_dataset,
                                                       config,
+                                                      &report,
                                                       metrics,
                                                       epoch,
                                                       global_step,
@@ -1482,8 +1582,50 @@ static void train_gpt(gd_context *ctx,
                     }
                 }
             }
+            if (validated) {
+                report.last_eval_loss = val_loss;
+                report.has_eval_loss = true;
+                if (val_improved) {
+                    report.best_epoch = epoch;
+                    report.has_best_epoch = true;
+                }
+                if (config->early_stopping_patience > 0) {
+                    gd_progress_rowf(&report.progress,
+                                     2U,
+                                     "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=%zu/%d",
+                                     epoch,
+                                     global_step,
+                                     (double)val_loss,
+                                     (double)best_val_loss,
+                                     val_improved ? "yes" : "no",
+                                     epochs_without_improvement,
+                                     config->early_stopping_patience);
+                } else {
+                    gd_progress_rowf(&report.progress,
+                                     2U,
+                                     "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=off",
+                                     epoch,
+                                     global_step,
+                                     (double)val_loss,
+                                     (double)best_val_loss,
+                                     val_improved ? "yes" : "no");
+                }
+            } else {
+                gd_progress_rowf(&report.progress, 2U, "eval skipped");
+            }
             if (config->save_latest) {
-                printf("latest_checkpoint: epoch=%zu step=%zu", epoch, global_step);
+                const char *best_status = validated ?
+                                              (val_improved ?
+                                                   (config->save_best ? "saved" : "improved save_best=off") :
+                                                   "unchanged") :
+                                              "skipped";
+                gd_progress_rowf(&report.progress,
+                                 3U,
+                                 "checkpoint best=%s latest=saving path=%s",
+                                 best_status,
+                                 config->latest_checkpoint_path);
+                gpt_report_summary(&report);
+                gd_progress_render(&report.progress);
                 gpt_save_checkpoint_bundle(ctx,
                                            model,
                                            optimizer,
@@ -1491,12 +1633,19 @@ static void train_gpt(gd_context *ctx,
                                            lr_config,
                                            config,
                                            config->latest_checkpoint_path,
-                                           "saved",
+                                           NULL,
                                            epoch,
                                            global_step,
                                            epochs_without_improvement,
                                            val_loss,
                                            best_val_loss);
+                gd_progress_rowf(&report.progress,
+                                 3U,
+                                 "checkpoint best=%s latest=saved path=%s",
+                                 best_status,
+                                 config->latest_checkpoint_path);
+                gpt_report_summary(&report);
+                gd_progress_render(&report.progress);
                 if (metrics != NULL) {
                     const gd_metrics_field fields[] = {
                         gd_metrics_string("kind", "latest"),
@@ -1509,14 +1658,26 @@ static void train_gpt(gd_context *ctx,
                     };
                     (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
                 }
-                printf("\n");
+            } else {
+                const char *best_status = validated ?
+                                              (val_improved ?
+                                                   (config->save_best ? "saved" : "improved save_best=off") :
+                                                   "unchanged") :
+                                              "skipped";
+                gd_progress_rowf(&report.progress, 3U, "checkpoint best=%s latest=off", best_status);
+                gpt_report_summary(&report);
+                gd_progress_render(&report.progress);
             }
             if (should_stop) {
-                printf("early_stopping: epoch=%zu step=%zu patience=%d best_val_loss=%.6f\n",
-                       epoch,
-                       global_step,
-                       config->early_stopping_patience,
-                       (double)best_val_loss);
+                gd_progress_rowf(&report.progress,
+                                 3U,
+                                 "early_stopping epoch=%zu step=%zu patience=%d best_val_loss=%.6f",
+                                 epoch,
+                                 global_step,
+                                 config->early_stopping_patience,
+                                 (double)best_val_loss);
+                gpt_report_summary(&report);
+                gd_progress_render(&report.progress);
                 if (metrics != NULL) {
                     const gd_metrics_field fields[] = {
                         gd_metrics_u64("epoch", (uint64_t)epoch),
@@ -1530,7 +1691,9 @@ static void train_gpt(gd_context *ctx,
             }
         }
     }
+    gd_progress_finish(&report.progress);
     gpt_generation_tokenizer_deinit(&generation_tokenizer);
+    gd_progress_deinit(&report.progress);
 }
 
 

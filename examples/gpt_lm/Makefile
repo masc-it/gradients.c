@@ -1,7 +1,4 @@
 ROOT := ../..
-BUILD_DIR := $(ROOT)/build
-LIB := $(BUILD_DIR)/libgradients.a
-METALLIB := $(BUILD_DIR)/gradients.metallib
 TRAIN_BIN := gd_main_gpt_lm
 INFER_BIN := gd_main_infer_gpt_lm
 GENERATE_BIN := gd_main_generate_gpt_lm
@@ -10,7 +7,7 @@ SHARED_SRC := gpt_lm_shared.c
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.gpt_lm_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.gpt_lm_gdds.args
-GPT_LM_DATASET ?= promessi
+GPT_LM_DATASET ?= ita_dict
 
 ifeq ($(GPT_LM_DATASET),ita_dict)
 DATA_SCRIPT := dataset_ita_dict.py
@@ -31,6 +28,7 @@ CORE_CFLAGS ?= -std=c11 -O2 -g3 -Wall -Wextra -Wpedantic -Werror \
                -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
                -Wmissing-prototypes -Wno-unused-parameter
 CORE_OBJCFLAGS ?= $$(CPPFLAGS) -O2 -g3 -Wall -Wextra -Werror -fobjc-arc
+include ../common.mk
 LDLIBS := -pthread -lm
 
 ifeq ($(UNAME_S),Darwin)
@@ -85,19 +83,16 @@ DATA_ARGS += --max-examples-per-definition $(GPT_LM_MAX_EXAMPLES_PER_DEFINITION)
 endif
 endif
 
-.PHONY: all run infer interactive build-lib tools data clean smoke overfit-smoke generate-smoke periodic-generate-smoke checkpoint-smoke FORCE
+.PHONY: all run infer interactive build-lib tools data data-tools clean smoke overfit-smoke generate-smoke periodic-generate-smoke checkpoint-smoke FORCE
 
 all: $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN)
 
-build-lib:
-	$(MAKE) -C $(ROOT) CFLAGS='$(CORE_CFLAGS)' OBJCFLAGS='$(CORE_OBJCFLAGS)' build
-
-tools:
-	$(MAKE) -C $(ROOT) tools
-
 data: $(DATA_STAMP)
 
-$(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/tok_utils.py tools
+data-tools:
+	$(MAKE) -C $(ROOT) tools
+
+$(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/tok_utils.py data-tools
 	@mkdir -p $(DATA_DIR)
 	@args='$(DATA_FORMAT_VERSION) $(DATA_ARGS)'; \
 	if [ -f '$(DATA_STAMP)' ] && [ -f '$(DATA_ARGS_FILE)' ] && \
@@ -112,34 +107,34 @@ $(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/to
 		touch '$(DATA_STAMP)'; \
 	fi
 
-$(TRAIN_BIN): main.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
-	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
+$(TRAIN_BIN): main.c gpt_lm_shared.h $(SHARED_SRC) $(GD_PROGRESS_DEPS) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(SHARED_SRC) $(GD_PROGRESS_SRC) $(LIB) $(LDLIBS) -o $@
 
-$(INFER_BIN): infer.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
+$(INFER_BIN): infer.c gpt_lm_shared.h $(SHARED_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) infer.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
-$(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) build-lib $(DATA_STAMP)
+$(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main_generate.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
-run: $(TRAIN_BIN)
+run: $(TRAIN_BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics $(ARGS)
 
-infer: $(INFER_BIN)
+infer: $(INFER_BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(INFER_BIN) --data-dir $(DATA_DIR) $(ARGS)
 
-interactive: $(GENERATE_BIN)
+interactive: $(GENERATE_BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(GENERATE_BIN) --data-dir $(DATA_DIR) $(ARGS)
 
-overfit-smoke: $(BIN)
+overfit-smoke: $(BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --no-save-best $(ARGS)
 
-generate-smoke: $(BIN)
+generate-smoke: $(BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 0 --generate "Don Abbondio" --max-new-tokens 16 $(ARGS)
 
-periodic-generate-smoke: $(BIN)
+periodic-generate-smoke: $(BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 1 --overfit-num-samples 1 --report-every 1 --generate-every-n-steps 1 --max-new-tokens 4 --no-save-best $(ARGS)
 
-checkpoint-smoke: $(TRAIN_BIN) $(INFER_BIN)
+checkpoint-smoke: $(TRAIN_BIN) $(INFER_BIN) $(DATA_STAMP)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(TRAIN_BIN) --data-dir $(DATA_DIR) --metrics-dir $(ROOT)/data/metrics --epochs 1 --batch-size 32 --overfit-num-samples 32 --report-every 1 --checkpoint-path checkpoints/smoke_best.gdckpt $(ARGS)
 	GRADIENTS_METALLIB=$(METALLIB) ./$(INFER_BIN) --data-dir $(DATA_DIR) --checkpoint checkpoints/smoke_best.gdckpt --prompt "Don Abbondio" --max-new-tokens 8 $(ARGS)
 

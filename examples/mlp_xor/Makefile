@@ -1,7 +1,4 @@
 ROOT := ../..
-BUILD_DIR := $(ROOT)/build
-LIB := $(BUILD_DIR)/libgradients.a
-METALLIB := $(BUILD_DIR)/gradients.metallib
 BIN := gd_main_mlp_xor
 DATASET := data/xor-00000.gdds
 
@@ -10,6 +7,7 @@ PYTHON ?= python3
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
+include ../common.mk
 LDLIBS := -pthread
 
 ifeq ($(UNAME_S),Darwin)
@@ -20,13 +18,10 @@ endif
 
 all: $(BIN)
 
-build-lib:
-	$(MAKE) -C $(ROOT) build
-
 $(DATASET): dataset.py $(ROOT)/tools/gdds_utils.py
 	$(PYTHON) dataset.py --out-dir data --split xor
 
-$(BIN): main.c build-lib $(DATASET)
+$(BIN): main.c $(LIB) $(DATASET)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(LIB) $(LDLIBS) -o $@
 
 run: $(BIN)

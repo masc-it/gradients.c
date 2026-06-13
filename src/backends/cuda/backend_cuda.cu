@@ -1,5 +1,6 @@
 #include "cuda_backend_internal.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,27 @@ gd_status gd_cuda_status(cudaError_t err)
         return GD_ERR_UNSUPPORTED;
     }
     return GD_ERR_INTERNAL;
+}
+
+gd_status gd_cublas_status(cublasStatus_t status)
+{
+    switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+        return GD_OK;
+    case CUBLAS_STATUS_ALLOC_FAILED:
+        return GD_ERR_OUT_OF_MEMORY;
+    case CUBLAS_STATUS_INVALID_VALUE:
+        return GD_ERR_INVALID_ARGUMENT;
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+        return GD_ERR_UNSUPPORTED;
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+    case CUBLAS_STATUS_MAPPING_ERROR:
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+    default:
+        return GD_ERR_INTERNAL;
+    }
 }
 
 bool gd_cuda_byte_range_valid(const gd_backend_buffer *buffer, size_t offset, size_t nbytes)
@@ -85,10 +107,112 @@ static gd_status gd_cuda_activate(gd_backend *backend)
     return gd_cuda_status(cudaSetDevice(backend->device));
 }
 
+static bool gd_cuda_size_add(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || a > SIZE_MAX - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+static bool gd_cuda_matrix_bounds_ok(const gd_backend_matrix_view *view)
+{
+    const size_t elem_size = 2U;
+    size_t last_row;
+    size_t row_span;
+    size_t matrix_bytes;
+    if (view == NULL || view->buffer == NULL || view->rows == 0U || view->cols == 0U ||
+        view->dtype != 1U || (view->row_bytes % elem_size) != 0U ||
+        (size_t)view->cols > SIZE_MAX / elem_size ||
+        view->row_bytes < (size_t)view->cols * elem_size ||
+        (size_t)(view->rows - 1U) > SIZE_MAX / view->row_bytes) {
+        return false;
+    }
+    last_row = (size_t)(view->rows - 1U) * view->row_bytes;
+    row_span = (size_t)view->cols * elem_size;
+    if (!gd_cuda_size_add(last_row, row_span, &matrix_bytes)) {
+        return false;
+    }
+    return gd_cuda_byte_range_valid(view->buffer, view->offset, matrix_bytes);
+}
+
+static bool gd_cuda_matrix_ld(const gd_backend_matrix_view *view, int *out_ld)
+{
+    size_t ld;
+    if (view == NULL || out_ld == NULL || (view->row_bytes % 2U) != 0U) {
+        return false;
+    }
+    ld = view->row_bytes / 2U;
+    if (ld == 0U || ld > (size_t)INT_MAX) {
+        return false;
+    }
+    *out_ld = (int)ld;
+    return true;
+}
+
+static bool gd_cuda_matrix_dims_fit_int(uint32_t a, uint32_t b, uint32_t c)
+{
+    return a <= (uint32_t)INT_MAX && b <= (uint32_t)INT_MAX && c <= (uint32_t)INT_MAX;
+}
+
+static gd_status gd_cuda_cublas_gemm(gd_backend *backend,
+                                     cublasOperation_t op_a,
+                                     cublasOperation_t op_b,
+                                     const gd_backend_matrix_view *a,
+                                     const gd_backend_matrix_view *b,
+                                     const gd_backend_matrix_view *c,
+                                     int m,
+                                     int n,
+                                     int k)
+{
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    int lda;
+    int ldb;
+    int ldc;
+    gd_status st;
+    cublasStatus_t cb;
+    if (backend == NULL || backend->cublas == NULL || a == NULL || b == NULL || c == NULL ||
+        m <= 0 || n <= 0 || k <= 0 || !gd_cuda_matrix_ld(a, &lda) ||
+        !gd_cuda_matrix_ld(b, &ldb) || !gd_cuda_matrix_ld(c, &ldc)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    st = gd_cuda_activate(backend);
+    if (st != GD_OK) {
+        return st;
+    }
+    cb = cublasGemmEx(backend->cublas,
+                      op_a,
+                      op_b,
+                      m,
+                      n,
+                      k,
+                      &alpha,
+                      (const unsigned char *)a->buffer->ptr + a->offset,
+                      CUDA_R_16F,
+                      lda,
+                      (const unsigned char *)b->buffer->ptr + b->offset,
+                      CUDA_R_16F,
+                      ldb,
+                      &beta,
+                      (unsigned char *)c->buffer->ptr + c->offset,
+                      CUDA_R_16F,
+                      ldc,
+                      CUBLAS_COMPUTE_32F,
+                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    st = gd_cublas_status(cb);
+    if (st != GD_OK) {
+        return st;
+    }
+    return gd_cuda_finish_if_immediate(backend);
+}
+
 gd_status gd_backend_create_default(gd_backend **out_backend)
 {
     gd_backend *backend;
     cudaError_t err;
+    cublasStatus_t cb;
     int device_count;
     if (out_backend == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
@@ -119,6 +243,24 @@ gd_status gd_backend_create_default(gd_backend **out_backend)
         free(backend);
         return gd_cuda_status(err);
     }
+    cb = cublasCreate(&backend->cublas);
+    if (cb != CUBLAS_STATUS_SUCCESS) {
+        (void)cudaStreamDestroy(backend->transfer_stream);
+        (void)cudaStreamDestroy(backend->stream);
+        free(backend);
+        return gd_cublas_status(cb);
+    }
+    cb = cublasSetStream(backend->cublas, backend->stream);
+    if (cb == CUBLAS_STATUS_SUCCESS) {
+        cb = cublasSetMathMode(backend->cublas, CUBLAS_TENSOR_OP_MATH);
+    }
+    if (cb != CUBLAS_STATUS_SUCCESS) {
+        (void)cublasDestroy(backend->cublas);
+        (void)cudaStreamDestroy(backend->transfer_stream);
+        (void)cudaStreamDestroy(backend->stream);
+        free(backend);
+        return gd_cublas_status(cb);
+    }
     backend->memory_mode = gd_cuda_memory_mode_from_env();
     backend->scope_active = false;
     *out_backend = backend;
@@ -136,6 +278,11 @@ void gd_backend_destroy(gd_backend *backend)
     }
     if (backend->transfer_stream != NULL) {
         (void)cudaStreamSynchronize(backend->transfer_stream);
+    }
+    if (backend->cublas != NULL) {
+        (void)cublasDestroy(backend->cublas);
+    }
+    if (backend->transfer_stream != NULL) {
         (void)cudaStreamDestroy(backend->transfer_stream);
     }
     if (backend->stream != NULL) {
@@ -360,11 +507,28 @@ gd_status gd_backend_matmul(gd_backend *backend,
                             const gd_backend_matrix_view *w,
                             const gd_backend_matrix_view *y)
 {
-    (void)backend;
-    (void)x;
-    (void)w;
-    (void)y;
-    return GD_ERR_UNSUPPORTED;
+    if (backend == NULL || x == NULL || w == NULL || y == NULL ||
+        !gd_cuda_matrix_bounds_ok(x) || !gd_cuda_matrix_bounds_ok(w) ||
+        !gd_cuda_matrix_bounds_ok(y) || x->dtype != w->dtype || x->dtype != y->dtype) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (x->cols != w->rows || x->rows != y->rows || w->cols != y->cols) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_cuda_matrix_dims_fit_int(y->cols, y->rows, x->cols)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    /* Row-major Y = X * W is column-major Y^T = W^T_storage * X^T_storage.
+     * Swapping operands lets cuBLAS consume row-major tensors without copies. */
+    return gd_cuda_cublas_gemm(backend,
+                               CUBLAS_OP_N,
+                               CUBLAS_OP_N,
+                               w,
+                               x,
+                               y,
+                               (int)y->cols,
+                               (int)y->rows,
+                               (int)x->cols);
 }
 
 gd_status gd_backend_matmul_nt(gd_backend *backend,
@@ -372,11 +536,27 @@ gd_status gd_backend_matmul_nt(gd_backend *backend,
                                const gd_backend_matrix_view *w,
                                const gd_backend_matrix_view *y)
 {
-    (void)backend;
-    (void)x;
-    (void)w;
-    (void)y;
-    return GD_ERR_UNSUPPORTED;
+    if (backend == NULL || x == NULL || w == NULL || y == NULL ||
+        !gd_cuda_matrix_bounds_ok(x) || !gd_cuda_matrix_bounds_ok(w) ||
+        !gd_cuda_matrix_bounds_ok(y) || x->dtype != w->dtype || x->dtype != y->dtype) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (x->cols != w->cols || x->rows != y->rows || w->rows != y->cols) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_cuda_matrix_dims_fit_int(y->cols, y->rows, x->cols)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    /* Row-major Y = X * W^T maps to column-major Y^T = W * X^T_storage. */
+    return gd_cuda_cublas_gemm(backend,
+                               CUBLAS_OP_T,
+                               CUBLAS_OP_N,
+                               w,
+                               x,
+                               y,
+                               (int)y->cols,
+                               (int)y->rows,
+                               (int)x->cols);
 }
 
 gd_status gd_backend_matmul_tn(gd_backend *backend,
@@ -384,11 +564,27 @@ gd_status gd_backend_matmul_tn(gd_backend *backend,
                                const gd_backend_matrix_view *w,
                                const gd_backend_matrix_view *y)
 {
-    (void)backend;
-    (void)x;
-    (void)w;
-    (void)y;
-    return GD_ERR_UNSUPPORTED;
+    if (backend == NULL || x == NULL || w == NULL || y == NULL ||
+        !gd_cuda_matrix_bounds_ok(x) || !gd_cuda_matrix_bounds_ok(w) ||
+        !gd_cuda_matrix_bounds_ok(y) || x->dtype != w->dtype || x->dtype != y->dtype) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (x->rows != w->rows || x->cols != y->rows || w->cols != y->cols) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (!gd_cuda_matrix_dims_fit_int(y->cols, y->rows, x->rows)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    /* Row-major Y = X^T * W maps to column-major Y^T = W^T_storage * X. */
+    return gd_cuda_cublas_gemm(backend,
+                               CUBLAS_OP_N,
+                               CUBLAS_OP_T,
+                               w,
+                               x,
+                               y,
+                               (int)y->cols,
+                               (int)y->rows,
+                               (int)x->rows);
 }
 
 gd_status gd_backend_batched_matmul(gd_backend *backend,

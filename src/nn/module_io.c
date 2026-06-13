@@ -104,6 +104,7 @@ static gd_status gd_ckpt_join_path(const char *prefix,
 static gd_status gd_ckpt_state_list_reserve(gd_ckpt_state_list *list)
 {
     gd_ckpt_state_entry *grown;
+    size_t max_items;
     uint32_t new_capacity;
     if (list == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
@@ -112,8 +113,8 @@ static gd_status gd_ckpt_state_list_reserve(gd_ckpt_state_list *list)
         return GD_OK;
     }
     new_capacity = list->capacity == 0U ? 16U : list->capacity * 2U;
-    if (new_capacity <= list->capacity ||
-        (size_t)new_capacity > SIZE_MAX / sizeof(list->items[0])) {
+    max_items = SIZE_MAX / sizeof(list->items[0]);
+    if (new_capacity <= list->capacity || (size_t)new_capacity > max_items) {
         return GD_ERR_OUT_OF_MEMORY;
     }
     grown = (gd_ckpt_state_entry *)realloc(list->items,
@@ -507,8 +508,11 @@ static gd_status gd_ckpt_read_dir(FILE *file,
     if (out->count == 0U) {
         return GD_OK;
     }
-    if ((size_t)out->count > SIZE_MAX / sizeof(out->items[0])) {
-        return GD_ERR_OUT_OF_MEMORY;
+    {
+        const size_t max_items = SIZE_MAX / sizeof(out->items[0]);
+        if ((size_t)out->count > max_items) {
+            return GD_ERR_OUT_OF_MEMORY;
+        }
     }
     out->items = (gd_ckpt_file_entry *)calloc((size_t)out->count, sizeof(out->items[0]));
     if (out->items == NULL) {

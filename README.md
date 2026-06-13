@@ -13,4 +13,4 @@ Supported backends as of now: Metal
 Operators live as per-op capsules under `src/ops/<op>/`. Registries are generated
 from filenames by `tools/gen_ops.c`; do not hand-edit `build/generated/*`.
 
-More details in docs/rules/add_new_op.md
+More details in docs/guides/register_op.md

@@ -7,6 +7,10 @@
 
 #include <gradients/status.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct gd_backend gd_backend;
 typedef struct gd_backend_buffer gd_backend_buffer;
 
@@ -16,6 +20,7 @@ typedef struct gd_backend_fence {
 
 typedef enum gd_backend_kind {
     GD_BACKEND_METAL = 1,
+    GD_BACKEND_CUDA = 2,
 } gd_backend_kind;
 
 typedef struct gd_backend_matrix_view {
@@ -745,5 +750,9 @@ gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fen
 void gd_backend_fence_destroy(gd_backend_fence *fence);
 bool gd_backend_fence_is_complete(gd_backend_fence *fence);
 gd_status gd_backend_fence_wait(gd_backend_fence *fence);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GD_CORE_BACKEND_H */

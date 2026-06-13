@@ -133,3 +133,80 @@ Extend `tools/gen_ops.c` to generate CUDA backend registration/stub glue if need
 ## Bottom line
 
 The existing architecture is promising for adding CUDA, but the project is not CUDA-ready yet. Do a small backend abstraction/build refactor and CUDA skeleton first, then start porting kernels.
+
+## CUDA memory management plan
+
+The current design is close to supporting proper CUDA memory, but the implementation still assumes M-series-style host-visible GPU buffers in several places. This is acceptable for a first CUDA correctness pass with `cudaMallocManaged`, but not for a performance-oriented CUDA backend.
+
+### What already works architecturally
+
+- Tensor descriptors already reference backend storage by `buffer + offset`, not by raw host pointers only.
+- Backend ops already receive backend-neutral views such as `gd_backend_tensor_view`.
+- Public transfer APIs already exist and should become the required host/device boundary:
+  - `gd_span_upload`
+  - `gd_span_download`
+  - `gd_tensor_write`
+  - `gd_tensor_read`
+  - `gd_upload`
+  - `gd_download`
+  - `gd_tensor_from_f32`
+- Arena suballocation can work over CUDA device buffers as long as offsets remain valid.
+
+### Current blocker
+
+Core memory currently requires every backend arena buffer to be host-visible:
+
+- `gd_arena_init()` rejects buffers where `gd_backend_buffer_is_host_visible()` is false.
+- `gd_span` stores `host_ptr` and arena allocation fills it unconditionally from `arena->base + offset`.
+- Dataloader writes directly into tensor storage with `memcpy(field->tensor.storage.host_ptr, ...)`.
+- Some tests/probes expect `span.host_ptr != NULL`.
+
+That is incompatible with normal CUDA `cudaMalloc` device-local allocations.
+
+### Required refactor
+
+1. Make `host_ptr` optional.
+   - CUDA device buffers should be allowed to return `NULL` from `gd_backend_buffer_host_ptr()`.
+   - `gd_backend_buffer_is_host_visible()` should be false for normal CUDA device-local buffers.
+
+2. Allow arenas backed by non-host-visible buffers.
+   - Remove the hard rejection in `gd_arena_init()`.
+   - Store `arena->base = NULL` for device-local buffers.
+   - In `gd_arena_alloc()`, set:
+
+   ```c
+   out->host_ptr = arena->base != NULL ? arena->base + off : NULL;
+   ```
+
+3. Keep span validation compatible with optional host pointers.
+   - If `arena->base == NULL`, validate only arena kind/slot/generation/buffer/offset/range.
+   - If `arena->base != NULL`, continue checking `span->host_ptr == arena->base + span->offset`.
+
+4. Replace dataloader direct writes with explicit backend upload.
+   - Replace host-pointer `memcpy` with:
+
+   ```c
+   gd_span_upload(ctx, &field->tensor.storage, 0U, field->host_data, field->nbytes);
+   ```
+
+5. Update tests/probes.
+   - Stop requiring `span.host_ptr != NULL` for all backends.
+   - Only assert host pointer availability when the selected backend guarantees host-visible storage.
+   - Add CUDA-specific tests for explicit upload/download.
+
+6. Add CUDA allocation modes.
+   - Bring-up/debug mode: `cudaMallocManaged`.
+   - Production default: `cudaMalloc` device-local arena buffers.
+   - Optional staging path: `cudaHostAlloc` / `cudaMallocHost` pinned host buffers for faster async transfers.
+
+### Recommended order
+
+1. Keep managed memory while bringing up initial CUDA ops.
+2. Refactor core memory so `host_ptr` is optional.
+3. Switch CUDA backend buffers from `cudaMallocManaged` to `cudaMalloc`.
+4. Make dataloader and all CPU interactions use upload/download paths.
+5. Add pinned staging and asynchronous transfer optimization after correctness is stable.
+
+### Bottom line for CUDA memory
+
+There is no fundamental design problem: tensors and ops are already backend-buffer oriented. The implementation needs a focused memory-model refactor to stop assuming host-visible storage everywhere. After that, `gd_tensor_empty(ctx, ...)` under `BACKEND=cuda` can behave like a PyTorch CUDA tensor allocation, while `gd_tensor_write/read` and dataloader upload paths handle host/device transfer explicitly.

@@ -1,24 +1,10 @@
-#include "../../core/backend.h"
-
-#include <cuda_runtime.h>
+#include "cuda_backend_internal.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define GD_CUDA_FILL_THREADS 256U
-
-struct gd_backend {
-    cudaStream_t stream;
-    bool scope_active;
-};
-
-struct gd_backend_buffer {
-    void *ptr;
-    size_t nbytes;
-};
-
-static gd_status gd_cuda_status(cudaError_t err)
+gd_status gd_cuda_status(cudaError_t err)
 {
     if (err == cudaSuccess) {
         return GD_OK;
@@ -32,12 +18,12 @@ static gd_status gd_cuda_status(cudaError_t err)
     return GD_ERR_INTERNAL;
 }
 
-static bool gd_cuda_byte_range_valid(const gd_backend_buffer *buffer, size_t offset, size_t nbytes)
+bool gd_cuda_byte_range_valid(const gd_backend_buffer *buffer, size_t offset, size_t nbytes)
 {
     return buffer != NULL && offset <= buffer->nbytes && nbytes <= buffer->nbytes - offset;
 }
 
-static bool gd_cuda_count_bytes(size_t count, size_t elem_size, size_t *out_nbytes)
+bool gd_cuda_count_bytes(size_t count, size_t elem_size, size_t *out_nbytes)
 {
     if (out_nbytes == NULL || count == 0U || elem_size == 0U || count > SIZE_MAX / elem_size) {
         return false;
@@ -46,7 +32,7 @@ static bool gd_cuda_count_bytes(size_t count, size_t elem_size, size_t *out_nbyt
     return true;
 }
 
-static gd_status gd_cuda_finish_if_immediate(gd_backend *backend)
+gd_status gd_cuda_finish_if_immediate(gd_backend *backend)
 {
     if (backend == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
@@ -275,8 +261,8 @@ gd_status gd_backend_fill(gd_backend *backend,
         !gd_cuda_byte_range_valid(buffer, offset, nbytes)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    blocks = (unsigned int)((count + GD_CUDA_FILL_THREADS - 1U) / GD_CUDA_FILL_THREADS);
-    gd_cuda_fill_kernel<<<blocks, GD_CUDA_FILL_THREADS, 0U, backend->stream>>>(
+    blocks = gd_cuda_blocks_for_count(count, GD_CUDA_DEFAULT_THREADS_PER_BLOCK);
+    gd_cuda_fill_kernel<<<blocks, GD_CUDA_DEFAULT_THREADS_PER_BLOCK, 0U, backend->stream>>>(
         (unsigned char *)buffer->ptr,
         offset,
         count,

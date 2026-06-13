@@ -16,6 +16,8 @@ typedef struct gd_new_op_options {
     const char *op;
     bool binary;
     bool no_backend;
+    bool emit_metal;
+    bool emit_cuda;
     bool f16_only;
     bool f16_f32_accum;
     bool save_stats;
@@ -169,11 +171,20 @@ static bool gd_make_option_notes(char *out,
         return false;
     }
     out[0] = '\0';
-    if (!gd_fixed_append_note(out,
+    if (opts->emit_metal &&
+        !gd_fixed_append_note(out,
                               out_size,
                               &len,
                               indent,
                               "See docs/guides/metal_tips.md before implementing Metal hot paths.")) {
+        return false;
+    }
+    if (opts->emit_cuda &&
+        !gd_fixed_append_note(out,
+                              out_size,
+                              &len,
+                              indent,
+                              "CUDA op capsules use src/backends/cuda/cuda_backend_internal.h and are built with BACKEND=cuda.")) {
         return false;
     }
     if (opts->no_backend &&
@@ -181,7 +192,7 @@ static bool gd_make_option_notes(char *out,
                               out_size,
                               &len,
                               indent,
-                              "Custom backend mode: generated backend stubs are omitted; add custom backend declarations/PSOs manually.")) {
+                              "Custom backend mode: generated backend stubs are omitted; add custom backend declarations/dispatch manually.")) {
         return false;
     }
     if (opts->f16_only &&
@@ -748,6 +759,290 @@ static bool gd_make_metal_kernel_content(char *out,
     return n >= 0 && (size_t)n < out_size;
 }
 
+static bool gd_make_cuda_content_custom(char *out,
+                                        size_t out_size,
+                                        const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, "   ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/cuda/cuda_backend_internal.h\"\n"
+                 "#include \"cuda_%s_types.h\"\n"
+                 "\n"
+                 "/* Custom CUDA backend capsule for '%s'.\n"
+                 "\n"
+                 "   backend= is omitted in op_%s.def. Add custom backend declarations\n"
+                 "   to src/core/backend.h and implement CUDA dispatch here when this\n"
+                 "   op needs custom backend entry points.\n"
+                 "\n"
+                 "%s"
+                 "*/\n"
+                 "typedef int gd_%s_cuda_scaffold_anchor;\n",
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_cuda_content_binary(char *out,
+                                        size_t out_size,
+                                        const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/cuda/cuda_backend_internal.h\"\n"
+                 "#include \"cuda_%s_types.h\"\n"
+                 "\n"
+                 "/* CUDA backend scaffold for '%s'.\n"
+                 "%s"
+                 " * TODO: validate direct/broadcast views, fill gd_cuda_%s_args,\n"
+                 " * launch gd_cuda_%s_kernel variants on gd_cuda_stream(backend),\n"
+                 " * and finish with gd_cuda_finish_if_immediate(). Return\n"
+                 " * GD_ERR_UNSUPPORTED until implemented.\n"
+                 " */\n"
+                 "__global__ void gd_cuda_%s_kernel(const unsigned char *x,\n"
+                 "                                  const unsigned char *y,\n"
+                 "                                  unsigned char *out,\n"
+                 "                                  gd_cuda_%s_args args)\n"
+                 "{\n"
+                 "    const size_t gid = ((size_t)blockIdx.x * (size_t)blockDim.x) + (size_t)threadIdx.x;\n"
+                 "    if (gid >= args.count) {\n"
+                 "        return;\n"
+                 "    }\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)out;\n"
+                 "    (void)args;\n"
+                 "}\n"
+                 "\n"
+                 "__global__ void gd_cuda_%s_bcast_kernel(const unsigned char *x,\n"
+                 "                                        const unsigned char *y,\n"
+                 "                                        unsigned char *out,\n"
+                 "                                        gd_cuda_%s_args args)\n"
+                 "{\n"
+                 "    const size_t gid = ((size_t)blockIdx.x * (size_t)blockDim.x) + (size_t)threadIdx.x;\n"
+                 "    if (gid >= args.count) {\n"
+                 "        return;\n"
+                 "    }\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)out;\n"
+                 "    (void)args;\n"
+                 "}\n"
+                 "\n"
+                 "__global__ void gd_cuda_%s_row_bcast_kernel(const unsigned char *x,\n"
+                 "                                            const unsigned char *y,\n"
+                 "                                            unsigned char *out,\n"
+                 "                                            gd_cuda_%s_args args)\n"
+                 "{\n"
+                 "    const size_t gid = ((size_t)blockIdx.x * (size_t)blockDim.x) + (size_t)threadIdx.x;\n"
+                 "    if (gid >= args.count) {\n"
+                 "        return;\n"
+                 "    }\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)out;\n"
+                 "    (void)args;\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s(gd_backend *backend,\n"
+                 "                        const gd_backend_tensor_view *x,\n"
+                 "                        const gd_backend_tensor_view *y,\n"
+                 "                        const gd_backend_tensor_view *out)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || y == NULL || out == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_cuda_stream(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)out;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_cuda_content_unary(char *out,
+                                       size_t out_size,
+                                       const gd_new_op_options *opts)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#include \"../../backends/cuda/cuda_backend_internal.h\"\n"
+                 "#include \"cuda_%s_types.h\"\n"
+                 "\n"
+                 "/* CUDA backend scaffold for '%s'.\n"
+                 "%s"
+                 " * TODO: validate contiguous views, fill gd_cuda_%s_args, launch\n"
+                 " * gd_cuda_%s_kernel / gd_cuda_%s_backward_kernel on\n"
+                 " * gd_cuda_stream(backend), and finish with\n"
+                 " * gd_cuda_finish_if_immediate(). Return GD_ERR_UNSUPPORTED until implemented.\n"
+                 " */\n"
+                 "__global__ void gd_cuda_%s_kernel(const unsigned char *x,\n"
+                 "                                  unsigned char *y,\n"
+                 "                                  gd_cuda_%s_args args)\n"
+                 "{\n"
+                 "    const size_t gid = ((size_t)blockIdx.x * (size_t)blockDim.x) + (size_t)threadIdx.x;\n"
+                 "    if (gid >= args.count) {\n"
+                 "        return;\n"
+                 "    }\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    (void)args;\n"
+                 "}\n"
+                 "\n"
+                 "__global__ void gd_cuda_%s_backward_kernel(const unsigned char *x,\n"
+                 "                                           const unsigned char *grad_out,\n"
+                 "                                           unsigned char *grad_x,\n"
+                 "                                           gd_cuda_%s_args args)\n"
+                 "{\n"
+                 "    const size_t gid = ((size_t)blockIdx.x * (size_t)blockDim.x) + (size_t)threadIdx.x;\n"
+                 "    if (gid >= args.count) {\n"
+                 "        return;\n"
+                 "    }\n"
+                 "    (void)x;\n"
+                 "    (void)grad_out;\n"
+                 "    (void)grad_x;\n"
+                 "    (void)args;\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s(gd_backend *backend,\n"
+                 "                        const gd_backend_tensor_view *x,\n"
+                 "                        const gd_backend_tensor_view *y)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || y == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_cuda_stream(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)y;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n"
+                 "\n"
+                 "gd_status gd_backend_%s_backward(gd_backend *backend,\n"
+                 "                                 const gd_backend_tensor_view *x,\n"
+                 "                                 const gd_backend_tensor_view *grad_out,\n"
+                 "                                 const gd_backend_tensor_view *grad_x)\n"
+                 "{\n"
+                 "    if (backend == NULL || x == NULL || grad_out == NULL || grad_x == NULL) {\n"
+                 "        return GD_ERR_INVALID_ARGUMENT;\n"
+                 "    }\n"
+                 "    (void)gd_cuda_stream(backend);\n"
+                 "    (void)x;\n"
+                 "    (void)grad_out;\n"
+                 "    (void)grad_x;\n"
+                 "    return GD_ERR_UNSUPPORTED;\n"
+                 "}\n",
+                 opts->op,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+static bool gd_make_cuda_content(char *out,
+                                 size_t out_size,
+                                 const gd_new_op_options *opts)
+{
+    if (opts == NULL) {
+        return false;
+    }
+    if (opts->no_backend) {
+        return gd_make_cuda_content_custom(out, out_size, opts);
+    }
+    if (opts->binary) {
+        return gd_make_cuda_content_binary(out, out_size, opts);
+    }
+    return gd_make_cuda_content_unary(out, out_size, opts);
+}
+
+static bool gd_make_cuda_types_content(char *out,
+                                       size_t out_size,
+                                       const gd_new_op_options *opts,
+                                       const char *upper)
+{
+    char notes[GD_NEW_OP_NOTES_MAX];
+    int n;
+    if (out == NULL || opts == NULL || upper == NULL) {
+        return false;
+    }
+    if (!gd_make_option_notes(notes, sizeof(notes), opts, " * ")) {
+        return false;
+    }
+    n = snprintf(out,
+                 out_size,
+                 "#ifndef GD_OP_%s_CUDA_TYPES_H\n"
+                 "#define GD_OP_%s_CUDA_TYPES_H\n"
+                 "\n"
+                 "/* Op-local CUDA ABI types for %s. Keep host/device layouts in sync.\n"
+                 "%s"
+                 " */\n"
+                 "#include <stddef.h>\n"
+                 "#include <stdint.h>\n"
+                 "\n"
+                 "typedef struct gd_cuda_%s_args {\n"
+                 "    size_t x_offset;\n"
+                 "    size_t y_offset;\n"
+                 "    size_t out_or_grad_offset;\n"
+                 "    size_t count;\n"
+                 "    uint32_t dtype;\n"
+                 "    uint32_t pad0;\n"
+                 "} gd_cuda_%s_args;\n"
+                 "\n"
+                 "#ifdef __cplusplus\n"
+                 "static_assert(sizeof(gd_cuda_%s_args) == (sizeof(size_t) * 4U) + 8U,\n"
+                 "              \"gd_cuda_%s_args ABI mismatch\");\n"
+                 "#endif\n"
+                 "\n"
+                 "#endif /* GD_OP_%s_CUDA_TYPES_H */\n",
+                 upper,
+                 upper,
+                 opts->op,
+                 notes,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 opts->op,
+                 upper);
+    return n >= 0 && (size_t)n < out_size;
+}
+
 static bool gd_make_fwd_py_content(char *out, size_t out_size, const char *op)
 {
     int n = snprintf(out,
@@ -1026,16 +1321,45 @@ static bool gd_make_readme_content(char *out,
                                    const gd_new_op_options *opts)
 {
     char notes[GD_NEW_OP_NOTES_MAX];
+    char metal_lines[512];
+    char cuda_lines[512];
     int n;
     if (!gd_make_option_notes(notes, sizeof(notes), opts, "- ")) {
         return false;
+    }
+    metal_lines[0] = '\0';
+    cuda_lines[0] = '\0';
+    if (opts->emit_metal) {
+        n = snprintf(metal_lines,
+                     sizeof(metal_lines),
+                     "- [ ] Metal backend dispatch in `metal_%s.m`\n"
+                     "- [ ] Op-local Metal ABI/kernel implementation in `metal_%s_types.h` / `metal_%s.metal`\n",
+                     opts->op,
+                     opts->op,
+                     opts->op);
+        if (n < 0 || (size_t)n >= sizeof(metal_lines)) {
+            return false;
+        }
+    }
+    if (opts->emit_cuda) {
+        n = snprintf(cuda_lines,
+                     sizeof(cuda_lines),
+                     "- [ ] CUDA backend dispatch in `cuda_%s.cu`\n"
+                     "- [ ] Op-local CUDA ABI/kernel implementation in `cuda_%s_types.h` / `cuda_%s.cu`\n",
+                     opts->op,
+                     opts->op,
+                     opts->op);
+        if (n < 0 || (size_t)n >= sizeof(cuda_lines)) {
+            return false;
+        }
     }
     n = snprintf(out,
                  out_size,
                  "# %s\n"
                  "\n"
                  "Generated op capsule scaffold. Before implementing Metal hot paths, read\n"
-                 "[Metal performance tips](../../../docs/guides/metal_tips.md).\n"
+                 "[Metal performance tips](../../../docs/guides/metal_tips.md). CUDA capsules\n"
+                 "are built and validated with `make BACKEND=cuda build` / `make BACKEND=cuda cuda-probe`.\n"
                  "\n"
                  "Scaffold notes:\n"
                  "\n"
@@ -1045,8 +1369,8 @@ static bool gd_make_readme_content(char *out,
                  "\n"
                  "- [ ] Public API generated in `include/gradients/ops_generated.h`\n"
                  "- [ ] Forward validation/allocation/recording in `core_%s.c`\n"
-                 "- [ ] Backend dispatch in `metal_%s.m`\n"
-                 "- [ ] Op-local Metal ABI/kernel implementation in `metal_%s_types.h` / `metal_%s.metal`\n"
+                 "%s"
+                 "%s"
                  "- [ ] Backward rule in `autograd_%s.c`\n"
                  "- [ ] Forward PyTorch harness in `fwd.py`\n"
                  "- [ ] Backward PyTorch harness in `bwd.py`\n"
@@ -1055,9 +1379,8 @@ static bool gd_make_readme_content(char *out,
                  opts->op,
                  notes,
                  opts->op,
-                 opts->op,
-                 opts->op,
-                 opts->op,
+                 metal_lines,
+                 cuda_lines,
                  opts->op,
                  opts->op);
     return n >= 0 && (size_t)n < out_size;
@@ -1155,6 +1478,10 @@ static void gd_print_usage(const char *argv0)
             "Options:\n"
             "  --binary          scaffold binary public API/backend shape (default unary)\n"
             "  --unary           scaffold unary public API/backend shape\n"
+            "  --cuda-only       emit CUDA backend scaffold only\n"
+            "  --metal-only      emit Metal backend scaffold only\n"
+            "  --no-cuda         do not emit CUDA backend scaffold\n"
+            "  --no-metal        do not emit Metal backend scaffold\n"
             "  --no-backend      omit generated backend= metadata for custom backend entry points\n"
             "  --custom          alias for --no-backend\n"
             "  --f16-only        annotate/scaffold for F16-specialized hot kernels\n"
@@ -1172,6 +1499,8 @@ static int gd_parse_args(int argc, char **argv, gd_new_op_options *opts)
         return 2;
     }
     memset(opts, 0, sizeof(*opts));
+    opts->emit_metal = true;
+    opts->emit_cuda = true;
     for (i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
@@ -1183,6 +1512,24 @@ static int gd_parse_args(int argc, char **argv, gd_new_op_options *opts)
         }
         if (strcmp(arg, "--unary") == 0) {
             opts->binary = false;
+            continue;
+        }
+        if (strcmp(arg, "--cuda-only") == 0) {
+            opts->emit_cuda = true;
+            opts->emit_metal = false;
+            continue;
+        }
+        if (strcmp(arg, "--metal-only") == 0) {
+            opts->emit_metal = true;
+            opts->emit_cuda = false;
+            continue;
+        }
+        if (strcmp(arg, "--no-cuda") == 0) {
+            opts->emit_cuda = false;
+            continue;
+        }
+        if (strcmp(arg, "--no-metal") == 0) {
+            opts->emit_metal = false;
             continue;
         }
         if (strcmp(arg, "--no-backend") == 0 || strcmp(arg, "--custom") == 0) {
@@ -1219,6 +1566,10 @@ static int gd_parse_args(int argc, char **argv, gd_new_op_options *opts)
         fprintf(stderr, "gradients-new-op: missing op name\n");
         return 2;
     }
+    if (!opts->emit_metal && !opts->emit_cuda) {
+        fprintf(stderr, "gradients-new-op: at least one backend scaffold must be enabled\n");
+        return 2;
+    }
     if (!gd_valid_op_name(opts->op)) {
         fprintf(stderr,
                 "gradients-new-op: invalid op name '%s' (use snake_case: [a-z][a-z0-9_]*, no trailing/double underscores)\n",
@@ -1240,6 +1591,8 @@ int main(int argc, char **argv)
     char metal_path[GD_NEW_OP_PATH_MAX];
     char metal_types_path[GD_NEW_OP_PATH_MAX];
     char metal_kernel_path[GD_NEW_OP_PATH_MAX];
+    char cuda_path[GD_NEW_OP_PATH_MAX];
+    char cuda_types_path[GD_NEW_OP_PATH_MAX];
     char fwd_path[GD_NEW_OP_PATH_MAX];
     char bwd_path[GD_NEW_OP_PATH_MAX];
     char perf_path[GD_NEW_OP_PATH_MAX];
@@ -1263,6 +1616,8 @@ int main(int argc, char **argv)
         !gd_make_op_file_path(metal_path, sizeof(metal_path), opts.op, "metal_", ".m") ||
         !gd_make_op_file_path(metal_types_path, sizeof(metal_types_path), opts.op, "metal_", "_types.h") ||
         !gd_make_op_file_path(metal_kernel_path, sizeof(metal_kernel_path), opts.op, "metal_", ".metal") ||
+        !gd_make_op_file_path(cuda_path, sizeof(cuda_path), opts.op, "cuda_", ".cu") ||
+        !gd_make_op_file_path(cuda_types_path, sizeof(cuda_types_path), opts.op, "cuda_", "_types.h") ||
         !gd_make_op_named_path(fwd_path, sizeof(fwd_path), opts.op, "fwd.py") ||
         !gd_make_op_named_path(bwd_path, sizeof(bwd_path), opts.op, "bwd.py") ||
         !gd_make_op_named_path(perf_path, sizeof(perf_path), opts.op, "perf_test.c") ||
@@ -1285,17 +1640,29 @@ int main(int argc, char **argv)
         gd_write_new_file(autograd_path, content) != 0) {
         return 1;
     }
-    if (!gd_make_metal_content(content, sizeof(content), &opts, upper) ||
-        gd_write_new_file(metal_path, content) != 0) {
-        return 1;
+    if (opts.emit_metal) {
+        if (!gd_make_metal_content(content, sizeof(content), &opts, upper) ||
+            gd_write_new_file(metal_path, content) != 0) {
+            return 1;
+        }
+        if (!gd_make_metal_types_content(content, sizeof(content), &opts, upper) ||
+            gd_write_new_file(metal_types_path, content) != 0) {
+            return 1;
+        }
+        if (!gd_make_metal_kernel_content(content, sizeof(content), &opts) ||
+            gd_write_new_file(metal_kernel_path, content) != 0) {
+            return 1;
+        }
     }
-    if (!gd_make_metal_types_content(content, sizeof(content), &opts, upper) ||
-        gd_write_new_file(metal_types_path, content) != 0) {
-        return 1;
-    }
-    if (!gd_make_metal_kernel_content(content, sizeof(content), &opts) ||
-        gd_write_new_file(metal_kernel_path, content) != 0) {
-        return 1;
+    if (opts.emit_cuda) {
+        if (!gd_make_cuda_content(content, sizeof(content), &opts) ||
+            gd_write_new_file(cuda_path, content) != 0) {
+            return 1;
+        }
+        if (!gd_make_cuda_types_content(content, sizeof(content), &opts, upper) ||
+            gd_write_new_file(cuda_types_path, content) != 0) {
+            return 1;
+        }
     }
     if (!gd_make_fwd_py_content(content, sizeof(content), opts.op) ||
         gd_write_new_file(fwd_path, content) != 0) {

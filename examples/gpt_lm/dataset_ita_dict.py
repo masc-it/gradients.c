@@ -41,8 +41,8 @@ from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_jsonl  # noqa: E402
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
-DEFAULT_CLEAN_DIR = Path("~/projects/DataFarmer/data/definizioni-clean")
-DEFAULT_ENRICHED_DIR = Path("~/projects/DataFarmer/data/definizioni-clean-enriched")
+DEFAULT_CLEAN_DIR = Path("~/projects/DataFarmer/data/definizioni-clean").expanduser()
+DEFAULT_ENRICHED_DIR = Path("~/projects/DataFarmer/data/definizioni-clean-enriched").expanduser()
 DEFAULT_CONTEXT_LENGTH = 512
 DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_VAL_FRACTION = 0.05

@@ -57,7 +57,7 @@ ifneq ($(strip $(CUDA_ARCH)),)
 CUDA_ARCH_FLAGS := -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)
 endif
 CUDA_LDFLAGS ?= $(if $(CUDA_HOME),-L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib/x86_64-linux-gnu,)
-CUDA_LDLIBS ?= $(CUDA_LDFLAGS) -lcudart -lcublas -lstdc++
+CUDA_LDLIBS ?= $(CUDA_LDFLAGS) -lcudart -lcublas -lcublasLt -lstdc++
 NVCCFLAGS ?= -std=c++17 -O0 -g -Xcompiler=-Wall -Xcompiler=-Wextra -Xcompiler=-Werror
 
 ifeq ($(BACKEND),auto)

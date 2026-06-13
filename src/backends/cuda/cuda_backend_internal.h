@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,6 +22,7 @@ struct gd_backend {
     cudaStream_t stream;
     cudaStream_t transfer_stream;
     cublasHandle_t cublas;
+    cublasLtHandle_t cublaslt;
     gd_cuda_memory_mode memory_mode;
     int device;
     bool scope_active;

@@ -118,6 +118,8 @@ static void print_usage(const char *argv0)
            (double)GPT_DEFAULT_GRAD_CLIP_NORM);
     printf("  --report-every N            report every N steps; 0 disables periodic reports (default: %d)\n",
            GPT_DEFAULT_REPORT_EVERY);
+    printf("  --eval-every-n-epochs N    run validation every N epochs; final epoch is always evaluated (default: %d)\n",
+           GPT_DEFAULT_EVAL_EVERY_N_EPOCHS);
     printf("  --overfit-num-samples N     repeatedly train on the first N samples; 0 disables (default: 0)\n");
     printf("  --seed N                    base seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
     printf("  --help                      show this help\n");
@@ -142,6 +144,7 @@ static gpt_config gpt_config_default(void)
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
+    config.eval_every_n_epochs = GPT_DEFAULT_EVAL_EVERY_N_EPOCHS;
     config.early_stopping_patience = GPT_DEFAULT_EARLY_STOPPING_PATIENCE;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = 64;
@@ -396,6 +399,15 @@ static gpt_config parse_args(int argc, char **argv)
                 exit(2);
             }
             config.report_every = (int)parsed_i64;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--eval-every-n-epochs");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 1, 1000000, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --eval-every-n-epochs %s\n", value);
+                exit(2);
+            }
+            config.eval_every_n_epochs = (int)parsed_i64;
             continue;
         }
         value = arg_value(argc, argv, &i, "--overfit-num-samples");
@@ -695,6 +707,33 @@ static void gpt_report_summary(gpt_report_state *report)
                      best_epoch);
 }
 
+static bool gpt_should_eval_epoch(const gpt_config *config, size_t epoch)
+{
+    if (config == NULL || config->eval_every_n_epochs <= 0) {
+        return false;
+    }
+    if (epoch >= (size_t)config->epochs) {
+        return true;
+    }
+    return (epoch % (size_t)config->eval_every_n_epochs) == 0U;
+}
+
+static size_t gpt_next_eval_epoch(const gpt_config *config, size_t epoch)
+{
+    size_t next;
+    const size_t every = config != NULL && config->eval_every_n_epochs > 0 ?
+                             (size_t)config->eval_every_n_epochs :
+                             1U;
+    if (config == NULL || epoch >= (size_t)config->epochs) {
+        return epoch;
+    }
+    next = ((epoch / every) + 1U) * every;
+    if (next > (size_t)config->epochs) {
+        next = (size_t)config->epochs;
+    }
+    return next;
+}
+
 static void train_one_batch(gd_context *ctx,
                             gpt_lm *model,
                             gd_dataloader *loader,
@@ -936,6 +975,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "dropout=%.9g\n"
                  "logits_softcap=%.9g\n"
                  "grad_clip_norm=%.9g\n"
+                 "eval_every_n_epochs=%d\n"
                  "early_stopping_patience=%d\n"
                  "epoch=%zu\n"
                  "global_step=%zu\n"
@@ -955,6 +995,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  (double)config->dropout_p,
                  (double)config->logits_softcap,
                  (double)config->grad_clip_norm,
+                 config->eval_every_n_epochs,
                  config->early_stopping_patience,
                  epoch,
                  global_step,
@@ -987,6 +1028,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "dropout=%.9g\n"
                    "logits_softcap=%.9g\n"
                    "grad_clip_norm=%.9g\n"
+                   "eval_every_n_epochs=%d\n"
                    "early_stopping_patience=%d\n"
                    "epoch=%zu\n"
                    "global_step=%zu\n"
@@ -1006,6 +1048,7 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    (double)config->dropout_p,
                    (double)config->logits_softcap,
                    (double)config->grad_clip_norm,
+                   config->eval_every_n_epochs,
                    config->early_stopping_patience,
                    epoch,
                    global_step,
@@ -1554,24 +1597,27 @@ static void train_gpt(gd_context *ctx,
         gd_dataloader_destroy(loader);
         gd_sampler_destroy(sampler);
         {
-            bool validated;
+            bool validated = false;
             bool val_improved = false;
             bool should_stop = false;
+            const bool should_eval = val_dataset != NULL && gpt_should_eval_epoch(config, epoch);
             float val_loss = NAN;
-            validated = validate_and_maybe_checkpoint(ctx,
-                                                      model,
-                                                      optimizer,
-                                                      scaler,
-                                                      lr_config,
-                                                      val_dataset,
-                                                      config,
-                                                      &report,
-                                                      metrics,
-                                                      epoch,
-                                                      global_step,
-                                                      &best_val_loss,
-                                                      &val_loss,
-                                                      &val_improved);
+            if (should_eval) {
+                validated = validate_and_maybe_checkpoint(ctx,
+                                                          model,
+                                                          optimizer,
+                                                          scaler,
+                                                          lr_config,
+                                                          val_dataset,
+                                                          config,
+                                                          &report,
+                                                          metrics,
+                                                          epoch,
+                                                          global_step,
+                                                          &best_val_loss,
+                                                          &val_loss,
+                                                          &val_improved);
+            }
             if (validated && config->early_stopping_patience > 0) {
                 if (val_improved) {
                     epochs_without_improvement = 0U;
@@ -1610,15 +1656,26 @@ static void train_gpt(gd_context *ctx,
                                      (double)best_val_loss,
                                      val_improved ? "yes" : "no");
                 }
+            } else if (val_dataset != NULL) {
+                const size_t next_eval_epoch = gpt_next_eval_epoch(config, epoch);
+                gd_progress_rowf(&report.progress,
+                                 2U,
+                                 "eval skipped epoch=%zu next_eval_epoch=%zu every=%d",
+                                 epoch,
+                                 next_eval_epoch,
+                                 config->eval_every_n_epochs);
             } else {
-                gd_progress_rowf(&report.progress, 2U, "eval skipped");
+                gd_progress_rowf(&report.progress, 2U, "eval skipped no validation split loaded");
             }
             if (config->save_latest) {
+                const float checkpoint_val_loss = validated ?
+                                                    val_loss :
+                                                    (report.has_eval_loss ? report.last_eval_loss : NAN);
                 const char *best_status = validated ?
                                               (val_improved ?
                                                    (config->save_best ? "saved" : "improved save_best=off") :
                                                    "unchanged") :
-                                              "skipped";
+                                              (val_dataset != NULL ? "deferred" : "skipped");
                 gd_progress_rowf(&report.progress,
                                  3U,
                                  "checkpoint best=%s latest=saving path=%s",
@@ -1637,7 +1694,7 @@ static void train_gpt(gd_context *ctx,
                                            epoch,
                                            global_step,
                                            epochs_without_improvement,
-                                           val_loss,
+                                           checkpoint_val_loss,
                                            best_val_loss);
                 gd_progress_rowf(&report.progress,
                                  3U,
@@ -1653,7 +1710,7 @@ static void train_gpt(gd_context *ctx,
                         gd_metrics_u64("epoch", (uint64_t)epoch),
                         gd_metrics_u64("step", (uint64_t)global_step),
                         gd_metrics_u64("epochs_without_improvement", (uint64_t)epochs_without_improvement),
-                        gd_metrics_f64("val_loss", (double)val_loss),
+                        gd_metrics_f64("val_loss", (double)checkpoint_val_loss),
                         gd_metrics_f64("best_val_loss", (double)best_val_loss),
                     };
                     (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
@@ -1663,7 +1720,7 @@ static void train_gpt(gd_context *ctx,
                                               (val_improved ?
                                                    (config->save_best ? "saved" : "improved save_best=off") :
                                                    "unchanged") :
-                                              "skipped";
+                                              (val_dataset != NULL ? "deferred" : "skipped");
                 gd_progress_rowf(&report.progress, 3U, "checkpoint best=%s latest=off", best_status);
                 gpt_report_summary(&report);
                 gd_progress_render(&report.progress);
@@ -1880,12 +1937,13 @@ int main(int argc, char **argv)
                config.generate_every_n_steps > 0 ? "yes" : "no");
     }
     if (config.epochs > 0) {
-        printf("checkpoint: save_best=%s path=%s save_latest=%s latest_path=%s val_split=%s early_stopping_patience=%d\n",
+        printf("checkpoint: save_best=%s path=%s save_latest=%s latest_path=%s val_split=%s eval_every_n_epochs=%d early_stopping_patience=%d\n",
                config.save_best ? "yes" : "no",
                config.checkpoint_path,
                config.save_latest ? "yes" : "no",
                config.latest_checkpoint_path,
                config.val_split,
+               config.eval_every_n_epochs,
                config.early_stopping_patience);
         printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g grad_clip=%.4g amp_scale=%.1f\n",
                (double)lr_config.max_lr,
@@ -1922,6 +1980,7 @@ int main(int argc, char **argv)
             gd_metrics_i64("head_dim", (int64_t)GPT_HEAD_DIM),
             gd_metrics_i64("mlp_hidden", (int64_t)GPT_MLP_HIDDEN),
             gd_metrics_i64("report_every", (int64_t)config.report_every),
+            gd_metrics_i64("eval_every_n_epochs", (int64_t)config.eval_every_n_epochs),
             gd_metrics_i64("early_stopping_patience", (int64_t)config.early_stopping_patience),
             gd_metrics_i64("warmup_steps", (int64_t)config.lr_warmup_steps),
             gd_metrics_u64("seed", config.seed),

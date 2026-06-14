@@ -8,12 +8,12 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 
 - vocab size: 2048
 - context length: 512 tokens
-- `d_model = 256`
-- `n_layers = 3` by default, about 3.67M trainable parameters
-  - use `--layers 7` for the older ~7.87M / target-8M profile
-- `n_heads = 4`
+- `d_model = 512`
+- `n_layers = 3` by default, about 8.92M trainable parameters
+  - use `--layers 2` for about 6.29M trainable parameters
+- `n_heads = 8`
 - `head_dim = 64`
-- MLP hidden size: 1024
+- MLP hidden size: 1024 (`2 * d_model`)
 - local causal `sdpa_varlen` sliding window: 256 for training/prompt prefill
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`

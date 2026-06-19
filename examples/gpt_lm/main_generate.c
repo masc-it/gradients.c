@@ -78,12 +78,35 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
     return NULL;
 }
 
+static const char *gpt_architecture_name(gpt_architecture architecture)
+{
+    return architecture == GPT_ARCH_MINIMAX_M3 ? "minimax_m3" : "gpt";
+}
+
+static int parse_architecture_arg(const char *text, gpt_architecture *out)
+{
+    if (text == NULL || out == NULL) {
+        return 0;
+    }
+    if (strcmp(text, "gpt") == 0 || strcmp(text, "dense") == 0) {
+        *out = GPT_ARCH_GPT;
+        return 1;
+    }
+    if (strcmp(text, "minimax_m3") == 0 || strcmp(text, "minimax") == 0 ||
+        strcmp(text, "m3") == 0) {
+        *out = GPT_ARCH_MINIMAX_M3;
+        return 1;
+    }
+    return 0;
+}
+
 static void print_usage(const char *argv0)
 {
     printf("usage: %s [options]\n", argv0);
     printf("\n");
     printf("Interactive GPT LM generation. Type a prefix and press enter; :q, :quit, exit, or quit ends the session.\n");
-    printf("Each prefix is encoded as <|im_start|> + your text.\n");
+    printf("Each prefix is used exactly as typed after escape decoding; include <|im_start|> yourself if desired.\n");
+    printf("Use literal \\n in a prefix to insert a newline, e.g. Termine: mangiare\\n\\n## Definizioni.\n");
     printf("Generation stops early when the tokenizer emits <|im_end|>.\n");
     printf("\n");
     printf("Options:\n");
@@ -96,6 +119,10 @@ static void print_usage(const char *argv0)
     printf("  --repetition-penalty P repetition penalty; 1 disables (default: 1)\n");
     printf("  --logits-softcap C     final logits softcap; metadata value is used when available\n");
     printf("  --layers N             model layers; metadata value is used when available\n");
+    printf("  --architecture NAME    gpt or minimax_m3; metadata value is used when available\n");
+    printf("  --minimax-topk-blocks N MiniMax M3 sparse top-k blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_TOPK_BLOCKS);
+    printf("  --minimax-init-blocks N MiniMax M3 forced initial blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_INIT_BLOCKS);
+    printf("  --minimax-local-blocks N MiniMax M3 forced local blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_LOCAL_BLOCKS);
     printf("  --seed N               sampling seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
     printf("  --help                 show this help\n");
 }
@@ -113,6 +140,10 @@ static gpt_config generate_config_default(void)
     config.epochs = 0;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
+    config.architecture = GPT_ARCH_GPT;
+    config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
+    config.minimax_m3_init_blocks = GPT_MINIMAX_M3_INIT_BLOCKS;
+    config.minimax_m3_local_blocks = GPT_MINIMAX_M3_LOCAL_BLOCKS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = GPT_CONTEXT_LENGTH;
@@ -138,13 +169,21 @@ static gpt_config parse_args(int argc,
                              char **argv,
                              bool *layers_set,
                              bool *tokenizer_set,
-                             bool *softcap_set)
+                             bool *softcap_set,
+                             bool *architecture_set,
+                             bool *minimax_topk_set,
+                             bool *minimax_init_set,
+                             bool *minimax_local_set)
 {
     gpt_config config = generate_config_default();
     int i;
     *layers_set = false;
     *tokenizer_set = false;
     *softcap_set = false;
+    *architecture_set = false;
+    *minimax_topk_set = false;
+    *minimax_init_set = false;
+    *minimax_local_set = false;
     for (i = 1; i < argc; ++i) {
         const char *value;
         int64_t parsed_i64 = 0;
@@ -231,6 +270,48 @@ static gpt_config parse_args(int argc,
             *layers_set = true;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--architecture");
+        if (value == NULL) {
+            value = arg_value(argc, argv, &i, "--arch");
+        }
+        if (value != NULL) {
+            if (!parse_architecture_arg(value, &config.architecture)) {
+                fprintf(stderr, "gpt_lm_generate: invalid --architecture %s (expected gpt or minimax_m3)\n", value);
+                exit(2);
+            }
+            *architecture_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-topk-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 1, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_generate: invalid --minimax-topk-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_topk_blocks = (int)parsed_i64;
+            *minimax_topk_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-init-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_generate: invalid --minimax-init-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_init_blocks = (int)parsed_i64;
+            *minimax_init_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-local-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_generate: invalid --minimax-local-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_local_blocks = (int)parsed_i64;
+            *minimax_local_set = true;
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--seed");
         if (value != NULL) {
             if (!parse_u64_arg(value, UINT64_MAX, &parsed_u64)) {
@@ -286,6 +367,10 @@ static void apply_checkpoint_metadata(gpt_config *config,
                                       bool layers_set,
                                       bool tokenizer_set,
                                       bool softcap_set,
+                                      bool architecture_set,
+                                      bool minimax_topk_set,
+                                      bool minimax_init_set,
+                                      bool minimax_local_set,
                                       char *tokenizer_storage,
                                       size_t tokenizer_storage_size)
 {
@@ -302,6 +387,21 @@ static void apply_checkpoint_metadata(gpt_config *config,
     if (!softcap_set && metadata_value(metadata, metadata_len, "logits_softcap", value, sizeof(value)) &&
         parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
         config->logits_softcap = parsed_f32;
+    }
+    if (!architecture_set && metadata_value(metadata, metadata_len, "architecture", value, sizeof(value))) {
+        (void)parse_architecture_arg(value, &config->architecture);
+    }
+    if (!minimax_topk_set && metadata_value(metadata, metadata_len, "minimax_m3_topk_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 1, 16, &parsed_i64)) {
+        config->minimax_m3_topk_blocks = (int)parsed_i64;
+    }
+    if (!minimax_init_set && metadata_value(metadata, metadata_len, "minimax_m3_init_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 0, 16, &parsed_i64)) {
+        config->minimax_m3_init_blocks = (int)parsed_i64;
+    }
+    if (!minimax_local_set && metadata_value(metadata, metadata_len, "minimax_m3_local_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 0, 16, &parsed_i64)) {
+        config->minimax_m3_local_blocks = (int)parsed_i64;
     }
     if (!tokenizer_set && metadata_value(metadata,
                                          metadata_len,
@@ -332,12 +432,61 @@ static bool should_quit(const char *line)
             strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0);
 }
 
+static void decode_interactive_escapes(char *line)
+{
+    char *read;
+    char *write;
+    if (line == NULL) {
+        return;
+    }
+    read = line;
+    write = line;
+    while (*read != '\0') {
+        if (read[0] == '\\' && read[1] != '\0') {
+            if (read[1] == 'n') {
+                *write++ = '\n';
+                read += 2;
+                continue;
+            }
+            if (read[1] == 'r') {
+                *write++ = '\r';
+                read += 2;
+                continue;
+            }
+            if (read[1] == 't') {
+                *write++ = '\t';
+                read += 2;
+                continue;
+            }
+            if (read[1] == '\\') {
+                *write++ = '\\';
+                read += 2;
+                continue;
+            }
+        }
+        *write++ = *read++;
+    }
+    *write = '\0';
+}
+
 int main(int argc, char **argv)
 {
     bool layers_set;
     bool tokenizer_set;
     bool softcap_set;
-    gpt_config config = parse_args(argc, argv, &layers_set, &tokenizer_set, &softcap_set);
+    bool architecture_set;
+    bool minimax_topk_set;
+    bool minimax_init_set;
+    bool minimax_local_set;
+    gpt_config config = parse_args(argc,
+                                   argv,
+                                   &layers_set,
+                                   &tokenizer_set,
+                                   &softcap_set,
+                                   &architecture_set,
+                                   &minimax_topk_set,
+                                   &minimax_init_set,
+                                   &minimax_local_set);
     char *metadata = NULL;
     size_t metadata_len = 0U;
     char tokenizer_from_metadata[1024];
@@ -363,6 +512,10 @@ int main(int argc, char **argv)
                                   layers_set,
                                   tokenizer_set,
                                   softcap_set,
+                                  architecture_set,
+                                  minimax_topk_set,
+                                  minimax_init_set,
+                                  minimax_local_set,
                                   tokenizer_from_metadata,
                                   sizeof(tokenizer_from_metadata));
     } else {
@@ -384,15 +537,21 @@ int main(int argc, char **argv)
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
     }
 
-    printf("interactive_generation: checkpoint=%s layers=%d max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
+    printf("interactive_generation: checkpoint=%s arch=%s layers=%d minimax=(topk=%d init=%d local=%d) max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
            config.checkpoint_path,
+           gpt_architecture_name(config.architecture),
            config.n_layers,
+           config.minimax_m3_topk_blocks,
+           config.minimax_m3_init_blocks,
+           config.minimax_m3_local_blocks,
            config.max_new_tokens,
            (double)config.temperature,
            (double)config.min_p,
            (double)config.repetition_penalty,
            (double)config.logits_softcap);
-    printf("prompt template: <|im_start|>{input}\n");
+    printf("prompt template: {input}\n");
+    printf("note: no automatic <|im_start|> prefix is added; type it explicitly if desired\n");
+    printf("escapes: type literal \\n for newline, \\t for tab, \\\\ for backslash\n");
     printf("stop: <|im_end|> when present in tokenizer; commands: :q, :quit, quit, exit\n");
 
     gpt_lm_init(ctx, &model, &config);
@@ -423,10 +582,12 @@ int main(int argc, char **argv)
         if (should_quit(line)) {
             break;
         }
+        decode_interactive_escapes(line);
         if (line[0] == '\0') {
             continue;
         }
-        const int n = snprintf(prompt, sizeof(prompt), "%s%s", GPT_GENERATE_IM_START, line);
+        /* No automatic <|im_start|> prepend: send the decoded line verbatim. */
+        const int n = snprintf(prompt, sizeof(prompt), "%s", line);
         if (n < 0 || (size_t)n >= sizeof(prompt)) {
             fprintf(stderr, "gpt_lm_generate: formatted prompt too long\n");
             continue;

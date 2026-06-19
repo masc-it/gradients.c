@@ -624,6 +624,45 @@ gd_status gd_backend_permute(gd_backend *backend,
                              const gd_backend_tensor_view *dst,
                              const gd_backend_permute_args *args);
 
+typedef struct gd_backend_minimax_m3_sparse_args {
+    float scale;
+    uint32_t block_size;
+    uint32_t topk;
+    uint32_t init_blocks;
+    uint32_t local_blocks;
+    uint32_t max_seqlen;
+} gd_backend_minimax_m3_sparse_args;
+
+gd_status gd_backend_minimax_m3_index_topk(gd_backend *backend,
+                                           const gd_backend_tensor_view *index_q,
+                                           const gd_backend_tensor_view *index_k,
+                                           const gd_backend_tensor_view *cu_seqlens,
+                                           const gd_backend_tensor_view *topk_idx,
+                                           const gd_backend_minimax_m3_sparse_args *args);
+
+gd_status gd_backend_minimax_m3_sparse_attention(gd_backend *backend,
+                                                 const gd_backend_tensor_view *q,
+                                                 const gd_backend_tensor_view *k,
+                                                 const gd_backend_tensor_view *v,
+                                                 const gd_backend_tensor_view *cu_seqlens,
+                                                 const gd_backend_tensor_view *topk_idx,
+                                                 const gd_backend_tensor_view *out,
+                                                 const gd_backend_minimax_m3_sparse_args *args);
+
+gd_status gd_backend_minimax_m3_sparse_attention_backward(
+    gd_backend *backend,
+    const gd_backend_tensor_view *grad_out,
+    const gd_backend_tensor_view *q,
+    const gd_backend_tensor_view *k,
+    const gd_backend_tensor_view *v,
+    const gd_backend_tensor_view *cu_seqlens,
+    const gd_backend_tensor_view *topk_idx,
+    const gd_backend_tensor_view *grad_q,
+    const gd_backend_tensor_view *grad_k,
+    const gd_backend_tensor_view *grad_v,
+    const gd_backend_tensor_view *stats,
+    const gd_backend_minimax_m3_sparse_args *args);
+
 typedef struct gd_backend_sdpa_varlen_args {
     float scale;
     uint32_t causal;

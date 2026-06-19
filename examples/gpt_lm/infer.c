@@ -75,6 +75,28 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
     return NULL;
 }
 
+static const char *gpt_architecture_name(gpt_architecture architecture)
+{
+    return architecture == GPT_ARCH_MINIMAX_M3 ? "minimax_m3" : "gpt";
+}
+
+static int parse_architecture_arg(const char *text, gpt_architecture *out)
+{
+    if (text == NULL || out == NULL) {
+        return 0;
+    }
+    if (strcmp(text, "gpt") == 0 || strcmp(text, "dense") == 0) {
+        *out = GPT_ARCH_GPT;
+        return 1;
+    }
+    if (strcmp(text, "minimax_m3") == 0 || strcmp(text, "minimax") == 0 ||
+        strcmp(text, "m3") == 0) {
+        *out = GPT_ARCH_MINIMAX_M3;
+        return 1;
+    }
+    return 0;
+}
+
 static void print_usage(const char *argv0)
 {
     printf("usage: %s --checkpoint PATH --prompt TEXT [options]\n", argv0);
@@ -90,6 +112,10 @@ static void print_usage(const char *argv0)
     printf("  --repetition-penalty P repetition penalty; 1 disables (default: 1)\n");
     printf("  --logits-softcap C     final logits softcap; 0 disables; metadata value is used when available\n");
     printf("  --layers N             model layers; metadata value is used when available\n");
+    printf("  --architecture NAME    gpt or minimax_m3; metadata value is used when available\n");
+    printf("  --minimax-topk-blocks N MiniMax M3 sparse top-k blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_TOPK_BLOCKS);
+    printf("  --minimax-init-blocks N MiniMax M3 forced initial blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_INIT_BLOCKS);
+    printf("  --minimax-local-blocks N MiniMax M3 forced local blocks (default/metadata: %d)\n", GPT_MINIMAX_M3_LOCAL_BLOCKS);
     printf("  --seed N               sampling/init seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
     printf("  --help                 show this help\n");
 }
@@ -107,6 +133,10 @@ static gpt_config infer_config_default(void)
     config.epochs = 0;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
+    config.architecture = GPT_ARCH_GPT;
+    config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
+    config.minimax_m3_init_blocks = GPT_MINIMAX_M3_INIT_BLOCKS;
+    config.minimax_m3_local_blocks = GPT_MINIMAX_M3_LOCAL_BLOCKS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = 64;
@@ -131,7 +161,11 @@ static gpt_config parse_args(int argc,
                              bool *layers_set,
                              bool *tokenizer_set,
                              bool *dropout_set,
-                             bool *softcap_set)
+                             bool *softcap_set,
+                             bool *architecture_set,
+                             bool *minimax_topk_set,
+                             bool *minimax_init_set,
+                             bool *minimax_local_set)
 {
     gpt_config config = infer_config_default();
     int i;
@@ -139,6 +173,10 @@ static gpt_config parse_args(int argc,
     *tokenizer_set = false;
     *dropout_set = false;
     *softcap_set = false;
+    *architecture_set = false;
+    *minimax_topk_set = false;
+    *minimax_init_set = false;
+    *minimax_local_set = false;
     for (i = 1; i < argc; ++i) {
         const char *value;
         int64_t parsed_i64 = 0;
@@ -230,6 +268,48 @@ static gpt_config parse_args(int argc,
             *layers_set = true;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--architecture");
+        if (value == NULL) {
+            value = arg_value(argc, argv, &i, "--arch");
+        }
+        if (value != NULL) {
+            if (!parse_architecture_arg(value, &config.architecture)) {
+                fprintf(stderr, "gpt_lm_infer: invalid --architecture %s (expected gpt or minimax_m3)\n", value);
+                exit(2);
+            }
+            *architecture_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-topk-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 1, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_infer: invalid --minimax-topk-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_topk_blocks = (int)parsed_i64;
+            *minimax_topk_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-init-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_infer: invalid --minimax-init-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_init_blocks = (int)parsed_i64;
+            *minimax_init_set = true;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-local-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm_infer: invalid --minimax-local-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_local_blocks = (int)parsed_i64;
+            *minimax_local_set = true;
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--dropout");
         if (value != NULL) {
             if (!parse_float_arg(value, 0.0f, 0.95f, &parsed_f32)) {
@@ -301,6 +381,10 @@ static void apply_checkpoint_metadata(gpt_config *config,
                                       bool tokenizer_set,
                                       bool dropout_set,
                                       bool softcap_set,
+                                      bool architecture_set,
+                                      bool minimax_topk_set,
+                                      bool minimax_init_set,
+                                      bool minimax_local_set,
                                       char *tokenizer_storage,
                                       size_t tokenizer_storage_size)
 {
@@ -322,6 +406,21 @@ static void apply_checkpoint_metadata(gpt_config *config,
         parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
         config->logits_softcap = parsed_f32;
     }
+    if (!architecture_set && metadata_value(metadata, metadata_len, "architecture", value, sizeof(value))) {
+        (void)parse_architecture_arg(value, &config->architecture);
+    }
+    if (!minimax_topk_set && metadata_value(metadata, metadata_len, "minimax_m3_topk_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 1, 16, &parsed_i64)) {
+        config->minimax_m3_topk_blocks = (int)parsed_i64;
+    }
+    if (!minimax_init_set && metadata_value(metadata, metadata_len, "minimax_m3_init_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 0, 16, &parsed_i64)) {
+        config->minimax_m3_init_blocks = (int)parsed_i64;
+    }
+    if (!minimax_local_set && metadata_value(metadata, metadata_len, "minimax_m3_local_blocks", value, sizeof(value)) &&
+        parse_i64_arg(value, 0, 16, &parsed_i64)) {
+        config->minimax_m3_local_blocks = (int)parsed_i64;
+    }
     if (!tokenizer_set && metadata_value(metadata,
                                          metadata_len,
                                          "tokenizer_path",
@@ -337,7 +436,20 @@ int main(int argc, char **argv)
     bool tokenizer_set;
     bool dropout_set;
     bool softcap_set;
-    gpt_config config = parse_args(argc, argv, &layers_set, &tokenizer_set, &dropout_set, &softcap_set);
+    bool architecture_set;
+    bool minimax_topk_set;
+    bool minimax_init_set;
+    bool minimax_local_set;
+    gpt_config config = parse_args(argc,
+                                   argv,
+                                   &layers_set,
+                                   &tokenizer_set,
+                                   &dropout_set,
+                                   &softcap_set,
+                                   &architecture_set,
+                                   &minimax_topk_set,
+                                   &minimax_init_set,
+                                   &minimax_local_set);
     char *metadata = NULL;
     size_t metadata_len = 0U;
     char tokenizer_from_metadata[1024];
@@ -359,6 +471,10 @@ int main(int argc, char **argv)
                                   tokenizer_set,
                                   dropout_set,
                                   softcap_set,
+                                  architecture_set,
+                                  minimax_topk_set,
+                                  minimax_init_set,
+                                  minimax_local_set,
                                   tokenizer_from_metadata,
                                   sizeof(tokenizer_from_metadata));
     } else {
@@ -380,10 +496,14 @@ int main(int argc, char **argv)
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
     }
 
-    printf("inference: checkpoint=%s prompt=\"%s\" layers=%d max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
+    printf("inference: checkpoint=%s prompt=\"%s\" arch=%s layers=%d minimax=(topk=%d init=%d local=%d) max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f\n",
            config.checkpoint_path,
            config.generate_prompt,
+           gpt_architecture_name(config.architecture),
            config.n_layers,
+           config.minimax_m3_topk_blocks,
+           config.minimax_m3_init_blocks,
+           config.minimax_m3_local_blocks,
            config.max_new_tokens,
            (double)config.temperature,
            (double)config.min_p,

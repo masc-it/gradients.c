@@ -162,6 +162,11 @@ struct gd_backend {
     void *permute_transpose_u8_pso;
     void *permute_transpose_u16_pso;
     void *permute_transpose_u32_pso;
+    void *minimax_m3_index_topk_pso;
+    void *minimax_m3_sparse_attention_pso;
+    void *minimax_m3_sparse_attention_q4_pso;
+    void *minimax_m3_sparse_attention_bwd_dq_pso;
+    void *minimax_m3_sparse_attention_bwd_dkv_pso;
     void *sdpa_varlen_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_stats_pso;

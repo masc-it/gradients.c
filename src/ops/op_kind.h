@@ -35,7 +35,9 @@ typedef enum gd_op_kind {
     GD_OP_TANH = 29,
     GD_OP_SWIGLU = 30,
     GD_OP_SWIGLU_SPLIT_LINEAR = 31,
-    GD_OP_COUNT = 32,
+    GD_OP_MINIMAX_M3_INDEX_TOPK = 32,
+    GD_OP_MINIMAX_M3_SPARSE_ATTENTION = 33,
+    GD_OP_COUNT = 34,
 } gd_op_kind;
 
 #endif /* GD_OP_KIND_H */

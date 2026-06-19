@@ -12,11 +12,14 @@ GPT_LM_DATASET ?= ita_dict
 ifeq ($(GPT_LM_DATASET),ita_dict)
 DATA_SCRIPT := dataset_ita_dict.py
 DATA_FORMAT_VERSION := gpt-lm-ita-dict-v3
+else ifeq ($(GPT_LM_DATASET),ita_dict_v2)
+DATA_SCRIPT := dataset_ita_dict_v2.py
+DATA_FORMAT_VERSION := gpt-lm-ita-dict-v2-md-gemma-docs-v5
 else ifeq ($(GPT_LM_DATASET),promessi)
 DATA_SCRIPT := dataset.py
 DATA_FORMAT_VERSION := gpt-lm-promessi-v3
 else
-$(error unsupported GPT_LM_DATASET=$(GPT_LM_DATASET); expected promessi or ita_dict)
+$(error unsupported GPT_LM_DATASET=$(GPT_LM_DATASET); expected promessi, ita_dict, or ita_dict_v2)
 endif
 
 CC ?= cc
@@ -80,6 +83,28 @@ DATA_ARGS += --min-frequency $(GPT_LM_MIN_FREQUENCY)
 endif
 ifneq ($(GPT_LM_MAX_EXAMPLES_PER_DEFINITION),)
 DATA_ARGS += --max-examples-per-definition $(GPT_LM_MAX_EXAMPLES_PER_DEFINITION)
+endif
+else ifeq ($(GPT_LM_DATASET),ita_dict_v2)
+ifneq ($(GPT_LM_ITA_SOURCE_DIR),)
+DATA_ARGS += --source-dir $(GPT_LM_ITA_SOURCE_DIR)
+endif
+ifneq ($(GPT_LM_ITA_SOURCE_GLOB),)
+DATA_ARGS += --source-glob $(GPT_LM_ITA_SOURCE_GLOB)
+endif
+ifneq ($(GPT_LM_ITA_STORY_SUFFIX),)
+DATA_ARGS += --story-suffix $(GPT_LM_ITA_STORY_SUFFIX)
+endif
+ifneq ($(GPT_LM_ITA_QUIZ_SUFFIX),)
+DATA_ARGS += --quiz-suffix $(GPT_LM_ITA_QUIZ_SUFFIX)
+endif
+ifneq ($(GPT_LM_MIN_FREQUENCY),)
+DATA_ARGS += --min-frequency $(GPT_LM_MIN_FREQUENCY)
+endif
+ifneq ($(GPT_LM_MAX_EXAMPLES_PER_DEFINITION),)
+DATA_ARGS += --max-examples-per-definition $(GPT_LM_MAX_EXAMPLES_PER_DEFINITION)
+endif
+ifneq ($(GPT_LM_KEEP_NONE_FIELDS),)
+DATA_ARGS += --keep-none-fields
 endif
 endif
 

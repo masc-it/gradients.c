@@ -14,6 +14,10 @@
 #define GPT_HEAD_DIM 64
 #define GPT_SDPA_WINDOW 256
 #define GPT_MLP_HIDDEN (2 * GPT_D_MODEL)
+#define GPT_MINIMAX_M3_BLOCK_SIZE 128
+#define GPT_MINIMAX_M3_TOPK_BLOCKS 3
+#define GPT_MINIMAX_M3_INIT_BLOCKS 1
+#define GPT_MINIMAX_M3_LOCAL_BLOCKS 1
 
 #define GPT_DEFAULT_LAYERS 3
 #define GPT_DEFAULT_EPOCHS 2
@@ -49,6 +53,11 @@
         }                                                                     \
     } while (0)
 
+typedef enum gpt_architecture {
+    GPT_ARCH_GPT = 0,
+    GPT_ARCH_MINIMAX_M3 = 1,
+} gpt_architecture;
+
 typedef struct gpt_block {
     gd_module mod;
     gd_tensor attn_norm_w;
@@ -81,6 +90,11 @@ typedef struct gpt_lm {
     int head_dim;
     int mlp_hidden;
     int sdpa_window;
+    gpt_architecture architecture;
+    int minimax_m3_block_size;
+    int minimax_m3_topk_blocks;
+    int minimax_m3_init_blocks;
+    int minimax_m3_local_blocks;
     float dropout_p;
     float rms_eps;
     float logits_softcap;
@@ -113,6 +127,10 @@ typedef struct gpt_config {
     int lr_warmup_steps;
     int max_new_tokens;
     int generate_every_n_steps;
+    gpt_architecture architecture;
+    int minimax_m3_topk_blocks;
+    int minimax_m3_init_blocks;
+    int minimax_m3_local_blocks;
     bool epochs_set;
     bool save_best;
     bool save_latest;

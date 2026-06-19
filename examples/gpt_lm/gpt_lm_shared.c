@@ -335,6 +335,17 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
     model->head_dim = GPT_HEAD_DIM;
     model->mlp_hidden = GPT_MLP_HIDDEN;
     model->sdpa_window = GPT_SDPA_WINDOW;
+    model->architecture = config->architecture;
+    model->minimax_m3_block_size = GPT_MINIMAX_M3_BLOCK_SIZE;
+    model->minimax_m3_topk_blocks = config->minimax_m3_topk_blocks > 0 ?
+                                        config->minimax_m3_topk_blocks :
+                                        GPT_MINIMAX_M3_TOPK_BLOCKS;
+    model->minimax_m3_init_blocks = config->minimax_m3_init_blocks >= 0 ?
+                                        config->minimax_m3_init_blocks :
+                                        GPT_MINIMAX_M3_INIT_BLOCKS;
+    model->minimax_m3_local_blocks = config->minimax_m3_local_blocks >= 0 ?
+                                         config->minimax_m3_local_blocks :
+                                         GPT_MINIMAX_M3_LOCAL_BLOCKS;
     model->dropout_p = config->dropout_p;
     model->rms_eps = GPT_DEFAULT_RMS_EPS;
     model->logits_softcap = config->logits_softcap;
@@ -536,6 +547,20 @@ static gd_status gpt_lm_prepare_generation_cache(gd_context *ctx,
     return GD_OK;
 }
 
+static bool gpt_minimax_m3_should_use_sparse(const gpt_lm *model)
+{
+    int64_t sparse_span;
+    int64_t min_sparse_context;
+    if (model == NULL || model->architecture != GPT_ARCH_MINIMAX_M3 ||
+        model->minimax_m3_block_size <= 0 || model->minimax_m3_topk_blocks <= 0) {
+        return false;
+    }
+    sparse_span = (int64_t)model->minimax_m3_block_size * (int64_t)model->minimax_m3_topk_blocks;
+    min_sparse_context = (int64_t)model->minimax_m3_block_size * 8;
+    return (int64_t)model->context_length > min_sparse_context &&
+           sparse_span * 2 < (int64_t)model->context_length;
+}
+
 static gd_status gpt_block_forward(gd_context *ctx,
                                    gpt_lm *model,
                                    gpt_block *block,
@@ -552,6 +577,21 @@ static gd_status gpt_block_forward(gd_context *ctx,
         .interleaved = false,
     };
     const gd_sdpa_varlen_config sdpa_cfg = {
+        .scale = 0.0f,
+        .causal = true,
+        .sliding_window = GPT_SDPA_WINDOW,
+        .prefix_len = 0,
+        .max_seqlen = GPT_CONTEXT_LENGTH,
+    };
+    const gd_minimax_m3_sparse_config minimax_cfg = {
+        .scale = 0.0f,
+        .block_size = model != NULL ? model->minimax_m3_block_size : GPT_MINIMAX_M3_BLOCK_SIZE,
+        .topk = model != NULL ? model->minimax_m3_topk_blocks : GPT_MINIMAX_M3_TOPK_BLOCKS,
+        .init_blocks = model != NULL ? model->minimax_m3_init_blocks : GPT_MINIMAX_M3_INIT_BLOCKS,
+        .local_blocks = model != NULL ? model->minimax_m3_local_blocks : GPT_MINIMAX_M3_LOCAL_BLOCKS,
+        .max_seqlen = GPT_CONTEXT_LENGTH,
+    };
+    const gd_sdpa_varlen_config minimax_dense_cfg = {
         .scale = 0.0f,
         .causal = true,
         .sliding_window = GPT_SDPA_WINDOW,
@@ -605,9 +645,35 @@ static gd_status gpt_block_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
-    if (st != GD_OK) {
-        return st;
+    if (model->architecture == GPT_ARCH_MINIMAX_M3) {
+        if (gpt_minimax_m3_should_use_sparse(model)) {
+            gd_tensor topk_idx;
+            st = gd_minimax_m3_index_topk(ctx, &q_rot, &k_rot, cu_seqlens, &minimax_cfg, &topk_idx);
+            if (st != GD_OK) {
+                return st;
+            }
+            st = gd_minimax_m3_sparse_attention(ctx,
+                                                &q_rot,
+                                                &k_rot,
+                                                &v_view,
+                                                cu_seqlens,
+                                                &topk_idx,
+                                                &minimax_cfg,
+                                                &attn);
+            if (st != GD_OK) {
+                return st;
+            }
+        } else {
+            st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &minimax_dense_cfg, &attn);
+            if (st != GD_OK) {
+                return st;
+            }
+        }
+    } else {
+        st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
+        if (st != GD_OK) {
+            return st;
+        }
     }
     st = gd_reshape(ctx, &attn, gd_shape_make(2U, flat_shape), &attn_flat);
     if (st != GD_OK) {
@@ -739,6 +805,21 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
         .prefix_len = 0,
         .max_seqlen = GPT_CONTEXT_LENGTH,
     };
+    const gd_minimax_m3_sparse_config minimax_cfg = {
+        .scale = 0.0f,
+        .block_size = model != NULL ? model->minimax_m3_block_size : GPT_MINIMAX_M3_BLOCK_SIZE,
+        .topk = model != NULL ? model->minimax_m3_topk_blocks : GPT_MINIMAX_M3_TOPK_BLOCKS,
+        .init_blocks = model != NULL ? model->minimax_m3_init_blocks : GPT_MINIMAX_M3_INIT_BLOCKS,
+        .local_blocks = model != NULL ? model->minimax_m3_local_blocks : GPT_MINIMAX_M3_LOCAL_BLOCKS,
+        .max_seqlen = GPT_CONTEXT_LENGTH,
+    };
+    const gd_sdpa_varlen_config minimax_dense_cfg = {
+        .scale = 0.0f,
+        .causal = true,
+        .sliding_window = GPT_SDPA_WINDOW,
+        .prefix_len = 0,
+        .max_seqlen = GPT_CONTEXT_LENGTH,
+    };
     gd_tensor residual;
     gd_tensor normed;
     gd_tensor qkv;
@@ -794,8 +875,28 @@ static gd_status gpt_block_prefill_cached(gd_context *ctx,
                                     &k_rot,
                                     &v_view);
     if (st != GD_OK) { return st; }
-    st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
-    if (st != GD_OK) { return st; }
+    if (model->architecture == GPT_ARCH_MINIMAX_M3) {
+        if (gpt_minimax_m3_should_use_sparse(model)) {
+            gd_tensor topk_idx;
+            st = gd_minimax_m3_index_topk(ctx, &q_rot, &k_rot, cu_seqlens, &minimax_cfg, &topk_idx);
+            if (st != GD_OK) { return st; }
+            st = gd_minimax_m3_sparse_attention(ctx,
+                                                &q_rot,
+                                                &k_rot,
+                                                &v_view,
+                                                cu_seqlens,
+                                                &topk_idx,
+                                                &minimax_cfg,
+                                                &attn);
+            if (st != GD_OK) { return st; }
+        } else {
+            st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &minimax_dense_cfg, &attn);
+            if (st != GD_OK) { return st; }
+        }
+    } else {
+        st = gd_sdpa_varlen(ctx, &q_rot, &k_rot, &v_view, cu_seqlens, &sdpa_cfg, &attn);
+        if (st != GD_OK) { return st; }
+    }
     st = gd_reshape(ctx, &attn, gd_shape_make(2U, flat_shape), &attn_flat);
     if (st != GD_OK) { return st; }
     st = gd_linear_layer_forward(ctx, &block->attn_proj, &attn_flat, &attn_proj);

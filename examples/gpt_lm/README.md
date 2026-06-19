@@ -14,7 +14,8 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 - `n_heads = 8`
 - `head_dim = 64`
 - MLP hidden size: 1024 (`2 * d_model`)
-- local causal `sdpa_varlen` sliding window: 256 for training/prompt prefill
+- default architecture: dense GPT attention (`sdpa_varlen`) with a 256-token sliding window for training/prompt prefill
+- optional `--architecture minimax_m3`: MiniMax M3-style attention; the example now auto-falls back to the fast dense 256-token window at the default 512-token context, and uses the Metal lightning indexer (`gd_minimax_m3_index_topk`) plus sparse attention (`gd_minimax_m3_sparse_attention`) only when the context is long enough for sparsity to win
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
 - tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
 - RMSNorm, RoPE, SwiGLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
@@ -75,6 +76,14 @@ DATA_DIR=data
 make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 2 --batch-size 64"
 ```
 
+Select the sparse MiniMax M3 attention architecture with:
+
+```sh
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--architecture minimax_m3 --epochs 2 --batch-size 64"
+```
+
+Sparse attention knobs are `--minimax-topk-blocks`, `--minimax-init-blocks`, and `--minimax-local-blocks` (block size is fixed at 128). At the default 512-token context, `minimax_m3` uses the dense-window fallback because sparse M3 would attend most blocks and pay indexer overhead; the true sparse kernels are selected automatically for longer contexts. The implementation uses the regular GPT Q/K projections as lightning-index Q/K and supports the example head size (`head_dim=64`).
+
 By default, training evaluates the `val` split at the end of each epoch, writes `checkpoints/gpt_lm_best.gdckpt` when validation improves, writes `checkpoints/gpt_lm_latest.gdckpt` for full resume, emits async JSONL metrics under `data/metrics/gpt_lm/`, and stops after 10 validation epochs without improvement. Optimizer/scaler/trainer state lives in sidecars next to each model checkpoint: `*.optim.gdckpt` and `*.train`.
 
 If both `--no-save-best` and `--early-stopping-patience 0` are set, validation is skipped. `--no-save-latest` disables latest/full-resume checkpoint writes. Metrics can be disabled with `--no-metrics`, or routed with `--metrics-dir`, `--metrics-project`, and `--metrics-run-id`.
@@ -91,6 +100,12 @@ Tiny overfit smoke test:
 
 ```sh
 make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 1 --batch-size 1 --layers 1 --overfit-num-samples 1 --report-every 1 --no-save-best --no-save-latest --early-stopping-patience 0"
+```
+
+MiniMax M3 architecture smoke test (dense fallback at the default 512-token context):
+
+```sh
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--architecture minimax_m3 --epochs 1 --batch-size 1 --layers 1 --overfit-num-samples 1 --report-every 1 --no-save-best --no-save-latest --early-stopping-patience 0"
 ```
 
 Generation-only smoke test with random/current in-memory weights:
@@ -139,6 +154,10 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --epochs N                  # 0 allowed with --generate
 --batch-size N
 --layers N
+--architecture NAME          # gpt or minimax_m3
+--minimax-topk-blocks N
+--minimax-init-blocks N
+--minimax-local-blocks N
 --dropout P
 --overfit-num-samples N
 --report-every N
@@ -169,4 +188,4 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --seed N
 ```
 
-Generation uses packed `sdpa_varlen` for batched prompt prefill, `kv_cache_append_packed` to materialize variable-length prompt K/V, then appends one token per batch row with `kv_cache_append_positions` and calls `sdpa_decode_positions` for each autoregressive step. Sampling is currently CPU-side, so very small generations are latency-bound by per-step logits readback.
+Generation uses the selected architecture for batched prompt prefill (`sdpa_varlen` for `gpt`, MiniMax M3 sparse attention for long enough `minimax_m3` contexts, otherwise the dense-window fallback), `kv_cache_append_packed` to materialize variable-length prompt K/V, then appends one token per batch row with `kv_cache_append_positions` and currently calls dense `sdpa_decode_positions` for each autoregressive step. Sampling is CPU-side, so very small generations are latency-bound by per-step logits readback.

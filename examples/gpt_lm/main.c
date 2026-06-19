@@ -78,6 +78,28 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
     return NULL;
 }
 
+static const char *gpt_architecture_name(gpt_architecture architecture)
+{
+    return architecture == GPT_ARCH_MINIMAX_M3 ? "minimax_m3" : "gpt";
+}
+
+static int parse_architecture_arg(const char *text, gpt_architecture *out)
+{
+    if (text == NULL || out == NULL) {
+        return 0;
+    }
+    if (strcmp(text, "gpt") == 0 || strcmp(text, "dense") == 0) {
+        *out = GPT_ARCH_GPT;
+        return 1;
+    }
+    if (strcmp(text, "minimax_m3") == 0 || strcmp(text, "minimax") == 0 ||
+        strcmp(text, "m3") == 0) {
+        *out = GPT_ARCH_MINIMAX_M3;
+        return 1;
+    }
+    return 0;
+}
+
 static void print_usage(const char *argv0)
 {
     printf("usage: %s [options]\n", argv0);
@@ -108,6 +130,10 @@ static void print_usage(const char *argv0)
     printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
     printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
     printf("  --layers N                  decoder blocks (default: %d)\n", GPT_DEFAULT_LAYERS);
+    printf("  --architecture NAME         gpt or minimax_m3 sparse attention (default: gpt)\n");
+    printf("  --minimax-topk-blocks N     MiniMax M3 sparse top-k blocks (default: %d)\n", GPT_MINIMAX_M3_TOPK_BLOCKS);
+    printf("  --minimax-init-blocks N     MiniMax M3 forced initial blocks (default: %d)\n", GPT_MINIMAX_M3_INIT_BLOCKS);
+    printf("  --minimax-local-blocks N    MiniMax M3 forced local blocks (default: %d)\n", GPT_MINIMAX_M3_LOCAL_BLOCKS);
     printf("  --dropout P                 dropout probability (default: %.2f)\n", (double)GPT_DEFAULT_DROPOUT_P);
     printf("  --lr-max LR                 cosine schedule max LR (default: %.6g)\n", (double)GPT_DEFAULT_LR_MAX);
     printf("  --lr-min LR                 cosine schedule min LR (default: %.6g)\n", (double)GPT_DEFAULT_LR_MIN);
@@ -143,6 +169,10 @@ static gpt_config gpt_config_default(void)
     config.epochs = GPT_DEFAULT_EPOCHS;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
+    config.architecture = GPT_ARCH_GPT;
+    config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
+    config.minimax_m3_init_blocks = GPT_MINIMAX_M3_INIT_BLOCKS;
+    config.minimax_m3_local_blocks = GPT_MINIMAX_M3_LOCAL_BLOCKS;
     config.report_every = GPT_DEFAULT_REPORT_EVERY;
     config.eval_every_n_epochs = GPT_DEFAULT_EVAL_EVERY_N_EPOCHS;
     config.early_stopping_patience = GPT_DEFAULT_EARLY_STOPPING_PATIENCE;
@@ -336,6 +366,44 @@ static gpt_config parse_args(int argc, char **argv)
                 exit(2);
             }
             config.n_layers = (int)parsed_i64;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--architecture");
+        if (value == NULL) {
+            value = arg_value(argc, argv, &i, "--arch");
+        }
+        if (value != NULL) {
+            if (!parse_architecture_arg(value, &config.architecture)) {
+                fprintf(stderr, "gpt_lm: invalid --architecture %s (expected gpt or minimax_m3)\n", value);
+                exit(2);
+            }
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-topk-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 1, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --minimax-topk-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_topk_blocks = (int)parsed_i64;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-init-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --minimax-init-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_init_blocks = (int)parsed_i64;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--minimax-local-blocks");
+        if (value != NULL) {
+            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
+                fprintf(stderr, "gpt_lm: invalid --minimax-local-blocks %s\n", value);
+                exit(2);
+            }
+            config.minimax_m3_local_blocks = (int)parsed_i64;
             continue;
         }
         value = arg_value(argc, argv, &i, "--dropout");
@@ -971,6 +1039,11 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  "head_dim=%d\n"
                  "mlp_hidden=%d\n"
                  "ffn_activation=swiglu\n"
+                 "architecture=%s\n"
+                 "minimax_m3_block_size=%d\n"
+                 "minimax_m3_topk_blocks=%d\n"
+                 "minimax_m3_init_blocks=%d\n"
+                 "minimax_m3_local_blocks=%d\n"
                  "sdpa_window=%d\n"
                  "dropout=%.9g\n"
                  "logits_softcap=%.9g\n"
@@ -991,6 +1064,11 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                  GPT_N_HEADS,
                  GPT_HEAD_DIM,
                  GPT_MLP_HIDDEN,
+                 gpt_architecture_name(config->architecture),
+                 GPT_MINIMAX_M3_BLOCK_SIZE,
+                 config->minimax_m3_topk_blocks,
+                 config->minimax_m3_init_blocks,
+                 config->minimax_m3_local_blocks,
                  GPT_SDPA_WINDOW,
                  (double)config->dropout_p,
                  (double)config->logits_softcap,
@@ -1024,6 +1102,11 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    "head_dim=%d\n"
                    "mlp_hidden=%d\n"
                    "ffn_activation=swiglu\n"
+                   "architecture=%s\n"
+                   "minimax_m3_block_size=%d\n"
+                   "minimax_m3_topk_blocks=%d\n"
+                   "minimax_m3_init_blocks=%d\n"
+                   "minimax_m3_local_blocks=%d\n"
                    "sdpa_window=%d\n"
                    "dropout=%.9g\n"
                    "logits_softcap=%.9g\n"
@@ -1044,6 +1127,11 @@ static char *gpt_checkpoint_metadata(const gpt_config *config,
                    GPT_N_HEADS,
                    GPT_HEAD_DIM,
                    GPT_MLP_HIDDEN,
+                   gpt_architecture_name(config->architecture),
+                   GPT_MINIMAX_M3_BLOCK_SIZE,
+                   config->minimax_m3_topk_blocks,
+                   config->minimax_m3_init_blocks,
+                   config->minimax_m3_local_blocks,
                    GPT_SDPA_WINDOW,
                    (double)config->dropout_p,
                    (double)config->logits_softcap,
@@ -1916,7 +2004,8 @@ int main(int argc, char **argv)
                (unsigned long long)config.overfit_num_samples,
                samples_per_epoch);
     }
-    printf("model: vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d ffn=swiglu sdpa_window=%d dropout=%.3f logits_softcap=%.3f\n",
+    printf("model: arch=%s vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d ffn=swiglu sdpa_window=%d minimax=(block=%d topk=%d init=%d local=%d) dropout=%.3f logits_softcap=%.3f\n",
+           gpt_architecture_name(config.architecture),
            GPT_VOCAB_SIZE,
            GPT_D_MODEL,
            config.n_layers,
@@ -1924,6 +2013,10 @@ int main(int argc, char **argv)
            GPT_HEAD_DIM,
            GPT_MLP_HIDDEN,
            GPT_SDPA_WINDOW,
+           GPT_MINIMAX_M3_BLOCK_SIZE,
+           config.minimax_m3_topk_blocks,
+           config.minimax_m3_init_blocks,
+           config.minimax_m3_local_blocks,
            (double)config.dropout_p,
            (double)config.logits_softcap);
     if (config.generate_prompt != NULL || config.generate_every_n_steps > 0) {
@@ -1973,6 +2066,11 @@ int main(int argc, char **argv)
             gd_metrics_i64("epochs", (int64_t)config.epochs),
             gd_metrics_i64("batch_size", (int64_t)config.batch_size),
             gd_metrics_i64("layers", (int64_t)config.n_layers),
+            gd_metrics_string("architecture", gpt_architecture_name(config.architecture)),
+            gd_metrics_i64("minimax_m3_block_size", (int64_t)GPT_MINIMAX_M3_BLOCK_SIZE),
+            gd_metrics_i64("minimax_m3_topk_blocks", (int64_t)config.minimax_m3_topk_blocks),
+            gd_metrics_i64("minimax_m3_init_blocks", (int64_t)config.minimax_m3_init_blocks),
+            gd_metrics_i64("minimax_m3_local_blocks", (int64_t)config.minimax_m3_local_blocks),
             gd_metrics_i64("context_length", (int64_t)GPT_CONTEXT_LENGTH),
             gd_metrics_i64("vocab_size", (int64_t)GPT_VOCAB_SIZE),
             gd_metrics_i64("d_model", (int64_t)GPT_D_MODEL),

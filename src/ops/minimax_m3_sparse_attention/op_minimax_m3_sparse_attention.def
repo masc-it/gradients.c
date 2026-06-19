@@ -1,0 +1,2 @@
+# MiniMax M3 block-sparse attention op; registers GD_OP_MINIMAX_M3_SPARSE_ATTENTION.
+# Public/backend signatures are declared manually in include/gradients/ops.h and src/core/backend.h.

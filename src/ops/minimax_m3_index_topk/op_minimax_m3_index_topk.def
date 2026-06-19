@@ -1,0 +1,2 @@
+# MiniMax M3 lightning indexer top-k op; registers GD_OP_MINIMAX_M3_INDEX_TOPK.
+# Public/backend signatures are declared manually in include/gradients/ops.h and src/core/backend.h.

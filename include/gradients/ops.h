@@ -348,6 +348,50 @@ gd_status gd_qkv_split_rope_backward(gd_context *ctx,
                                       const gd_rope_config *config,
                                       gd_tensor *grad_qkv);
 
+/* MiniMax M3 lightning-indexer + block-sparse attention.
+ * The indexer scores each visible key block by max_j(q_i · k_j), then selects
+ * top-k block ids with optional forced initial and local blocks. Sparse
+ * attention consumes those block ids and applies causal attention only inside
+ * selected blocks. Tensors are contiguous [N,H,Dh], cu_seqlens is I32 [B+1],
+ * topk_idx is I32 [Hkv,N,topk]. Current Metal kernels are optimized for F16,
+ * head_dim <= 64, topk <= 16, and block_size <= 128 (M3 uses 128). */
+typedef struct gd_minimax_m3_sparse_config {
+    float scale;        /* <= 0 selects 1 / sqrt(Dh) for attention. */
+    int32_t block_size; /* <= 0 selects 128. */
+    int32_t topk;       /* <= 0 selects 4. */
+    int32_t init_blocks;
+    int32_t local_blocks;
+    int32_t max_seqlen; /* <= 0 selects N. */
+} gd_minimax_m3_sparse_config;
+
+gd_status gd_minimax_m3_index_topk(gd_context *ctx,
+                                   const gd_tensor *index_q,
+                                   const gd_tensor *index_k,
+                                   const gd_tensor *cu_seqlens,
+                                   const gd_minimax_m3_sparse_config *config,
+                                   gd_tensor *topk_idx);
+
+gd_status gd_minimax_m3_sparse_attention(gd_context *ctx,
+                                         const gd_tensor *q,
+                                         const gd_tensor *k,
+                                         const gd_tensor *v,
+                                         const gd_tensor *cu_seqlens,
+                                         const gd_tensor *topk_idx,
+                                         const gd_minimax_m3_sparse_config *config,
+                                         gd_tensor *out);
+
+gd_status gd_minimax_m3_sparse_attention_backward(gd_context *ctx,
+                                                  const gd_tensor *q,
+                                                  const gd_tensor *k,
+                                                  const gd_tensor *v,
+                                                  const gd_tensor *cu_seqlens,
+                                                  const gd_tensor *topk_idx,
+                                                  const gd_tensor *grad_out,
+                                                  const gd_minimax_m3_sparse_config *config,
+                                                  gd_tensor *grad_q,
+                                                  gd_tensor *grad_k,
+                                                  gd_tensor *grad_v);
+
 /* Packed variable-length scaled dot-product attention.
  * q/k/v are contiguous [N, Hq|Hkv, Dh], cu_seqlens is I32 [B+1].
  * Hq must be a multiple of Hkv. Output has q's shape and dtype.

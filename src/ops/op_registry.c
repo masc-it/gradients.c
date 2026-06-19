@@ -30,6 +30,7 @@ extern const gd_autograd_rule gd_bwd_rule_powlu_split_linear;
 extern const gd_autograd_rule gd_bwd_rule_tanh;
 extern const gd_autograd_rule gd_bwd_rule_swiglu;
 extern const gd_autograd_rule gd_bwd_rule_swiglu_split_linear;
+extern const gd_autograd_rule gd_bwd_rule_minimax_m3_sparse_attention;
 
 static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_MATMUL] = &gd_bwd_rule_matmul,
@@ -61,6 +62,7 @@ static const gd_autograd_rule *const gd_bwd_rules[GD_OP_COUNT] = {
     [GD_OP_TANH] = &gd_bwd_rule_tanh,
     [GD_OP_SWIGLU] = &gd_bwd_rule_swiglu,
     [GD_OP_SWIGLU_SPLIT_LINEAR] = &gd_bwd_rule_swiglu_split_linear,
+    [GD_OP_MINIMAX_M3_SPARSE_ATTENTION] = &gd_bwd_rule_minimax_m3_sparse_attention,
 };
 
 const gd_autograd_rule *gd_autograd_rule_for(gd_op_kind kind)

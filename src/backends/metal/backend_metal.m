@@ -290,6 +290,8 @@ static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
     GD_METAL_PIPELINE("gd_rope_backward_f32_kernel", rope_backward_f32_pso),
     GD_METAL_PIPELINE("gd_qkv_split_rope_forward_f16_kernel", qkv_split_rope_forward_f16_pso),
     GD_METAL_PIPELINE("gd_qkv_split_rope_backward_f16_kernel", qkv_split_rope_backward_f16_pso),
+    GD_METAL_PIPELINE("gd_qkv_split_rope_forward_table_f16_kernel", qkv_split_rope_forward_table_f16_pso),
+    GD_METAL_PIPELINE("gd_qkv_split_rope_backward_table_f16_kernel", qkv_split_rope_backward_table_f16_pso),
 };
 
 static gd_status gd_metal_make_pipelines(gd_backend *backend)
@@ -438,6 +440,7 @@ void gd_backend_destroy(gd_backend *backend)
     }
     gd_metal_release_retained(&backend->active_command_buffer);
     gd_metal_release_pipelines(backend);
+    gd_metal_release_retained(&backend->qkv_split_rope_table_f32_buffer);
     gd_metal_release_retained(&backend->mps_matmul_kernel);
     gd_metal_release_retained(&backend->queue);
     gd_metal_release_retained(&backend->device);

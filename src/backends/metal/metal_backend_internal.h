@@ -59,6 +59,9 @@ struct gd_backend {
     void *rope_backward_f32_pso;
     void *qkv_split_rope_forward_f16_pso;
     void *qkv_split_rope_backward_f16_pso;
+    void *qkv_split_rope_forward_table_f16_pso;
+    void *qkv_split_rope_backward_table_f16_pso;
+    void *qkv_split_rope_table_f32_buffer;
     void *binary_pso[GD_OP_COUNT];
     void *binary_bcast_pso[GD_OP_COUNT];
     void *binary_row_bcast_pso[GD_OP_COUNT];

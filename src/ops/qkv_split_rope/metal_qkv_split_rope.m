@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static id<MTLComputePipelineState> gd_qkv_split_rope_forward_pso(gd_backend *backend)
@@ -15,6 +16,81 @@ static id<MTLComputePipelineState> gd_qkv_split_rope_forward_pso(gd_backend *bac
 static id<MTLComputePipelineState> gd_qkv_split_rope_backward_pso(gd_backend *backend)
 {
     return backend != NULL ? (__bridge id<MTLComputePipelineState>)backend->qkv_split_rope_backward_f16_pso : nil;
+}
+
+static id<MTLComputePipelineState> gd_qkv_split_rope_forward_table_pso(gd_backend *backend)
+{
+    return backend != NULL ?
+               (__bridge id<MTLComputePipelineState>)backend->qkv_split_rope_forward_table_f16_pso :
+               nil;
+}
+
+static id<MTLComputePipelineState> gd_qkv_split_rope_backward_table_pso(gd_backend *backend)
+{
+    return backend != NULL ?
+               (__bridge id<MTLComputePipelineState>)backend->qkv_split_rope_backward_table_f16_pso :
+               nil;
+}
+
+static bool gd_qkv_split_rope_table_disabled(void)
+{
+    const char *env = getenv("GD_QKV_SPLIT_ROPE_TABLE");
+    return env != NULL && env[0] == '0' && env[1] == '\0';
+}
+
+static bool gd_qkv_split_rope_table_config_ok(uint32_t head_dim, const gd_backend_rope_args *rope_args)
+{
+    return !gd_qkv_split_rope_table_disabled() && rope_args != NULL &&
+           head_dim == GD_METAL_QKV_SPLIT_ROPE_TABLE_HEAD_DIM &&
+           rope_args->n_dims == GD_METAL_QKV_SPLIT_ROPE_TABLE_HEAD_DIM &&
+           rope_args->interleaved == 0U &&
+           fabsf(rope_args->theta - GD_METAL_QKV_SPLIT_ROPE_TABLE_THETA) <= 1.0e-3f;
+}
+
+static void gd_qkv_split_rope_fill_table(float *table)
+{
+    const float freq_scale = -2.0f * log2f(GD_METAL_QKV_SPLIT_ROPE_TABLE_THETA) /
+                             (float)GD_METAL_QKV_SPLIT_ROPE_TABLE_HEAD_DIM;
+    uint32_t pos;
+    if (table == NULL) {
+        return;
+    }
+    for (pos = 0U; pos < GD_METAL_QKV_SPLIT_ROPE_TABLE_POSITIONS; ++pos) {
+        uint32_t pair;
+        for (pair = 0U; pair < GD_METAL_QKV_SPLIT_ROPE_TABLE_PAIRS; ++pair) {
+            const float angle = (float)pos * exp2f((float)pair * freq_scale);
+            const size_t idx = ((size_t)pos * GD_METAL_QKV_SPLIT_ROPE_TABLE_PAIRS + (size_t)pair) * 2U;
+            table[idx] = cosf(angle);
+            table[idx + 1U] = sinf(angle);
+        }
+    }
+}
+
+static id<MTLBuffer> gd_qkv_split_rope_table_buffer(gd_backend *backend)
+{
+    id<MTLDevice> device;
+    id<MTLBuffer> table_buffer;
+    const size_t n_floats = (size_t)GD_METAL_QKV_SPLIT_ROPE_TABLE_POSITIONS *
+                            (size_t)GD_METAL_QKV_SPLIT_ROPE_TABLE_PAIRS * 2U;
+    const size_t nbytes = n_floats * sizeof(float);
+    if (backend == NULL) {
+        return nil;
+    }
+    table_buffer = (__bridge id<MTLBuffer>)backend->qkv_split_rope_table_f32_buffer;
+    if (table_buffer != nil) {
+        return table_buffer;
+    }
+    device = (__bridge id<MTLDevice>)backend->device;
+    if (device == nil) {
+        return nil;
+    }
+    table_buffer = [device newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
+    if (table_buffer == nil || [table_buffer contents] == NULL) {
+        return nil;
+    }
+    gd_qkv_split_rope_fill_table((float *)[table_buffer contents]);
+    backend->qkv_split_rope_table_f32_buffer = (void *)CFBridgingRetain(table_buffer);
+    return (__bridge id<MTLBuffer>)backend->qkv_split_rope_table_f32_buffer;
 }
 
 static id<MTLBuffer> gd_qkv_split_rope_buffer(gd_backend_buffer *buffer)
@@ -169,6 +245,7 @@ static gd_status gd_qkv_split_rope_encode_forward(gd_backend *backend,
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
     id<MTLComputePipelineState> pso;
+    id<MTLBuffer> rope_table;
     gd_metal_qkv_split_rope_args args;
     MTLSize grid;
     MTLSize threads;
@@ -187,7 +264,17 @@ static gd_status gd_qkv_split_rope_encode_forward(gd_backend *backend,
                                                         &args)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
+    rope_table = nil;
     pso = backward ? gd_qkv_split_rope_backward_pso(backend) : gd_qkv_split_rope_forward_pso(backend);
+    if (gd_qkv_split_rope_table_config_ok(head_dim, rope_args)) {
+        id<MTLComputePipelineState> table_pso = backward ? gd_qkv_split_rope_backward_table_pso(backend) :
+                                                           gd_qkv_split_rope_forward_table_pso(backend);
+        id<MTLBuffer> table_buffer = gd_qkv_split_rope_table_buffer(backend);
+        if (table_pso != nil && table_buffer != nil) {
+            pso = table_pso;
+            rope_table = table_buffer;
+        }
+    }
     if (pso == nil) {
         return GD_ERR_UNSUPPORTED;
     }
@@ -215,6 +302,9 @@ static gd_status gd_qkv_split_rope_encode_forward(gd_backend *backend,
         [encoder setBuffer:gd_qkv_split_rope_buffer(v->buffer) offset:0U atIndex:4U];
     }
     [encoder setBytes:&args length:sizeof(args) atIndex:5U];
+    if (rope_table != nil) {
+        [encoder setBuffer:rope_table offset:0U atIndex:6U];
+    }
     grid = MTLSizeMake(thread_count, 1U, 1U);
     threads = MTLSizeMake(thread_count < GD_METAL_QKV_SPLIT_ROPE_MAX_THREADS_PER_GROUP ?
                               thread_count : GD_METAL_QKV_SPLIT_ROPE_MAX_THREADS_PER_GROUP,

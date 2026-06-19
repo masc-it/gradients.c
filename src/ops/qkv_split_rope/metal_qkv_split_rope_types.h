@@ -4,6 +4,10 @@
 #include "../../backends/metal/metal_abi.h"
 
 #define GD_METAL_QKV_SPLIT_ROPE_MAX_THREADS_PER_GROUP 256U
+#define GD_METAL_QKV_SPLIT_ROPE_TABLE_POSITIONS 512U
+#define GD_METAL_QKV_SPLIT_ROPE_TABLE_HEAD_DIM 64U
+#define GD_METAL_QKV_SPLIT_ROPE_TABLE_PAIRS (GD_METAL_QKV_SPLIT_ROPE_TABLE_HEAD_DIM / 2U)
+#define GD_METAL_QKV_SPLIT_ROPE_TABLE_THETA 10000.0f
 
 typedef struct gd_metal_qkv_split_rope_args {
     gd_metal_u64 qkv_offset;

@@ -1061,22 +1061,21 @@ static gd_status gpt_block_decode_cached(gd_context *ctx,
     return gd_add(ctx, &residual, &mlp_proj, out);
 }
 
-static gd_status gpt_lm_prefill_logits(gd_context *ctx,
-                                       gpt_lm *model,
-                                       gpt_kv_cache *cache,
-                                       const gd_tensor *input_ids,
-                                       const gd_tensor *positions,
-                                       const gd_tensor *cu_seqlens,
-                                       const gd_tensor *cache_positions,
-                                       gd_tensor *logits)
+static gd_status gpt_lm_prefill_block_hidden(gd_context *ctx,
+                                             gpt_lm *model,
+                                             gpt_kv_cache *cache,
+                                             const gd_tensor *input_ids,
+                                             const gd_tensor *positions,
+                                             const gd_tensor *cu_seqlens,
+                                             const gd_tensor *cache_positions,
+                                             gd_tensor *hidden)
 {
     gd_tensor x;
     gd_tensor block_out;
-    gd_tensor final_norm;
     gd_status st;
     uint32_t i;
     if (ctx == NULL || model == NULL || cache == NULL || input_ids == NULL || positions == NULL ||
-        cu_seqlens == NULL || cache_positions == NULL || logits == NULL || input_ids->rank != 1U ||
+        cu_seqlens == NULL || cache_positions == NULL || hidden == NULL || input_ids->rank != 1U ||
         positions->rank != 1U || input_ids->shape[0] != positions->shape[0] ||
         input_ids->shape[0] <= 0 || cache_positions->rank != 1U ||
         cache_positions->shape[0] != cache->batch_size || cu_seqlens->rank != 1U ||
@@ -1099,11 +1098,98 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
         if (st != GD_OK) { return st; }
         x = block_out;
     }
-    st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
-    if (st != GD_OK) { return st; }
-    st = gd_linear_transposed_weight(ctx, &final_norm, &model->lm_head, &model->lm_head_bias, logits);
-    if (st != GD_OK) { return st; }
+    *hidden = x;
     return GD_OK;
+}
+
+/* Select the final row of each packed prompt segment. Generation only needs
+ * these hidden states for next-token sampling; all earlier prompt rows have
+ * already served their purpose by filling the per-layer KV cache. */
+static gd_status gpt_lm_select_packed_last_rows(gd_context *ctx,
+                                                const gd_tensor *x,
+                                                const int32_t *cu_seqlens_host,
+                                                int batch_size,
+                                                gd_tensor *out)
+{
+    gd_tensor *rows = NULL;
+    const gd_tensor **inputs = NULL;
+    gd_status st = GD_OK;
+    int64_t total_rows;
+    int b;
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (ctx == NULL || x == NULL || cu_seqlens_host == NULL || out == NULL || x->rank != 2U ||
+        batch_size <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    total_rows = x->shape[0];
+    if (total_rows <= 0 || cu_seqlens_host[0] != 0 ||
+        (int64_t)cu_seqlens_host[batch_size] != total_rows) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        if (cu_seqlens_host[b] < 0 || cu_seqlens_host[b + 1] <= cu_seqlens_host[b] ||
+            (int64_t)cu_seqlens_host[b + 1] > total_rows) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+    }
+    if (batch_size == 1) {
+        return gd_tensor_slice(ctx, x, 0U, (int64_t)cu_seqlens_host[1] - 1, 1, out);
+    }
+
+    rows = (gd_tensor *)calloc((size_t)batch_size, sizeof(rows[0]));
+    inputs = (const gd_tensor **)calloc((size_t)batch_size, sizeof(inputs[0]));
+    if (rows == NULL || inputs == NULL) {
+        st = GD_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    for (b = 0; b < batch_size; ++b) {
+        st = gd_tensor_slice(ctx, x, 0U, (int64_t)cu_seqlens_host[b + 1] - 1, 1, &rows[b]);
+        if (st != GD_OK) {
+            goto done;
+        }
+        inputs[b] = &rows[b];
+    }
+    st = gd_concat(ctx, inputs, (uint32_t)batch_size, 0, out);
+
+done:
+    free(inputs);
+    free(rows);
+    return st;
+}
+
+/* Prefill the KV cache for all prompt tokens, then run the row-wise final norm
+ * and LM head only on the last prompt row(s). This is equivalent to projecting
+ * all prompt rows and slicing the final logits, but avoids unused logits. */
+static gd_status gpt_lm_prefill_last_logits(gd_context *ctx,
+                                            gpt_lm *model,
+                                            gpt_kv_cache *cache,
+                                            const gd_tensor *input_ids,
+                                            const gd_tensor *positions,
+                                            const gd_tensor *cu_seqlens,
+                                            const int32_t *cu_seqlens_host,
+                                            const gd_tensor *cache_positions,
+                                            gd_tensor *logits)
+{
+    gd_tensor block_hidden;
+    gd_tensor last_hidden;
+    gd_tensor last_norm;
+    gd_status st;
+    st = gpt_lm_prefill_block_hidden(ctx,
+                                     model,
+                                     cache,
+                                     input_ids,
+                                     positions,
+                                     cu_seqlens,
+                                     cache_positions,
+                                     &block_hidden);
+    if (st != GD_OK) { return st; }
+    st = gpt_lm_select_packed_last_rows(ctx, &block_hidden, cu_seqlens_host, cache->batch_size, &last_hidden);
+    if (st != GD_OK) { return st; }
+    st = gd_rms_norm(ctx, &last_hidden, &model->final_norm_w, model->rms_eps, &last_norm);
+    if (st != GD_OK) { return st; }
+    return gd_linear_transposed_weight(ctx, &last_norm, &model->lm_head, &model->lm_head_bias, logits);
 }
 
 static gd_status gpt_lm_decode_logits(gd_context *ctx,
@@ -1369,7 +1455,6 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     int32_t *decode_positions = NULL;
     int *next_ids = NULL;
     bool *finished = NULL;
-    gd_tensor *last_logits = NULL;
     float *logits_host = NULL;
     gpt_kv_cache *cache = NULL;
     int total_prompt_tokens = 0;
@@ -1406,12 +1491,11 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     decode_positions = (int32_t *)calloc((size_t)n_prompts, sizeof(decode_positions[0]));
     next_ids = (int *)calloc((size_t)n_prompts, sizeof(next_ids[0]));
     finished = (bool *)calloc((size_t)n_prompts, sizeof(finished[0]));
-    last_logits = (gd_tensor *)calloc((size_t)n_prompts, sizeof(last_logits[0]));
     logits_host = (float *)malloc((size_t)n_prompts * (size_t)GPT_VOCAB_SIZE * sizeof(logits_host[0]));
     if (encoded == NULL || seq_ids == NULL || n_encoded == NULL || prompt_offset == NULL ||
         prompt_len == NULL || seq_len == NULL || cu == NULL || cache_pos_values == NULL ||
         decode_ids == NULL || decode_positions == NULL || next_ids == NULL || finished == NULL ||
-        last_logits == NULL || logits_host == NULL) {
+        logits_host == NULL) {
         gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "generation allocation", __LINE__);
     }
 
@@ -1474,23 +1558,21 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
         TRY(ctx, gpt_data_i32_tensor(ctx, packed_positions, total_prompt_tokens, &pos_t));
         TRY(ctx, gpt_data_i32_tensor(ctx, cu, n_prompts + 1, &cu_t));
         TRY(ctx, gpt_data_i32_tensor(ctx, cache_pos_values, n_prompts, &cache_pos_t));
-        TRY(ctx, gpt_lm_prefill_logits(ctx,
-                                       model,
-                                       cache,
-                                       &ids_t,
-                                       &pos_t,
-                                       &cu_t,
-                                       &cache_pos_t,
-                                       &logits));
-        for (b = 0; b < n_prompts; ++b) {
-            TRY(ctx, gd_tensor_slice(ctx, &logits, 0U, (int64_t)cu[b + 1] - 1, 1, &last_logits[b]));
-        }
+        TRY(ctx, gpt_lm_prefill_last_logits(ctx,
+                                            model,
+                                            cache,
+                                            &ids_t,
+                                            &pos_t,
+                                            &cu_t,
+                                            cu,
+                                            &cache_pos_t,
+                                            &logits));
         TRY(ctx, gd_end_step(ctx));
+        TRY(ctx, gd_tensor_read_f32(ctx,
+                                    &logits,
+                                    logits_host,
+                                    (size_t)n_prompts * (size_t)GPT_VOCAB_SIZE));
         for (b = 0; b < n_prompts; ++b) {
-            TRY(ctx, gd_tensor_read_f32(ctx,
-                                        &last_logits[b],
-                                        logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
-                                        GPT_VOCAB_SIZE));
             gpt_apply_logits_softcap(logits_host + (size_t)b * (size_t)GPT_VOCAB_SIZE,
                                      GPT_VOCAB_SIZE,
                                      model->logits_softcap);
@@ -1625,7 +1707,6 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
         free(seq_ids[b]);
     }
     free(logits_host);
-    free(last_logits);
     free(finished);
     free(next_ids);
     free(decode_positions);

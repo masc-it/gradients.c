@@ -1940,6 +1940,7 @@ int main(int argc, char **argv)
     {
         const gd_param_group groups[] = {
             gd_param_group_build("no_decay_norm", "gpt_lm.*norm_w", 1.0f, 0.0f, true),
+            gd_param_group_build("no_decay_bias", "gpt_lm.*bias", 1.0f, 0.0f, true),
             gd_param_group_build("decay", "gpt_lm.*", 1.0f, config.weight_decay, true),
         };
         TRY(ctx, gd_module_collect_params(ctx, &model.mod, groups, GD_ARRAY_LEN(groups), &params));

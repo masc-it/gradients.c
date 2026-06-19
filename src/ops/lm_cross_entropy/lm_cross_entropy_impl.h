@@ -13,6 +13,7 @@ _Static_assert(sizeof(gd_lm_cross_entropy_attrs) == 4U,
 gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   const gd_tensor *hidden,
                                                   const gd_tensor *weight,
+                                                  const gd_tensor *bias,
                                                   const gd_tensor *targets,
                                                   const gd_tensor *row_max,
                                                   const gd_tensor *row_inv_sum,
@@ -21,6 +22,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   float logits_softcap,
                                                   const gd_tensor *grad_out,
                                                   gd_tensor *grad_hidden,
-                                                  gd_tensor *grad_weight);
+                                                  gd_tensor *grad_weight,
+                                                  gd_tensor *grad_bias);
 
 #endif /* GD_OP_LM_CROSS_ENTROPY_IMPL_H */

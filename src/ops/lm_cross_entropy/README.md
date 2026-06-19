@@ -1,19 +1,19 @@
 # lm_cross_entropy
 
-Fused language-model head plus cross entropy for tied-token embeddings:
+Fused language-model head plus cross entropy:
 
 ```text
-hidden [..., D], weight [V, D], targets [rows] -> scalar F32 loss
+hidden [..., D], weight [V, D], optional bias [V], targets [rows] -> scalar F32 loss
 ```
 
-The training path computes logits with `hidden @ weight^T`, evaluates row-wise cross
+The training path computes logits with `hidden @ weight^T + bias`, evaluates row-wise cross
 entropy, and records one autograd node for the LM head and loss together.  For the
 GPT-sized vocabulary used by `examples/gpt_lm`, the op streams vocab chunks through
 F16 logits scratch and saves only compact row softmax stats (`row_max`, reciprocal
 `row_sum`) for backward. Backward recomputes each logits chunk, forms `dlogits`, and
-uses the production GEMM path for hidden/weight gradients.
+uses the production GEMM path for hidden/weight gradients plus row-reduction for bias gradients.
 
-`gd_lm_cross_entropy_softcapped(..., logits_softcap, ...)` optionally applies final
+`gd_lm_cross_entropy_softcapped_bias(..., logits_softcap, ...)` optionally applies final
 logits softcapping inside the fused loss without materializing full logits:
 
 ```text

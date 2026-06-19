@@ -406,12 +406,14 @@ gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
                                                   const gd_backend_tensor_view *grad_loss,
                                                   const gd_backend_tensor_view *grad_logits,
                                                   float scale);
-/* Fused tied LM-head CE helpers. logits_chunk is [rows, chunk_classes] for
- * hidden @ weight[class_start:class_start+chunk_classes]^T. row_inv_sum is
- * used as row_sum before finalize, then overwritten with reciprocal row_sum.
- * logits_softcap=0 disables final-logits softcapping. */
+/* Fused LM-head CE helpers. logits_chunk is [rows, chunk_classes] for
+ * hidden @ weight[class_start:class_start+chunk_classes]^T, with optional
+ * bias_chunk [chunk_classes]. row_inv_sum is used as row_sum before finalize,
+ * then overwritten with reciprocal row_sum. logits_softcap=0 disables
+ * final-logits softcapping. */
 gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                                     const gd_backend_tensor_view *logits_chunk,
+                                                    const gd_backend_tensor_view *bias_chunk,
                                                     const gd_backend_tensor_view *targets,
                                                     const gd_backend_tensor_view *row_loss,
                                                     const gd_backend_tensor_view *row_max,
@@ -433,6 +435,7 @@ gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
                                                        const gd_backend_tensor_view *inv_valid_count);
 gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *logits_chunk,
+                                                     const gd_backend_tensor_view *bias_chunk,
                                                      const gd_backend_tensor_view *targets,
                                                      const gd_backend_tensor_view *row_max,
                                                      const gd_backend_tensor_view *row_inv_sum,

@@ -89,6 +89,16 @@ static bool gd_lm_cross_entropy_logits_chunk_valid(const gd_backend_tensor_view 
     return rows <= SIZE_MAX / classes && logits->count == rows * classes && targets->count == rows;
 }
 
+static bool gd_lm_cross_entropy_bias_chunk_valid(const gd_backend_tensor_view *bias,
+                                                 const gd_backend_tensor_view *logits)
+{
+    return bias == NULL ||
+           (logits != NULL && gd_lm_cross_entropy_view_range_valid(bias) &&
+            bias->dtype == (uint32_t)GD_DTYPE_F16 && bias->rank == 1U &&
+            bias->shape[0] == logits->shape[1] && bias->strides[0] == 1 &&
+            bias->count == (size_t)logits->shape[1]);
+}
+
 static bool gd_lm_cross_entropy_row_vector_valid(const gd_backend_tensor_view *targets,
                                                  const gd_backend_tensor_view *row_vector)
 {
@@ -99,6 +109,7 @@ static bool gd_lm_cross_entropy_row_vector_valid(const gd_backend_tensor_view *t
 }
 
 static gd_status gd_lm_cross_entropy_online_update_validate(const gd_backend_tensor_view *logits,
+                                                            const gd_backend_tensor_view *bias,
                                                             const gd_backend_tensor_view *targets,
                                                             const gd_backend_tensor_view *row_loss,
                                                             const gd_backend_tensor_view *row_max,
@@ -110,6 +121,7 @@ static gd_status gd_lm_cross_entropy_online_update_validate(const gd_backend_ten
         !gd_lm_cross_entropy_view_range_valid(targets) ||
         logits->dtype != (uint32_t)GD_DTYPE_F16 || targets->dtype != (uint32_t)GD_DTYPE_I32 ||
         !gd_lm_cross_entropy_logits_chunk_valid(logits, targets) ||
+        !gd_lm_cross_entropy_bias_chunk_valid(bias, logits) ||
         !gd_lm_cross_entropy_row_vector_valid(targets, row_loss) ||
         !gd_lm_cross_entropy_row_vector_valid(targets, row_max) ||
         !gd_lm_cross_entropy_row_vector_valid(targets, row_inv_sum) ||
@@ -169,6 +181,7 @@ static gd_status gd_lm_cross_entropy_reduce_normalize_validate(const gd_backend_
 }
 
 static gd_status gd_lm_cross_entropy_backward_chunk_validate(const gd_backend_tensor_view *logits,
+                                                             const gd_backend_tensor_view *bias,
                                                              const gd_backend_tensor_view *targets,
                                                              const gd_backend_tensor_view *row_max,
                                                              const gd_backend_tensor_view *row_inv_sum,
@@ -179,6 +192,7 @@ static gd_status gd_lm_cross_entropy_backward_chunk_validate(const gd_backend_te
                                                              uint64_t total_classes)
 {
     gd_status st = gd_lm_cross_entropy_online_update_validate(logits,
+                                                             bias,
                                                              targets,
                                                              row_inv_sum,
                                                              row_max,
@@ -216,6 +230,7 @@ static uint32_t gd_lm_cross_entropy_simdgroups(size_t classes)
 
 static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
                                           const gd_backend_tensor_view *logits,
+                                          const gd_backend_tensor_view *bias,
                                           const gd_backend_tensor_view *targets,
                                           const gd_backend_tensor_view *row_loss,
                                           const gd_backend_tensor_view *row_max,
@@ -230,6 +245,7 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
 {
     memset(args, 0, sizeof(*args));
     args->logits_offset = logits != NULL ? (uint64_t)logits->offset : 0U;
+    args->bias_offset = bias != NULL ? (uint64_t)bias->offset : 0U;
     args->target_offset = targets != NULL ? (uint64_t)targets->offset : 0U;
     args->row_loss_offset = row_loss != NULL ? (uint64_t)row_loss->offset : 0U;
     args->row_max_offset = row_max != NULL ? (uint64_t)row_max->offset : 0U;
@@ -250,12 +266,14 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
     args->scale = scale;
     args->logits_softcap = logits_softcap;
     args->inv_logits_softcap = logits_softcap > 0.0f ? 1.0f / logits_softcap : 0.0f;
+    args->has_bias = bias != NULL ? 1U : 0U;
     args->simdgroups = logits != NULL ? gd_lm_cross_entropy_simdgroups((size_t)logits->shape[1]) :
                                         gd_lm_cross_entropy_simdgroups((size_t)args->rows);
 }
 
 gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                                     const gd_backend_tensor_view *logits_chunk,
+                                                    const gd_backend_tensor_view *bias_chunk,
                                                     const gd_backend_tensor_view *targets,
                                                     const gd_backend_tensor_view *row_loss,
                                                     const gd_backend_tensor_view *row_max,
@@ -275,6 +293,7 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_lm_cross_entropy_online_update_validate(logits_chunk,
+                                                    bias_chunk,
                                                     targets,
                                                     row_loss,
                                                     row_max,
@@ -294,6 +313,7 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
     }
     gd_lm_cross_entropy_fill_args(&args,
                                   logits_chunk,
+                                  bias_chunk,
                                   targets,
                                   row_loss,
                                   row_max,
@@ -307,11 +327,12 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                   logits_softcap);
     [encoder setComputePipelineState:gd_lm_cross_entropy_online_update_f16_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(logits_chunk->buffer) offset:0U atIndex:0U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(targets->buffer) offset:0U atIndex:1U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_loss->buffer) offset:0U atIndex:2U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:3U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:4U];
-    [encoder setBytes:&args length:sizeof(args) atIndex:5U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(bias_chunk != NULL ? bias_chunk->buffer : logits_chunk->buffer) offset:0U atIndex:1U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(targets->buffer) offset:0U atIndex:2U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_loss->buffer) offset:0U atIndex:3U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:4U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:5U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:6U];
     grid = MTLSizeMake((NSUInteger)args.rows, 1U, 1U);
     threads = MTLSizeMake(32U, (NSUInteger)args.simdgroups, 1U);
     [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
@@ -350,6 +371,7 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
         return GD_ERR_INTERNAL;
     }
     gd_lm_cross_entropy_fill_args(&args,
+                                  NULL,
                                   NULL,
                                   targets,
                                   row_loss,
@@ -407,6 +429,7 @@ gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
     gd_lm_cross_entropy_fill_args(&args,
                                   NULL,
                                   NULL,
+                                  NULL,
                                   row_loss,
                                   row_valid,
                                   NULL,
@@ -432,6 +455,7 @@ gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
 
 gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *logits_chunk,
+                                                     const gd_backend_tensor_view *bias_chunk,
                                                      const gd_backend_tensor_view *targets,
                                                      const gd_backend_tensor_view *row_max,
                                                      const gd_backend_tensor_view *row_inv_sum,
@@ -454,6 +478,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
         return GD_ERR_INVALID_ARGUMENT;
     }
     st = gd_lm_cross_entropy_backward_chunk_validate(logits_chunk,
+                                                     bias_chunk,
                                                      targets,
                                                      row_max,
                                                      row_inv_sum,
@@ -475,6 +500,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
     }
     gd_lm_cross_entropy_fill_args(&args,
                                   logits_chunk,
+                                  bias_chunk,
                                   targets,
                                   NULL,
                                   row_max,
@@ -488,13 +514,14 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                   logits_softcap);
     [encoder setComputePipelineState:gd_lm_cross_entropy_backward_chunk_f16_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(logits_chunk->buffer) offset:0U atIndex:0U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(targets->buffer) offset:0U atIndex:1U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:2U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:3U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_loss->buffer) offset:0U atIndex:4U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(inv_valid_count->buffer) offset:0U atIndex:5U];
-    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_logits_chunk->buffer) offset:0U atIndex:6U];
-    [encoder setBytes:&args length:sizeof(args) atIndex:7U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(bias_chunk != NULL ? bias_chunk->buffer : logits_chunk->buffer) offset:0U atIndex:1U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(targets->buffer) offset:0U atIndex:2U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_max->buffer) offset:0U atIndex:3U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(row_inv_sum->buffer) offset:0U atIndex:4U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_loss->buffer) offset:0U atIndex:5U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(inv_valid_count->buffer) offset:0U atIndex:6U];
+    [encoder setBuffer:gd_lm_cross_entropy_buffer(grad_logits_chunk->buffer) offset:0U atIndex:7U];
+    [encoder setBytes:&args length:sizeof(args) atIndex:8U];
     grid = MTLSizeMake((NSUInteger)args.rows, 1U, 1U);
     threads = MTLSizeMake(32U, (NSUInteger)args.simdgroups, 1U);
     [encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];

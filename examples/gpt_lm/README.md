@@ -9,15 +9,15 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 - vocab size: 2048
 - context length: 512 tokens
 - `d_model = 512`
-- `n_layers = 3` by default, about 8.92M trainable parameters
-  - use `--layers 2` for about 6.29M trainable parameters
+- `n_layers = 3` by default, about 9.98M trainable parameters
+  - use `--layers 2` for about 7.35M trainable parameters
 - `n_heads = 8`
 - `head_dim = 64`
 - MLP hidden size: 1024 (`2 * d_model`)
 - default architecture: dense GPT attention (`sdpa_varlen`) with a 256-token sliding window for training/prompt prefill
 - optional `--architecture minimax_m3`: MiniMax M3-style attention; the example now auto-falls back to the fast dense 256-token window at the default 512-token context, and uses the Metal lightning indexer (`gd_minimax_m3_index_topk`) plus sparse attention (`gd_minimax_m3_sparse_attention`) only when the context is long enough for sparsity to win
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
-- tied LM head: token embedding weight is reused by `gd_linear_transposed_weight`
+- biased dense projections throughout the transformer block, plus an untied LM head (`lm_head` + `lm_head_bias`) used by the fused LM cross-entropy and generation logits
 - RMSNorm, RoPE, SwiGLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
 
 ## Dataset: `ita_dict`

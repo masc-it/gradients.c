@@ -7,6 +7,7 @@
 
 typedef struct gd_metal_lm_cross_entropy_args {
     gd_metal_u64 logits_offset;
+    gd_metal_u64 bias_offset;
     gd_metal_u64 target_offset;
     gd_metal_u64 row_loss_offset;
     gd_metal_u64 row_max_offset;
@@ -21,11 +22,12 @@ typedef struct gd_metal_lm_cross_entropy_args {
     float scale;
     float logits_softcap;
     float inv_logits_softcap;
+    gd_metal_u32 has_bias;
     gd_metal_u32 simdgroups;
 } gd_metal_lm_cross_entropy_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 112U,
+_Static_assert(sizeof(gd_metal_lm_cross_entropy_args) == 128U,
                "gd_metal_lm_cross_entropy_args ABI mismatch");
 #endif
 

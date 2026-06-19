@@ -566,6 +566,7 @@ gd_status gd_backend_cross_entropy_backward_stats(gd_backend *backend,
 
 gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                                     const gd_backend_tensor_view *logits_chunk,
+                                                    const gd_backend_tensor_view *bias_chunk,
                                                     const gd_backend_tensor_view *targets,
                                                     const gd_backend_tensor_view *row_loss,
                                                     const gd_backend_tensor_view *row_max,
@@ -576,6 +577,7 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
 {
     (void)backend;
     (void)logits_chunk;
+    (void)bias_chunk;
     (void)targets;
     (void)row_loss;
     (void)row_max;
@@ -620,6 +622,7 @@ gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
 
 gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      const gd_backend_tensor_view *logits_chunk,
+                                                     const gd_backend_tensor_view *bias_chunk,
                                                      const gd_backend_tensor_view *targets,
                                                      const gd_backend_tensor_view *row_max,
                                                      const gd_backend_tensor_view *row_inv_sum,
@@ -633,6 +636,7 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
 {
     (void)backend;
     (void)logits_chunk;
+    (void)bias_chunk;
     (void)targets;
     (void)row_max;
     (void)row_inv_sum;

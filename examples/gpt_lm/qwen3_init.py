@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
                    help="Select source MLP neurons uniformly or by gate/up/down path norm")
     p.add_argument("--seed", type=int, default=0x5179_9EED)
     p.add_argument("--no-rescale", action="store_true", help="Do not RMS-rescale transplanted tensors")
-    p.add_argument("--embedding-only", action="store_true", help="Only transplant tied embedding; random-init blocks")
+    p.add_argument("--embedding-only", action="store_true", help="Only transplant token embedding/LM head; random-init blocks")
     return p.parse_args()
 
 
@@ -420,7 +420,7 @@ def make_metadata(args: argparse.Namespace, cfg, mapped_tokens: int) -> bytes:
         f"sdpa_window={TARGET_SDPA_WINDOW}",
         "dropout=0.100000001",
         "tokenizer_path=data/tokenizer-v2048.json",
-        "note=Qwen3 weight-surgery init; follow with KL/CE distillation",
+        "note=Qwen3 weight-surgery init; token_embedding and untied lm_head start from same mapped weights; all biases start at zero; follow with KL/CE distillation",
         "",
     ]
     return "\n".join(lines).encode("utf-8")
@@ -493,7 +493,7 @@ def build_entries(args: argparse.Namespace, model_dir: pathlib.Path) -> list[Tar
         print("projection: random orthogonal")
         projection = random_orthogonal_projection(int(cfg.hidden_size), TARGET_D_MODEL, args.seed)
 
-    print("building target tied embedding")
+    print("building target token embedding / untied LM head init")
     emb, mapped_tokens = compose_target_embedding(
         src_embed,
         projection,
@@ -506,6 +506,8 @@ def build_entries(args: argparse.Namespace, model_dir: pathlib.Path) -> list[Tar
 
     entries: list[TargetEntry] = [
         TargetEntry("gpt_lm.token_embedding", emb),
+        TargetEntry("gpt_lm.lm_head", emb.copy()),
+        TargetEntry("gpt_lm.lm_head_bias", np_to_f16_np(np.zeros((TARGET_VOCAB,), dtype=np.float32))),
         TargetEntry("gpt_lm.final_norm_w", np_to_f16_np(np.ones((TARGET_D_MODEL,), dtype=np.float32))),
     ]
 
@@ -533,6 +535,10 @@ def build_entries(args: argparse.Namespace, model_dir: pathlib.Path) -> list[Tar
             entries.append(TargetEntry(f"{b}.attn_proj.weight", torch_to_f16_np(normalize_std(attn_out, residual_std, rescale))))
             entries.append(TargetEntry(f"{b}.up_gate.weight", torch_to_f16_np(normalize_std(up_gate, TARGET_WEIGHT_STD, rescale))))
             entries.append(TargetEntry(f"{b}.down_proj.weight", torch_to_f16_np(normalize_std(down, residual_std, rescale))))
+        entries.append(TargetEntry(f"{b}.qkv_proj.bias", np_to_f16_np(np.zeros((3 * TARGET_D_MODEL,), dtype=np.float32))))
+        entries.append(TargetEntry(f"{b}.attn_proj.bias", np_to_f16_np(np.zeros((TARGET_D_MODEL,), dtype=np.float32))))
+        entries.append(TargetEntry(f"{b}.up_gate.bias", np_to_f16_np(np.zeros((2 * TARGET_MLP,), dtype=np.float32))))
+        entries.append(TargetEntry(f"{b}.down_proj.bias", np_to_f16_np(np.zeros((TARGET_D_MODEL,), dtype=np.float32))))
 
     metadata = make_metadata(args, cfg, mapped_tokens)
     args._metadata = metadata  # keep simple for main()

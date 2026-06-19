@@ -166,6 +166,50 @@ static bool gd_lm_cross_entropy_weight_chunk_view(const gd_tensor *tensor,
     return true;
 }
 
+static bool gd_lm_cross_entropy_bias_chunk_view(const gd_tensor *tensor,
+                                                int64_t classes,
+                                                uint64_t class_start,
+                                                uint64_t chunk_classes,
+                                                gd_backend_tensor_view *tensor_view,
+                                                gd_backend_vector_view *vector_view)
+{
+    gd_backend_vector_view base;
+    const size_t elem_size = gd_dtype_size(GD_DTYPE_F16);
+    size_t delta;
+    if (tensor_view != NULL) {
+        memset(tensor_view, 0, sizeof(*tensor_view));
+    }
+    if (vector_view != NULL) {
+        memset(vector_view, 0, sizeof(*vector_view));
+    }
+    if (tensor == NULL || classes <= 0 || class_start > (uint64_t)classes || chunk_classes == 0U ||
+        chunk_classes > (uint64_t)classes - class_start || chunk_classes > (uint64_t)UINT32_MAX ||
+        !gd_op_vector_view_from_tensor(tensor, &base) || base.dtype != (uint32_t)GD_DTYPE_F16 ||
+        base.length != (uint32_t)classes || elem_size == 0U ||
+        class_start > (uint64_t)(SIZE_MAX / elem_size)) {
+        return false;
+    }
+    delta = (size_t)class_start * elem_size;
+    if (base.offset > SIZE_MAX - delta) {
+        return false;
+    }
+    base.offset += delta;
+    base.length = (uint32_t)chunk_classes;
+    if (vector_view != NULL) {
+        *vector_view = base;
+    }
+    if (tensor_view != NULL) {
+        tensor_view->buffer = base.buffer;
+        tensor_view->offset = base.offset;
+        tensor_view->count = (size_t)chunk_classes;
+        tensor_view->dtype = (uint32_t)GD_DTYPE_F16;
+        tensor_view->rank = 1U;
+        tensor_view->shape[0] = (int64_t)chunk_classes;
+        tensor_view->strides[0] = 1;
+    }
+    return true;
+}
+
 static gd_status gd_lm_cross_entropy_make_logits_chunk(gd_context *ctx,
                                                        const gd_linear_shape_info *info,
                                                        uint64_t chunk_classes,
@@ -198,6 +242,7 @@ static gd_status gd_lm_cross_entropy_make_logits_chunk(gd_context *ctx,
 
 static gd_status gd_lm_cross_entropy_dispatch_online_update(gd_context *ctx,
                                                             const gd_tensor *logits_chunk,
+                                                            const gd_backend_tensor_view *bias_chunk,
                                                             const gd_tensor *targets,
                                                             const gd_tensor *row_loss,
                                                             const gd_tensor *row_max,
@@ -219,6 +264,7 @@ static gd_status gd_lm_cross_entropy_dispatch_online_update(gd_context *ctx,
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, row_inv_sum, &iv));
     st = gd_backend_lm_cross_entropy_online_update(gd_context_backend(ctx),
                                                    &lv,
+                                                   bias_chunk,
                                                    &tv,
                                                    &rv,
                                                    &mv,
@@ -288,6 +334,7 @@ static gd_status gd_lm_cross_entropy_dispatch_reduce_normalize(gd_context *ctx,
 
 static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
                                                              const gd_tensor *logits_chunk,
+                                                             const gd_backend_tensor_view *bias_chunk,
                                                              const gd_tensor *targets,
                                                              const gd_tensor *row_max,
                                                              const gd_tensor *row_inv_sum,
@@ -316,6 +363,7 @@ static gd_status gd_lm_cross_entropy_dispatch_backward_chunk(gd_context *ctx,
     GD_TRY(gd_lm_cross_entropy_tensor_view(ctx, grad_logits_chunk, &dgv));
     st = gd_backend_lm_cross_entropy_backward_chunk(gd_context_backend(ctx),
                                                     &lv,
+                                                    bias_chunk,
                                                     &tv,
                                                     &mv,
                                                     &iv,
@@ -338,7 +386,17 @@ gd_status gd_lm_cross_entropy(gd_context *ctx,
                               const gd_tensor *targets,
                               gd_tensor *loss)
 {
-    return gd_lm_cross_entropy_softcapped(ctx, hidden, weight, targets, 0.0f, loss);
+    return gd_lm_cross_entropy_softcapped_bias(ctx, hidden, weight, NULL, targets, 0.0f, loss);
+}
+
+gd_status gd_lm_cross_entropy_bias(gd_context *ctx,
+                                   const gd_tensor *hidden,
+                                   const gd_tensor *weight,
+                                   const gd_tensor *bias,
+                                   const gd_tensor *targets,
+                                   gd_tensor *loss)
+{
+    return gd_lm_cross_entropy_softcapped_bias(ctx, hidden, weight, bias, targets, 0.0f, loss);
 }
 
 gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
@@ -347,6 +405,17 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
                                          const gd_tensor *targets,
                                          float logits_softcap,
                                          gd_tensor *loss)
+{
+    return gd_lm_cross_entropy_softcapped_bias(ctx, hidden, weight, NULL, targets, logits_softcap, loss);
+}
+
+gd_status gd_lm_cross_entropy_softcapped_bias(gd_context *ctx,
+                                              const gd_tensor *hidden,
+                                              const gd_tensor *weight,
+                                              const gd_tensor *bias,
+                                              const gd_tensor *targets,
+                                              float logits_softcap,
+                                              gd_tensor *loss)
 {
     gd_status st;
     gd_linear_shape_info info;
@@ -377,7 +446,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     if (ctx == NULL || hidden == NULL || weight == NULL || targets == NULL || loss == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    st = gd_linear_transposed_weight_validate_common(ctx, hidden, weight, NULL, &info);
+    st = gd_linear_transposed_weight_validate_common(ctx, hidden, weight, bias, &info);
     if (st != GD_OK) {
         return st;
     }
@@ -429,7 +498,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
     if (!gd_linear_flat_matrix_view_from_tensor(hidden, info.rows, info.k, &hv)) {
         return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid hidden matrix view");
     }
-    needs_grad = hidden->requires_grad || weight->requires_grad;
+    needs_grad = hidden->requires_grad || weight->requires_grad || (bias != NULL && bias->requires_grad);
     chunk_size = gd_lm_cross_entropy_chunk_classes(info.n);
     for (class_start = 0U; class_start < (uint64_t)info.n; class_start += chunk_size) {
         const uint64_t remaining = (uint64_t)info.n - class_start;
@@ -437,6 +506,8 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         gd_tensor logits_chunk;
         gd_backend_matrix_view wv;
         gd_backend_matrix_view lv;
+        gd_backend_tensor_view bv;
+        const gd_backend_tensor_view *bv_ptr = NULL;
         st = gd_lm_cross_entropy_make_logits_chunk(ctx, &info, chunk_classes, &logits_chunk, &lv);
         if (st != GD_OK) {
             return st;
@@ -453,8 +524,15 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         if (st != GD_OK) {
             return gd_context_set_error(ctx, st, "backend lm_cross_entropy logits chunk failed");
         }
+        if (bias != NULL) {
+            if (!gd_lm_cross_entropy_bias_chunk_view(bias, info.n, class_start, chunk_classes, &bv, NULL)) {
+                return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid bias chunk view");
+            }
+            bv_ptr = &bv;
+        }
         st = gd_lm_cross_entropy_dispatch_online_update(ctx,
                                                         &logits_chunk,
+                                                        bv_ptr,
                                                         targets,
                                                         &row_loss,
                                                         &row_max,
@@ -503,7 +581,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         return st;
     }
     if (needs_grad) {
-        const gd_tensor *inputs[3];
+        const gd_tensor *inputs[4];
         gd_tensor *outputs[1];
         const gd_tensor *saved[4];
         const gd_lm_cross_entropy_attrs attrs = {
@@ -511,7 +589,12 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         };
         inputs[0] = hidden;
         inputs[1] = weight;
-        inputs[2] = targets;
+        if (bias != NULL) {
+            inputs[2] = bias;
+            inputs[3] = targets;
+        } else {
+            inputs[2] = targets;
+        }
         outputs[0] = loss;
         saved[0] = &row_max;
         saved[1] = &row_inv_sum;
@@ -520,7 +603,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
         st = gd_autograd_record(ctx,
                                 GD_OP_LM_CROSS_ENTROPY,
                                 inputs,
-                                3U,
+                                bias != NULL ? 4U : 3U,
                                 outputs,
                                 1U,
                                 &attrs,
@@ -550,6 +633,7 @@ gd_status gd_lm_cross_entropy_softcapped(gd_context *ctx,
 gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   const gd_tensor *hidden,
                                                   const gd_tensor *weight,
+                                                  const gd_tensor *bias,
                                                   const gd_tensor *targets,
                                                   const gd_tensor *row_max,
                                                   const gd_tensor *row_inv_sum,
@@ -558,16 +642,19 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   float logits_softcap,
                                                   const gd_tensor *grad_out,
                                                   gd_tensor *grad_hidden,
-                                                  gd_tensor *grad_weight)
+                                                  gd_tensor *grad_weight,
+                                                  gd_tensor *grad_bias)
 {
     gd_status st;
     gd_linear_shape_info info;
     gd_tensor dhidden;
     gd_tensor dweight;
+    gd_tensor dbias;
     gd_tensor partial_dhidden;
     gd_backend_matrix_view hv;
     bool need_hidden;
     bool need_weight;
+    bool need_bias;
     bool single_chunk;
     uint64_t chunk_size;
     uint64_t class_start;
@@ -577,19 +664,25 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
     if (grad_weight != NULL) {
         memset(grad_weight, 0, sizeof(*grad_weight));
     }
+    if (grad_bias != NULL) {
+        memset(grad_bias, 0, sizeof(*grad_bias));
+    }
     memset(&dhidden, 0, sizeof(dhidden));
     memset(&dweight, 0, sizeof(dweight));
+    memset(&dbias, 0, sizeof(dbias));
     memset(&partial_dhidden, 0, sizeof(partial_dhidden));
     if (ctx == NULL || hidden == NULL || weight == NULL || targets == NULL ||
-        row_max == NULL || row_inv_sum == NULL || inv_valid_count == NULL || grad_out == NULL) {
+        row_max == NULL || row_inv_sum == NULL || inv_valid_count == NULL || grad_out == NULL ||
+        (grad_bias != NULL && bias == NULL)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     need_hidden = grad_hidden != NULL;
     need_weight = grad_weight != NULL;
-    if (!need_hidden && !need_weight) {
+    need_bias = grad_bias != NULL;
+    if (!need_hidden && !need_weight && !need_bias) {
         return GD_OK;
     }
-    st = gd_linear_transposed_weight_validate_common(ctx, hidden, weight, NULL, &info);
+    st = gd_linear_transposed_weight_validate_common(ctx, hidden, weight, bias, &info);
     if (st != GD_OK) {
         return st;
     }
@@ -682,12 +775,26 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         }
         dweight.is_leaf = false;
     }
+    if (need_bias) {
+        st = gd_tensor_empty(ctx,
+                             GD_ARENA_SCRATCH,
+                             GD_DTYPE_F16,
+                             gd_shape_make(bias->rank, bias->shape),
+                             256U,
+                             &dbias);
+        if (st != GD_OK) {
+            return st;
+        }
+        dbias.is_leaf = false;
+    }
     for (class_start = 0U; class_start < (uint64_t)info.n; class_start += chunk_size) {
         const uint64_t remaining = (uint64_t)info.n - class_start;
         const uint64_t chunk_classes = remaining < chunk_size ? remaining : chunk_size;
         gd_tensor logits_chunk;
         gd_backend_matrix_view wv;
         gd_backend_matrix_view lv;
+        gd_backend_tensor_view bv;
+        const gd_backend_tensor_view *bv_ptr = NULL;
         bool using_saved_logits = saved_logits != NULL && single_chunk;
         if (using_saved_logits) {
             logits_chunk = *saved_logits;
@@ -710,6 +817,12 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                    &wv)) {
             return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid weight chunk view");
         }
+        if (bias != NULL) {
+            if (!gd_lm_cross_entropy_bias_chunk_view(bias, info.n, class_start, chunk_classes, &bv, NULL)) {
+                return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid bias chunk view");
+            }
+            bv_ptr = &bv;
+        }
         if (!using_saved_logits) {
             st = gd_backend_matmul_nt(gd_context_backend(ctx), &hv, &wv, &lv);
             if (st != GD_OK) {
@@ -718,6 +831,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
         }
         st = gd_lm_cross_entropy_dispatch_backward_chunk(ctx,
                                                          &logits_chunk,
+                                                         bv_ptr,
                                                          targets,
                                                          row_max,
                                                          row_inv_sum,
@@ -779,6 +893,16 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                 return gd_context_set_error(ctx, st, "backend lm_cross_entropy weight grad chunk failed");
             }
         }
+        if (need_bias) {
+            gd_backend_vector_view dbv;
+            if (!gd_lm_cross_entropy_bias_chunk_view(&dbias, info.n, class_start, chunk_classes, NULL, &dbv)) {
+                return gd_context_set_error(ctx, GD_ERR_INVALID_ARGUMENT, "lm_cross_entropy invalid bias grad view");
+            }
+            st = gd_backend_reduce_rows(gd_context_backend(ctx), &lv, &dbv);
+            if (st != GD_OK) {
+                return gd_context_set_error(ctx, st, "backend lm_cross_entropy bias grad chunk failed");
+            }
+        }
         if (!using_saved_logits) {
             st = gd_lm_cross_entropy_free_scratch(ctx, &logits_chunk);
             if (st != GD_OK) {
@@ -797,6 +921,9 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
     }
     if (need_weight) {
         *grad_weight = dweight;
+    }
+    if (need_bias) {
+        *grad_bias = dbias;
     }
     return GD_OK;
 }

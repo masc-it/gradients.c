@@ -88,11 +88,12 @@ static inline float gd_lm_ce_threadgroup_sum(float local,
 
 kernel void gd_lm_cross_entropy_online_update_f16_kernel(
     device const uchar *logitsbuf [[buffer(0)]],
-    device const uchar *targetbuf [[buffer(1)]],
-    device uchar *row_lossbuf [[buffer(2)]],
-    device uchar *row_maxbuf [[buffer(3)]],
-    device uchar *row_inv_sumbuf [[buffer(4)]],
-    constant gd_metal_lm_cross_entropy_args &args [[buffer(5)]],
+    device const uchar *biasbuf [[buffer(1)]],
+    device const uchar *targetbuf [[buffer(2)]],
+    device uchar *row_lossbuf [[buffer(3)]],
+    device uchar *row_maxbuf [[buffer(4)]],
+    device uchar *row_inv_sumbuf [[buffer(5)]],
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(6)]],
     uint3 tgpos [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simdgroup_id [[simdgroup_index_in_threadgroup]])
@@ -105,6 +106,7 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
     const ulong thread_i = ulong(simdgroup_id) * 32ul + ulong(simd_lane);
     const ulong thread_stride = 32ul * ulong(simdgroups);
     device const half *logits = reinterpret_cast<device const half *>(logitsbuf + args.logits_offset);
+    device const half *bias = reinterpret_cast<device const half *>(biasbuf + args.bias_offset);
     device const int *targets = reinterpret_cast<device const int *>(targetbuf + args.target_offset);
     device float *target_logit = reinterpret_cast<device float *>(row_lossbuf + args.row_loss_offset);
     device float *row_max = reinterpret_cast<device float *>(row_maxbuf + args.row_max_offset);
@@ -115,7 +117,9 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
     const ulong base = row * classes;
     float local_max = GD_LM_CE_NEG_INF;
     for (ulong c = thread_i; c < classes; c += thread_stride) {
-        const float logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        const float matmul_logit = float(logits[base + c]);
+        const float raw_logit = args.has_bias != 0u ? float(half(matmul_logit + float(bias[c]))) : matmul_logit;
+        const float logit = gd_lm_ce_apply_softcap(raw_logit, args);
         local_max = max(local_max, logit);
     }
     const float chunk_max = gd_lm_ce_threadgroup_max(local_max,
@@ -126,7 +130,9 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
                                                      simdgroups);
     float local_sum = 0.0f;
     for (ulong c = thread_i; c < classes; c += thread_stride) {
-        const float logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        const float matmul_logit = float(logits[base + c]);
+        const float raw_logit = args.has_bias != 0u ? float(half(matmul_logit + float(bias[c]))) : matmul_logit;
+        const float logit = gd_lm_ce_apply_softcap(raw_logit, args);
         local_sum += exp(logit - chunk_max);
     }
     const float chunk_sum = gd_lm_ce_threadgroup_sum(local_sum,
@@ -142,7 +148,10 @@ kernel void gd_lm_cross_entropy_online_update_f16_kernel(
             const ulong chunk_start = ulong(args.class_start);
             if (target_u >= chunk_start && target_u < chunk_start + classes &&
                 target_u < ulong(args.total_classes)) {
-                target_logit[row] = gd_lm_ce_apply_softcap(float(logits[base + (target_u - chunk_start)]), args);
+                const ulong c = target_u - chunk_start;
+                const float matmul_logit = float(logits[base + c]);
+                const float raw_logit = args.has_bias != 0u ? float(half(matmul_logit + float(bias[c]))) : matmul_logit;
+                target_logit[row] = gd_lm_ce_apply_softcap(raw_logit, args);
             }
         }
         const float old_max = row_max[row];
@@ -246,13 +255,14 @@ kernel void gd_lm_cross_entropy_reduce_normalize_f32_kernel(
 
 kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     device const uchar *logitsbuf [[buffer(0)]],
-    device const uchar *targetbuf [[buffer(1)]],
-    device const uchar *row_maxbuf [[buffer(2)]],
-    device const uchar *row_inv_sumbuf [[buffer(3)]],
-    device const uchar *gradbuf [[buffer(4)]],
-    device const uchar *inv_valid_countbuf [[buffer(5)]],
-    device uchar *grad_logitsbuf [[buffer(6)]],
-    constant gd_metal_lm_cross_entropy_args &args [[buffer(7)]],
+    device const uchar *biasbuf [[buffer(1)]],
+    device const uchar *targetbuf [[buffer(2)]],
+    device const uchar *row_maxbuf [[buffer(3)]],
+    device const uchar *row_inv_sumbuf [[buffer(4)]],
+    device const uchar *gradbuf [[buffer(5)]],
+    device const uchar *inv_valid_countbuf [[buffer(6)]],
+    device uchar *grad_logitsbuf [[buffer(7)]],
+    constant gd_metal_lm_cross_entropy_args &args [[buffer(8)]],
     uint3 tgpos [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simdgroup_id [[simdgroup_index_in_threadgroup]])
@@ -263,6 +273,7 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     const ulong thread_i = ulong(simdgroup_id) * 32ul + ulong(simd_lane);
     const ulong thread_stride = 32ul * ulong(simdgroups);
     device const half *logits = reinterpret_cast<device const half *>(logitsbuf + args.logits_offset);
+    device const half *bias = reinterpret_cast<device const half *>(biasbuf + args.bias_offset);
     device const int *targets = reinterpret_cast<device const int *>(targetbuf + args.target_offset);
     device const float *row_max = reinterpret_cast<device const float *>(row_maxbuf + args.row_max_offset);
     device const float *row_inv_sum = reinterpret_cast<device const float *>(row_inv_sumbuf + args.row_inv_sum_offset);
@@ -287,7 +298,9 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     const ulong chunk_start = ulong(args.class_start);
     for (ulong c = thread_i; c < classes; c += thread_stride) {
         const ulong global_c = chunk_start + c;
-        const float soft_logit = gd_lm_ce_apply_softcap(float(logits[base + c]), args);
+        const float matmul_logit = float(logits[base + c]);
+        const float raw_logit = args.has_bias != 0u ? float(half(matmul_logit + float(bias[c]))) : matmul_logit;
+        const float soft_logit = gd_lm_ce_apply_softcap(raw_logit, args);
         float p = exp(soft_logit - rm) * inv_sum;
         if (global_c == target_u) {
             p -= 1.0f;

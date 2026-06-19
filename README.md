@@ -40,10 +40,10 @@ make -C examples/mlp_mnist smoke
 [`examples/gpt_lm`](examples/gpt_lm/README.md) — decoder-only LM with training,
 validation, checkpoints, resume, checkpoint inference, interactive generation,
 and KV-cache decode. Defaults are vocab 2048, context 512, `d_model=512`,
-3 layers, 8 heads, DH=64, about 8.92M trainable parameters. The model uses
-RMSNorm, RoPE, packed variable-length causal attention, SwiGLU, tied LM head,
-fused LM cross entropy, dropout, AdamW AMP, gradient clipping, and optional
-logits softcap.
+3 layers, 8 heads, DH=64, about 9.98M trainable parameters. The model uses
+RMSNorm, RoPE, packed variable-length causal attention, SwiGLU, biased dense
+projections, an untied biased LM head, fused LM cross entropy, dropout, AdamW
+AMP, gradient clipping, and optional logits softcap.
 
 ```sh
 make -C examples/gpt_lm GPT_LM_DATASET=ita_dict data

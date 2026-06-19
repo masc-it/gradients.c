@@ -33,7 +33,7 @@ static gd_status full_logits(gd_context *ctx, gpt_lm *model, const gd_tensor *id
         x = block_out;
     }
     st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm); if (st != GD_OK) return st;
-    return gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
+    return gd_linear_transposed_weight(ctx, &final_norm, &model->lm_head, &model->lm_head_bias, logits);
 }
 
 int main(int argc, char **argv) {

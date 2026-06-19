@@ -109,12 +109,18 @@ size_t gpt_param_count_for_layers(int n_layers)
     size_t per_block = 0U;
     size_t total = 0U;
     total += checked_mul_size((size_t)GPT_VOCAB_SIZE, (size_t)GPT_D_MODEL, "embedding params");
+    total += checked_mul_size((size_t)GPT_VOCAB_SIZE, (size_t)GPT_D_MODEL, "LM head params");
+    total += (size_t)GPT_VOCAB_SIZE;
     total += (size_t)GPT_D_MODEL;
     per_block += (size_t)(2 * GPT_D_MODEL);
     per_block += checked_mul_size((size_t)GPT_D_MODEL, (size_t)(3 * GPT_D_MODEL), "qkv params");
     per_block += checked_mul_size((size_t)GPT_D_MODEL, (size_t)GPT_D_MODEL, "attn out params");
     per_block += checked_mul_size((size_t)GPT_D_MODEL, (size_t)(2 * GPT_MLP_HIDDEN), "up/gate params");
     per_block += checked_mul_size((size_t)GPT_MLP_HIDDEN, (size_t)GPT_D_MODEL, "down params");
+    per_block += (size_t)(3 * GPT_D_MODEL);      /* qkv bias */
+    per_block += (size_t)GPT_D_MODEL;            /* attn out bias */
+    per_block += (size_t)(2 * GPT_MLP_HIDDEN);   /* up/gate bias */
+    per_block += (size_t)GPT_D_MODEL;            /* down bias */
     total += checked_mul_size(per_block, (size_t)n_layers, "block params");
     return total;
 }
@@ -239,19 +245,25 @@ static void gpt_linear_layer_init_normal_child(gd_context *ctx,
                                                float stddev)
 {
     int64_t weight_shape[2];
+    int64_t bias_shape[1];
     gd_tensor_spec weight_spec;
+    gd_tensor_spec bias_spec;
     const gd_init_spec empty = gd_init_empty();
+    const gd_init_spec zero = gd_init_zero();
     memset(layer, 0, sizeof(*layer));
     weight_shape[0] = transposed_weight ? out_features : in_features;
     weight_shape[1] = transposed_weight ? in_features : out_features;
+    bias_shape[0] = out_features;
     weight_spec = gd_tensor_spec_make(GD_DTYPE_F16, gd_shape_make(2U, weight_shape), GPT_ALIGNMENT);
+    bias_spec = gd_tensor_spec_make(GD_DTYPE_F16, gd_shape_make(1U, bias_shape), GPT_ALIGNMENT);
     TRY(ctx, gd_module_init(ctx, &layer->mod, name));
     layer->in_features = in_features;
     layer->out_features = out_features;
-    layer->has_bias = false;
+    layer->has_bias = true;
     layer->weight_transposed = transposed_weight;
     TRY(ctx, gd_module_param(ctx, &layer->mod, "weight", &weight_spec, &empty, &layer->weight));
     gpt_tensor_init_normal(ctx, &layer->weight, seed, stddev);
+    TRY(ctx, gd_module_param(ctx, &layer->mod, "bias", &bias_spec, &zero, &layer->bias));
     TRY(ctx, gd_module_add_child(parent, name, &layer->mod));
 }
 
@@ -322,8 +334,10 @@ static void gpt_block_init(gd_context *ctx,
 void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
 {
     const gd_tensor_spec embed_spec = tensor_spec_2d(GD_DTYPE_F16, GPT_VOCAB_SIZE, GPT_D_MODEL);
+    const gd_tensor_spec bias_spec = tensor_spec_1d(GD_DTYPE_F16, GPT_VOCAB_SIZE);
     const gd_tensor_spec norm_spec = tensor_spec_1d(GD_DTYPE_F16, GPT_D_MODEL);
     const gd_init_spec empty = gd_init_empty();
+    const gd_init_spec zero = gd_init_zero();
     const gd_init_spec rms_norm_init = gd_init_one();
     uint32_t i;
     memset(model, 0, sizeof(*model));
@@ -362,6 +376,22 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
                            &model->token_embedding,
                            splitmix64(config->seed ^ UINT64_C(0xabc001)),
                            GPT_WEIGHT_INIT_STD);
+    TRY(ctx, gd_module_param(ctx,
+                             &model->mod,
+                             "lm_head",
+                             &embed_spec,
+                             &empty,
+                             &model->lm_head));
+    gpt_tensor_init_normal(ctx,
+                           &model->lm_head,
+                           splitmix64(config->seed ^ UINT64_C(0xabc002)),
+                           GPT_WEIGHT_INIT_STD);
+    TRY(ctx, gd_module_param(ctx,
+                             &model->mod,
+                             "lm_head_bias",
+                             &bias_spec,
+                             &zero,
+                             &model->lm_head_bias));
     TRY(ctx, gd_module_param(ctx,
                              &model->mod,
                              "final_norm_w",
@@ -774,12 +804,13 @@ gd_status gpt_lm_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    return gd_lm_cross_entropy_softcapped(ctx,
-                                          &final_norm,
-                                          &model->token_embedding,
-                                          target_ids,
-                                          model->logits_softcap,
-                                          loss);
+    return gd_lm_cross_entropy_softcapped_bias(ctx,
+                                               &final_norm,
+                                               &model->lm_head,
+                                               &model->lm_head_bias,
+                                               target_ids,
+                                               model->logits_softcap,
+                                               loss);
 }
 
 static gd_status gpt_block_prefill_cached(gd_context *ctx,
@@ -1070,7 +1101,7 @@ static gd_status gpt_lm_prefill_logits(gd_context *ctx,
     }
     st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
     if (st != GD_OK) { return st; }
-    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
+    st = gd_linear_transposed_weight(ctx, &final_norm, &model->lm_head, &model->lm_head_bias, logits);
     if (st != GD_OK) { return st; }
     return GD_OK;
 }
@@ -1111,7 +1142,7 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
     }
     st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
     if (st != GD_OK) { return st; }
-    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, NULL, logits);
+    st = gd_linear_transposed_weight(ctx, &final_norm, &model->lm_head, &model->lm_head_bias, logits);
     if (st != GD_OK) { return st; }
     for (i = 0U; i < (uint32_t)cache->batch_size; ++i) {
         cache->pos[i] += 1;

@@ -18,6 +18,8 @@ size_t gd_dtype_size(gd_dtype dtype)
         return 4U;
     case GD_DTYPE_U8:
         return 1U;
+    case GD_DTYPE_U16:
+        return 2U;
     case GD_DTYPE_INVALID:
     default:
         return 0U;
@@ -37,6 +39,8 @@ const char *gd_dtype_name(gd_dtype dtype)
         return "i32";
     case GD_DTYPE_U8:
         return "u8";
+    case GD_DTYPE_U16:
+        return "u16";
     case GD_DTYPE_INVALID:
     default:
         return "invalid";
@@ -352,6 +356,7 @@ static bool gd_dtype_one_pattern(gd_dtype dtype, uint32_t *out_pattern)
         return true;
     case GD_DTYPE_I32:
     case GD_DTYPE_U8:
+    case GD_DTYPE_U16:
         *out_pattern = 1U;
         return true;
     case GD_DTYPE_INVALID:

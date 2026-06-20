@@ -7,17 +7,37 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef GPT_VOCAB_SIZE
 #define GPT_VOCAB_SIZE 2048
+#endif
+#ifndef GPT_CONTEXT_LENGTH
 #define GPT_CONTEXT_LENGTH 512
+#endif
+#ifndef GPT_D_MODEL
 #define GPT_D_MODEL 512
+#endif
+#ifndef GPT_N_HEADS
 #define GPT_N_HEADS 8
+#endif
+#ifndef GPT_HEAD_DIM
 #define GPT_HEAD_DIM 64
+#endif
+#ifndef GPT_SDPA_WINDOW
 #define GPT_SDPA_WINDOW 256
+#endif
 #define GPT_MLP_HIDDEN (2 * GPT_D_MODEL)
+#ifndef GPT_MINIMAX_M3_BLOCK_SIZE
 #define GPT_MINIMAX_M3_BLOCK_SIZE 128
+#endif
+#ifndef GPT_MINIMAX_M3_TOPK_BLOCKS
 #define GPT_MINIMAX_M3_TOPK_BLOCKS 3
+#endif
+#ifndef GPT_MINIMAX_M3_INIT_BLOCKS
 #define GPT_MINIMAX_M3_INIT_BLOCKS 1
+#endif
+#ifndef GPT_MINIMAX_M3_LOCAL_BLOCKS
 #define GPT_MINIMAX_M3_LOCAL_BLOCKS 1
+#endif
 
 #define GPT_DEFAULT_LAYERS 3
 #define GPT_DEFAULT_EPOCHS 2
@@ -98,6 +118,7 @@ typedef struct gpt_lm {
     float dropout_p;
     float rms_eps;
     float logits_softcap;
+    int pad_token_id;
     uint64_t dropout_seed;
     gd_tensor token_embedding;
     gd_tensor lm_head;
@@ -148,6 +169,7 @@ typedef struct gpt_config {
     float min_p;
     float repetition_penalty;
     float logits_softcap;
+    int pad_token_id;
 } gpt_config;
 
 typedef struct gpt_generation_tokenizer {

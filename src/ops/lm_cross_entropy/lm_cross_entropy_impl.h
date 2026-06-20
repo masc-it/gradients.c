@@ -5,9 +5,10 @@
 
 typedef struct gd_lm_cross_entropy_attrs {
     float logits_softcap;
+    int32_t ignore_index;
 } gd_lm_cross_entropy_attrs;
 
-_Static_assert(sizeof(gd_lm_cross_entropy_attrs) == 4U,
+_Static_assert(sizeof(gd_lm_cross_entropy_attrs) == 8U,
                "gd_lm_cross_entropy_attrs ABI mismatch");
 
 gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
@@ -20,6 +21,7 @@ gd_status gd_lm_cross_entropy_backward_with_stats(gd_context *ctx,
                                                   const gd_tensor *inv_valid_count,
                                                   const gd_tensor *saved_logits,
                                                   float logits_softcap,
+                                                  int32_t ignore_index,
                                                   const gd_tensor *grad_out,
                                                   gd_tensor *grad_hidden,
                                                   gd_tensor *grad_weight,

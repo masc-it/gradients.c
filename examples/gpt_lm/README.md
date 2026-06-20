@@ -57,6 +57,8 @@ cu_seqlens      i32 [num_segments + 1] # generated from segment_lengths
 
 The model consumes `input_ids`, `target_ids`, `positions`, and `cu_seqlens`.
 
+`GPT_LM_DATASET=ita_dict_v2` now writes compact GDDS shards: on disk each sample stores `tokens` as `u16 [context_length + 1]` plus small `segment_lengths` metadata. The training dataloader expands those fields into the runtime tensors above and replaces cross-document targets with the tokenizer `<|pad|>` id, which the fused LM CE ignores.
+
 Useful data-prep variables:
 
 ```text

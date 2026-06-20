@@ -7,6 +7,7 @@ SHARED_SRC := gpt_lm_shared.c
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.gpt_lm_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.gpt_lm_gdds.args
+BUILD_ARGS_FILE := .gpt_lm_build.args
 GPT_LM_DATASET ?= ita_dict
 
 ifeq ($(GPT_LM_DATASET),ita_dict)
@@ -14,7 +15,7 @@ DATA_SCRIPT := dataset_ita_dict.py
 DATA_FORMAT_VERSION := gpt-lm-ita-dict-v3
 else ifeq ($(GPT_LM_DATASET),ita_dict_v2)
 DATA_SCRIPT := dataset_ita_dict_v2.py
-DATA_FORMAT_VERSION := gpt-lm-ita-dict-v2-md-gemma-docs-v5
+DATA_FORMAT_VERSION := gpt-lm-ita-dict-v2-md-gemma-docs-v6-compact-u16-segments
 else ifeq ($(GPT_LM_DATASET),promessi)
 DATA_SCRIPT := dataset.py
 DATA_FORMAT_VERSION := gpt-lm-promessi-v3
@@ -26,6 +27,12 @@ CC ?= cc
 PYTHON ?= uv run --with numpy
 UNAME_S := $(shell uname -s)
 CPPFLAGS := -I$(ROOT)/include
+ifneq ($(GPT_LM_VOCAB_SIZE),)
+CPPFLAGS += -DGPT_VOCAB_SIZE=$(GPT_LM_VOCAB_SIZE)
+endif
+ifneq ($(GPT_LM_CONTEXT_LENGTH),)
+CPPFLAGS += -DGPT_CONTEXT_LENGTH=$(GPT_LM_CONTEXT_LENGTH)
+endif
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic
 CORE_CFLAGS ?= -std=c11 -O2 -g3 -Wall -Wextra -Wpedantic -Werror \
                -Wshadow -Wconversion -Wdouble-promotion -Wstrict-prototypes \
@@ -37,6 +44,8 @@ LDLIBS := -pthread -lm
 ifeq ($(UNAME_S),Darwin)
 LDLIBS += -framework Foundation -framework Metal
 endif
+
+BUILD_ARGS := GPT_LM_VOCAB_SIZE=$(GPT_LM_VOCAB_SIZE) GPT_LM_CONTEXT_LENGTH=$(GPT_LM_CONTEXT_LENGTH)
 
 DATA_ARGS := --out-dir $(DATA_DIR) --preview-samples 0
 ifneq ($(GPT_LM_VOCAB_SIZE),)
@@ -117,6 +126,12 @@ data: $(DATA_STAMP)
 data-tools:
 	$(MAKE) -C $(ROOT) tools
 
+$(BUILD_ARGS_FILE): FORCE
+	@args='$(BUILD_ARGS)'; \
+	if [ ! -f '$(BUILD_ARGS_FILE)' ] || [ "$$(cat '$(BUILD_ARGS_FILE)')" != "$$args" ]; then \
+		printf '%s\n' "$$args" > '$(BUILD_ARGS_FILE)'; \
+	fi
+
 $(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/tok_utils.py data-tools
 	@mkdir -p $(DATA_DIR)
 	@args='$(DATA_FORMAT_VERSION) $(DATA_ARGS)'; \
@@ -132,13 +147,13 @@ $(DATA_STAMP): FORCE $(DATA_SCRIPT) $(ROOT)/tools/gdds_utils.py $(ROOT)/tools/to
 		touch '$(DATA_STAMP)'; \
 	fi
 
-$(TRAIN_BIN): main.c gpt_lm_shared.h $(SHARED_SRC) $(GD_PROGRESS_DEPS) $(LIB)
+$(TRAIN_BIN): main.c gpt_lm_shared.h $(SHARED_SRC) $(GD_PROGRESS_DEPS) $(LIB) $(BUILD_ARGS_FILE)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(SHARED_SRC) $(GD_PROGRESS_SRC) $(LIB) $(LDLIBS) -o $@
 
-$(INFER_BIN): infer.c gpt_lm_shared.h $(SHARED_SRC) $(LIB)
+$(INFER_BIN): infer.c gpt_lm_shared.h $(SHARED_SRC) $(LIB) $(BUILD_ARGS_FILE)
 	$(CC) $(CPPFLAGS) $(CFLAGS) infer.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
-$(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) $(LIB)
+$(GENERATE_BIN): main_generate.c gpt_lm_shared.h $(SHARED_SRC) $(LIB) $(BUILD_ARGS_FILE)
 	$(CC) $(CPPFLAGS) $(CFLAGS) main_generate.c $(SHARED_SRC) $(LIB) $(LDLIBS) -o $@
 
 run: $(TRAIN_BIN) $(DATA_STAMP)
@@ -166,5 +181,5 @@ checkpoint-smoke: $(TRAIN_BIN) $(INFER_BIN) $(DATA_STAMP)
 smoke: overfit-smoke generate-smoke periodic-generate-smoke
 
 clean:
-	rm -f $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN)
+	rm -f $(TRAIN_BIN) $(INFER_BIN) $(GENERATE_BIN) $(BUILD_ARGS_FILE)
 	rm -rf $(DATA_DIR) checkpoints

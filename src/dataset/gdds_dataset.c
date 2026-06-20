@@ -437,7 +437,7 @@ static gd_status gd_gdds_read_schema(const uint8_t *map,
             return GD_ERR_INVALID_ARGUMENT;
         }
         dtype_u = gd_gdds_get_le32(src + GD_GDDS_FIELD_DTYPE_OFFSET);
-        if (dtype_u > (uint32_t)GD_DTYPE_U8 || gd_dtype_size((gd_dtype)dtype_u) == 0U) {
+        if (dtype_u > (uint32_t)GD_DTYPE_U16 || gd_dtype_size((gd_dtype)dtype_u) == 0U) {
             free(fields);
             return GD_ERR_INVALID_ARGUMENT;
         }

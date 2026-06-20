@@ -4,6 +4,7 @@ build*/
 data*/
 
 gd_main_*
+.gpt_lm_build.args
 __pycache__
 checkpoints*/
 .DS_Store

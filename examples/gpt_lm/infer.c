@@ -153,6 +153,7 @@ static gpt_config infer_config_default(void)
     config.min_p = GPT_DEFAULT_MIN_P;
     config.repetition_penalty = GPT_DEFAULT_REPETITION_PENALTY;
     config.logits_softcap = 0.0f;
+    config.pad_token_id = -1;
     return config;
 }
 

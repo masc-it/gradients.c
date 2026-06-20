@@ -61,6 +61,7 @@ static void test_params_tensor(gd_context *ctx)
     float rand_values_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     CHECK(gd_dtype_size(GD_DTYPE_F16) == 2U, "f16 dtype size");
+    CHECK(gd_dtype_size(GD_DTYPE_U16) == 2U, "u16 dtype size");
     CHECK(gd_dtype_size(GD_DTYPE_F32) == 4U, "f32 dtype size");
     CHECK_OK(gd_memory_stats_query(ctx, &before));
     CHECK_STATUS(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(1U, bad_shape), 64U, &bad),

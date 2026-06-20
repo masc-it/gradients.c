@@ -172,6 +172,9 @@ static int GD_ORACLE_MAYBE_UNUSED dtype_element_size(gd_dtype dtype, size_t *ele
     case GD_DTYPE_U8:
         *elem_size = 1U;
         return 0;
+    case GD_DTYPE_U16:
+        *elem_size = 2U;
+        return 0;
     case GD_DTYPE_I32:
         *elem_size = 4U;
         return 0;
@@ -195,6 +198,10 @@ static int GD_ORACLE_MAYBE_UNUSED parse_dtype(const char *s, gd_dtype *dtype)
     }
     if (strcmp(s, "u8") == 0) {
         *dtype = GD_DTYPE_U8;
+        return 0;
+    }
+    if (strcmp(s, "u16") == 0) {
+        *dtype = GD_DTYPE_U16;
         return 0;
     }
     if (strcmp(s, "i32") == 0) {

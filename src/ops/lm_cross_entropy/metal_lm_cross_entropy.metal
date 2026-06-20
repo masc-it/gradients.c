@@ -182,7 +182,7 @@ kernel void gd_lm_cross_entropy_finalize_f32_kernel(
     device float *row_inv_sum = reinterpret_cast<device float *>(row_inv_sumbuf + args.row_inv_sum_offset);
     device float *row_valid = reinterpret_cast<device float *>(row_validbuf + args.out_offset);
     const int target = targets[row];
-    if (target < 0) {
+    if (target < 0 || target == args.ignore_index) {
         row_loss[row] = 0.0f;
         row_max[row] = 0.0f;
         row_inv_sum[row] = 0.0f;
@@ -285,7 +285,7 @@ kernel void gd_lm_cross_entropy_backward_chunk_f16_kernel(
     }
     const ulong base = row * classes;
     const int target = targets[row];
-    if (target < 0 || ulong(target) >= ulong(args.total_classes)) {
+    if (target < 0 || target == args.ignore_index || ulong(target) >= ulong(args.total_classes)) {
         for (ulong c = thread_i; c < classes; c += thread_stride) {
             grad_logits[base + c] = half(0.0f);
         }

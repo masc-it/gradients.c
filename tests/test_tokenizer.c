@@ -70,14 +70,20 @@ int main(void)
     const char *specials[] = {"<eot>"};
     const char *roundtrip = "hello <eot> 123 hello";
     const char *literal_special = "hello <eot>";
+    const char corpus_line0[] = "hello hello hello <eot>\n";
+    const char corpus_line1[] = "byte-level BPE tokenizer test 123 123 123\n";
+    const char corpus_line2[] = "hello tokenizer tokenizer tokenizer\n";
     const char corpus[] =
         "hello hello hello <eot>\n"
         "byte-level BPE tokenizer test 123 123 123\n"
         "hello tokenizer tokenizer tokenizer\n";
     gd_bpe_train_config train_cfg;
+    gd_bpe_trainer_stats trainer_stats;
     gd_tokenizer_config load_cfg;
     gd_tokenizer_config no_special_cfg;
+    gd_bpe_trainer *trainer = NULL;
     gd_tokenizer *tok = NULL;
+    gd_tokenizer *streamed = NULL;
     gd_tokenizer *loaded = NULL;
     gd_tokenizer *no_special = NULL;
     int32_t *ids = NULL;
@@ -99,7 +105,21 @@ int main(void)
     train_cfg.special_tokens = specials;
     train_cfg.seed = 17U;
     CHECK_OK(gd_bpe_tokenizer_train(&corpus_path, 1, &train_cfg, &tok));
+    CHECK_OK(gd_bpe_trainer_create(&train_cfg, &trainer));
+    CHECK_OK(gd_bpe_trainer_add_text(trainer, (const uint8_t *)corpus_line0, strlen(corpus_line0)));
+    CHECK_OK(gd_bpe_trainer_add_text(trainer, (const uint8_t *)corpus_line1, strlen(corpus_line1)));
+    CHECK_OK(gd_bpe_trainer_add_text(trainer, (const uint8_t *)corpus_line2, strlen(corpus_line2)));
+    CHECK_OK(gd_bpe_trainer_get_stats(trainer, &trainer_stats));
+    CHECK(trainer_stats.texts == 3U, "streaming trainer text count");
+    CHECK(trainer_stats.bytes == strlen(corpus), "streaming trainer byte count");
+    CHECK(trainer_stats.pieces > 0U, "streaming trainer piece count");
+    CHECK(trainer_stats.unique_pieces > 0U, "streaming trainer unique piece count");
+    CHECK_OK(gd_bpe_trainer_finish(trainer, &streamed));
+    gd_bpe_trainer_destroy(trainer);
+    trainer = NULL;
     CHECK(gd_tokenizer_vocab_size(tok) > 256, "trained vocab includes specials/merges");
+    CHECK(gd_tokenizer_vocab_size(streamed) == gd_tokenizer_vocab_size(tok), "streamed vocab size");
+    CHECK(gd_tokenizer_hash(streamed) == gd_tokenizer_hash(tok), "streamed tokenizer hash");
     CHECK_OK(gd_tokenizer_id(tok, "<eot>", &special_id));
     CHECK(special_id >= 256, "special token id follows byte vocabulary");
     hash = gd_tokenizer_hash(tok);
@@ -138,8 +158,10 @@ int main(void)
     gd_tokenizer_free(decoded);
     gd_tokenizer_free(literal_ids);
     gd_tokenizer_free(ids);
+    gd_bpe_trainer_destroy(trainer);
     gd_tokenizer_destroy(no_special);
     gd_tokenizer_destroy(loaded);
+    gd_tokenizer_destroy(streamed);
     gd_tokenizer_destroy(tok);
     (void)remove(tokenizer_path);
     (void)remove(corpus_path);

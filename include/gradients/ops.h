@@ -60,6 +60,14 @@ gd_status gd_lm_cross_entropy_bias(gd_context *ctx,
                                    const gd_tensor *targets,
                                    gd_tensor *loss);
 
+gd_status gd_lm_cross_entropy_bias_ignore(gd_context *ctx,
+                                          const gd_tensor *hidden,
+                                          const gd_tensor *weight,
+                                          const gd_tensor *bias,
+                                          const gd_tensor *targets,
+                                          int32_t ignore_index,
+                                          gd_tensor *loss);
+
 /* Fused LM head + cross entropy with optional final-logits softcap:
  * soft_logit = logits_softcap * tanh(logit / logits_softcap).
  * Pass logits_softcap=0 to disable softcapping and use the exact gd_lm_cross_entropy path. */
@@ -77,6 +85,15 @@ gd_status gd_lm_cross_entropy_softcapped_bias(gd_context *ctx,
                                               const gd_tensor *targets,
                                               float logits_softcap,
                                               gd_tensor *loss);
+
+gd_status gd_lm_cross_entropy_softcapped_bias_ignore(gd_context *ctx,
+                                                     const gd_tensor *hidden,
+                                                     const gd_tensor *weight,
+                                                     const gd_tensor *bias,
+                                                     const gd_tensor *targets,
+                                                     float logits_softcap,
+                                                     int32_t ignore_index,
+                                                     gd_tensor *loss);
 
 /* Fused residual add with inverted dropout on the branch:
  * out = residual + dropout(x, p, seed) in training, or residual + x otherwise.

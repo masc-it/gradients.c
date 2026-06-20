@@ -241,7 +241,8 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
                                           uint64_t class_start,
                                           uint64_t total_classes,
                                           float scale,
-                                          float logits_softcap)
+                                          float logits_softcap,
+                                          int32_t ignore_index)
 {
     memset(args, 0, sizeof(*args));
     args->logits_offset = logits != NULL ? (uint64_t)logits->offset : 0U;
@@ -269,6 +270,7 @@ static void gd_lm_cross_entropy_fill_args(gd_metal_lm_cross_entropy_args *args,
     args->has_bias = bias != NULL ? 1U : 0U;
     args->simdgroups = logits != NULL ? gd_lm_cross_entropy_simdgroups((size_t)logits->shape[1]) :
                                         gd_lm_cross_entropy_simdgroups((size_t)args->rows);
+    args->ignore_index = ignore_index;
 }
 
 gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
@@ -324,7 +326,8 @@ gd_status gd_backend_lm_cross_entropy_online_update(gd_backend *backend,
                                   class_start,
                                   total_classes,
                                   1.0f,
-                                  logits_softcap);
+                                  logits_softcap,
+                                  -1);
     [encoder setComputePipelineState:gd_lm_cross_entropy_online_update_f16_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(logits_chunk->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(bias_chunk != NULL ? bias_chunk->buffer : logits_chunk->buffer) offset:0U atIndex:1U];
@@ -346,7 +349,8 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                                const gd_backend_tensor_view *row_max,
                                                const gd_backend_tensor_view *row_inv_sum,
                                                const gd_backend_tensor_view *row_valid,
-                                               uint64_t total_classes)
+                                               uint64_t total_classes,
+                                               int32_t ignore_index)
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
@@ -383,7 +387,8 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                   0U,
                                   total_classes,
                                   1.0f,
-                                  0.0f);
+                                  0.0f,
+                                  ignore_index);
     [encoder setComputePipelineState:gd_lm_cross_entropy_finalize_f32_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(targets->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_loss->buffer) offset:0U atIndex:1U];
@@ -439,7 +444,8 @@ gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
                                   0U,
                                   0U,
                                   1.0f,
-                                  0.0f);
+                                  0.0f,
+                                  -1);
     [encoder setComputePipelineState:gd_lm_cross_entropy_reduce_normalize_f32_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_loss->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(row_valid->buffer) offset:0U atIndex:1U];
@@ -465,7 +471,8 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      uint64_t class_start,
                                                      uint64_t total_classes,
                                                      float scale,
-                                                     float logits_softcap)
+                                                     float logits_softcap,
+                                                     int32_t ignore_index)
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
@@ -511,7 +518,8 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                   class_start,
                                   total_classes,
                                   scale,
-                                  logits_softcap);
+                                  logits_softcap,
+                                  ignore_index);
     [encoder setComputePipelineState:gd_lm_cross_entropy_backward_chunk_f16_pso(backend)];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(logits_chunk->buffer) offset:0U atIndex:0U];
     [encoder setBuffer:gd_lm_cross_entropy_buffer(bias_chunk != NULL ? bias_chunk->buffer : logits_chunk->buffer) offset:0U atIndex:1U];

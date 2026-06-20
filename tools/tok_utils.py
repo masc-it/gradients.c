@@ -59,6 +59,104 @@ def _run(args: Sequence[str | Path]) -> Mapping[str, object]:
     return out
 
 
+def _append_training_options(
+    args: list[str | Path],
+    *,
+    vocab_size: int,
+    min_frequency: int,
+    special_tokens: Sequence[str],
+    seed: int,
+) -> None:
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    if min_frequency <= 0:
+        raise ValueError("min_frequency must be positive")
+    args += ["--vocab-size", str(vocab_size), "--min-frequency", str(min_frequency), "--seed", str(seed)]
+    for token in special_tokens:
+        args += ["--special", token]
+
+
+def _append_optional_im_tokens(args: list[str | Path], im_start: str | None, im_end: str | None) -> None:
+    if (im_start is None) != (im_end is None):
+        raise ValueError("im_start and im_end must be provided together")
+    if im_start is not None and im_end is not None:
+        args += ["--im-start", im_start, "--im-end", im_end]
+
+
+def train_tokenizer_file(
+    *,
+    tokenizer: str | Path,
+    input_path: str | Path,
+    im_start: str | None = None,
+    im_end: str | None = None,
+    vocab_size: int = 32768,
+    min_frequency: int = 2,
+    special_tokens: Sequence[str] = (),
+    seed: int = 17,
+    binary: str | Path | None = None,
+) -> Mapping[str, object]:
+    """Train and save a BPE tokenizer from a text file without tokenized output.
+
+    The native trainer streams input into a global pretoken-count table instead
+    of loading the whole corpus into memory. Optional ``im_start``/``im_end``
+    values are reserved as special tokens for later document-delimited LM use.
+    """
+
+    exe = Path(binary) if binary is not None else default_tokenizer_binary()
+    args: list[str | Path] = [exe, "--tokenizer", tokenizer, "--input", input_path, "--train-only"]
+    _append_optional_im_tokens(args, im_start, im_end)
+    _append_training_options(
+        args,
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        special_tokens=special_tokens,
+        seed=seed,
+    )
+    return _run(args)
+
+
+def train_tokenizer_jsonl(
+    *,
+    tokenizer: str | Path,
+    input_jsonl: str | Path,
+    jsonl_text_field: str = "text",
+    im_start: str | None = None,
+    im_end: str | None = None,
+    vocab_size: int = 32768,
+    min_frequency: int = 2,
+    special_tokens: Sequence[str] = (),
+    seed: int = 17,
+    binary: str | Path | None = None,
+) -> Mapping[str, object]:
+    """Train and save a BPE tokenizer from a JSONL text field.
+
+    JSONL rows are read one at a time and no temporary extracted training file
+    is written. Optional ``im_start``/``im_end`` values are reserved as special
+    tokens for later document-delimited LM use.
+    """
+
+    exe = Path(binary) if binary is not None else default_tokenizer_binary()
+    args: list[str | Path] = [
+        exe,
+        "--tokenizer",
+        tokenizer,
+        "--input-jsonl",
+        input_jsonl,
+        "--jsonl-text-field",
+        jsonl_text_field,
+        "--train-only",
+    ]
+    _append_optional_im_tokens(args, im_start, im_end)
+    _append_training_options(
+        args,
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        special_tokens=special_tokens,
+        seed=seed,
+    )
+    return _run(args)
+
+
 def tokenize_file_packed(
     *,
     tokenizer: str | Path,
@@ -92,10 +190,6 @@ def tokenize_file_packed(
 
     if num_tokens_per_sequence < 3:
         raise ValueError("num_tokens_per_sequence must be >= 3")
-    if vocab_size <= 0:
-        raise ValueError("vocab_size must be positive")
-    if min_frequency <= 0:
-        raise ValueError("min_frequency must be positive")
     exe = Path(binary) if binary is not None else default_tokenizer_binary()
     args: list[str | Path] = [
         exe,
@@ -115,9 +209,13 @@ def tokenize_file_packed(
     if max_length is not None:
         args += ["--max-length", str(max_length)]
     if not use_tokenizer:
-        args += ["--vocab-size", str(vocab_size), "--min-frequency", str(min_frequency), "--seed", str(seed)]
-        for token in special_tokens:
-            args += ["--special", token]
+        _append_training_options(
+            args,
+            vocab_size=vocab_size,
+            min_frequency=min_frequency,
+            special_tokens=special_tokens,
+            seed=seed,
+        )
     return _run(args)
 
 
@@ -140,15 +238,13 @@ def tokenize_jsonl(
     """Run the C tokenizer in JSONL one-sequence-per-line mode.
 
     By default ``tokenizer`` is trained from the JSONL text field and saved.
-    Set ``use_tokenizer=True`` to reuse an existing tokenizer from that path.
+    Training is streamed row-by-row without writing a temporary extracted text
+    file. Set ``use_tokenizer=True`` to reuse an existing tokenizer from that
+    path.
     """
 
     if max_length < 2:
         raise ValueError("max_length must be >= 2")
-    if vocab_size <= 0:
-        raise ValueError("vocab_size must be positive")
-    if min_frequency <= 0:
-        raise ValueError("min_frequency must be positive")
     exe = Path(binary) if binary is not None else default_tokenizer_binary()
     args: list[str | Path] = [
         exe,
@@ -168,9 +264,13 @@ def tokenize_jsonl(
         str(max_length),
     ]
     if not use_tokenizer:
-        args += ["--vocab-size", str(vocab_size), "--min-frequency", str(min_frequency), "--seed", str(seed)]
-        for token in special_tokens:
-            args += ["--special", token]
+        _append_training_options(
+            args,
+            vocab_size=vocab_size,
+            min_frequency=min_frequency,
+            special_tokens=special_tokens,
+            seed=seed,
+        )
     return _run(args)
 
 
@@ -337,4 +437,6 @@ __all__ = [
     "default_tokenizer_binary",
     "tokenize_file_packed",
     "tokenize_jsonl",
+    "train_tokenizer_file",
+    "train_tokenizer_jsonl",
 ]

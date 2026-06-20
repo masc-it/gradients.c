@@ -363,6 +363,7 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
     model->dropout_p = config->dropout_p;
     model->rms_eps = GPT_DEFAULT_RMS_EPS;
     model->logits_softcap = config->logits_softcap;
+    model->pad_token_id = config->pad_token_id;
     model->dropout_seed = splitmix64(config->seed ^ UINT64_C(0xd00d1234));
 
     TRY(ctx, gd_module_init(ctx, &model->mod, "gpt_lm"));
@@ -804,13 +805,14 @@ gd_status gpt_lm_forward(gd_context *ctx,
     if (st != GD_OK) {
         return st;
     }
-    return gd_lm_cross_entropy_softcapped_bias(ctx,
-                                               &final_norm,
-                                               &model->lm_head,
-                                               &model->lm_head_bias,
-                                               target_ids,
-                                               model->logits_softcap,
-                                               loss);
+    return gd_lm_cross_entropy_softcapped_bias_ignore(ctx,
+                                                      &final_norm,
+                                                      &model->lm_head,
+                                                      &model->lm_head_bias,
+                                                      target_ids,
+                                                      model->logits_softcap,
+                                                      model->pad_token_id,
+                                                      loss);
 }
 
 static gd_status gpt_block_prefill_cached(gd_context *ctx,
@@ -1237,9 +1239,12 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
 }
 
 
+#define GPT_STR2(x) #x
+#define GPT_STR(x) GPT_STR2(x)
+
 char *gpt_default_tokenizer_path(const char *data_dir)
 {
-    const char *file = "tokenizer-v2048.json";
+    const char *file = "tokenizer-v" GPT_STR(GPT_VOCAB_SIZE) ".json";
     const size_t data_len = strlen(data_dir);
     const bool need_sep = data_len == 0U || data_dir[data_len - 1U] != '/';
     const size_t file_len = strlen(file);

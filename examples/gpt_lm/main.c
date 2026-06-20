@@ -106,7 +106,7 @@ static void print_usage(const char *argv0)
     printf("\n");
     printf("Options:\n");
     printf("  --data-dir PATH             GDDS directory (default: examples/gpt_lm/data)\n");
-    printf("  --tokenizer-path PATH       tokenizer JSON for generation (default: DATA/tokenizer-v2048.json)\n");
+    printf("  --tokenizer-path PATH       tokenizer JSON for generation (default: DATA/tokenizer-v%d.json)\n", GPT_VOCAB_SIZE);
     printf("  --generate TEXT             run KV-cache generation from TEXT; skips training unless --epochs is set\n");
     printf("  --generate-every-n-steps N  during training, generate batched a/e/i/o/u samples every N steps (default: 0)\n");
     printf("  --checkpoint-path PATH      best-val checkpoint path (default: checkpoints/gpt_lm_best.gdckpt)\n");
@@ -194,6 +194,7 @@ static gpt_config gpt_config_default(void)
     config.min_p = GPT_DEFAULT_MIN_P;
     config.repetition_penalty = GPT_DEFAULT_REPETITION_PENALTY;
     config.logits_softcap = 30.0f;
+    config.pad_token_id = -1;
     return config;
 }
 
@@ -584,6 +585,294 @@ static void print_param_set(const gd_param_set *params)
                (double)params->items[i].weight_decay,
                params->items[i].trainable ? "yes" : "no");
     }
+}
+
+typedef struct gpt_lm_special_ids {
+    int32_t pad_id;
+    int32_t im_start_id;
+    int32_t im_end_id;
+} gpt_lm_special_ids;
+
+typedef struct gpt_lm_compact_transform {
+    int32_t context_length;
+    int32_t record_length;
+    int32_t vocab_size;
+    int32_t pad_id;
+    int32_t im_start_id;
+    int32_t im_end_id;
+} gpt_lm_compact_transform;
+
+static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
+    {
+        "input_ids",
+        GD_DTYPE_I32,
+        1,
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        GD_GDDS_COLLATE_PACKED_SEQUENCE,
+        GD_GDDS_GENERATED_NONE,
+        0,
+        -1,
+        0U,
+    },
+    {
+        "positions",
+        GD_DTYPE_I32,
+        1,
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        GD_GDDS_COLLATE_PACKED_SEQUENCE,
+        GD_GDDS_GENERATED_NONE,
+        0,
+        -1,
+        0U,
+    },
+    {
+        "target_ids",
+        GD_DTYPE_I32,
+        1,
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        GD_GDDS_COLLATE_PACKED_SEQUENCE,
+        GD_GDDS_GENERATED_NONE,
+        0,
+        -1,
+        0U,
+    },
+    {
+        "segment_lengths",
+        GD_DTYPE_I32,
+        1,
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        GD_GDDS_COLLATE_PACKED_SEQUENCE,
+        GD_GDDS_GENERATED_NONE,
+        0,
+        -1,
+        0U,
+    },
+    {
+        "cu_seqlens",
+        GD_DTYPE_I32,
+        1,
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        GD_GDDS_COLLATE_GENERATED,
+        GD_GDDS_GENERATED_CU_SEQLENS_FROM_LENGTHS,
+        -1,
+        3,
+        0U,
+    },
+};
+
+static gd_status gpt_lm_resolve_special_ids(gd_context *ctx,
+                                             const gpt_config *config,
+                                             gpt_lm_special_ids *out)
+{
+    gd_tokenizer_config tok_cfg;
+    gd_tokenizer *tok = NULL;
+    char *default_tok_path = NULL;
+    const char *tokenizer_path;
+    gd_status st;
+    if (ctx == NULL || config == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    out->pad_id = -1;
+    out->im_start_id = -1;
+    out->im_end_id = -1;
+    tok_cfg.split_digits = 1;
+    tok_cfg.allow_special = 1;
+    default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
+    tokenizer_path = config->tokenizer_path != NULL ? config->tokenizer_path : default_tok_path;
+    if (tokenizer_path == NULL) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    st = gd_bpe_tokenizer_load(tokenizer_path, &tok_cfg, &tok);
+    if (st != GD_OK) {
+        fprintf(stderr,
+                "gpt_lm: failed to load tokenizer '%s' while resolving special ids; "
+                "ensure --data-dir points at the rebuilt dataset and rebuild with "
+                "GPT_LM_VOCAB_SIZE matching manifest.json (or pass --tokenizer-path).\n",
+                tokenizer_path);
+        free(default_tok_path);
+        (void)ctx;
+        return st;
+    }
+    free(default_tok_path);
+    (void)gd_tokenizer_id(tok, "<|pad|>", &out->pad_id);
+    (void)gd_tokenizer_id(tok, "<|im_start|>", &out->im_start_id);
+    (void)gd_tokenizer_id(tok, "<|im_end|>", &out->im_end_id);
+    gd_tokenizer_destroy(tok);
+    return GD_OK;
+}
+
+static int gpt_lm_dataset_is_compact(gd_dataset *dataset)
+{
+    gd_gdds_field_info tokens;
+    gd_gdds_field_info segments;
+    int token_index;
+    int segment_index;
+    if (dataset == NULL) {
+        return 0;
+    }
+    token_index = gd_gdds_dataset_field_index(dataset, "tokens");
+    segment_index = gd_gdds_dataset_field_index(dataset, "segment_lengths");
+    if (token_index != 0 || segment_index != 1 ||
+        gd_gdds_dataset_field_info(dataset, token_index, &tokens) != GD_OK ||
+        gd_gdds_dataset_field_info(dataset, segment_index, &segments) != GD_OK) {
+        return 0;
+    }
+    return tokens.dtype == GD_DTYPE_U16 && tokens.rank == 1 &&
+           tokens.collate == GD_GDDS_COLLATE_STACK &&
+           tokens.shape[0] == (int64_t)GPT_CONTEXT_LENGTH + 1 &&
+           segments.dtype == GD_DTYPE_I32 && segments.rank == 1 &&
+           segments.collate == GD_GDDS_COLLATE_PACKED_SEQUENCE &&
+           segments.shape[0] == -1;
+}
+
+static uint16_t gpt_lm_load_le_u16(const void *src)
+{
+    const uint8_t *p = (const uint8_t *)src;
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8U));
+}
+
+static int32_t gpt_lm_load_le_i32(const void *src)
+{
+    const uint8_t *p = (const uint8_t *)src;
+    uint32_t u = (uint32_t)p[0] | ((uint32_t)p[1] << 8U) |
+                 ((uint32_t)p[2] << 16U) | ((uint32_t)p[3] << 24U);
+    int32_t out;
+    memcpy(&out, &u, sizeof(out));
+    return out;
+}
+
+static gd_status gpt_lm_compact_transform_fn(const gd_sample *src,
+                                             gd_sample *dst,
+                                             void *user_data)
+{
+    const gpt_lm_compact_transform *cfg = (const gpt_lm_compact_transform *)user_data;
+    const uint8_t *token_bytes;
+    const uint8_t *segment_bytes;
+    int32_t *input_ids;
+    int32_t *positions;
+    int32_t *target_ids;
+    int32_t *dst_segments;
+    int64_t context_shape[1];
+    int64_t segments_shape[1];
+    int64_t n_segments_i64;
+    int32_t offset = 0;
+    int64_t s;
+    int32_t i;
+    gd_status st;
+    if (cfg == NULL || src == NULL || dst == NULL || cfg->context_length <= 0 ||
+        cfg->record_length != cfg->context_length + 1 || cfg->vocab_size <= 0 ||
+        cfg->pad_id < 0 || cfg->pad_id >= cfg->vocab_size || cfg->im_start_id < 0 ||
+        cfg->im_end_id < 0 || gd_sample_field_count(src) < 2 || gd_sample_field_count(dst) < 5) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (gd_sample_field_dtype(src, 0) != GD_DTYPE_U16 || gd_sample_field_rank(src, 0) != 1 ||
+        gd_sample_field_dim(src, 0, 0) != cfg->record_length ||
+        gd_sample_field_nbytes(src, 0) != (size_t)cfg->record_length * sizeof(uint16_t) ||
+        gd_sample_field_dtype(src, 1) != GD_DTYPE_I32 || gd_sample_field_rank(src, 1) != 1) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    token_bytes = (const uint8_t *)gd_sample_field_data(src, 0);
+    segment_bytes = (const uint8_t *)gd_sample_field_data(src, 1);
+    n_segments_i64 = gd_sample_field_dim(src, 1, 0);
+    if (token_bytes == NULL || segment_bytes == NULL || n_segments_i64 <= 0 ||
+        n_segments_i64 > (int64_t)cfg->context_length ||
+        gd_sample_field_nbytes(src, 1) != (size_t)n_segments_i64 * sizeof(int32_t)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    context_shape[0] = cfg->context_length;
+    segments_shape[0] = n_segments_i64;
+    st = gd_sample_resize_field(dst, 0, GD_DTYPE_I32, 1, context_shape);
+    if (st != GD_OK) { return st; }
+    st = gd_sample_resize_field(dst, 1, GD_DTYPE_I32, 1, context_shape);
+    if (st != GD_OK) { return st; }
+    st = gd_sample_resize_field(dst, 2, GD_DTYPE_I32, 1, context_shape);
+    if (st != GD_OK) { return st; }
+    st = gd_sample_resize_field(dst, 3, GD_DTYPE_I32, 1, segments_shape);
+    if (st != GD_OK) { return st; }
+    input_ids = (int32_t *)gd_sample_mutable_field_data(dst, 0);
+    positions = (int32_t *)gd_sample_mutable_field_data(dst, 1);
+    target_ids = (int32_t *)gd_sample_mutable_field_data(dst, 2);
+    dst_segments = (int32_t *)gd_sample_mutable_field_data(dst, 3);
+    if (input_ids == NULL || positions == NULL || target_ids == NULL || dst_segments == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < cfg->context_length; ++i) {
+        const int32_t token = (int32_t)gpt_lm_load_le_u16(token_bytes + (size_t)i * sizeof(uint16_t));
+        const int32_t next = (int32_t)gpt_lm_load_le_u16(token_bytes + (size_t)(i + 1) * sizeof(uint16_t));
+        if (token >= cfg->vocab_size || next >= cfg->vocab_size) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        input_ids[i] = token;
+        target_ids[i] = next;
+    }
+    for (s = 0; s < n_segments_i64; ++s) {
+        const int32_t len = gpt_lm_load_le_i32(segment_bytes + (size_t)s * sizeof(int32_t));
+        int32_t j;
+        if (len <= 0 || len > cfg->context_length - offset) {
+            return GD_ERR_INVALID_ARGUMENT;
+        }
+        dst_segments[s] = len;
+        for (j = 0; j < len; ++j) {
+            positions[offset + j] = j;
+        }
+        offset += len;
+        if (offset < cfg->context_length) {
+            target_ids[offset - 1] = cfg->pad_id;
+        }
+    }
+    if (offset != cfg->context_length) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (input_ids[cfg->context_length - 1] == cfg->im_end_id &&
+        target_ids[cfg->context_length - 1] == cfg->im_start_id) {
+        target_ids[cfg->context_length - 1] = cfg->pad_id;
+    }
+    return GD_OK;
+}
+
+static gd_status gpt_lm_open_gdds_split(gd_context *ctx,
+                                        const gpt_config *config,
+                                        const char *split,
+                                        const gpt_lm_special_ids *special_ids,
+                                        gpt_lm_compact_transform *transform,
+                                        gd_dataset **out)
+{
+    gd_dataset *raw = NULL;
+    gd_status st;
+    if (ctx == NULL || config == NULL || split == NULL || transform == NULL || out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    st = gd_dataset_open_gdds_split(config->data_dir, split, &raw);
+    if (st != GD_OK) {
+        return st;
+    }
+    if (gpt_lm_dataset_is_compact(raw) == 0) {
+        *out = raw;
+        return GD_OK;
+    }
+    gd_dataset_destroy(raw);
+    if (special_ids == NULL || special_ids->pad_id < 0 || special_ids->im_start_id < 0 ||
+        special_ids->im_end_id < 0) {
+        (void)ctx;
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    transform->context_length = GPT_CONTEXT_LENGTH;
+    transform->record_length = GPT_CONTEXT_LENGTH + 1;
+    transform->vocab_size = GPT_VOCAB_SIZE;
+    transform->pad_id = special_ids->pad_id;
+    transform->im_start_id = special_ids->im_start_id;
+    transform->im_end_id = special_ids->im_end_id;
+    {
+        const gd_dataset_transform_config transform_cfg = {
+            .transform = gpt_lm_compact_transform_fn,
+            .user_data = transform,
+            .output_fields = gpt_lm_compact_runtime_fields,
+            .n_output_fields = (int)GD_ARRAY_LEN(gpt_lm_compact_runtime_fields),
+        };
+        st = gd_dataset_open_gdds_split_with_transform(config->data_dir, split, &transform_cfg, out);
+    }
+    return st;
 }
 
 static gd_status create_gdds_loader(gd_context *ctx,
@@ -1844,7 +2133,7 @@ static void train_gpt(gd_context *ctx,
 
 int main(int argc, char **argv)
 {
-    const gpt_config config = parse_args(argc, argv);
+    gpt_config config = parse_args(argc, argv);
     const gd_memory_config mem = gpt_memory_config(&config);
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
@@ -1857,6 +2146,9 @@ int main(int argc, char **argv)
     gd_metrics_logger *metrics = NULL;
     gd_lr_scheduler_config lr_config;
     gpt_training_state resume_state;
+    gpt_lm_special_ids special_ids;
+    gpt_lm_compact_transform train_transform;
+    gpt_lm_compact_transform val_transform;
     size_t dataset_samples = 0U;
     size_t val_samples = 0U;
     size_t dataset_tokens = 0U;
@@ -1874,6 +2166,9 @@ int main(int argc, char **argv)
     memset(&params, 0, sizeof(params));
     memset(&lr_config, 0, sizeof(lr_config));
     memset(&resume_state, 0, sizeof(resume_state));
+    memset(&special_ids, 0, sizeof(special_ids));
+    memset(&train_transform, 0, sizeof(train_transform));
+    memset(&val_transform, 0, sizeof(val_transform));
 
     if (st == GD_ERR_UNSUPPORTED) {
         printf("gpt_lm: skipped (no supported gradients.c backend)\n");
@@ -1900,7 +2195,11 @@ int main(int argc, char **argv)
     }
 
     if (config.epochs > 0) {
-        TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, "train", &dataset));
+        TRY(ctx, gpt_lm_resolve_special_ids(ctx, &config, &special_ids));
+        if (special_ids.pad_id >= 0) {
+            config.pad_token_id = special_ids.pad_id;
+        }
+        TRY(ctx, gpt_lm_open_gdds_split(ctx, &config, "train", &special_ids, &train_transform, &dataset));
         dataset_samples = (size_t)gd_dataset_num_samples(dataset);
         if (dataset_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
             gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "dataset token count overflow", __LINE__);
@@ -1912,7 +2211,7 @@ int main(int argc, char **argv)
         }
         total_steps = (size_t)config.epochs * steps_per_epoch;
         if (config.save_best || config.early_stopping_patience > 0) {
-            TRY(ctx, gd_dataset_open_gdds_split(config.data_dir, config.val_split, &val_dataset));
+            TRY(ctx, gpt_lm_open_gdds_split(ctx, &config, config.val_split, &special_ids, &val_transform, &val_dataset));
             val_samples = (size_t)gd_dataset_num_samples(val_dataset);
             if (val_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
                 gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "validation token count overflow", __LINE__);

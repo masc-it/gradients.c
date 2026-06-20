@@ -46,6 +46,7 @@ DTYPE_CODES: dict[str, int] = {
     "f32": 3,
     "i32": 4,
     "u8": 5,
+    "u16": 6,
 }
 DTYPE_NAMES = {v: k for k, v in DTYPE_CODES.items()}
 DTYPE_SIZES: dict[str, int] = {
@@ -54,6 +55,7 @@ DTYPE_SIZES: dict[str, int] = {
     "f32": 4,
     "i32": 4,
     "u8": 1,
+    "u16": 2,
 }
 
 COLLATE_CODES: dict[str, int] = {
@@ -448,6 +450,15 @@ def _pack_u8(values: Sequence[Any]) -> bytes:
     return bytes(int(x) & 0xFF for x in values)
 
 
+def _pack_u16(values: Sequence[Any]) -> bytes:
+    chunks: list[bytes] = []
+    step = 8192
+    for start in range(0, len(values), step):
+        chunk = [int(x) & 0xFFFF for x in values[start : start + step]]
+        chunks.append(struct.pack("<" + "H" * len(chunk), *chunk))
+    return b"".join(chunks)
+
+
 def pack_values(dtype: str, values: Any) -> bytes:
     """Pack Python scalar/list data into GDDS little-endian bytes."""
 
@@ -463,6 +474,8 @@ def pack_values(dtype: str, values: Any) -> bytes:
         return _pack_i32(flat)
     if dtype == "u8":
         return _pack_u8(flat)
+    if dtype == "u16":
+        return _pack_u16(flat)
     raise AssertionError(dtype)
 
 

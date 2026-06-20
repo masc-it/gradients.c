@@ -53,6 +53,7 @@ typedef enum gd_dtype {
     GD_DTYPE_F32 = 3,
     GD_DTYPE_I32 = 4,
     GD_DTYPE_U8 = 5,
+    GD_DTYPE_U16 = 6,
 } gd_dtype;
 
 typedef enum gd_device {

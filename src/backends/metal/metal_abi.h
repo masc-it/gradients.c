@@ -7,6 +7,7 @@
 
 typedef ulong gd_metal_u64;
 typedef uint gd_metal_u32;
+typedef int gd_metal_i32;
 
 #else
 
@@ -15,6 +16,7 @@ typedef uint gd_metal_u32;
 
 typedef uint64_t gd_metal_u64;
 typedef uint32_t gd_metal_u32;
+typedef int32_t gd_metal_i32;
 
 #endif /* __METAL_VERSION__ */
 

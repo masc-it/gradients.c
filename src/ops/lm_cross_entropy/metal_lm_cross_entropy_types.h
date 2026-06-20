@@ -24,6 +24,7 @@ typedef struct gd_metal_lm_cross_entropy_args {
     float inv_logits_softcap;
     gd_metal_u32 has_bias;
     gd_metal_u32 simdgroups;
+    gd_metal_i32 ignore_index;
 } gd_metal_lm_cross_entropy_args;
 
 #ifndef __METAL_VERSION__

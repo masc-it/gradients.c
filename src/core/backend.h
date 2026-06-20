@@ -427,7 +427,8 @@ gd_status gd_backend_lm_cross_entropy_finalize(gd_backend *backend,
                                                const gd_backend_tensor_view *row_max,
                                                const gd_backend_tensor_view *row_inv_sum,
                                                const gd_backend_tensor_view *row_valid,
-                                               uint64_t total_classes);
+                                               uint64_t total_classes,
+                                               int32_t ignore_index);
 gd_status gd_backend_lm_cross_entropy_reduce_normalize(gd_backend *backend,
                                                        const gd_backend_tensor_view *row_loss,
                                                        const gd_backend_tensor_view *row_valid,
@@ -445,7 +446,8 @@ gd_status gd_backend_lm_cross_entropy_backward_chunk(gd_backend *backend,
                                                      uint64_t class_start,
                                                      uint64_t total_classes,
                                                      float scale,
-                                                     float logits_softcap);
+                                                     float logits_softcap,
+                                                     int32_t ignore_index);
 /* MSE loss: out chunks contain scale * sum((x - y)^2) over each contiguous chunk. */
 gd_status gd_backend_mse_forward(gd_backend *backend,
                                  const gd_backend_tensor_view *x,

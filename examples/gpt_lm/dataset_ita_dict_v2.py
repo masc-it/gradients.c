@@ -20,7 +20,10 @@ documents, splits optional ``.quiz.md`` siblings into one document per
 ``---``-separated Q&A, splits by term before tokenizer training,
 tokenizes one JSONL row per document with
 ``<|im_start|>``/``<|im_end|>`` delimiters, then repacks the delimited token
-stream into fixed-size GPT LM samples compatible with ``examples/gpt_lm``.
+stream into compact fixed-size GPT LM samples.  On disk, each GDDS sample stores
+``uint16`` token rows plus small segment-length metadata; the C dataloader
+transform expands those rows into the runtime ``input_ids``/``target_ids`` /
+``positions``/``cu_seqlens`` tensors consumed by ``examples/gpt_lm``.
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ from gdds_utils import (  # noqa: E402
 )
 from tok_utils import TOKEN_DTYPE, TokenizedCorpus, tokenize_jsonl  # noqa: E402
 
+PAD = "<|pad|>"
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 DEFAULT_SOURCE_DIR = Path(
@@ -66,7 +70,7 @@ DEFAULT_VOCAB_SIZE = 2048
 DEFAULT_VAL_FRACTION = 0.05
 DEFAULT_MAX_EXAMPLES_PER_DEFINITION = -1  # no limit
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
-DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v2-md-gemma-docs-v5"
+DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v2-md-gemma-docs-v6-compact-u16-segments"
 
 TERM_RE = re.compile(r"^#\s+Termine:\s*(?P<term>.+?)\s*$", re.MULTILINE)
 DEFINITION_HEADING_RE = re.compile(
@@ -138,6 +142,15 @@ class TextDocument:
     text: str
 
 
+def tokenizer_special_id(tokenizer_path: Path, text: str) -> int:
+    with tokenizer_path.open("r", encoding="utf-8") as f:
+        spec = json.load(f)
+    for token in spec.get("tokens", []):
+        if isinstance(token, Mapping) and token.get("kind") == "special" and token.get("text") == text:
+            return int(token["id"])
+    raise ValueError(f"special token {text!r} not found in {tokenizer_path}")
+
+
 class TokenDecoder:
     """Small byte-token decoder for previewing generated samples."""
 
@@ -160,6 +173,8 @@ class TokenDecoder:
 
 
 def fields_for_context(context_length: int) -> list[FieldSpec]:
+    """Runtime fields exposed by the compact GDDS transform."""
+
     if context_length <= 0:
         raise ValueError("context_length must be positive")
     return [
@@ -176,6 +191,29 @@ def fields_for_context(context_length: int) -> list[FieldSpec]:
             collate="generated",
             generated="cu_seqlens_from_lengths",
             source="segment_lengths",
+        ),
+    ]
+
+
+def storage_fields_for_context(context_length: int) -> list[FieldSpec]:
+    """Compact on-disk fields.
+
+    Each sample stores one uint16 token row of length ``context_length + 1``.
+    Runtime ``input_ids``/``target_ids`` are derived by shifting this row.  We
+    also store per-row document-fragment lengths so positions/cu_seqlens can be
+    reconstructed exactly without re-running document-id logic during training.
+    """
+
+    if context_length <= 0:
+        raise ValueError("context_length must be positive")
+    return [
+        FieldSpec("tokens", "u16", (context_length + 1,), collate="stack"),
+        FieldSpec(
+            "segment_lengths",
+            "i32",
+            (-1,),
+            collate="packed_sequence",
+            ragged_dim=0,
         ),
     ]
 
@@ -870,6 +908,7 @@ def prepare_tokenized_corpus(
         use_tokenizer=use_existing_tokenizer,
         vocab_size=vocab_size,
         min_frequency=min_frequency,
+        special_tokens=(PAD,),
         seed=17,
     )
     action = (
@@ -889,6 +928,18 @@ def i32_tensor(array: np.ndarray) -> TensorData:
     if not arr.flags.c_contiguous:
         arr = np.ascontiguousarray(arr)
     return TensorData(dtype="i32", shape=(int(arr.size),), data=arr.tobytes(order="C"))
+
+
+def u16_tensor(array: np.ndarray) -> TensorData:
+    arr_i64 = np.asarray(array, dtype=np.int64)
+    if arr_i64.size == 0:
+        raise ValueError("token rows cannot be empty")
+    if int(arr_i64.min()) < 0 or int(arr_i64.max()) > 0xFFFF:
+        raise ValueError("token id does not fit in uint16 compact storage")
+    arr = arr_i64.astype(np.dtype("<u2"), copy=False)
+    if not arr.flags.c_contiguous:
+        arr = np.ascontiguousarray(arr)
+    return TensorData(dtype="u16", shape=(int(arr.size),), data=arr.tobytes(order="C"))
 
 
 def _segment_lengths_and_positions(
@@ -913,8 +964,8 @@ def _segment_lengths_and_positions(
     return lengths, positions
 
 
-def iter_lm_samples(corpus: TokenizedCorpus, context_length: int):
-    """Yield fixed-length LM rows with document-local attention segments."""
+def iter_compact_lm_samples(corpus: TokenizedCorpus, context_length: int):
+    """Yield compact fixed-length LM rows plus document-fragment metadata."""
 
     record_length = context_length + 1
     if corpus.mode != "jsonl":
@@ -934,16 +985,11 @@ def iter_lm_samples(corpus: TokenizedCorpus, context_length: int):
     for start in range(0, stream.size - record_length + 1, context_length):
         row = stream[start : start + record_length]
         row_doc_ids = doc_ids[start : start + record_length]
-        input_doc_ids = row_doc_ids[:-1]
-        target_ids = row[1:].copy()
-        target_ids[input_doc_ids != row_doc_ids[1:]] = -1
-        segment_lengths, positions = _segment_lengths_and_positions(input_doc_ids)
+        segment_lengths, _positions = _segment_lengths_and_positions(row_doc_ids[:-1])
         if int(segment_lengths.sum()) != context_length:
             raise ValueError("attention segment lengths do not cover the fixed row")
         yield {
-            "input_ids": i32_tensor(row[:-1]),
-            "positions": i32_tensor(positions),
-            "target_ids": i32_tensor(target_ids),
+            "tokens": u16_tensor(row),
             "segment_lengths": i32_tensor(segment_lengths),
         }
 
@@ -960,7 +1006,7 @@ def write_gdds_dataset(
         raise ValueError(f"expected jsonl training corpus, got {train_corpus.mode!r}")
     if val_corpus is not None and val_corpus.mode != "jsonl":
         raise ValueError(f"expected jsonl validation corpus, got {val_corpus.mode!r}")
-    fields = fields_for_context(context_length)
+    fields = storage_fields_for_context(context_length)
     remove_split_shards(out_dir, "train")
     remove_split_shards(out_dir, "val")
     train_writer = GddsSplitWriter(
@@ -970,10 +1016,10 @@ def write_gdds_dataset(
         out_dir, "val", fields, max_shard_bytes=max_shard_bytes
     )
     try:
-        for sample in iter_lm_samples(train_corpus, context_length):
+        for sample in iter_compact_lm_samples(train_corpus, context_length):
             train_writer.write_sample(sample)
         if val_corpus is not None:
-            for sample in iter_lm_samples(val_corpus, context_length):
+            for sample in iter_compact_lm_samples(val_corpus, context_length):
                 val_writer.write_sample(sample)
         train_paths = train_writer.finish()
         val_paths = val_writer.finish()
@@ -1016,7 +1062,9 @@ def write_manifest(
     split_seed: int,
     max_examples_per_definition: int,
 ) -> None:
-    fields = fields_for_context(context_length)
+    storage_fields = storage_fields_for_context(context_length)
+    runtime_fields = fields_for_context(context_length)
+    pad_id = tokenizer_special_id(tokenizer_path, PAD)
     split_samples = {
         split_name: sum(read_gdds_header(path).samples for path in paths)
         for split_name, paths in gdds_paths.items()
@@ -1026,19 +1074,23 @@ def write_manifest(
     manifest = {
         "format": "GDDS",
         "version": 1,
-        "schema_hash": f"0x{schema_hash(fields):016x}",
-        "fields": [field_metadata(field_spec) for field_spec in fields],
+        "schema_hash": f"0x{schema_hash(storage_fields):016x}",
+        "fields": [field_metadata(field_spec) for field_spec in storage_fields],
+        "runtime_schema_hash": f"0x{schema_hash(runtime_fields):016x}",
+        "runtime_fields": [field_metadata(field_spec) for field_spec in runtime_fields],
         "storage": {
-            "input_ids": f"per-sample int32 token ids, fixed length {context_length}; batch-collated packed",
-            "positions": "per-token positions reset at each dictionary-entry fragment inside the fixed row",
-            "target_ids": "input_ids shifted by one token; -1 marks cross-entry targets ignored by LM CE",
-            "segment_lengths": "per-row dictionary-entry-fragment lengths summing to context_length",
-            "cu_seqlens": "generated by GDDS dataloader from segment_lengths; shape [sum document fragments + 1]",
+            "tokens": f"per-sample uint16 token ids, fixed length {context_length + 1}; runtime transform emits shifted i32 inputs/targets",
+            "segment_lengths": "per-row document-fragment lengths over tokens[:-1], summing to context_length",
+            "input_ids": "runtime transform: tokens[:-1] cast to i32; batch-collated packed",
+            "positions": "runtime transform: per-token positions reset at each document fragment",
+            "target_ids": "runtime transform: tokens[1:] cast to i32; cross-document targets replaced by pad_id and ignored by LM CE",
+            "cu_seqlens": "generated by GDDS dataloader from runtime segment_lengths; shape [sum document fragments + 1]",
         },
         "tokenizer": {
             "path": tokenizer_path.name,
             "hash": train_corpus.manifest["tokenizer_hash"],
             "vocab_size": vocab_size,
+            "pad_id": pad_id,
             "im_start_id": train_corpus.im_start_id,
             "im_end_id": train_corpus.im_end_id,
             "digits": "always split before BPE merges",
@@ -1125,8 +1177,8 @@ def write_manifest(
         "prep": {
             "format_version": DATA_FORMAT_VERSION,
             "max_shard_bytes": max_shard_bytes,
-            "attention_boundaries": "document-local segments inside each fixed row via segment_lengths",
-            "ignore_index": -1,
+            "attention_boundaries": "document-local segments inside each fixed row via stored segment_lengths",
+            "ignore_index": pad_id,
         },
     }
     (out_dir / "manifest.json").write_text(
@@ -1144,9 +1196,7 @@ def write_manifest(
     )
 
 
-def read_gdds_lm_sample(
-    shards: Sequence[Path], sample_index: int
-) -> tuple[np.ndarray, np.ndarray]:
+def read_gdds_lm_sample(shards: Sequence[Path], sample_index: int) -> np.ndarray:
     remaining = sample_index
     for path in shards:
         header = read_gdds_header(path)
@@ -1178,14 +1228,11 @@ def read_gdds_lm_sample(
                 + payload_offset
                 + payload_nbytes
             ]
-            arrays[field_id] = (
-                np.frombuffer(data, dtype=TOKEN_DTYPE).reshape(dims).copy()
-            )
+            dtype = np.dtype("<u2") if field_id == 0 else TOKEN_DTYPE
+            arrays[field_id] = np.frombuffer(data, dtype=dtype).reshape(dims).copy()
         if 0 not in arrays:
-            raise ValueError(f"missing input_ids in {path}")
-        if 2 not in arrays:
-            raise ValueError(f"missing target_ids in {path}")
-        return arrays[0], arrays[2]
+            raise ValueError(f"missing compact tokens in {path}")
+        return arrays[0].astype(TOKEN_DTYPE, copy=False)
     raise IndexError(sample_index)
 
 
@@ -1203,13 +1250,7 @@ def show_random_samples(
     selected = sorted(rng.sample(range(total_samples), k=min(count, total_samples)))
     print(f"\nDecoded random train samples ({len(selected)}):")
     for sample_index in selected:
-        input_ids, target_ids = read_gdds_lm_sample(shards, sample_index)
-        shift_mask = target_ids[:-1] >= 0
-        if not np.array_equal(input_ids[1:][shift_mask], target_ids[:-1][shift_mask]):
-            raise ValueError(f"sample {sample_index} is not correctly shifted")
-        full = np.empty(input_ids.shape[0] + 1, dtype=TOKEN_DTYPE)
-        full[:-1] = input_ids
-        full[-1] = target_ids[-1] if target_ids[-1] >= 0 else input_ids[-1]
+        full = read_gdds_lm_sample(shards, sample_index)
         text = decoder.decode(full)
         print(f"\n--- sample {sample_index} ({len(full)} tokens) ---")
         print(text[:900].replace("\0", "�"))
@@ -1254,9 +1295,9 @@ def main() -> int:
         raise FileNotFoundError(source_dir)
     if args.context_length < 2:
         raise ValueError("--context-length must be >= 2")
-    if args.vocab_size < 258:
+    if args.vocab_size < 259:
         raise ValueError(
-            "--vocab-size must be at least 258 for byte tokens plus two specials"
+            "--vocab-size must be at least 259 for byte tokens plus pad/start/end specials"
         )
     if args.min_frequency <= 0:
         raise ValueError("--min-frequency must be positive")

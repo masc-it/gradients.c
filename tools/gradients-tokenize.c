@@ -28,7 +28,9 @@
 typedef enum gd_tok_mode {
     GD_TOK_MODE_LEGACY_FLAT = 0,
     GD_TOK_MODE_PACKED_TEXT = 1,
-    GD_TOK_MODE_JSONL = 2
+    GD_TOK_MODE_JSONL = 2,
+    GD_TOK_MODE_TRAIN_TEXT = 3,
+    GD_TOK_MODE_TRAIN_JSONL = 4
 } gd_tok_mode;
 
 typedef struct gd_tok_args {
@@ -49,6 +51,7 @@ typedef struct gd_tok_args {
     int min_frequency;
     uint64_t seed;
     int no_special;
+    int train_only;
 } gd_tok_args;
 
 typedef struct gd_tok_shard_info {
@@ -119,6 +122,12 @@ static void usage(FILE *f)
             "    gradients-tokenize --use-tokenizer tokenizer.json --input-jsonl data.jsonl "
             "--jsonl-text-field text --output-dir out --im-start '<|im_start|>' "
             "--im-end '<|im_end|>' --max-length N\n"
+            "\n"
+            "  train tokenizer only:\n"
+            "    gradients-tokenize --tokenizer tokenizer.json --input-jsonl data.jsonl "
+            "--jsonl-text-field text --train-only [--im-start S --im-end E] [--vocab-size N]\n"
+            "    gradients-tokenize --tokenizer tokenizer.json --input text.txt "
+            "--train-only [--im-start S --im-end E] [--vocab-size N]\n"
             "\n"
             "training options when --use-tokenizer is absent:\n"
             "  --vocab-size N       target BPE vocabulary (default: 32768)\n"
@@ -764,98 +773,6 @@ static gd_status gd_tok_add_unique_special(const char **specials, int *n_special
     return GD_OK;
 }
 
-static gd_status gd_tok_extract_jsonl_training_file(const gd_tok_args *args, char **path_out)
-{
-    FILE *in;
-    FILE *out;
-    int fd;
-    char tmpl[GD_TOK_PATH_MAX];
-    char *line = NULL;
-    size_t line_cap = 0U;
-    size_t line_len = 0U;
-    uint64_t line_no = 0U;
-    gd_status status;
-
-    if (args == NULL || args->input_jsonl_path == NULL || args->output_dir == NULL ||
-        args->jsonl_text_field == NULL || path_out == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    *path_out = NULL;
-    status = gd_tok_mkdir_p(args->output_dir);
-    if (status != GD_OK) {
-        return status;
-    }
-    status = gd_tok_join_path(tmpl,
-                              sizeof(tmpl),
-                              args->output_dir,
-                              ".gradients-tokenize-train-XXXXXX.tmp");
-    if (status != GD_OK) {
-        return status;
-    }
-    fd = mkstemp(tmpl);
-    if (fd < 0) {
-        return GD_ERR_IO;
-    }
-    out = fdopen(fd, "wb");
-    if (out == NULL) {
-        (void)close(fd);
-        (void)unlink(tmpl);
-        return GD_ERR_IO;
-    }
-    in = fopen(args->input_jsonl_path, "rb");
-    if (in == NULL) {
-        (void)fclose(out);
-        (void)unlink(tmpl);
-        return GD_ERR_IO;
-    }
-    for (;;) {
-        char *text = NULL;
-        status = gd_tok_read_line(in, &line, &line_cap, &line_len);
-        if (status == GD_TOK_STATUS_EOF) {
-            status = GD_OK;
-            break;
-        }
-        if (status != GD_OK) {
-            break;
-        }
-        line_no += 1U;
-        (void)line_len;
-        status = gd_tok_jsonl_extract_string(line, args->jsonl_text_field, &text);
-        if (status != GD_OK) {
-            fprintf(stderr,
-                    "jsonl parse failed while preparing tokenizer training data at line %"
-                    PRIu64 ": missing/string field '%s'\n",
-                    line_no,
-                    args->jsonl_text_field);
-            break;
-        }
-        if (fputs(text, out) == EOF || fputc('\n', out) == EOF) {
-            free(text);
-            status = GD_ERR_IO;
-            break;
-        }
-        free(text);
-    }
-    free(line);
-    if (fclose(in) != 0 && status == GD_OK) {
-        status = GD_ERR_IO;
-    }
-    if (fclose(out) != 0 && status == GD_OK) {
-        status = GD_ERR_IO;
-    }
-    if (status != GD_OK) {
-        (void)unlink(tmpl);
-        return status;
-    }
-    *path_out = (char *)malloc(strlen(tmpl) + 1U);
-    if (*path_out == NULL) {
-        (void)unlink(tmpl);
-        return GD_ERR_OUT_OF_MEMORY;
-    }
-    memcpy(*path_out, tmpl, strlen(tmpl) + 1U);
-    return GD_OK;
-}
-
 static gd_status gd_tok_load_existing_tokenizer(const gd_tok_args *args,
                                                 const char *path,
                                                 int allow_special,
@@ -870,6 +787,64 @@ static gd_status gd_tok_load_existing_tokenizer(const gd_tok_args *args,
     return gd_bpe_tokenizer_load(path, &cfg, tok_out);
 }
 
+static gd_status gd_tok_make_train_config(const gd_tok_args *args,
+                                          int include_im_specials,
+                                          gd_bpe_train_config *cfg,
+                                          const char **specials,
+                                          int *n_specials)
+{
+    int i;
+    gd_status status;
+    if (args == NULL || cfg == NULL || specials == NULL || n_specials == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *n_specials = 0;
+    for (i = 0; i < args->n_specials; ++i) {
+        status = gd_tok_add_unique_special(specials, n_specials, args->specials[i]);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    if (include_im_specials != 0) {
+        status = gd_tok_add_unique_special(specials, n_specials, args->im_start);
+        if (status != GD_OK) {
+            return status;
+        }
+        status = gd_tok_add_unique_special(specials, n_specials, args->im_end);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->vocab_size = args->vocab_size;
+    cfg->min_frequency = args->min_frequency;
+    cfg->split_digits = 1;
+    cfg->n_special_tokens = *n_specials;
+    cfg->special_tokens = specials;
+    cfg->seed = args->seed;
+    return GD_OK;
+}
+
+static gd_status gd_tok_save_trained_tokenizer(const gd_tok_args *args,
+                                               gd_tokenizer *trained,
+                                               int allow_special,
+                                               gd_tokenizer **tok_out)
+{
+    gd_status status;
+    if (args == NULL || args->tokenizer_path == NULL || trained == NULL || tok_out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_tok_ensure_parent_dir(args->tokenizer_path);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_bpe_tokenizer_save(trained, args->tokenizer_path);
+    if (status != GD_OK) {
+        return status;
+    }
+    return gd_tok_load_existing_tokenizer(args, args->tokenizer_path, allow_special, tok_out);
+}
+
 static gd_status gd_tok_load_or_train_tokenizer(const gd_tok_args *args,
                                                 const char *train_path,
                                                 int include_im_specials,
@@ -877,13 +852,12 @@ static gd_status gd_tok_load_or_train_tokenizer(const gd_tok_args *args,
                                                 gd_tokenizer **tok_out,
                                                 int *trained_out)
 {
-    gd_tokenizer *trained = NULL;
     gd_bpe_train_config cfg;
+    gd_bpe_trainer *trainer = NULL;
+    gd_tokenizer *trained = NULL;
     const char *specials[GD_TOK_MAX_SPECIALS];
-    const char *inputs[1];
     const char *path;
     int n_specials = 0;
-    int i;
     gd_status status;
 
     if (args == NULL || tok_out == NULL || trained_out == NULL) {
@@ -901,46 +875,134 @@ static gd_status gd_tok_load_or_train_tokenizer(const gd_tok_args *args,
     if (train_path == NULL || args->tokenizer_path == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    for (i = 0; i < args->n_specials; ++i) {
-        status = gd_tok_add_unique_special(specials, &n_specials, args->specials[i]);
-        if (status != GD_OK) {
-            return status;
-        }
-    }
-    if (include_im_specials != 0) {
-        status = gd_tok_add_unique_special(specials, &n_specials, args->im_start);
-        if (status != GD_OK) {
-            return status;
-        }
-        status = gd_tok_add_unique_special(specials, &n_specials, args->im_end);
-        if (status != GD_OK) {
-            return status;
-        }
-    }
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.vocab_size = args->vocab_size;
-    cfg.min_frequency = args->min_frequency;
-    cfg.split_digits = 1;
-    cfg.n_special_tokens = n_specials;
-    cfg.special_tokens = specials;
-    cfg.seed = args->seed;
-    inputs[0] = train_path;
-    status = gd_bpe_tokenizer_train(inputs, 1, &cfg, &trained);
+    status = gd_tok_make_train_config(args, include_im_specials, &cfg, specials, &n_specials);
     if (status != GD_OK) {
         return status;
     }
-    status = gd_tok_ensure_parent_dir(args->tokenizer_path);
+    (void)n_specials;
+    status = gd_bpe_trainer_create(&cfg, &trainer);
     if (status != GD_OK) {
-        gd_tokenizer_destroy(trained);
         return status;
     }
-    status = gd_bpe_tokenizer_save(trained, args->tokenizer_path);
+    status = gd_bpe_trainer_add_file(trainer, train_path, 0U);
+    if (status == GD_OK) {
+        status = gd_bpe_trainer_finish(trainer, &trained);
+    }
+    gd_bpe_trainer_destroy(trainer);
+    if (status != GD_OK) {
+        return status;
+    }
+    status = gd_tok_save_trained_tokenizer(args, trained, allow_special, tok_out);
     gd_tokenizer_destroy(trained);
     if (status != GD_OK) {
         return status;
     }
     *trained_out = 1;
-    return gd_tok_load_existing_tokenizer(args, args->tokenizer_path, allow_special, tok_out);
+    return GD_OK;
+}
+
+static gd_status gd_tok_load_or_train_tokenizer_jsonl(const gd_tok_args *args,
+                                                      int include_im_specials,
+                                                      int allow_special,
+                                                      gd_tokenizer **tok_out,
+                                                      int *trained_out)
+{
+    gd_bpe_train_config cfg;
+    gd_bpe_trainer *trainer = NULL;
+    gd_tokenizer *trained = NULL;
+    FILE *f = NULL;
+    char *line = NULL;
+    size_t line_cap = 0U;
+    size_t line_len = 0U;
+    uint64_t line_no = 0U;
+    const char *specials[GD_TOK_MAX_SPECIALS];
+    const char *path;
+    int n_specials = 0;
+    gd_status status;
+
+    if (args == NULL || args->input_jsonl_path == NULL || args->jsonl_text_field == NULL ||
+        tok_out == NULL || trained_out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *tok_out = NULL;
+    *trained_out = 0;
+    path = gd_tok_effective_tokenizer_path(args);
+    if (path == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    if (args->use_tokenizer_path != NULL) {
+        return gd_tok_load_existing_tokenizer(args, path, allow_special, tok_out);
+    }
+    if (args->tokenizer_path == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = gd_tok_make_train_config(args, include_im_specials, &cfg, specials, &n_specials);
+    if (status != GD_OK) {
+        return status;
+    }
+    (void)n_specials;
+    status = gd_bpe_trainer_create(&cfg, &trainer);
+    if (status != GD_OK) {
+        return status;
+    }
+    f = fopen(args->input_jsonl_path, "rb");
+    if (f == NULL) {
+        gd_bpe_trainer_destroy(trainer);
+        return GD_ERR_IO;
+    }
+    for (;;) {
+        char *text = NULL;
+        status = gd_tok_read_line(f, &line, &line_cap, &line_len);
+        if (status == GD_TOK_STATUS_EOF) {
+            status = GD_OK;
+            break;
+        }
+        if (status != GD_OK) {
+            fprintf(stderr, "read jsonl failed while training tokenizer at line %" PRIu64 ": %s\n",
+                    line_no + 1U,
+                    gd_status_string(status));
+            break;
+        }
+        line_no += 1U;
+        (void)line_len;
+        status = gd_tok_jsonl_extract_string(line, args->jsonl_text_field, &text);
+        if (status != GD_OK) {
+            fprintf(stderr,
+                    "jsonl parse failed while training tokenizer at line %" PRIu64
+                    ": missing/string field '%s'\n",
+                    line_no,
+                    args->jsonl_text_field);
+            break;
+        }
+        status = gd_bpe_trainer_add_text(trainer, (const uint8_t *)text, strlen(text));
+        free(text);
+        if (status != GD_OK) {
+            fprintf(stderr,
+                    "tokenizer trainer failed at jsonl line %" PRIu64 ": %s\n",
+                    line_no,
+                    gd_status_string(status));
+            break;
+        }
+    }
+    free(line);
+    if (fclose(f) != 0 && status == GD_OK) {
+        status = GD_ERR_IO;
+    }
+    if (status == GD_OK) {
+        status = gd_bpe_trainer_finish(trainer, &trained);
+    }
+    gd_bpe_trainer_destroy(trainer);
+    if (status != GD_OK) {
+        gd_tokenizer_destroy(trained);
+        return status;
+    }
+    status = gd_tok_save_trained_tokenizer(args, trained, allow_special, tok_out);
+    gd_tokenizer_destroy(trained);
+    if (status != GD_OK) {
+        return status;
+    }
+    *trained_out = 1;
+    return GD_OK;
 }
 
 static gd_status gd_tok_writer_add_info(gd_tok_writer *w, const gd_tok_shard_info *info)
@@ -1487,7 +1549,6 @@ static gd_status gd_tok_run_jsonl(const gd_tok_args *args)
     int32_t im_end_id;
     int body_cap;
     int trained = 0;
-    char *train_path = NULL;
     const char *tok_path = gd_tok_effective_tokenizer_path(args);
     gd_status status;
 
@@ -1498,24 +1559,7 @@ static gd_status gd_tok_run_jsonl(const gd_tok_args *args)
         return GD_ERR_INVALID_ARGUMENT;
     }
     body_cap = (int)args->max_length - 2;
-    if (args->use_tokenizer_path == NULL) {
-        status = gd_tok_extract_jsonl_training_file(args, &train_path);
-        if (status != GD_OK) {
-            fprintf(stderr, "prepare jsonl training data failed: %s\n", gd_status_string(status));
-            return status;
-        }
-    }
-    status = gd_tok_load_or_train_tokenizer(args,
-                                            train_path != NULL ? train_path : args->input_jsonl_path,
-                                            1,
-                                            0,
-                                            &tok,
-                                            &trained);
-    if (train_path != NULL) {
-        (void)unlink(train_path);
-        free(train_path);
-        train_path = NULL;
-    }
+    status = gd_tok_load_or_train_tokenizer_jsonl(args, 1, 0, &tok, &trained);
     if (status != GD_OK) {
         fprintf(stderr, "tokenizer prepare failed: %s\n", gd_status_string(status));
         return status;
@@ -1637,6 +1681,65 @@ static gd_status gd_tok_run_jsonl(const gd_tok_args *args)
     return GD_OK;
 }
 
+static gd_status gd_tok_run_train_text(const gd_tok_args *args)
+{
+    gd_tokenizer *tok = NULL;
+    int trained = 0;
+    int include_im_specials;
+    gd_status status;
+    if (args == NULL || args->input_path == NULL || args->tokenizer_path == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    include_im_specials = args->im_start != NULL || args->im_end != NULL;
+    status = gd_tok_load_or_train_tokenizer(args,
+                                            args->input_path,
+                                            include_im_specials,
+                                            1,
+                                            &tok,
+                                            &trained);
+    if (status != GD_OK) {
+        fprintf(stderr, "train tokenizer failed: %s\n", gd_status_string(status));
+        return status;
+    }
+    printf("{\"mode\":\"train\",\"trained\":%s,\"tokenizer\":\"%s\","
+           "\"vocab_size\":%d,\"tokenizer_hash\":%" PRIu64 "}\n",
+           trained != 0 ? "true" : "false",
+           args->tokenizer_path,
+           gd_tokenizer_vocab_size(tok),
+           gd_tokenizer_hash(tok));
+    gd_tokenizer_destroy(tok);
+    return GD_OK;
+}
+
+static gd_status gd_tok_run_train_jsonl(const gd_tok_args *args)
+{
+    gd_tokenizer *tok = NULL;
+    int trained = 0;
+    int include_im_specials;
+    gd_status status;
+    if (args == NULL || args->input_jsonl_path == NULL || args->tokenizer_path == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    include_im_specials = args->im_start != NULL || args->im_end != NULL;
+    status = gd_tok_load_or_train_tokenizer_jsonl(args,
+                                                  include_im_specials,
+                                                  1,
+                                                  &tok,
+                                                  &trained);
+    if (status != GD_OK) {
+        fprintf(stderr, "train jsonl tokenizer failed: %s\n", gd_status_string(status));
+        return status;
+    }
+    printf("{\"mode\":\"train_jsonl\",\"trained\":%s,\"tokenizer\":\"%s\","
+           "\"vocab_size\":%d,\"tokenizer_hash\":%" PRIu64 "}\n",
+           trained != 0 ? "true" : "false",
+           args->tokenizer_path,
+           gd_tokenizer_vocab_size(tok),
+           gd_tokenizer_hash(tok));
+    gd_tokenizer_destroy(tok);
+    return GD_OK;
+}
+
 static gd_status gd_tok_parse_args(int argc, char **argv, gd_tok_args *args)
 {
     int i;
@@ -1726,6 +1829,8 @@ static gd_status gd_tok_parse_args(int argc, char **argv, gd_tok_args *args)
             }
         } else if (strcmp(argv[i], "--no-special") == 0) {
             args->no_special = 1;
+        } else if (strcmp(argv[i], "--train-only") == 0) {
+            args->train_only = 1;
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
             return GD_ERR_INVALID_ARGUMENT;
@@ -1749,6 +1854,20 @@ static gd_tok_mode gd_tok_select_mode(const gd_tok_args *args, gd_status *status
         status = GD_ERR_INVALID_ARGUMENT;
     } else if (args->input_path != NULL && args->input_jsonl_path != NULL) {
         status = GD_ERR_INVALID_ARGUMENT;
+    } else if ((args->im_start == NULL) != (args->im_end == NULL)) {
+        status = GD_ERR_INVALID_ARGUMENT;
+    } else if (args->train_only != 0) {
+        if (args->use_tokenizer_path != NULL || args->tokenizer_path == NULL ||
+            args->output_path != NULL || args->output_dir != NULL || args->max_length != 0U ||
+            args->num_tokens_per_sequence != 0U || args->no_special != 0) {
+            status = GD_ERR_INVALID_ARGUMENT;
+        } else if (args->input_jsonl_path != NULL) {
+            mode = GD_TOK_MODE_TRAIN_JSONL;
+        } else if (args->input_path != NULL) {
+            mode = GD_TOK_MODE_TRAIN_TEXT;
+        } else {
+            status = GD_ERR_INVALID_ARGUMENT;
+        }
     } else if (args->output_dir != NULL) {
         if (args->output_path != NULL || args->im_start == NULL || args->im_end == NULL) {
             status = GD_ERR_INVALID_ARGUMENT;
@@ -1803,8 +1922,12 @@ int main(int argc, char **argv)
         status = gd_tok_run_legacy_flat(&args);
     } else if (mode == GD_TOK_MODE_PACKED_TEXT) {
         status = gd_tok_run_packed_text(&args);
-    } else {
+    } else if (mode == GD_TOK_MODE_JSONL) {
         status = gd_tok_run_jsonl(&args);
+    } else if (mode == GD_TOK_MODE_TRAIN_TEXT) {
+        status = gd_tok_run_train_text(&args);
+    } else {
+        status = gd_tok_run_train_jsonl(&args);
     }
     return status == GD_OK ? 0 : 1;
 }

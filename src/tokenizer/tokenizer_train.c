@@ -216,33 +216,6 @@ static void gd_bpe_words_free(gd_bpe_word *words, int n_words)
     free(words);
 }
 
-static gd_status gd_count_word_pairs(const gd_bpe_word *words,
-                                     int n_words,
-                                     gd_pair_stats *stats)
-{
-    int i;
-    gd_status status;
-    status = gd_pair_stats_init(stats, 4096U);
-    if (status != GD_OK) {
-        return status;
-    }
-    for (i = 0; i < n_words; ++i) {
-        int j;
-        const gd_bpe_word *word = &words[i];
-        if (word->len < 2) {
-            continue;
-        }
-        for (j = 0; j + 1 < word->len; ++j) {
-            status = gd_pair_stats_add(stats, word->ids[j], word->ids[j + 1], word->count);
-            if (status != GD_OK) {
-                gd_pair_stats_free(stats);
-                return status;
-            }
-        }
-    }
-    return GD_OK;
-}
-
 static uint64_t gd_pair_tie_key(uint64_t seed, int32_t left, int32_t right)
 {
     uint64_t h = GD_FNV_OFFSET;
@@ -252,72 +225,796 @@ static uint64_t gd_pair_tie_key(uint64_t seed, int32_t left, int32_t right)
     return h;
 }
 
-static int gd_choose_best_pair(const gd_pair_stats *stats,
-                               uint64_t min_frequency,
-                               uint64_t seed,
-                               int32_t *left_out,
-                               int32_t *right_out,
-                               uint64_t *count_out)
-{
-    uint64_t best_count = 0U;
-    uint64_t best_tie = UINT64_MAX;
-    int32_t best_left = INT32_MAX;
-    int32_t best_right = INT32_MAX;
-    size_t i;
+typedef struct gd_train_pair {
+    int32_t left;
+    int32_t right;
+    uint64_t count;
+    int occ_head;
+    int touched_epoch;
+} gd_train_pair;
 
-    for (i = 0U; i < stats->cap; ++i) {
-        const gd_pair_stat_entry *entry = &stats->entries[i];
-        uint64_t tie;
-        if (entry->used == 0) {
-            continue;
-        }
-        tie = gd_pair_tie_key(seed, entry->left, entry->right);
-        if (entry->count > best_count ||
-            (entry->count == best_count &&
-             (tie < best_tie ||
-              (tie == best_tie &&
-               (entry->left < best_left ||
-                (entry->left == best_left && entry->right < best_right)))))) {
-            best_count = entry->count;
-            best_tie = tie;
-            best_left = entry->left;
-            best_right = entry->right;
+typedef struct gd_train_pair_slot {
+    int used;
+    int32_t left;
+    int32_t right;
+    int pair_index;
+} gd_train_pair_slot;
+
+typedef struct gd_train_pair_table {
+    gd_train_pair_slot *slots;
+    size_t slot_cap;
+    size_t slot_size;
+    gd_train_pair *pairs;
+    int n_pairs;
+    int pair_cap;
+} gd_train_pair_table;
+
+typedef struct gd_train_occurrence {
+    int node;
+    int next;
+} gd_train_occurrence;
+
+typedef struct gd_train_occ_vec {
+    gd_train_occurrence *data;
+    int len;
+    int cap;
+} gd_train_occ_vec;
+
+typedef struct gd_train_heap_item {
+    int pair_index;
+    uint64_t count;
+    uint64_t tie;
+    int32_t left;
+    int32_t right;
+} gd_train_heap_item;
+
+typedef struct gd_train_heap {
+    gd_train_heap_item *data;
+    int len;
+    int cap;
+} gd_train_heap;
+
+typedef struct gd_train_touch_vec {
+    int *data;
+    int len;
+    int cap;
+    int epoch;
+} gd_train_touch_vec;
+
+typedef struct gd_train_node {
+    int32_t sym;
+    int prev;
+    int next;
+    int word;
+    int alive;
+} gd_train_node;
+
+typedef struct gd_train_word {
+    int head;
+    int len;
+    uint64_t count;
+} gd_train_word;
+
+typedef struct gd_train_corpus {
+    gd_train_word *words;
+    int n_words;
+    gd_train_node *nodes;
+    int n_nodes;
+} gd_train_corpus;
+
+static void gd_train_pair_table_free(gd_train_pair_table *table)
+{
+    if (table == NULL) {
+        return;
+    }
+    free(table->slots);
+    free(table->pairs);
+    memset(table, 0, sizeof(*table));
+}
+
+static void gd_train_occ_vec_free(gd_train_occ_vec *occs)
+{
+    if (occs == NULL) {
+        return;
+    }
+    free(occs->data);
+    memset(occs, 0, sizeof(*occs));
+}
+
+static void gd_train_heap_free(gd_train_heap *heap)
+{
+    if (heap == NULL) {
+        return;
+    }
+    free(heap->data);
+    memset(heap, 0, sizeof(*heap));
+}
+
+static void gd_train_touch_vec_free(gd_train_touch_vec *touches)
+{
+    if (touches == NULL) {
+        return;
+    }
+    free(touches->data);
+    memset(touches, 0, sizeof(*touches));
+}
+
+static void gd_train_corpus_free(gd_train_corpus *corpus)
+{
+    if (corpus == NULL) {
+        return;
+    }
+    free(corpus->words);
+    free(corpus->nodes);
+    memset(corpus, 0, sizeof(*corpus));
+}
+
+static gd_status gd_train_pair_table_init(gd_train_pair_table *table,
+                                          size_t requested_pairs)
+{
+    size_t slot_cap;
+    if (table == NULL) {
+        return gd_tokenizer_error(GD_ERR_INVALID_ARGUMENT, "train pair table is null");
+    }
+    memset(table, 0, sizeof(*table));
+    slot_cap = gd_next_pow2(requested_pairs * 2U + 16U);
+    table->slots = (gd_train_pair_slot *)calloc(slot_cap, sizeof(gd_train_pair_slot));
+    if (table->slots == NULL) {
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train pair slot allocation failed");
+    }
+    table->slot_cap = slot_cap;
+    table->pair_cap = 1024;
+    if ((size_t)table->pair_cap < requested_pairs) {
+        while ((size_t)table->pair_cap < requested_pairs) {
+            if (table->pair_cap > INT_MAX / 2) {
+                gd_train_pair_table_free(table);
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many train pairs");
+            }
+            table->pair_cap *= 2;
         }
     }
-    if (best_count < min_frequency || best_count == 0U) {
+    table->pairs = (gd_train_pair *)calloc((size_t)table->pair_cap, sizeof(gd_train_pair));
+    if (table->pairs == NULL) {
+        gd_train_pair_table_free(table);
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train pair allocation failed");
+    }
+    return GD_OK;
+}
+
+static gd_status gd_train_pair_table_rehash(gd_train_pair_table *table,
+                                            size_t requested_cap)
+{
+    gd_train_pair_slot *new_slots;
+    size_t new_cap = gd_next_pow2(requested_cap);
+    int i;
+    if (new_cap < 16U) {
+        new_cap = 16U;
+    }
+    new_slots = (gd_train_pair_slot *)calloc(new_cap, sizeof(gd_train_pair_slot));
+    if (new_slots == NULL) {
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train pair rehash failed");
+    }
+    for (i = 0; i < table->n_pairs; ++i) {
+        gd_train_pair *pair = &table->pairs[i];
+        size_t mask = new_cap - 1U;
+        size_t j = (size_t)gd_pair_hash(pair->left, pair->right) & mask;
+        while (new_slots[j].used != 0) {
+            j = (j + 1U) & mask;
+        }
+        new_slots[j].used = 1;
+        new_slots[j].left = pair->left;
+        new_slots[j].right = pair->right;
+        new_slots[j].pair_index = i;
+    }
+    free(table->slots);
+    table->slots = new_slots;
+    table->slot_cap = new_cap;
+    table->slot_size = (size_t)table->n_pairs;
+    return GD_OK;
+}
+
+static gd_status gd_train_pair_table_reserve_pair(gd_train_pair_table *table)
+{
+    gd_train_pair *new_pairs;
+    int new_cap;
+    if (table->n_pairs < table->pair_cap) {
+        return GD_OK;
+    }
+    if (table->pair_cap > INT_MAX / 2) {
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many train pairs");
+    }
+    new_cap = table->pair_cap * 2;
+    new_pairs = (gd_train_pair *)realloc(table->pairs,
+                                         (size_t)new_cap * sizeof(gd_train_pair));
+    if (new_pairs == NULL) {
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train pair growth failed");
+    }
+    memset(&new_pairs[table->pair_cap], 0,
+           (size_t)(new_cap - table->pair_cap) * sizeof(gd_train_pair));
+    table->pairs = new_pairs;
+    table->pair_cap = new_cap;
+    return GD_OK;
+}
+
+static gd_status gd_train_pair_get_or_create(gd_train_pair_table *table,
+                                             int32_t left,
+                                             int32_t right,
+                                             int *pair_index_out)
+{
+    uint64_t h;
+    size_t mask;
+    size_t i;
+    gd_status status;
+    if ((table->slot_size + 1U) * GD_BPE_HASH_LOAD_DEN >
+        table->slot_cap * GD_BPE_HASH_LOAD_NUM) {
+        status = gd_train_pair_table_rehash(table, table->slot_cap * 2U);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    h = gd_pair_hash(left, right);
+    mask = table->slot_cap - 1U;
+    i = (size_t)h & mask;
+    while (table->slots[i].used != 0) {
+        if (table->slots[i].left == left && table->slots[i].right == right) {
+            *pair_index_out = table->slots[i].pair_index;
+            return GD_OK;
+        }
+        i = (i + 1U) & mask;
+    }
+    status = gd_train_pair_table_reserve_pair(table);
+    if (status != GD_OK) {
+        return status;
+    }
+    table->pairs[table->n_pairs].left = left;
+    table->pairs[table->n_pairs].right = right;
+    table->pairs[table->n_pairs].count = 0U;
+    table->pairs[table->n_pairs].occ_head = -1;
+    table->slots[i].used = 1;
+    table->slots[i].left = left;
+    table->slots[i].right = right;
+    table->slots[i].pair_index = table->n_pairs;
+    table->slot_size += 1U;
+    *pair_index_out = table->n_pairs;
+    table->n_pairs += 1;
+    return GD_OK;
+}
+
+static int gd_train_pair_lookup(const gd_train_pair_table *table,
+                                int32_t left,
+                                int32_t right)
+{
+    uint64_t h;
+    size_t mask;
+    size_t i;
+    if (table == NULL || table->slot_cap == 0U) {
+        return -1;
+    }
+    h = gd_pair_hash(left, right);
+    mask = table->slot_cap - 1U;
+    i = (size_t)h & mask;
+    while (table->slots[i].used != 0) {
+        if (table->slots[i].left == left && table->slots[i].right == right) {
+            return table->slots[i].pair_index;
+        }
+        i = (i + 1U) & mask;
+    }
+    return -1;
+}
+
+static gd_status gd_train_occ_vec_push(gd_train_occ_vec *occs,
+                                       int node,
+                                       int next,
+                                       int *index_out)
+{
+    gd_train_occurrence *new_data;
+    int new_cap;
+    if (occs->len == occs->cap) {
+        new_cap = occs->cap == 0 ? 4096 : occs->cap;
+        while (occs->len >= new_cap) {
+            if (new_cap > INT_MAX / 2) {
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY,
+                                          "too many train pair occurrences");
+            }
+            new_cap *= 2;
+        }
+        new_data = (gd_train_occurrence *)realloc(occs->data,
+                                                  (size_t)new_cap *
+                                                      sizeof(gd_train_occurrence));
+        if (new_data == NULL) {
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY,
+                                      "train occurrence growth failed");
+        }
+        occs->data = new_data;
+        occs->cap = new_cap;
+    }
+    occs->data[occs->len].node = node;
+    occs->data[occs->len].next = next;
+    *index_out = occs->len;
+    occs->len += 1;
+    return GD_OK;
+}
+
+static int gd_train_heap_item_better(const gd_train_heap_item *a,
+                                     const gd_train_heap_item *b)
+{
+    if (a->count != b->count) {
+        return a->count > b->count;
+    }
+    if (a->tie != b->tie) {
+        return a->tie < b->tie;
+    }
+    if (a->left != b->left) {
+        return a->left < b->left;
+    }
+    return a->right < b->right;
+}
+
+static gd_status gd_train_heap_push(gd_train_heap *heap,
+                                    int pair_index,
+                                    uint64_t count,
+                                    uint64_t seed,
+                                    int32_t left,
+                                    int32_t right)
+{
+    gd_train_heap_item item;
+    gd_train_heap_item *new_data;
+    int new_cap;
+    int i;
+    if (count == 0U) {
+        return GD_OK;
+    }
+    if (heap->len == heap->cap) {
+        new_cap = heap->cap == 0 ? 4096 : heap->cap;
+        while (heap->len >= new_cap) {
+            if (new_cap > INT_MAX / 2) {
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train heap too large");
+            }
+            new_cap *= 2;
+        }
+        new_data = (gd_train_heap_item *)realloc(heap->data,
+                                                 (size_t)new_cap *
+                                                     sizeof(gd_train_heap_item));
+        if (new_data == NULL) {
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train heap growth failed");
+        }
+        heap->data = new_data;
+        heap->cap = new_cap;
+    }
+    item.pair_index = pair_index;
+    item.count = count;
+    item.tie = gd_pair_tie_key(seed, left, right);
+    item.left = left;
+    item.right = right;
+    i = heap->len;
+    heap->len += 1;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (!gd_train_heap_item_better(&item, &heap->data[parent])) {
+            break;
+        }
+        heap->data[i] = heap->data[parent];
+        i = parent;
+    }
+    heap->data[i] = item;
+    return GD_OK;
+}
+
+static int gd_train_heap_pop(gd_train_heap *heap, gd_train_heap_item *out)
+{
+    gd_train_heap_item item;
+    int i = 0;
+    if (heap->len == 0) {
         return 0;
     }
-    *left_out = best_left;
-    *right_out = best_right;
-    *count_out = best_count;
+    *out = heap->data[0];
+    heap->len -= 1;
+    if (heap->len == 0) {
+        return 1;
+    }
+    item = heap->data[heap->len];
+    for (;;) {
+        int left = i * 2 + 1;
+        int right = left + 1;
+        int child;
+        if (left >= heap->len) {
+            break;
+        }
+        child = left;
+        if (right < heap->len &&
+            gd_train_heap_item_better(&heap->data[right], &heap->data[left])) {
+            child = right;
+        }
+        if (!gd_train_heap_item_better(&heap->data[child], &item)) {
+            break;
+        }
+        heap->data[i] = heap->data[child];
+        i = child;
+    }
+    heap->data[i] = item;
     return 1;
 }
 
-static void gd_merge_words(gd_bpe_word *words,
-                           int n_words,
-                           int32_t left,
-                           int32_t right,
-                           int32_t merged)
+static gd_status gd_train_touch_vec_push(gd_train_touch_vec *touches, int pair_index)
+{
+    int *new_data;
+    int new_cap;
+    if (touches == NULL) {
+        return GD_OK;
+    }
+    if (touches->len == touches->cap) {
+        new_cap = touches->cap == 0 ? 4096 : touches->cap;
+        while (touches->len >= new_cap) {
+            if (new_cap > INT_MAX / 2) {
+                return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many touched pairs");
+            }
+            new_cap *= 2;
+        }
+        new_data = (int *)realloc(touches->data, (size_t)new_cap * sizeof(int));
+        if (new_data == NULL) {
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "touched pair growth failed");
+        }
+        touches->data = new_data;
+        touches->cap = new_cap;
+    }
+    touches->data[touches->len] = pair_index;
+    touches->len += 1;
+    return GD_OK;
+}
+
+static gd_status gd_train_mark_touched(gd_train_pair_table *table,
+                                       gd_train_touch_vec *touches,
+                                       int pair_index)
+{
+    if (touches == NULL) {
+        return GD_OK;
+    }
+    if (table->pairs[pair_index].touched_epoch == touches->epoch) {
+        return GD_OK;
+    }
+    table->pairs[pair_index].touched_epoch = touches->epoch;
+    return gd_train_touch_vec_push(touches, pair_index);
+}
+
+static void gd_train_touch_begin(gd_train_pair_table *table, gd_train_touch_vec *touches)
 {
     int i;
+    if (touches == NULL) {
+        return;
+    }
+    touches->len = 0;
+    if (touches->epoch == INT_MAX) {
+        for (i = 0; i < table->n_pairs; ++i) {
+            table->pairs[i].touched_epoch = 0;
+        }
+        touches->epoch = 1;
+    } else {
+        touches->epoch += 1;
+    }
+}
+
+static gd_status gd_train_heap_push_touched(const gd_train_pair_table *table,
+                                            const gd_train_touch_vec *touches,
+                                            gd_train_heap *heap,
+                                            uint64_t seed)
+{
+    int i;
+    if (touches == NULL) {
+        return GD_OK;
+    }
+    for (i = 0; i < touches->len; ++i) {
+        int pair_index = touches->data[i];
+        const gd_train_pair *pair = &table->pairs[pair_index];
+        gd_status status = gd_train_heap_push(heap,
+                                              pair_index,
+                                              pair->count,
+                                              seed,
+                                              pair->left,
+                                              pair->right);
+        if (status != GD_OK) {
+            return status;
+        }
+    }
+    return GD_OK;
+}
+
+static gd_status gd_train_pair_increment(gd_train_pair_table *table,
+                                         gd_train_occ_vec *occs,
+                                         gd_train_touch_vec *touches,
+                                         int32_t left,
+                                         int32_t right,
+                                         uint64_t count,
+                                         int left_node)
+{
+    int pair_index;
+    int occ_index;
+    gd_train_pair *pair;
+    gd_status status;
+    if (count == 0U) {
+        return GD_OK;
+    }
+    status = gd_train_pair_get_or_create(table, left, right, &pair_index);
+    if (status != GD_OK) {
+        return status;
+    }
+    pair = &table->pairs[pair_index];
+    pair->count = gd_sat_add_u64(pair->count, count);
+    if (left_node >= 0) {
+        status = gd_train_occ_vec_push(occs, left_node, pair->occ_head, &occ_index);
+        if (status != GD_OK) {
+            return status;
+        }
+        pair->occ_head = occ_index;
+    }
+    return gd_train_mark_touched(table, touches, pair_index);
+}
+
+static gd_status gd_train_pair_decrement(gd_train_pair_table *table,
+                                         gd_train_touch_vec *touches,
+                                         int32_t left,
+                                         int32_t right,
+                                         uint64_t count)
+{
+    int pair_index;
+    gd_train_pair *pair;
+    if (count == 0U) {
+        return GD_OK;
+    }
+    pair_index = gd_train_pair_lookup(table, left, right);
+    if (pair_index < 0) {
+        return GD_OK;
+    }
+    pair = &table->pairs[pair_index];
+    pair->count = pair->count > count ? pair->count - count : 0U;
+    return gd_train_mark_touched(table, touches, pair_index);
+}
+
+static int gd_train_pair_occurrence_valid(const gd_train_corpus *corpus,
+                                          int node_index,
+                                          int32_t left,
+                                          int32_t right,
+                                          int *right_node_out)
+{
+    const gd_train_node *node;
+    int right_node;
+    if (node_index < 0 || node_index >= corpus->n_nodes) {
+        return 0;
+    }
+    node = &corpus->nodes[node_index];
+    if (node->alive == 0 || node->sym != left) {
+        return 0;
+    }
+    right_node = node->next;
+    if (right_node < 0 || right_node >= corpus->n_nodes ||
+        corpus->nodes[right_node].alive == 0 || corpus->nodes[right_node].sym != right) {
+        return 0;
+    }
+    *right_node_out = right_node;
+    return 1;
+}
+
+static gd_status gd_train_corpus_build(const gd_bpe_word *words,
+                                       int n_words,
+                                       gd_train_corpus *corpus,
+                                       gd_train_pair_table *table,
+                                       gd_train_occ_vec *occs,
+                                       gd_train_heap *heap,
+                                       uint64_t seed)
+{
+    int i;
+    int node_cursor = 0;
+    int64_t total_symbols = 0;
+    gd_status status;
+    memset(corpus, 0, sizeof(*corpus));
     for (i = 0; i < n_words; ++i) {
-        gd_bpe_word *word = &words[i];
-        int read = 0;
-        int write = 0;
-        while (read < word->len) {
-            if (read + 1 < word->len && word->ids[read] == left &&
-                word->ids[read + 1] == right) {
-                word->ids[write] = merged;
-                write += 1;
-                read += 2;
-            } else {
-                word->ids[write] = word->ids[read];
-                write += 1;
-                read += 1;
+        if (words[i].len < 0 || total_symbols > (int64_t)INT_MAX - words[i].len) {
+            return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "too many BPE training symbols");
+        }
+        total_symbols += words[i].len;
+    }
+    corpus->words = (gd_train_word *)calloc((size_t)(n_words == 0 ? 1 : n_words),
+                                            sizeof(gd_train_word));
+    if (corpus->words == NULL) {
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train word allocation failed");
+    }
+    corpus->nodes = (gd_train_node *)calloc((size_t)(total_symbols == 0 ? 1 : total_symbols),
+                                            sizeof(gd_train_node));
+    if (corpus->nodes == NULL) {
+        gd_train_corpus_free(corpus);
+        return gd_tokenizer_error(GD_ERR_OUT_OF_MEMORY, "train node allocation failed");
+    }
+    corpus->n_words = n_words;
+    corpus->n_nodes = (int)total_symbols;
+    status = gd_train_pair_table_init(table, 4096U);
+    if (status != GD_OK) {
+        gd_train_corpus_free(corpus);
+        return status;
+    }
+    for (i = 0; i < n_words; ++i) {
+        int j;
+        int head = node_cursor;
+        corpus->words[i].head = words[i].len > 0 ? head : -1;
+        corpus->words[i].len = words[i].len;
+        corpus->words[i].count = words[i].count;
+        for (j = 0; j < words[i].len; ++j) {
+            int node_index = node_cursor + j;
+            corpus->nodes[node_index].sym = words[i].ids[j];
+            corpus->nodes[node_index].prev = j == 0 ? -1 : node_index - 1;
+            corpus->nodes[node_index].next = j + 1 == words[i].len ? -1 : node_index + 1;
+            corpus->nodes[node_index].word = i;
+            corpus->nodes[node_index].alive = 1;
+        }
+        for (j = 0; j + 1 < words[i].len; ++j) {
+            int node_index = node_cursor + j;
+            status = gd_train_pair_increment(table,
+                                             occs,
+                                             NULL,
+                                             words[i].ids[j],
+                                             words[i].ids[j + 1],
+                                             words[i].count,
+                                             node_index);
+            if (status != GD_OK) {
+                gd_train_corpus_free(corpus);
+                return status;
             }
         }
-        word->len = write;
+        node_cursor += words[i].len;
     }
+    for (i = 0; i < table->n_pairs; ++i) {
+        status = gd_train_heap_push(heap,
+                                    i,
+                                    table->pairs[i].count,
+                                    seed,
+                                    table->pairs[i].left,
+                                    table->pairs[i].right);
+        if (status != GD_OK) {
+            gd_train_corpus_free(corpus);
+            return status;
+        }
+    }
+    return GD_OK;
+}
+
+static int gd_train_heap_best_pair(gd_train_pair_table *table,
+                                   gd_train_heap *heap,
+                                   uint64_t min_frequency,
+                                   int *pair_index_out,
+                                   uint64_t *count_out)
+{
+    gd_train_heap_item item;
+    while (gd_train_heap_pop(heap, &item) != 0) {
+        gd_train_pair *pair;
+        if (item.pair_index < 0 || item.pair_index >= table->n_pairs) {
+            continue;
+        }
+        pair = &table->pairs[item.pair_index];
+        if (pair->count != item.count || pair->left != item.left || pair->right != item.right) {
+            continue;
+        }
+        if (pair->count < min_frequency || pair->count == 0U) {
+            return 0;
+        }
+        *pair_index_out = item.pair_index;
+        *count_out = pair->count;
+        return 1;
+    }
+    return 0;
+}
+
+static gd_status gd_train_merge_pair(gd_train_corpus *corpus,
+                                     gd_train_pair_table *table,
+                                     gd_train_occ_vec *occs,
+                                     gd_train_touch_vec *touches,
+                                     gd_train_heap *heap,
+                                     uint64_t seed,
+                                     int pair_index,
+                                     int32_t left,
+                                     int32_t right,
+                                     int32_t merged,
+                                     uint64_t *merged_count_out)
+{
+    int occ_index;
+    uint64_t merged_count = 0U;
+    gd_status status;
+    if (pair_index < 0 || pair_index >= table->n_pairs) {
+        return gd_tokenizer_error(GD_ERR_INTERNAL, "invalid train pair index");
+    }
+    gd_train_touch_begin(table, touches);
+    occ_index = table->pairs[pair_index].occ_head;
+    while (occ_index >= 0) {
+        int node_index;
+        int right_node;
+        int prev_node;
+        int next_node;
+        int word_index;
+        uint64_t word_count;
+        gd_train_node *node;
+        gd_train_node *right_sym;
+        if (occ_index >= occs->len) {
+            return gd_tokenizer_error(GD_ERR_INTERNAL, "invalid train occurrence index");
+        }
+        node_index = occs->data[occ_index].node;
+        occ_index = occs->data[occ_index].next;
+        if (gd_train_pair_occurrence_valid(corpus, node_index, left, right, &right_node) == 0) {
+            continue;
+        }
+        node = &corpus->nodes[node_index];
+        right_sym = &corpus->nodes[right_node];
+        prev_node = node->prev;
+        next_node = right_sym->next;
+        word_index = node->word;
+        word_count = corpus->words[word_index].count;
+
+        if (prev_node >= 0) {
+            status = gd_train_pair_decrement(table,
+                                             touches,
+                                             corpus->nodes[prev_node].sym,
+                                             left,
+                                             word_count);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+        status = gd_train_pair_decrement(table, touches, left, right, word_count);
+        if (status != GD_OK) {
+            return status;
+        }
+        if (next_node >= 0) {
+            status = gd_train_pair_decrement(table,
+                                             touches,
+                                             right,
+                                             corpus->nodes[next_node].sym,
+                                             word_count);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+
+        node->sym = merged;
+        node->next = next_node;
+        if (next_node >= 0) {
+            corpus->nodes[next_node].prev = node_index;
+        }
+        right_sym->alive = 0;
+        right_sym->prev = -1;
+        right_sym->next = -1;
+        corpus->words[word_index].len -= 1;
+        merged_count = gd_sat_add_u64(merged_count, word_count);
+
+        if (prev_node >= 0) {
+            status = gd_train_pair_increment(table,
+                                             occs,
+                                             touches,
+                                             corpus->nodes[prev_node].sym,
+                                             merged,
+                                             word_count,
+                                             prev_node);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+        if (next_node >= 0) {
+            status = gd_train_pair_increment(table,
+                                             occs,
+                                             touches,
+                                             merged,
+                                             corpus->nodes[next_node].sym,
+                                             word_count,
+                                             node_index);
+            if (status != GD_OK) {
+                return status;
+            }
+        }
+    }
+    table->pairs[pair_index].occ_head = -1;
+    status = gd_train_heap_push_touched(table, touches, heap, seed);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (merged_count_out != NULL) {
+        *merged_count_out = merged_count;
+    }
+    return GD_OK;
 }
 
 static gd_status gd_add_special_tokens(gd_tokenizer *tok,
@@ -349,58 +1046,93 @@ static gd_status gd_run_bpe_merges(gd_tokenizer *tok,
                                    int min_frequency,
                                    uint64_t seed)
 {
-    gd_status status = GD_OK;
+    gd_train_corpus corpus = {0};
+    gd_train_pair_table table = {0};
+    gd_train_occ_vec occs = {0};
+    gd_train_heap heap = {0};
+    gd_train_touch_vec touches = {0};
+    gd_status status;
+
+    status = gd_train_corpus_build(words, n_words, &corpus, &table, &occs, &heap, seed);
+    if (status != GD_OK) {
+        gd_train_pair_table_free(&table);
+        gd_train_occ_vec_free(&occs);
+        gd_train_heap_free(&heap);
+        gd_train_touch_vec_free(&touches);
+        gd_train_corpus_free(&corpus);
+        return status;
+    }
+
     while (tok->n_tokens < target_vocab) {
-        gd_pair_stats stats = {0};
-        int32_t left = -1;
-        int32_t right = -1;
+        int pair_index = -1;
         uint64_t count = 0U;
+        int32_t left;
+        int32_t right;
         const gd_bpe_token *lt;
         const gd_bpe_token *rt;
         uint8_t merged_bytes[GD_BPE_MAX_PIECE_BYTES * 2U];
         size_t merged_len;
         int32_t existing;
         int32_t merged_id = -1;
+        uint64_t actual_merges = 0U;
 
-        status = gd_count_word_pairs(words, n_words, &stats);
-        if (status != GD_OK) {
-            return status;
-        }
-        if (gd_choose_best_pair(&stats,
-                                (uint64_t)min_frequency,
-                                seed,
-                                &left,
-                                &right,
-                                &count) == 0) {
-            gd_pair_stats_free(&stats);
+        if (gd_train_heap_best_pair(&table,
+                                    &heap,
+                                    (uint64_t)min_frequency,
+                                    &pair_index,
+                                    &count) == 0) {
             break;
         }
-        gd_pair_stats_free(&stats);
-
+        left = table.pairs[pair_index].left;
+        right = table.pairs[pair_index].right;
         if (left < 0 || right < 0 || left >= tok->n_tokens || right >= tok->n_tokens) {
-            return gd_tokenizer_error(GD_ERR_INTERNAL, "BPE trainer selected invalid pair");
+            status = gd_tokenizer_error(GD_ERR_INTERNAL, "BPE trainer selected invalid pair");
+            break;
         }
         lt = &tok->tokens[left];
         rt = &tok->tokens[right];
         if (lt->len + rt->len > sizeof(merged_bytes)) {
-            return gd_tokenizer_error(GD_ERR_INTERNAL, "BPE merge exceeded piece limit");
+            status = gd_tokenizer_error(GD_ERR_INTERNAL, "BPE merge exceeded piece limit");
+            break;
         }
         merged_len = lt->len + rt->len;
         memcpy(merged_bytes, lt->bytes, lt->len);
         memcpy(&merged_bytes[lt->len], rt->bytes, rt->len);
         existing = gd_bytes_map_get(&tok->bytes_map, merged_bytes, merged_len);
         if (existing >= 0) {
-            gd_merge_words(words, n_words, left, right, existing);
-            continue;
+            merged_id = existing;
+        } else {
+            status = gd_tokenizer_add_token(tok, merged_bytes, merged_len, 0, left, right,
+                                            &merged_id);
+            if (status != GD_OK) {
+                break;
+            }
         }
-        status = gd_tokenizer_add_token(tok, merged_bytes, merged_len, 0, left, right,
-                                        &merged_id);
+        status = gd_train_merge_pair(&corpus,
+                                     &table,
+                                     &occs,
+                                     &touches,
+                                     &heap,
+                                     seed,
+                                     pair_index,
+                                     left,
+                                     right,
+                                     merged_id,
+                                     &actual_merges);
         if (status != GD_OK) {
-            return status;
+            break;
+        }
+        if (actual_merges == 0U) {
+            table.pairs[pair_index].count = 0U;
         }
         (void)count;
-        gd_merge_words(words, n_words, left, right, merged_id);
     }
+
+    gd_train_pair_table_free(&table);
+    gd_train_occ_vec_free(&occs);
+    gd_train_heap_free(&heap);
+    gd_train_touch_vec_free(&touches);
+    gd_train_corpus_free(&corpus);
     return status;
 }
 

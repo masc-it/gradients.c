@@ -742,17 +742,31 @@ class _GddsShardWriter:
         return projected <= max_shard_bytes
 
     def write_record(self, record: bytes | bytearray | memoryview) -> None:
+        self.write_records((record,))
+
+    def write_records(self, records: Iterable[bytes | bytearray | memoryview]) -> None:
         if self._closed or self._file is None or self._index is None:
             raise ValueError("cannot write to a closed GDDS shard")
-        view = memoryview(record)
-        nbytes = view.nbytes
-        if nbytes < GDDS_RECORD_HEADER_SIZE:
-            raise ValueError("encoded GDDS record is too small")
-        self._index.write(struct.pack("<QQ", self.cursor, nbytes))
-        self._file.write(view)
-        self.cursor += nbytes
-        self.data_nbytes += nbytes
-        self.n_samples += 1
+        index = bytearray()
+        payload = bytearray()
+        cursor = self.cursor
+        n_records = 0
+        for record in records:
+            view = memoryview(record)
+            nbytes = view.nbytes
+            if nbytes < GDDS_RECORD_HEADER_SIZE:
+                raise ValueError("encoded GDDS record is too small")
+            index.extend(struct.pack("<QQ", cursor, nbytes))
+            payload.extend(view)
+            cursor += nbytes
+            self.data_nbytes += nbytes
+            n_records += 1
+        if n_records == 0:
+            return
+        self._index.write(index)
+        self._file.write(payload)
+        self.cursor = cursor
+        self.n_samples += n_records
 
     def finalize(self) -> GddsShardInfo:
         if self._closed:

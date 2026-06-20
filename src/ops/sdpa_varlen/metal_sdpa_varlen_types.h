@@ -16,6 +16,11 @@
     (GD_METAL_SDPA_CAUSAL_QROWS * GD_METAL_SDPA_DKV_LANES)
 #define GD_METAL_SDPA_SPLIT_MIN 512U
 #define GD_METAL_SDPA_SPLIT_MAX 8U
+#define GD_METAL_SDPA_COMPACT_SETUP_THREADS 256U
+#define GD_METAL_SDPA_COMPACT_Q_DISPATCH_OFFSET 0U
+#define GD_METAL_SDPA_COMPACT_K_DISPATCH_OFFSET 16U
+#define GD_METAL_SDPA_COMPACT_DISPATCH_BYTES 32U
+#define GD_METAL_SDPA_COMPACT_COUNT_BYTES (2U * sizeof(gd_metal_u32))
 
 #define GD_METAL_SDPA_DTYPE_F16 1U
 #define GD_METAL_SDPA_DTYPE_F32 3U
@@ -44,10 +49,12 @@ typedef struct gd_metal_sdpa_varlen_args {
     gd_metal_u32 dtype;
     float scale;
     gd_metal_u32 n_splits;
+    gd_metal_u32 compact_blocks;
+    gd_metal_u32 reserved0;
 } gd_metal_sdpa_varlen_args;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(gd_metal_sdpa_varlen_args) == 136U,
+_Static_assert(sizeof(gd_metal_sdpa_varlen_args) == 144U,
                "gd_metal_sdpa_varlen_args ABI mismatch");
 #endif
 

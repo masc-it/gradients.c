@@ -542,6 +542,181 @@ static inline float gd_sdpa_varlen_sum_lanes8(float x)
     return x;
 }
 
+static inline uint gd_sdpa_varlen_div_up_u32(uint x, uint y)
+{
+    return (x + y - 1U) / y;
+}
+
+kernel void gd_sdpa_varlen_compact_qblocks_kernel(
+    device const int *cu [[buffer(0)]],
+    device uint2 *q_blocks [[buffer(1)]],
+    device atomic_uint *counts [[buffer(2)]],
+    device uint *dispatch_args [[buffer(3)]],
+    constant gd_metal_sdpa_varlen_args &p [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (tid == 0U) {
+        atomic_store_explicit(&counts[0], 0U, memory_order_relaxed);
+        dispatch_args[0] = 0U;
+        dispatch_args[1] = 1U;
+        dispatch_args[2] = 1U;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint b = tid; b < p.batch; b += uint(GD_METAL_SDPA_COMPACT_SETUP_THREADS)) {
+        int T = cu[b + 1U] - cu[b];
+        if (T <= 0) {
+            continue;
+        }
+        uint n_q = gd_sdpa_varlen_div_up_u32(uint(T), uint(GD_METAL_SDPA_CAUSAL_QROWS));
+        if (n_q > p.n_qb_max) {
+            n_q = p.n_qb_max;
+        }
+        uint base = atomic_fetch_add_explicit(&counts[0], n_q, memory_order_relaxed);
+        for (uint qb = 0U; qb < n_q; ++qb) {
+            q_blocks[base + qb] = uint2(b, qb);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0U) {
+        uint n_q = atomic_load_explicit(&counts[0], memory_order_relaxed);
+        dispatch_args[0] = n_q * p.hq;
+        dispatch_args[1] = 1U;
+        dispatch_args[2] = 1U;
+    }
+}
+
+kernel void gd_sdpa_varlen_compact_qkblocks_kernel(
+    device const int *cu [[buffer(0)]],
+    device uint2 *q_blocks [[buffer(1)]],
+    device uint2 *k_blocks [[buffer(2)]],
+    device atomic_uint *counts [[buffer(3)]],
+    device uint *dispatch_args [[buffer(4)]],
+    constant gd_metal_sdpa_varlen_args &p [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (tid == 0U) {
+        atomic_store_explicit(&counts[0], 0U, memory_order_relaxed);
+        atomic_store_explicit(&counts[1], 0U, memory_order_relaxed);
+        dispatch_args[0] = 0U;
+        dispatch_args[1] = 1U;
+        dispatch_args[2] = 1U;
+        dispatch_args[4] = 0U;
+        dispatch_args[5] = 1U;
+        dispatch_args[6] = 1U;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint b = tid; b < p.batch; b += uint(GD_METAL_SDPA_COMPACT_SETUP_THREADS)) {
+        int T = cu[b + 1U] - cu[b];
+        if (T <= 0) {
+            continue;
+        }
+        uint n_q = gd_sdpa_varlen_div_up_u32(uint(T), uint(GD_METAL_SDPA_CAUSAL_QROWS));
+        uint n_k = gd_sdpa_varlen_div_up_u32(uint(T), uint(GD_METAL_SDPA_DKV_WIDE_KEYS));
+        uint max_k = gd_sdpa_varlen_div_up_u32(p.max_seqlen, uint(GD_METAL_SDPA_DKV_WIDE_KEYS));
+        if (n_q > p.n_qb_max) {
+            n_q = p.n_qb_max;
+        }
+        if (n_k > max_k) {
+            n_k = max_k;
+        }
+        uint q_base = atomic_fetch_add_explicit(&counts[0], n_q, memory_order_relaxed);
+        uint k_base = atomic_fetch_add_explicit(&counts[1], n_k, memory_order_relaxed);
+        for (uint qb = 0U; qb < n_q; ++qb) {
+            q_blocks[q_base + qb] = uint2(b, qb);
+        }
+        for (uint kb = 0U; kb < n_k; ++kb) {
+            k_blocks[k_base + kb] = uint2(b, kb);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0U) {
+        uint n_q = atomic_load_explicit(&counts[0], memory_order_relaxed);
+        uint n_k = atomic_load_explicit(&counts[1], memory_order_relaxed);
+        dispatch_args[0] = n_q * p.hq;
+        dispatch_args[1] = 1U;
+        dispatch_args[2] = 1U;
+        dispatch_args[4] = n_k * p.hkv * p.n_splits;
+        dispatch_args[5] = 1U;
+        dispatch_args[6] = 1U;
+    }
+}
+
+struct gd_sdpa_varlen_q_work_item {
+    int b;
+    int hq;
+    int qb;
+};
+
+static inline gd_sdpa_varlen_q_work_item gd_sdpa_varlen_decode_q_work(
+    uint tgid,
+    constant gd_metal_sdpa_varlen_args &p,
+    device const uint2 *q_blocks)
+{
+    gd_sdpa_varlen_q_work_item item;
+    if (p.compact_blocks != 0U) {
+        uint hq = tgid % p.hq;
+        uint work = tgid / p.hq;
+        uint2 block = q_blocks[work];
+        item.b = int(block.x);
+        item.hq = int(hq);
+        item.qb = int(block.y);
+    } else {
+        int n_qb = int(p.n_qb_max);
+        int qb = int(tgid) % n_qb;
+        int r = int(tgid) / n_qb;
+        item.hq = r % int(p.hq);
+        item.b = r / int(p.hq);
+        item.qb = qb;
+    }
+    return item;
+}
+
+struct gd_sdpa_varlen_k_work_item {
+    int b;
+    int hkv;
+    int kblk;
+    int split;
+};
+
+static inline gd_sdpa_varlen_k_work_item gd_sdpa_varlen_decode_k_work(
+    uint tgid,
+    constant gd_metal_sdpa_varlen_args &p,
+    device const uint2 *k_blocks,
+    bool split_kernel)
+{
+    gd_sdpa_varlen_k_work_item item;
+    item.split = 0;
+    if (p.compact_blocks != 0U) {
+        uint t = tgid;
+        if (split_kernel) {
+            item.split = int(t % p.n_splits);
+            t /= p.n_splits;
+        }
+        item.hkv = int(t % p.hkv);
+        uint work = t / p.hkv;
+        uint2 block = k_blocks[work];
+        item.b = int(block.x);
+        item.kblk = int(block.y);
+    } else {
+        int n_kb = (int(p.max_seqlen) + int(GD_METAL_SDPA_DKV_WIDE_KEYS) - 1) /
+                   int(GD_METAL_SDPA_DKV_WIDE_KEYS);
+        uint t = tgid;
+        if (split_kernel) {
+            item.split = int(t % p.n_splits);
+            t /= p.n_splits;
+        }
+        item.kblk = int(t) % n_kb;
+        int r = int(t) / n_kb;
+        item.hkv = r % int(p.hkv);
+        item.b = r / int(p.hkv);
+    }
+    return item;
+}
+
 /* Prefix-free causal local attention has mask (j <= i && i - j < window).
  * Tight per-row/key loop bounds avoid calling gd_sdpa_varlen_allowed() in the
  * DH=64 GPT inner loops while leaving prefix-LM kernels on the generic path. */
@@ -643,17 +818,17 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel(
     device const int *cu [[buffer(3)]],
     device half *out [[buffer(4)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(5)]],
+    device const uint2 *q_blocks [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
-    int n_qb = int(p.n_qb_max);
-    int qb = int(tgid) % n_qb;
-    int r = int(tgid) / n_qb;
-    int hq = r % int(p.hq);
-    int b = r / int(p.hq);
+    gd_sdpa_varlen_q_work_item work = gd_sdpa_varlen_decode_q_work(tgid, p, q_blocks);
+    int qb = work.qb;
+    int hq = work.hq;
+    int b = work.b;
     int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
     int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
     if (b >= int(p.batch)) {
@@ -800,17 +975,17 @@ kernel void gd_sdpa_varlen_prefix_window_lane8_dh64_f16_stats_kernel(
     device half *out [[buffer(4)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(5)]],
     device float *stats [[buffer(6)]],
+    device const uint2 *q_blocks [[buffer(7)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
-    int n_qb = int(p.n_qb_max);
-    int qb = int(tgid) % n_qb;
-    int r = int(tgid) / n_qb;
-    int hq = r % int(p.hq);
-    int b = r / int(p.hq);
+    gd_sdpa_varlen_q_work_item work = gd_sdpa_varlen_decode_q_work(tgid, p, q_blocks);
+    int qb = work.qb;
+    int hq = work.hq;
+    int b = work.b;
     int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
     int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
     if (b >= int(p.batch)) {
@@ -969,17 +1144,17 @@ kernel void gd_sdpa_varlen_bwd_stats_dq_prefix_window_lane8_dh64_f16_kernel(
     device half *dq [[buffer(5)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(6)]],
     device float *stats [[buffer(7)]],
+    device const uint2 *q_blocks [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
-    int n_qb = int(p.n_qb_max);
-    int qb = int(tgid) % n_qb;
-    int r = int(tgid) / n_qb;
-    int hq = r % int(p.hq);
-    int b = r / int(p.hq);
+    gd_sdpa_varlen_q_work_item work = gd_sdpa_varlen_decode_q_work(tgid, p, q_blocks);
+    int qb = work.qb;
+    int hq = work.hq;
+    int b = work.b;
     int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
     int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
     if (b >= int(p.batch)) {
@@ -1158,17 +1333,17 @@ kernel void gd_sdpa_varlen_bwd_saved_stats_dq_prefix_window_lane8_dh64_f16_kerne
     device half *dq [[buffer(5)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(6)]],
     device float *stats [[buffer(7)]],
+    device const uint2 *q_blocks [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup half ksh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
     threadgroup half vsh[GD_METAL_SDPA_BK * GD_SDPA_VARLEN_DH64];
 
-    int n_qb = int(p.n_qb_max);
-    int qb = int(tgid) % n_qb;
-    int r = int(tgid) / n_qb;
-    int hq = r % int(p.hq);
-    int b = r / int(p.hq);
+    gd_sdpa_varlen_q_work_item work = gd_sdpa_varlen_decode_q_work(tgid, p, q_blocks);
+    int qb = work.qb;
+    int hq = work.hq;
+    int b = work.b;
     int local_q = int(tid) / int(GD_METAL_SDPA_DKV_LANES);
     int lane = int(tid) - local_q * int(GD_METAL_SDPA_DKV_LANES);
     if (b >= int(p.batch)) {
@@ -1334,6 +1509,7 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
     device half *dv [[buffer(6)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(7)]],
     device const float *stats [[buffer(8)]],
+    device const uint2 *k_blocks [[buffer(9)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
@@ -1343,12 +1519,10 @@ kernel void gd_sdpa_varlen_bwd_dkv_prefix_window_k16_dh64_f16_kernel(
     threadgroup float lsh[GD_METAL_SDPA_BK];
     threadgroup float dsh[GD_METAL_SDPA_BK];
 
-    int n_kb = (int(p.max_seqlen) + int(GD_METAL_SDPA_DKV_WIDE_KEYS) - 1) /
-               int(GD_METAL_SDPA_DKV_WIDE_KEYS);
-    int kblk = int(tgid) % n_kb;
-    int r = int(tgid) / n_kb;
-    int hkv = r % int(p.hkv);
-    int b = r / int(p.hkv);
+    gd_sdpa_varlen_k_work_item work = gd_sdpa_varlen_decode_k_work(tgid, p, k_blocks, false);
+    int kblk = work.kblk;
+    int hkv = work.hkv;
+    int b = work.b;
     int local_key = int(tid) / int(GD_METAL_SDPA_DKV_WIDE_LANES);
     int lane = int(tid) - local_key * int(GD_METAL_SDPA_DKV_WIDE_LANES);
     if (b >= int(p.batch)) {
@@ -1530,6 +1704,7 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
     device float *part [[buffer(5)]],
     constant gd_metal_sdpa_varlen_args &p [[buffer(6)]],
     device const float *stats [[buffer(7)]],
+    device const uint2 *k_blocks [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
@@ -1539,14 +1714,11 @@ kernel void gd_sdpa_varlen_bwd_dkv_split_prefix_window_k16_dh64_f16_kernel(
     threadgroup float lsh[GD_METAL_SDPA_BK];
     threadgroup float dsh[GD_METAL_SDPA_BK];
 
-    int n_kb = (int(p.max_seqlen) + int(GD_METAL_SDPA_DKV_WIDE_KEYS) - 1) /
-               int(GD_METAL_SDPA_DKV_WIDE_KEYS);
-    int split = int(tgid) % int(p.n_splits);
-    int t2 = int(tgid) / int(p.n_splits);
-    int kblk = t2 % n_kb;
-    int r = t2 / n_kb;
-    int hkv = r % int(p.hkv);
-    int b = r / int(p.hkv);
+    gd_sdpa_varlen_k_work_item work = gd_sdpa_varlen_decode_k_work(tgid, p, k_blocks, true);
+    int split = work.split;
+    int kblk = work.kblk;
+    int hkv = work.hkv;
+    int b = work.b;
     int local_key = int(tid) / int(GD_METAL_SDPA_DKV_WIDE_LANES);
     int lane = int(tid) - local_key * int(GD_METAL_SDPA_DKV_WIDE_LANES);
     if (b >= int(p.batch)) {

@@ -12,6 +12,16 @@ static id<MTLComputePipelineState> gd_sdpa_varlen_pso(gd_backend *backend)
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_pso;
 }
 
+static id<MTLComputePipelineState> gd_sdpa_varlen_compact_qblocks_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_compact_qblocks_pso;
+}
+
+static id<MTLComputePipelineState> gd_sdpa_varlen_compact_qkblocks_pso(gd_backend *backend)
+{
+    return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_compact_qkblocks_pso;
+}
+
 static id<MTLComputePipelineState> gd_sdpa_varlen_prefix_window_dh64_f16_pso(gd_backend *backend)
 {
     return (__bridge id<MTLComputePipelineState>)backend->sdpa_varlen_prefix_window_dh64_f16_pso;
@@ -110,15 +120,34 @@ static uint32_t gd_sdpa_varlen_num_splits(uint32_t seqlen)
     return splits;
 }
 
-static bool gd_sdpa_varlen_fast_enabled(void)
+static bool gd_sdpa_varlen_env_enabled(const char *name, bool fallback)
 {
-    const char *value = getenv("GD_METAL_SDPA_VARLEN_FAST");
+    const char *value = getenv(name);
     if (value == NULL || value[0] == '\0') {
-        return true;
+        return fallback;
     }
     return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 &&
            strcmp(value, "FALSE") != 0 && strcmp(value, "off") != 0 &&
            strcmp(value, "OFF") != 0;
+}
+
+static bool gd_sdpa_varlen_fast_enabled(void)
+{
+    return gd_sdpa_varlen_env_enabled("GD_METAL_SDPA_VARLEN_FAST", true);
+}
+
+static bool gd_sdpa_varlen_compact_enabled(void)
+{
+    return gd_sdpa_varlen_env_enabled("GD_METAL_SDPA_VARLEN_COMPACT", true);
+}
+
+static bool gd_sdpa_varlen_size_mul(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || (a != 0U && b > SIZE_MAX / a)) {
+        return false;
+    }
+    *out = a * b;
+    return true;
 }
 
 static bool gd_sdpa_varlen_use_dh64_prefix_window(const gd_backend_tensor_view *q,
@@ -301,6 +330,131 @@ static void gd_sdpa_varlen_fill_metal_args(gd_metal_sdpa_varlen_args *p,
     p->dtype = q->dtype;
     p->scale = args->scale;
     p->n_splits = 1U;
+    p->compact_blocks = 0U;
+    p->reserved0 = 0U;
+}
+
+static uint32_t gd_sdpa_varlen_kblock_count(uint32_t max_seqlen)
+{
+    return (max_seqlen + GD_METAL_SDPA_DKV_WIDE_KEYS - 1U) /
+           GD_METAL_SDPA_DKV_WIDE_KEYS;
+}
+
+static bool gd_sdpa_varlen_worklist_nbytes(uint32_t batch, uint32_t blocks_per_segment, size_t *out_bytes)
+{
+    size_t entries;
+    if (!gd_sdpa_varlen_size_mul((size_t)batch, (size_t)blocks_per_segment, &entries) ||
+        !gd_sdpa_varlen_size_mul(entries, 2U * sizeof(uint32_t), out_bytes)) {
+        return false;
+    }
+    return *out_bytes > 0U;
+}
+
+static id<MTLBuffer> gd_sdpa_varlen_new_private_buffer(gd_backend *backend, size_t nbytes)
+{
+    id<MTLDevice> device = gd_sdpa_varlen_device(backend);
+    if (device == nil || nbytes == 0U) {
+        return nil;
+    }
+    return [device newBufferWithLength:nbytes options:MTLResourceStorageModePrivate];
+}
+
+static gd_status gd_sdpa_varlen_make_compact_q_buffers(gd_backend *backend,
+                                                       const gd_metal_sdpa_varlen_args *p,
+                                                       id<MTLBuffer> *q_blocks,
+                                                       id<MTLBuffer> *counts,
+                                                       id<MTLBuffer> *dispatch_args)
+{
+    size_t q_bytes;
+    if (backend == NULL || p == NULL || q_blocks == NULL || counts == NULL || dispatch_args == NULL ||
+        !gd_sdpa_varlen_worklist_nbytes(p->batch, p->n_qb_max, &q_bytes)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *q_blocks = gd_sdpa_varlen_new_private_buffer(backend, q_bytes);
+    *counts = gd_sdpa_varlen_new_private_buffer(backend, GD_METAL_SDPA_COMPACT_COUNT_BYTES);
+    *dispatch_args = gd_sdpa_varlen_new_private_buffer(backend, GD_METAL_SDPA_COMPACT_DISPATCH_BYTES);
+    return (*q_blocks != nil && *counts != nil && *dispatch_args != nil) ? GD_OK : GD_ERR_OUT_OF_MEMORY;
+}
+
+static gd_status gd_sdpa_varlen_make_compact_qk_buffers(gd_backend *backend,
+                                                        const gd_metal_sdpa_varlen_args *p,
+                                                        id<MTLBuffer> *q_blocks,
+                                                        id<MTLBuffer> *k_blocks,
+                                                        id<MTLBuffer> *counts,
+                                                        id<MTLBuffer> *dispatch_args)
+{
+    size_t q_bytes;
+    size_t k_bytes;
+    if (backend == NULL || p == NULL || q_blocks == NULL || k_blocks == NULL || counts == NULL ||
+        dispatch_args == NULL || !gd_sdpa_varlen_worklist_nbytes(p->batch, p->n_qb_max, &q_bytes) ||
+        !gd_sdpa_varlen_worklist_nbytes(p->batch, gd_sdpa_varlen_kblock_count(p->max_seqlen), &k_bytes)) {
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    *q_blocks = gd_sdpa_varlen_new_private_buffer(backend, q_bytes);
+    *k_blocks = gd_sdpa_varlen_new_private_buffer(backend, k_bytes);
+    *counts = gd_sdpa_varlen_new_private_buffer(backend, GD_METAL_SDPA_COMPACT_COUNT_BYTES);
+    *dispatch_args = gd_sdpa_varlen_new_private_buffer(backend, GD_METAL_SDPA_COMPACT_DISPATCH_BYTES);
+    return (*q_blocks != nil && *k_blocks != nil && *counts != nil && *dispatch_args != nil) ?
+               GD_OK :
+               GD_ERR_OUT_OF_MEMORY;
+}
+
+static gd_status gd_sdpa_varlen_encode_compact_q_setup(id<MTLComputeCommandEncoder> encoder,
+                                                       gd_backend *backend,
+                                                       const gd_backend_tensor_view *cu_seqlens,
+                                                       id<MTLBuffer> q_blocks,
+                                                       id<MTLBuffer> counts,
+                                                       id<MTLBuffer> dispatch_args,
+                                                       const gd_metal_sdpa_varlen_args *p)
+{
+    id<MTLComputePipelineState> setup_pso;
+    if (encoder == nil || backend == NULL || cu_seqlens == NULL || q_blocks == nil || counts == nil ||
+        dispatch_args == nil || p == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    setup_pso = gd_sdpa_varlen_compact_qblocks_pso(backend);
+    if (setup_pso == nil) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    [encoder setComputePipelineState:setup_pso];
+    [encoder setBuffer:gd_sdpa_varlen_buffer(cu_seqlens->buffer) offset:cu_seqlens->offset atIndex:0U];
+    [encoder setBuffer:q_blocks offset:0U atIndex:1U];
+    [encoder setBuffer:counts offset:0U atIndex:2U];
+    [encoder setBuffer:dispatch_args offset:0U atIndex:3U];
+    [encoder setBytes:p length:sizeof(*p) atIndex:4U];
+    [encoder dispatchThreadgroups:MTLSizeMake(1U, 1U, 1U)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_COMPACT_SETUP_THREADS, 1U, 1U)];
+    return GD_OK;
+}
+
+static gd_status gd_sdpa_varlen_encode_compact_qk_setup(id<MTLComputeCommandEncoder> encoder,
+                                                        gd_backend *backend,
+                                                        const gd_backend_tensor_view *cu_seqlens,
+                                                        id<MTLBuffer> q_blocks,
+                                                        id<MTLBuffer> k_blocks,
+                                                        id<MTLBuffer> counts,
+                                                        id<MTLBuffer> dispatch_args,
+                                                        const gd_metal_sdpa_varlen_args *p)
+{
+    id<MTLComputePipelineState> setup_pso;
+    if (encoder == nil || backend == NULL || cu_seqlens == NULL || q_blocks == nil || k_blocks == nil ||
+        counts == nil || dispatch_args == nil || p == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    setup_pso = gd_sdpa_varlen_compact_qkblocks_pso(backend);
+    if (setup_pso == nil) {
+        return GD_ERR_UNSUPPORTED;
+    }
+    [encoder setComputePipelineState:setup_pso];
+    [encoder setBuffer:gd_sdpa_varlen_buffer(cu_seqlens->buffer) offset:cu_seqlens->offset atIndex:0U];
+    [encoder setBuffer:q_blocks offset:0U atIndex:1U];
+    [encoder setBuffer:k_blocks offset:0U atIndex:2U];
+    [encoder setBuffer:counts offset:0U atIndex:3U];
+    [encoder setBuffer:dispatch_args offset:0U atIndex:4U];
+    [encoder setBytes:p length:sizeof(*p) atIndex:5U];
+    [encoder dispatchThreadgroups:MTLSizeMake(1U, 1U, 1U)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_COMPACT_SETUP_THREADS, 1U, 1U)];
+    return GD_OK;
 }
 
 gd_status gd_backend_sdpa_varlen(gd_backend *backend,
@@ -314,6 +468,9 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLBuffer> q_blocks = nil;
+    id<MTLBuffer> compact_counts = nil;
+    id<MTLBuffer> compact_dispatch = nil;
     gd_metal_sdpa_varlen_args p;
     MTLSize groups;
     MTLSize threads;
@@ -338,8 +495,28 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
     gd_sdpa_varlen_fill_metal_args(&p, q, k, cu_seqlens, out, NULL, NULL, NULL, NULL, stats, args);
     p.v_offset = (uint64_t)v->offset;
     if (gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
+        bool compact = gd_sdpa_varlen_compact_enabled();
         p.n_qb_max = (args->max_seqlen + GD_METAL_SDPA_CAUSAL_QROWS - 1U) /
                      GD_METAL_SDPA_CAUSAL_QROWS;
+        p.compact_blocks = compact ? 1U : 0U;
+        if (compact) {
+            st = gd_sdpa_varlen_make_compact_q_buffers(backend, &p, &q_blocks, &compact_counts, &compact_dispatch);
+            if (st != GD_OK) {
+                [encoder endEncoding];
+                return st;
+            }
+            st = gd_sdpa_varlen_encode_compact_q_setup(encoder,
+                                                       backend,
+                                                       cu_seqlens,
+                                                       q_blocks,
+                                                       compact_counts,
+                                                       compact_dispatch,
+                                                       &p);
+            if (st != GD_OK) {
+                [encoder endEncoding];
+                return st;
+            }
+        }
         [encoder setComputePipelineState:stats != NULL ? gd_sdpa_varlen_prefix_window_dh64_f16_stats_pso(backend) :
                                           gd_sdpa_varlen_prefix_window_dh64_f16_pso(backend)];
         [encoder setBuffer:gd_sdpa_varlen_buffer(q->buffer) offset:q->offset atIndex:0U];
@@ -350,10 +527,23 @@ gd_status gd_backend_sdpa_varlen(gd_backend *backend,
         [encoder setBytes:&p length:sizeof(p) atIndex:5U];
         if (stats != NULL) {
             [encoder setBuffer:gd_sdpa_varlen_buffer(stats->buffer) offset:stats->offset atIndex:6U];
+            [encoder setBuffer:compact ? q_blocks : gd_sdpa_varlen_buffer(cu_seqlens->buffer)
+                         offset:compact ? 0U : cu_seqlens->offset
+                        atIndex:7U];
+        } else {
+            [encoder setBuffer:compact ? q_blocks : gd_sdpa_varlen_buffer(cu_seqlens->buffer)
+                         offset:compact ? 0U : cu_seqlens->offset
+                        atIndex:6U];
         }
-        groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq * (NSUInteger)p.n_qb_max, 1U, 1U);
         threads = MTLSizeMake((NSUInteger)GD_METAL_SDPA_CAUSAL_THREADS, 1U, 1U);
-        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        if (compact) {
+            [encoder dispatchThreadgroupsWithIndirectBuffer:compact_dispatch
+                                       indirectBufferOffset:GD_METAL_SDPA_COMPACT_Q_DISPATCH_OFFSET
+                                      threadsPerThreadgroup:threads];
+        } else {
+            groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq * (NSUInteger)p.n_qb_max, 1U, 1U);
+            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        }
     } else {
         [encoder setComputePipelineState:gd_sdpa_varlen_pso(backend)];
         [encoder setBuffer:gd_sdpa_varlen_buffer(q->buffer) offset:0U atIndex:0U];
@@ -384,6 +574,10 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
 {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLBuffer> q_blocks = nil;
+    id<MTLBuffer> k_blocks = nil;
+    id<MTLBuffer> compact_counts = nil;
+    id<MTLBuffer> compact_dispatch = nil;
     gd_metal_sdpa_varlen_args p;
     MTLSize q_groups;
     MTLSize kv_groups;
@@ -429,14 +623,40 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
     if (gd_sdpa_varlen_use_dh64_prefix_window(q, args)) {
         const uint32_t n_qb = (args->max_seqlen + GD_METAL_SDPA_CAUSAL_QROWS - 1U) /
                                GD_METAL_SDPA_CAUSAL_QROWS;
-        const uint32_t n_kb = (args->max_seqlen + GD_METAL_SDPA_DKV_WIDE_KEYS - 1U) /
-                               GD_METAL_SDPA_DKV_WIDE_KEYS;
+        const uint32_t n_kb = gd_sdpa_varlen_kblock_count(args->max_seqlen);
         const uint32_t n_splits = gd_sdpa_varlen_num_splits(args->max_seqlen);
+        const bool compact = gd_sdpa_varlen_compact_enabled();
         id<MTLBuffer> part_buffer = nil;
         p.n_qb_max = n_qb;
         p.n_splits = n_splits;
-        q_groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq * (NSUInteger)n_qb, 1U, 1U);
-        kv_groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hkv * (NSUInteger)n_kb, 1U, 1U);
+        p.compact_blocks = compact ? 1U : 0U;
+        if (compact) {
+            st = gd_sdpa_varlen_make_compact_qk_buffers(backend,
+                                                        &p,
+                                                        &q_blocks,
+                                                        &k_blocks,
+                                                        &compact_counts,
+                                                        &compact_dispatch);
+            if (st != GD_OK) {
+                [encoder endEncoding];
+                return st;
+            }
+            st = gd_sdpa_varlen_encode_compact_qk_setup(encoder,
+                                                        backend,
+                                                        cu_seqlens,
+                                                        q_blocks,
+                                                        k_blocks,
+                                                        compact_counts,
+                                                        compact_dispatch,
+                                                        &p);
+            if (st != GD_OK) {
+                [encoder endEncoding];
+                return st;
+            }
+        } else {
+            q_groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hq * (NSUInteger)n_qb, 1U, 1U);
+            kv_groups = MTLSizeMake((NSUInteger)p.batch * (NSUInteger)p.hkv * (NSUInteger)n_kb, 1U, 1U);
+        }
         if (n_splits > 1U) {
             size_t part_elems;
             size_t part_bytes;
@@ -474,8 +694,19 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
         [encoder setBuffer:gd_sdpa_varlen_buffer(grad_q->buffer) offset:grad_q->offset atIndex:5U];
         [encoder setBytes:&p length:sizeof(p) atIndex:6U];
         [encoder setBuffer:gd_sdpa_varlen_buffer(stats->buffer) offset:stats->offset atIndex:7U];
-        [encoder dispatchThreadgroups:q_groups
-                threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_CAUSAL_THREADS, 1U, 1U)];
+        [encoder setBuffer:compact ? q_blocks : gd_sdpa_varlen_buffer(cu_seqlens->buffer)
+                     offset:compact ? 0U : cu_seqlens->offset
+                    atIndex:8U];
+        if (compact) {
+            [encoder dispatchThreadgroupsWithIndirectBuffer:compact_dispatch
+                                       indirectBufferOffset:GD_METAL_SDPA_COMPACT_Q_DISPATCH_OFFSET
+                                      threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_CAUSAL_THREADS,
+                                                                         1U,
+                                                                         1U)];
+        } else {
+            [encoder dispatchThreadgroups:q_groups
+                    threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_CAUSAL_THREADS, 1U, 1U)];
+        }
 
         if (n_splits > 1U) {
             const NSUInteger reduce_count = (NSUInteger)p.total_tokens * (NSUInteger)p.hkv *
@@ -489,8 +720,19 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
             [encoder setBuffer:part_buffer offset:0U atIndex:5U];
             [encoder setBytes:&p length:sizeof(p) atIndex:6U];
             [encoder setBuffer:gd_sdpa_varlen_buffer(stats->buffer) offset:stats->offset atIndex:7U];
-            [encoder dispatchThreadgroups:MTLSizeMake(kv_groups.width * (NSUInteger)n_splits, 1U, 1U)
-                    threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS, 1U, 1U)];
+            [encoder setBuffer:compact ? k_blocks : gd_sdpa_varlen_buffer(cu_seqlens->buffer)
+                         offset:compact ? 0U : cu_seqlens->offset
+                        atIndex:8U];
+            if (compact) {
+                [encoder dispatchThreadgroupsWithIndirectBuffer:compact_dispatch
+                                           indirectBufferOffset:GD_METAL_SDPA_COMPACT_K_DISPATCH_OFFSET
+                                          threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS,
+                                                                             1U,
+                                                                             1U)];
+            } else {
+                [encoder dispatchThreadgroups:MTLSizeMake(kv_groups.width * (NSUInteger)n_splits, 1U, 1U)
+                        threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS, 1U, 1U)];
+            }
 
             [encoder setComputePipelineState:gd_sdpa_varlen_bwd_dkv_reduce_f16_pso(backend)];
             [encoder setBuffer:part_buffer offset:0U atIndex:0U];
@@ -510,8 +752,19 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
             [encoder setBuffer:gd_sdpa_varlen_buffer(grad_v->buffer) offset:grad_v->offset atIndex:6U];
             [encoder setBytes:&p length:sizeof(p) atIndex:7U];
             [encoder setBuffer:gd_sdpa_varlen_buffer(stats->buffer) offset:stats->offset atIndex:8U];
-            [encoder dispatchThreadgroups:kv_groups
-                    threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS, 1U, 1U)];
+            [encoder setBuffer:compact ? k_blocks : gd_sdpa_varlen_buffer(cu_seqlens->buffer)
+                         offset:compact ? 0U : cu_seqlens->offset
+                        atIndex:9U];
+            if (compact) {
+                [encoder dispatchThreadgroupsWithIndirectBuffer:compact_dispatch
+                                           indirectBufferOffset:GD_METAL_SDPA_COMPACT_K_DISPATCH_OFFSET
+                                          threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS,
+                                                                             1U,
+                                                                             1U)];
+            } else {
+                [encoder dispatchThreadgroups:kv_groups
+                        threadsPerThreadgroup:MTLSizeMake((NSUInteger)GD_METAL_SDPA_DKV_WIDE_THREADS, 1U, 1U)];
+            }
         }
         [encoder endEncoding];
         return gd_metal_finish_immediate(command_buffer, immediate);

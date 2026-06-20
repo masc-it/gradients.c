@@ -239,6 +239,8 @@ static const gd_metal_pipeline_spec gd_metal_pipeline_specs[] = {
     GD_METAL_PIPELINE("gd_minimax_m3_sparse_attention_bwd_dq_kernel", minimax_m3_sparse_attention_bwd_dq_pso),
     GD_METAL_PIPELINE("gd_minimax_m3_sparse_attention_bwd_dkv_kernel", minimax_m3_sparse_attention_bwd_dkv_pso),
     GD_METAL_PIPELINE("gd_sdpa_varlen_kernel", sdpa_varlen_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_compact_qblocks_kernel", sdpa_varlen_compact_qblocks_pso),
+    GD_METAL_PIPELINE("gd_sdpa_varlen_compact_qkblocks_kernel", sdpa_varlen_compact_qkblocks_pso),
     GD_METAL_PIPELINE("gd_sdpa_varlen_prefix_window_lane8_dh64_f16_kernel", sdpa_varlen_prefix_window_dh64_f16_pso),
     GD_METAL_PIPELINE("gd_sdpa_varlen_prefix_window_lane8_dh64_f16_stats_kernel", sdpa_varlen_prefix_window_dh64_f16_stats_pso),
     GD_METAL_PIPELINE("gd_sdpa_varlen_bwd_stats_kernel", sdpa_varlen_bwd_stats_pso),

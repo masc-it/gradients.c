@@ -578,7 +578,7 @@ static void print_param_set(const gd_param_set *params)
         return;
     }
     for (i = 0U; i < params->count; ++i) {
-        printf("  %-48s lr_mult=%.2f weight_decay=%.4f trainable=%s\n",
+        printf("  %-48s lr_mult=%.9g weight_decay=%.9g trainable=%s\n",
                params->items[i].path,
                (double)params->items[i].lr_mult,
                (double)params->items[i].weight_decay,

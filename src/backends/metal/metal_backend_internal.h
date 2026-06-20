@@ -171,6 +171,8 @@ struct gd_backend {
     void *minimax_m3_sparse_attention_bwd_dq_pso;
     void *minimax_m3_sparse_attention_bwd_dkv_pso;
     void *sdpa_varlen_pso;
+    void *sdpa_varlen_compact_qblocks_pso;
+    void *sdpa_varlen_compact_qkblocks_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_pso;
     void *sdpa_varlen_prefix_window_dh64_f16_stats_pso;
     void *sdpa_varlen_bwd_stats_pso;

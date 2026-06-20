@@ -943,6 +943,54 @@ class GddsSplitWriter:
         self._finished = True
 
 
+def write_gdds_shard_records(
+    path: str | Path,
+    fields: Sequence[FieldSpec | Mapping[str, Any]],
+    records: Iterable[bytes | bytearray | memoryview],
+    *,
+    max_shard_bytes: int | None = GDDS_DEFAULT_MAX_SHARD_BYTES,
+    index_spool_bytes: int = GDDS_DEFAULT_INDEX_SPOOL_BYTES,
+    record_batch_size: int = 1000,
+) -> Path:
+    """Write one GDDS shard from pre-encoded records.
+
+    Records are streamed and data/index writes are batched, which reduces write
+    syscall pressure for large preprocessing jobs on HDDs.
+    """
+
+    if record_batch_size <= 0:
+        raise ValueError("record_batch_size must be positive")
+    fields_norm = tuple(_normalize_fields(fields))
+    schema = _encode_schema(fields_norm)
+    writer = _GddsShardWriter(
+        Path(path),
+        fields_norm,
+        schema,
+        schema_hash(fields_norm),
+        index_spool_bytes=index_spool_bytes,
+    )
+    batch: list[bytes | bytearray | memoryview] = []
+    try:
+        for record in records:
+            record_nbytes = memoryview(record).nbytes
+            if not writer.can_fit(record_nbytes, max_shard_bytes):
+                raise ValueError(
+                    f"GDDS records exceed max_shard_bytes={max_shard_bytes} for shard {path}"
+                )
+            batch.append(record)
+            if len(batch) >= record_batch_size:
+                writer.write_records(batch)
+                batch.clear()
+        if batch:
+            writer.write_records(batch)
+            batch.clear()
+        writer.finalize()
+        return Path(path)
+    except BaseException:
+        writer.abort()
+        raise
+
+
 def write_gdds_shard(
     path: str | Path,
     fields: Sequence[FieldSpec | Mapping[str, Any]],
@@ -1055,5 +1103,6 @@ __all__ = [
     "schema_hash",
     "tensor",
     "write_gdds_shard",
+    "write_gdds_shard_records",
     "write_gdds_split",
 ]

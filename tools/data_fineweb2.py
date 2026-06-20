@@ -28,7 +28,7 @@ import shutil
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -55,6 +55,7 @@ DEFAULT_MIN_CHARS = 200
 DEFAULT_MAX_CHARS = 0  # 0 means unbounded
 MAX_RAW_SHARD_BYTES = 512 * 1024 * 1024
 DEFAULT_RAW_WRITE_BUFFER_BYTES = 8 * 1024 * 1024
+DEFAULT_GDDS_RECORD_BATCH_SIZE = 1000
 MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024
 DATA_FORMAT_VERSION = "gpt-lm-fineweb2-plus-fineweb-en-v1-2048-u16-segments"
 
@@ -1741,37 +1742,36 @@ def pack_stage(config: PipelineConfig, paths: PipelinePaths, budgets: Sequence[L
     if not train_refs:
         raise ValueError("no tokenized train shards found; run tokenize first")
 
-    target_train_samples = sum(budget.train_packed_samples for budget in budgets)
-    target_val_samples = sum(budget.val_packed_samples for budget in budgets)
+    tokenized_train_tokens = sum(ref.tokens for ref in train_refs)
+    tokenized_val_tokens = sum(ref.tokens for ref in val_refs)
+    target_train_samples = packed_sample_capacity(tokenized_train_tokens, config.context_length)
+    target_val_samples = packed_sample_capacity(tokenized_val_tokens, config.context_length)
     print(
         f"pack: train_shards={len(train_refs)} val_shards={len(val_refs)} "
-        f"context={config.context_length} max_shard_bytes={config.max_shard_bytes}",
+        f"context={config.context_length} max_shard_bytes={config.max_shard_bytes} "
+        f"target=all-available",
         flush=True,
     )
 
-    train_packed = write_gdds_split(
-        iter_packed_samples(
-            train_refs,
-            context_length=config.context_length,
-            split="train",
-            max_samples=target_train_samples,
-        ),
+    train_packed = write_gdds_split_parallel(
+        train_refs,
         paths,
         split="train",
+        context_length=config.context_length,
+        max_samples=target_train_samples,
         max_shard_bytes=config.max_shard_bytes,
+        workers=min(config.workers, 4),
     )
     val_packed: tuple[PackedShardRef, ...] = ()
     if val_refs:
-        val_packed = write_gdds_split(
-            iter_packed_samples(
-                val_refs,
-                context_length=config.context_length,
-                split="val",
-                max_samples=target_val_samples,
-            ),
+        val_packed = write_gdds_split_parallel(
+            val_refs,
             paths,
             split="val",
+            context_length=config.context_length,
+            max_samples=target_val_samples,
             max_shard_bytes=config.max_shard_bytes,
+            workers=min(config.workers, 4),
         )
 
     packed_refs = tuple([*train_packed, *val_packed])
@@ -1792,10 +1792,11 @@ def pack_stage(config: PipelineConfig, paths: PipelinePaths, budgets: Sequence[L
         "val_packed_tokens": val_samples * config.context_length,
         "target_train_samples": target_train_samples,
         "target_val_samples": target_val_samples,
+        "pack_target": "all_available_tokens",
         "target_train_reached": train_samples >= target_train_samples,
         "target_val_reached": val_samples >= target_val_samples if val_refs else target_val_samples == 0,
-        "tokenized_train_tokens": sum(ref.tokens for ref in train_refs),
-        "tokenized_val_tokens": sum(ref.tokens for ref in val_refs),
+        "tokenized_train_tokens": tokenized_train_tokens,
+        "tokenized_val_tokens": tokenized_val_tokens,
         "shards": len(packed_refs),
         "storage_schema_hash": f"0x{schema_hash(storage_fields):016x}",
         "runtime_schema_hash": f"0x{schema_hash(runtime_fields):016x}",
@@ -1857,6 +1858,160 @@ def runtime_fields_for_context(context_length: int) -> object:
     ]
 
 
+def packed_sample_capacity(total_tokens: int, context_length: int) -> int:
+    """Return number of fixed-stride packed samples available from a token stream."""
+
+    record_length = context_length + 1
+    if total_tokens < record_length:
+        return 0
+    return (total_tokens - record_length) // context_length + 1
+
+
+def estimate_packed_record_nbytes(context_length: int) -> int:
+    """Conservative byte estimate for planning parallel GDDS shard ranges."""
+
+    token_payload = (context_length + 1) * 2
+    # Segment metadata is variable.  Reserve enough for many short documents per
+    # row and record/index overhead so planned shards stay below max_shard_bytes.
+    return max(16 * 1024, token_payload + context_length * 2 + 512)
+
+
+def plan_pack_ranges(
+    *,
+    total_samples: int,
+    context_length: int,
+    max_shard_bytes: int,
+    workers: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(shard_index, sample_start, sample_count)`` ranges."""
+
+    if total_samples <= 0:
+        return ()
+    record_estimate = estimate_packed_record_nbytes(context_length)
+    max_samples_per_shard = max(1, max_shard_bytes // record_estimate)
+    desired_shards = min(max(1, workers), 4, total_samples)
+    shard_count = max(desired_shards, (total_samples + max_samples_per_shard - 1) // max_samples_per_shard)
+    samples_per_shard = (total_samples + shard_count - 1) // shard_count
+    ranges = []
+    start = 0
+    for shard_index in range(shard_count):
+        remaining = total_samples - start
+        if remaining <= 0:
+            break
+        count = min(samples_per_shard, remaining)
+        ranges.append((shard_index, start, count))
+        start += count
+    return tuple(ranges)
+
+
+def write_gdds_split_parallel(
+    tokenized_shards: Sequence[TokenizedShardRef],
+    paths: PipelinePaths,
+    *,
+    split: str,
+    context_length: int,
+    max_samples: int,
+    max_shard_bytes: int,
+    workers: int,
+) -> tuple[PackedShardRef, ...]:
+    """Serialize one split to independent GDDS shards in parallel."""
+
+    total_tokens = sum(ref.tokens for ref in tokenized_shards)
+    available_samples = packed_sample_capacity(total_tokens, context_length)
+    total_samples = min(max_samples, available_samples)
+    if total_samples <= 0:
+        return ()
+    ranges = plan_pack_ranges(
+        total_samples=total_samples,
+        context_length=context_length,
+        max_shard_bytes=max_shard_bytes,
+        workers=workers,
+    )
+    worker_count = min(max(1, workers), 4, len(ranges))
+    print(
+        f"pack[{split}]: tokens={total_tokens} samples={total_samples} "
+        f"shards={len(ranges)} workers={worker_count} batch={DEFAULT_GDDS_RECORD_BATCH_SIZE}",
+        flush=True,
+    )
+    args = [
+        (
+            tuple(tokenized_shards),
+            paths.gdds_dir,
+            split,
+            shard_index,
+            sample_start,
+            sample_count,
+            context_length,
+            max_shard_bytes,
+            DEFAULT_GDDS_RECORD_BATCH_SIZE,
+        )
+        for shard_index, sample_start, sample_count in ranges
+    ]
+    if worker_count == 1:
+        refs = [write_gdds_range_worker(arg) for arg in args]
+    else:
+        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        ctx = mp.get_context(start_method)
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as pool:
+            futures = {pool.submit(write_gdds_range_worker, arg): arg[3] for arg in args}
+            refs = []
+            for future in as_completed(futures):
+                refs.append(future.result())
+    refs.sort(key=lambda ref: ref.path.name)
+    return tuple(refs)
+
+
+def write_gdds_range_worker(args: tuple[object, ...]) -> PackedShardRef:
+    """Worker entrypoint that writes one fixed sample range to one GDDS shard."""
+
+    (
+        tokenized_shards,
+        gdds_dir,
+        split,
+        shard_index,
+        sample_start,
+        sample_count,
+        context_length,
+        max_shard_bytes,
+        record_batch_size,
+    ) = args
+    tokenized_refs = tuple(tokenized_shards)  # type: ignore[arg-type]
+    out_dir = Path(gdds_dir)  # type: ignore[arg-type]
+    path = out_dir / f"{split}-{int(shard_index):05d}.gdds"
+    fields = storage_fields_for_context(int(context_length))
+    from gdds_utils import GddsRecordEncoder, schema_hash, write_gdds_shard_records
+
+    encoder = GddsRecordEncoder(fields)
+
+    def records() -> Iterator[bytes]:
+        for sample in iter_packed_samples_range(
+            tokenized_refs,
+            context_length=int(context_length),
+            split=str(split),
+            sample_start=int(sample_start),
+            sample_count=int(sample_count),
+        ):
+            yield encoder.encode(packed_sample_to_gdds(sample))
+
+    write_gdds_shard_records(
+        path,
+        fields,
+        records(),
+        max_shard_bytes=int(max_shard_bytes),
+        record_batch_size=int(record_batch_size),
+    )
+    return PackedShardRef(
+        path=path,
+        language="mixed",
+        split=str(split),
+        samples=int(sample_count),
+        packed_tokens=int(sample_count) * int(context_length),
+        schema_hash=schema_hash(fields),
+        bytes=path.stat().st_size,
+        sha256="",
+    )
+
+
 def iter_tokenized_documents(tokenized_shards: Sequence[TokenizedShardRef]) -> Iterator[tuple[object, str]]:
     """Yield ``(token_ids, language)`` document sequences from tokenized shard dirs."""
 
@@ -1916,6 +2071,81 @@ def iter_packed_samples(
             emitted += 1
             pending_tokens = pending_tokens[context_length:]
             pending_doc_ids = pending_doc_ids[context_length:]
+
+
+def iter_packed_samples_range(
+    tokenized_shards: Sequence[TokenizedShardRef],
+    *,
+    context_length: int,
+    split: str,
+    sample_start: int,
+    sample_count: int,
+) -> Iterator[PackedSample]:
+    """Yield a deterministic packed sample range from the global token stream."""
+
+    import numpy as np
+    from tok_utils import TOKEN_DTYPE, TokenizedCorpus
+
+    if context_length < 2:
+        raise ValueError("context_length must be >= 2")
+    if sample_start < 0 or sample_count < 0:
+        raise ValueError("sample_start/sample_count must be non-negative")
+    if sample_count == 0:
+        return
+    record_length = context_length + 1
+    start_token = sample_start * context_length
+    end_token = start_token + sample_count * context_length + 1
+    token_cursor = 0
+    doc_index = 0
+    emitted = 0
+    pending_tokens = np.empty((0,), dtype=TOKEN_DTYPE)
+    pending_doc_ids = np.empty((0,), dtype=np.int64)
+
+    for ref in sorted(tokenized_shards, key=lambda r: (r.language, r.split, str(r.path))):
+        corpus = TokenizedCorpus.open(ref.path)
+        if corpus.mode != "jsonl":
+            raise ValueError(f"expected jsonl tokenized corpus at {ref.path}, got {corpus.mode!r}")
+        for shard in corpus.shards:
+            tokens, offsets = corpus.mmap_jsonl_shard(shard)
+            for i in range(shard.sequences):
+                doc_begin = int(offsets[i])
+                doc_end = int(offsets[i + 1])
+                doc_len = doc_end - doc_begin
+                global_begin = token_cursor
+                global_end = token_cursor + doc_len
+                if global_end <= start_token:
+                    token_cursor = global_end
+                    doc_index += 1
+                    continue
+                if global_begin >= end_token:
+                    return
+                local_begin = max(0, start_token - global_begin)
+                local_end = min(doc_len, end_token - global_begin)
+                if local_end > local_begin:
+                    chunk = np.asarray(tokens[doc_begin + local_begin : doc_begin + local_end], dtype=TOKEN_DTYPE)
+                    chunk_doc_ids = np.full(chunk.shape, doc_index, dtype=np.int64)
+                    if pending_tokens.size == 0:
+                        pending_tokens = chunk
+                        pending_doc_ids = chunk_doc_ids
+                    else:
+                        pending_tokens = np.concatenate([pending_tokens, chunk])
+                        pending_doc_ids = np.concatenate([pending_doc_ids, chunk_doc_ids])
+                    while pending_tokens.size >= record_length and emitted < sample_count:
+                        row = np.asarray(pending_tokens[:record_length], dtype=TOKEN_DTYPE)
+                        row_doc_ids = np.asarray(pending_doc_ids[:record_length], dtype=np.int64)
+                        segment_lengths = compute_segment_lengths(row_doc_ids[:-1])
+                        if int(segment_lengths.sum()) != context_length:
+                            raise ValueError("segment lengths do not cover packed context")
+                        yield PackedSample(tokens=row, segment_lengths=segment_lengths, language="mixed", split=split)
+                        emitted += 1
+                        pending_tokens = pending_tokens[context_length:]
+                        pending_doc_ids = pending_doc_ids[context_length:]
+                    if emitted >= sample_count:
+                        return
+                token_cursor = global_end
+                doc_index += 1
+    if emitted != sample_count:
+        raise ValueError(f"packed range underflow: emitted {emitted}, expected {sample_count}")
 
 
 def compute_segment_lengths(doc_ids: object) -> object:

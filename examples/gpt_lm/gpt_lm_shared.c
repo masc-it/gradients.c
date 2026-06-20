@@ -108,9 +108,8 @@ size_t gpt_param_count_for_layers(int n_layers)
 {
     size_t per_block = 0U;
     size_t total = 0U;
-    total += checked_mul_size((size_t)GPT_VOCAB_SIZE, (size_t)GPT_D_MODEL, "embedding params");
-    total += checked_mul_size((size_t)GPT_VOCAB_SIZE, (size_t)GPT_D_MODEL, "LM head params");
-    total += (size_t)GPT_VOCAB_SIZE;
+    total += checked_mul_size((size_t)GPT_VOCAB_SIZE, (size_t)GPT_D_MODEL, "tied embedding/LM head params");
+    total += (size_t)GPT_VOCAB_SIZE; /* LM head bias */
     total += (size_t)GPT_D_MODEL;
     per_block += (size_t)(2 * GPT_D_MODEL);
     per_block += checked_mul_size((size_t)GPT_D_MODEL, (size_t)(3 * GPT_D_MODEL), "qkv params");
@@ -377,16 +376,10 @@ void gpt_lm_init(gd_context *ctx, gpt_lm *model, const gpt_config *config)
                            &model->token_embedding,
                            splitmix64(config->seed ^ UINT64_C(0xabc001)),
                            GPT_WEIGHT_INIT_STD);
-    TRY(ctx, gd_module_param(ctx,
-                             &model->mod,
-                             "lm_head",
-                             &embed_spec,
-                             &empty,
-                             &model->lm_head));
-    gpt_tensor_init_normal(ctx,
-                           &model->lm_head,
-                           splitmix64(config->seed ^ UINT64_C(0xabc002)),
-                           GPT_WEIGHT_INIT_STD);
+    /* Weight tying: the LM projection uses token_embedding as its [V, D]
+     * transposed linear weight.  Do not register a separate lm_head parameter;
+     * autograd accumulates the embedding lookup and LM-head gradients into the
+     * same tensor id, and the optimizer/checkpoint see one shared parameter. */
     TRY(ctx, gd_module_param(ctx,
                              &model->mod,
                              "lm_head_bias",
@@ -807,7 +800,7 @@ gd_status gpt_lm_forward(gd_context *ctx,
     }
     return gd_lm_cross_entropy_softcapped_bias_ignore(ctx,
                                                       &final_norm,
-                                                      &model->lm_head,
+                                                      &model->token_embedding,
                                                       &model->lm_head_bias,
                                                       target_ids,
                                                       model->logits_softcap,
@@ -1191,7 +1184,7 @@ static gd_status gpt_lm_prefill_last_logits(gd_context *ctx,
     if (st != GD_OK) { return st; }
     st = gd_rms_norm(ctx, &last_hidden, &model->final_norm_w, model->rms_eps, &last_norm);
     if (st != GD_OK) { return st; }
-    return gd_linear_transposed_weight(ctx, &last_norm, &model->lm_head, &model->lm_head_bias, logits);
+    return gd_linear_transposed_weight(ctx, &last_norm, &model->token_embedding, &model->lm_head_bias, logits);
 }
 
 static gd_status gpt_lm_decode_logits(gd_context *ctx,
@@ -1230,7 +1223,7 @@ static gd_status gpt_lm_decode_logits(gd_context *ctx,
     }
     st = gd_rms_norm(ctx, &x, &model->final_norm_w, model->rms_eps, &final_norm);
     if (st != GD_OK) { return st; }
-    st = gd_linear_transposed_weight(ctx, &final_norm, &model->lm_head, &model->lm_head_bias, logits);
+    st = gd_linear_transposed_weight(ctx, &final_norm, &model->token_embedding, &model->lm_head_bias, logits);
     if (st != GD_OK) { return st; }
     for (i = 0U; i < (uint32_t)cache->batch_size; ++i) {
         cache->pos[i] += 1;

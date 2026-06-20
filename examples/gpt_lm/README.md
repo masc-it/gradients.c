@@ -9,15 +9,15 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 - vocab size: 2048
 - context length: 512 tokens
 - `d_model = 512`
-- `n_layers = 3` by default, about 9.98M trainable parameters
-  - use `--layers 2` for about 7.35M trainable parameters
+- `n_layers = 3` by default, about 8.93M trainable parameters
+  - use `--layers 2` for about 6.30M trainable parameters
 - `n_heads = 8`
 - `head_dim = 64`
 - MLP hidden size: 1024 (`2 * d_model`)
 - default architecture: dense GPT attention (`sdpa_varlen`) with a 256-token sliding window for training/prompt prefill
 - optional `--architecture minimax_m3`: MiniMax M3-style attention; the example now auto-falls back to the fast dense 256-token window at the default 512-token context, and uses the Metal lightning indexer (`gd_minimax_m3_index_topk`) plus sparse attention (`gd_minimax_m3_sparse_attention`) only when the context is long enough for sparsity to win
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
-- biased dense projections throughout the transformer block, plus an untied LM head (`lm_head` + `lm_head_bias`) used by the fused LM cross-entropy and generation logits
+- biased dense projections throughout the transformer block, plus a tied LM head that reuses `token_embedding` with a separate `lm_head_bias` for fused LM cross-entropy and generation logits
 - RMSNorm, RoPE, SwiGLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
 
 ## Dataset: `ita_dict`
@@ -191,3 +191,32 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 ```
 
 Generation uses the selected architecture for batched prompt prefill (`sdpa_varlen` for `gpt`, MiniMax M3 sparse attention for long enough `minimax_m3` contexts, otherwise the dense-window fallback), `kv_cache_append_packed` to materialize variable-length prompt K/V, then appends one token per batch row with `kv_cache_append_positions` and currently calls dense `sdpa_decode_positions` for each autoregressive step. Sampling is CPU-side, so very small generations are latency-bound by per-step logits readback.
+
+
+---
+fineweb2
+
+```
+
+make -C examples/gpt_lm \
+  GPT_LM_VOCAB_SIZE=8192 \
+  GPT_DEFAULT_LAYERS=6 \
+  GPT_LM_CONTEXT_LENGTH=2048 \
+  all
+
+GRADIENTS_METALLIB="$(pwd)/build/gradients.metallib" \
+   examples/gpt_lm/gd_main_gpt_lm \
+     --data-dir "/Volumes/Seagate 2TB/datasets/gd_fineweb2/gdds" \
+     --tokenizer-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/tokenizer/tokenizer-v8192.json" \
+     --epochs 1 \
+     --batch-size 4 \
+     --report-every 4 \
+     --generate-every-n-steps 1000 \
+     --early-stopping-patience 0 \
+     --weight-decay 1e-5 \
+     --lr-min 3e-5 \
+     --lr-max 3e-4 \
+     --eval-every-n-epochs 10 \
+     --logits-softcap 0 \
+     --architecture gpt
+     ```

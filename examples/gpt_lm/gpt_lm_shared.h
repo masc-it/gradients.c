@@ -121,7 +121,6 @@ typedef struct gpt_lm {
     int pad_token_id;
     uint64_t dropout_seed;
     gd_tensor token_embedding;
-    gd_tensor lm_head;
     gd_tensor lm_head_bias;
     gd_tensor final_norm_w;
     gd_module_list blocks;

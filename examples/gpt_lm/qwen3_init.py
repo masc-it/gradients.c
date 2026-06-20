@@ -420,7 +420,7 @@ def make_metadata(args: argparse.Namespace, cfg, mapped_tokens: int) -> bytes:
         f"sdpa_window={TARGET_SDPA_WINDOW}",
         "dropout=0.100000001",
         "tokenizer_path=data/tokenizer-v2048.json",
-        "note=Qwen3 weight-surgery init; token_embedding and untied lm_head start from same mapped weights; all biases start at zero; follow with KL/CE distillation",
+        "note=Qwen3 weight-surgery init; token_embedding is tied as the LM-head weight; lm_head_bias starts at zero; follow with KL/CE distillation",
         "",
     ]
     return "\n".join(lines).encode("utf-8")
@@ -493,7 +493,7 @@ def build_entries(args: argparse.Namespace, model_dir: pathlib.Path) -> list[Tar
         print("projection: random orthogonal")
         projection = random_orthogonal_projection(int(cfg.hidden_size), TARGET_D_MODEL, args.seed)
 
-    print("building target token embedding / untied LM head init")
+    print("building target token embedding / tied LM head init")
     emb, mapped_tokens = compose_target_embedding(
         src_embed,
         projection,
@@ -506,7 +506,6 @@ def build_entries(args: argparse.Namespace, model_dir: pathlib.Path) -> list[Tar
 
     entries: list[TargetEntry] = [
         TargetEntry("gpt_lm.token_embedding", emb),
-        TargetEntry("gpt_lm.lm_head", emb.copy()),
         TargetEntry("gpt_lm.lm_head_bias", np_to_f16_np(np.zeros((TARGET_VOCAB,), dtype=np.float32))),
         TargetEntry("gpt_lm.final_norm_w", np_to_f16_np(np.ones((TARGET_D_MODEL,), dtype=np.float32))),
     ]

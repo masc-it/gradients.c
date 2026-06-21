@@ -155,6 +155,8 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --tokenizer-path PATH
 --epochs N                  # 0 allowed with --generate
 --batch-size N
+--dataloader-workers N
+--dataloader-prefetch-factor N # workers * prefetch <= 63; one data slot is reserved
 --layers N
 --architecture NAME          # gpt or minimax_m3
 --minimax-topk-blocks N

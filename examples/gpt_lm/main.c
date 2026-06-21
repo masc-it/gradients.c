@@ -202,6 +202,10 @@ static void print_usage(const char *argv0)
     printf("  --logits-softcap C          final logits softcap; 0 disables (default: 30)\n");
     printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
     printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
+    printf("  --dataloader-workers N      training dataloader workers (default: %d)\n", GPT_DEFAULT_DATALOADER_WORKERS);
+    printf("  --dataloader-prefetch-factor N batches queued per worker (default: %d; workers*prefetch <= %u)\n",
+           GPT_DEFAULT_DATALOADER_PREFETCH_FACTOR,
+           (unsigned)GPT_MAX_DATALOADER_SLOTS);
     printf("  --layers N                  decoder blocks (default: %d)\n", GPT_DEFAULT_LAYERS);
     printf("  --architecture NAME         gpt or minimax_m3 sparse attention (default: gpt)\n");
     printf("  --minimax-topk-blocks N     MiniMax M3 sparse top-k blocks (default: %d)\n", GPT_MINIMAX_M3_TOPK_BLOCKS);
@@ -244,6 +248,8 @@ static gpt_config gpt_config_default(void)
     config.epochs = GPT_DEFAULT_EPOCHS;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
+    config.dataloader_workers = GPT_DEFAULT_DATALOADER_WORKERS;
+    config.dataloader_prefetch_factor = GPT_DEFAULT_DATALOADER_PREFETCH_FACTOR;
     config.architecture = GPT_ARCH_GPT;
     config.shuffle_scope = GPT_SHUFFLE_GLOBAL;
     config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
@@ -404,6 +410,8 @@ static gpt_config parse_args(int argc, char **argv)
         GPT_ARG_F32("--logits-softcap", 0.0f, 1000000.0f, logits_softcap);
         GPT_ARG_I64_SET("--epochs", 0, 1000000, config.epochs = (int)parsed_i64; config.epochs_set = true);
         GPT_ARG_I64_INT("--batch-size", 1, 1024, batch_size);
+        GPT_ARG_I64_INT("--dataloader-workers", 1, 64, dataloader_workers);
+        GPT_ARG_I64_INT("--dataloader-prefetch-factor", 1, 16, dataloader_prefetch_factor);
         GPT_ARG_I64_INT("--layers", 1, 96, n_layers);
         GPT_ARG_ENUM_ALIAS("--architecture", "--arch", parse_architecture_arg, architecture,
                            "--architecture", " (expected gpt or minimax_m3)");
@@ -444,6 +452,14 @@ static gpt_config parse_args(int argc, char **argv)
     }
     if (config.epochs == 0 && config.generate_prompt == NULL) {
         fprintf(stderr, "gpt_lm: --epochs 0 requires --generate\n");
+        exit(2);
+    }
+    if ((size_t)config.dataloader_workers > (size_t)GPT_MAX_DATALOADER_SLOTS /
+                                             (size_t)config.dataloader_prefetch_factor) {
+        fprintf(stderr,
+                "gpt_lm: --dataloader-workers * --dataloader-prefetch-factor must be <= %u "
+                "(one data slot is reserved for generation/checkpoint sync)\n",
+                (unsigned)GPT_MAX_DATALOADER_SLOTS);
         exit(2);
     }
     if (config.lr_min > config.lr_max) {
@@ -914,18 +930,18 @@ static gd_status gpt_lm_open_gdds_file(gd_context *ctx,
 static gd_status create_gdds_loader(gd_context *ctx,
                                     gd_dataset *dataset,
                                     gd_sampler *sampler,
-                                    int batch_size,
+                                    const gpt_config *config,
                                     gd_dataloader **out)
 {
     gd_dataloader_config cfg;
     gd_status st;
-    if (out == NULL) {
+    if (config == NULL || out == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
-    cfg = gd_dataloader_config_default(batch_size);
-    cfg.num_workers = 2;
-    cfg.prefetch_factor = 4;
+    cfg = gd_dataloader_config_default(config->batch_size);
+    cfg.num_workers = config->dataloader_workers;
+    cfg.prefetch_factor = config->dataloader_prefetch_factor;
     st = gd_dataloader_create(ctx, dataset, sampler, &cfg, out);
     if (st != GD_OK) {
         return st;
@@ -2692,7 +2708,7 @@ static void train_gpt(gd_context *ctx,
                                                       (uint64_t)epoch ^
                                                       (uint64_t)(shard_index + 1U) * GPT_TRAIN_SHARD_SEED_STRIDE,
                                                   &sampler));
-                TRY(ctx, create_gdds_loader(ctx, shard_dataset, sampler, config->batch_size, &loader));
+                TRY(ctx, create_gdds_loader(ctx, shard_dataset, sampler, config, &loader));
                 if (local_first_step > 1U) {
                     gpt_skip_loader_batches(ctx, loader, local_first_step - 1U);
                 }
@@ -2728,9 +2744,9 @@ static void train_gpt(gd_context *ctx,
                 } else if (config->shuffle_scope == GPT_SHUFFLE_SHARD) {
                     TRY(ctx, gd_sampler_create_gdds_shard_random(dataset, shuffle_seed, &sampler));
                 }
-                TRY(ctx, create_gdds_loader(ctx, dataset, sampler, config->batch_size, &loader));
+                TRY(ctx, create_gdds_loader(ctx, dataset, sampler, config, &loader));
             } else {
-                TRY(ctx, create_gdds_loader(ctx, dataset, NULL, config->batch_size, &loader));
+                TRY(ctx, create_gdds_loader(ctx, dataset, NULL, config, &loader));
             }
             if (epoch_first_step > 1U) {
                 gpt_skip_loader_batches(ctx, loader, epoch_first_step - 1U);
@@ -2980,6 +2996,12 @@ static void gpt_log_run_config_metrics(gd_metrics_logger *metrics,
             gd_metrics_string("val_split", config->val_split),
             gd_metrics_i64("epochs", (int64_t)config->epochs),
             gd_metrics_i64("batch_size", (int64_t)config->batch_size),
+            gd_metrics_i64("dataloader_workers", (int64_t)config->dataloader_workers),
+            gd_metrics_i64("dataloader_prefetch_factor", (int64_t)config->dataloader_prefetch_factor),
+            gd_metrics_u64("dataloader_slots",
+                           (uint64_t)((size_t)config->dataloader_workers *
+                                      (size_t)config->dataloader_prefetch_factor)),
+            gd_metrics_u64("reserved_data_slots", (uint64_t)GPT_RESERVED_DATA_SLOTS),
             gd_metrics_i64("layers", (int64_t)config->n_layers),
             gd_metrics_string("architecture", gpt_architecture_name(config->architecture)),
             gd_metrics_string("shuffle_scope", gpt_shuffle_scope_name(config->shuffle_scope)),
@@ -3018,6 +3040,8 @@ static void gpt_log_run_config_metrics(gd_metrics_logger *metrics,
             gd_metrics_u64("memory_state_bytes", (uint64_t)mem->state_bytes),
             gd_metrics_u64("memory_scratch_slot_bytes", (uint64_t)mem->scratch_slot_bytes),
             gd_metrics_u64("memory_data_slot_bytes", (uint64_t)mem->data_slot_bytes),
+            gd_metrics_u64("memory_scratch_slots", (uint64_t)mem->scratch_slots),
+            gd_metrics_u64("memory_data_slots", (uint64_t)mem->data_slots),
             gd_metrics_bool("save_best", config->save_best),
             gd_metrics_bool("save_latest", config->save_latest),
         };
@@ -3052,6 +3076,12 @@ static void gpt_print_startup_summary(const gpt_config *config,
            config->epochs,
            total_steps,
            config->overfit_num_samples > 0U ? " overfit" : "");
+    printf("dataloader: workers=%d prefetch_factor=%d slots=%zu reserved_data_slots=%u memory_data_slots=%u\n",
+           config->dataloader_workers,
+           config->dataloader_prefetch_factor,
+           (size_t)config->dataloader_workers * (size_t)config->dataloader_prefetch_factor,
+           (unsigned)GPT_RESERVED_DATA_SLOTS,
+           mem->data_slots);
     if (config->overfit_num_samples > 0U && samples_per_epoch != (size_t)config->overfit_num_samples) {
         printf("overfit: requested=%llu using=%zu full-batch samples\n",
                (unsigned long long)config->overfit_num_samples,
@@ -3108,11 +3138,13 @@ static void gpt_print_startup_summary(const gpt_config *config,
     } else {
         printf("optim: skipped (generation-only run)\n");
     }
-    printf("memory: params=%zuMB state=%zuMB scratch_slot=%zuMB data_slot=%zuMB\n",
+    printf("memory: params=%zuMB state=%zuMB scratch_slot=%zuMBx%u data_slot=%zuMBx%u\n",
            mem->params_bytes / (1024U * 1024U),
            mem->state_bytes / (1024U * 1024U),
            mem->scratch_slot_bytes / (1024U * 1024U),
-           mem->data_slot_bytes / (1024U * 1024U));
+           mem->scratch_slots,
+           mem->data_slot_bytes / (1024U * 1024U),
+           mem->data_slots);
 }
 
 

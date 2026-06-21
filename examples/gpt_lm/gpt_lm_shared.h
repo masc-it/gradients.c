@@ -42,6 +42,11 @@
 #define GPT_DEFAULT_LAYERS 3
 #define GPT_DEFAULT_EPOCHS 2
 #define GPT_DEFAULT_BATCH_SIZE 64
+#define GPT_DEFAULT_DATALOADER_WORKERS 2
+#define GPT_DEFAULT_DATALOADER_PREFETCH_FACTOR 4
+#define GPT_RESERVED_DATA_SLOTS 1U
+#define GPT_MAX_DATA_SLOTS 64U
+#define GPT_MAX_DATALOADER_SLOTS (GPT_MAX_DATA_SLOTS - GPT_RESERVED_DATA_SLOTS)
 #define GPT_DEFAULT_REPORT_EVERY 10
 #define GPT_DEFAULT_EVAL_EVERY_N_EPOCHS 1
 #define GPT_DEFAULT_EARLY_STOPPING_PATIENCE 10
@@ -150,6 +155,8 @@ typedef struct gpt_config {
     int epochs;
     int batch_size;
     int n_layers;
+    int dataloader_workers;
+    int dataloader_prefetch_factor;
     int report_every;
     int eval_every_n_epochs;
     int early_stopping_patience;

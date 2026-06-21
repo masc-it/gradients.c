@@ -139,6 +139,12 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
     const size_t token_field_bytes = checked_mul_size(tokens_per_batch,
                                                       gd_dtype_size(GD_DTYPE_I32),
                                                       "packed token field bytes");
+    const size_t dataloader_slots = checked_mul_size((size_t)config->dataloader_workers,
+                                                     (size_t)config->dataloader_prefetch_factor,
+                                                     "dataloader slots");
+    const size_t data_slots = checked_add_size(dataloader_slots,
+                                               (size_t)GPT_RESERVED_DATA_SLOTS,
+                                               "reserved data slots");
     gd_memory_config mem = gd_memory_config_default();
     mem.params_bytes = size_max2((size_t)GPT_MIN_PARAMS_BYTES,
                                  checked_add_size(param_bytes,
@@ -158,8 +164,16 @@ gd_memory_config gpt_memory_config(const gpt_config *config)
                                           "data arena packed token fields"),
                          64U * 1024U * 1024U,
                          "data arena bytes"));
+    if (data_slots == 0U || data_slots > (size_t)GPT_MAX_DATA_SLOTS) {
+        fprintf(stderr,
+                "gpt_lm: dataloader slots %zu plus reserve %u exceed data slot limit %u\n",
+                dataloader_slots,
+                (unsigned)GPT_RESERVED_DATA_SLOTS,
+                (unsigned)GPT_MAX_DATA_SLOTS);
+        exit(2);
+    }
     mem.scratch_slots = 1U;
-    mem.data_slots = 2U;
+    mem.data_slots = (uint32_t)data_slots;
     mem.default_alignment = GPT_ALIGNMENT;
     return mem;
 }

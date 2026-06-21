@@ -202,16 +202,13 @@ fineweb2
 
 make -C examples/gpt_lm \
   GPT_LM_VOCAB_SIZE=8192 \
-  GPT_DEFAULT_LAYERS=6 \
   GPT_LM_CONTEXT_LENGTH=2048 \
-  all
-
-GRADIENTS_METALLIB="$(pwd)/build/gradients.metallib" \
+  all && GRADIENTS_METALLIB="$(pwd)/build-gpt_lm/gradients.metallib" \
    examples/gpt_lm/gd_main_gpt_lm \
      --data-dir "/Volumes/Seagate 2TB/datasets/gd_fineweb2/gdds" \
      --tokenizer-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/tokenizer/tokenizer-v8192.json" \
      --epochs 1 \
-     --batch-size 4 \
+     --batch-size 8 \
      --report-every 4 \
      --generate-every-n-steps 1000 \
      --early-stopping-patience 0 \
@@ -222,5 +219,6 @@ GRADIENTS_METALLIB="$(pwd)/build/gradients.metallib" \
      --logits-softcap 0 \
      --architecture gpt \
      --latest-checkpoint-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/checkpoints/gpt_lm_latest.gdckpt" \
-     --latest-every-n-steps 1000
+     --latest-every-n-steps 1000 \
+     --shuffle-scope shard
      ```

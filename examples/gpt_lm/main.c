@@ -280,6 +280,95 @@ static gpt_config parse_args(int argc, char **argv)
 {
     gpt_config config = gpt_config_default();
     int i;
+
+#define GPT_ARG_STRING(name, field)                \
+    value = arg_value(argc, argv, &i, (name));     \
+    if (value != NULL) {                           \
+        config.field = value;                      \
+        continue;                                  \
+    }
+
+#define GPT_ARG_STRING_ALIAS(name, alias_name, field)       \
+    value = arg_value(argc, argv, &i, (name));              \
+    if (value == NULL) {                                    \
+        value = arg_value(argc, argv, &i, (alias_name));    \
+    }                                                       \
+    if (value != NULL) {                                    \
+        config.field = value;                               \
+        continue;                                           \
+    }
+
+#define GPT_ARG_FLAG(name, field, flag_value)      \
+    if (strcmp(argv[i], (name)) == 0) {             \
+        config.field = (flag_value);                \
+        continue;                                  \
+    }
+
+#define GPT_ARG_I64_SET(name, min_value, max_value, set_stmt)                                \
+    value = arg_value(argc, argv, &i, (name));                                              \
+    if (value != NULL) {                                                                    \
+        if (!parse_i64_arg(value, (int64_t)(min_value), (int64_t)(max_value), &parsed_i64)) { \
+            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value);                     \
+            exit(2);                                                                        \
+        }                                                                                   \
+        { set_stmt; }                                                                       \
+        continue;                                                                           \
+    }
+
+#define GPT_ARG_I64_INT(name, min_value, max_value, field) \
+    GPT_ARG_I64_SET((name), (min_value), (max_value), config.field = (int)parsed_i64)
+
+#define GPT_ARG_U64_SET(name, max_value, set_stmt)                       \
+    value = arg_value(argc, argv, &i, (name));                          \
+    if (value != NULL) {                                                \
+        if (!parse_u64_arg(value, (uint64_t)(max_value), &parsed_u64)) { \
+            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value); \
+            exit(2);                                                    \
+        }                                                               \
+        { set_stmt; }                                                   \
+        continue;                                                       \
+    }
+
+#define GPT_ARG_U64(name, max_value, field) \
+    GPT_ARG_U64_SET((name), (max_value), config.field = parsed_u64)
+
+#define GPT_ARG_SIZE(name, max_value, field) \
+    GPT_ARG_U64_SET((name), (max_value), config.field = (size_t)parsed_u64)
+
+#define GPT_ARG_F32(name, min_value, max_value, field)                      \
+    value = arg_value(argc, argv, &i, (name));                             \
+    if (value != NULL) {                                                   \
+        if (!parse_float_arg(value, (min_value), (max_value), &parsed_f32)) { \
+            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value);    \
+            exit(2);                                                       \
+        }                                                                  \
+        config.field = parsed_f32;                                         \
+        continue;                                                          \
+    }
+
+#define GPT_ARG_ENUM(name, parse_fn, field, expected_text)              \
+    value = arg_value(argc, argv, &i, (name));                         \
+    if (value != NULL) {                                               \
+        if (!(parse_fn)(value, &config.field)) {                       \
+            fprintf(stderr, "gpt_lm: invalid %s %s%s\n", (name), value, (expected_text)); \
+            exit(2);                                                   \
+        }                                                              \
+        continue;                                                      \
+    }
+
+#define GPT_ARG_ENUM_ALIAS(name, alias_name, parse_fn, field, error_name, expected_text) \
+    value = arg_value(argc, argv, &i, (name));                         \
+    if (value == NULL) {                                               \
+        value = arg_value(argc, argv, &i, (alias_name));               \
+    }                                                                  \
+    if (value != NULL) {                                               \
+        if (!(parse_fn)(value, &config.field)) {                       \
+            fprintf(stderr, "gpt_lm: invalid %s %s%s\n", (error_name), value, (expected_text)); \
+            exit(2);                                                   \
+        }                                                              \
+        continue;                                                      \
+    }
+
     for (i = 1; i < argc; ++i) {
         const char *value;
         int64_t parsed_i64 = 0;
@@ -289,325 +378,67 @@ static gpt_config parse_args(int argc, char **argv)
             print_usage(argv[0]);
             exit(0);
         }
-        value = arg_value(argc, argv, &i, "--data-dir");
-        if (value != NULL) {
-            config.data_dir = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--tokenizer-path");
-        if (value != NULL) {
-            config.tokenizer_path = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--generate");
-        if (value != NULL) {
-            config.generate_prompt = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--checkpoint-path");
-        if (value != NULL) {
-            config.checkpoint_path = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--latest-checkpoint-path");
-        if (value != NULL) {
-            config.latest_checkpoint_path = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--load-checkpoint");
-        if (value != NULL) {
-            config.load_checkpoint_path = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--latest-every-n-steps");
-        if (value != NULL) {
-            if (!parse_u64_arg(value, (uint64_t)SIZE_MAX, &parsed_u64)) {
-                fprintf(stderr, "gpt_lm: invalid --latest-every-n-steps %s\n", value);
-                exit(2);
-            }
-            config.latest_every_n_steps = (size_t)parsed_u64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--resume-checkpoint");
-        if (value != NULL) {
-            config.resume_checkpoint_path = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--val-split");
-        if (value != NULL) {
-            config.val_split = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--metrics-dir");
-        if (value != NULL) {
-            config.metrics_dir = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--metrics-project");
-        if (value != NULL) {
-            config.metrics_project = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--metrics-run-id");
-        if (value != NULL) {
-            config.metrics_run_id = value;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--local-shard-cache-dir");
-        if (value == NULL) {
-            value = arg_value(argc, argv, &i, "--shard-cache-dir");
-        }
-        if (value != NULL) {
-            config.local_shard_cache_dir = value;
-            continue;
-        }
-        if (strcmp(argv[i], "--keep-shard-cache") == 0) {
-            config.keep_shard_cache = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--no-metrics") == 0) {
-            config.metrics_enabled = false;
-            continue;
-        }
-        if (strcmp(argv[i], "--no-save-best") == 0) {
-            config.save_best = false;
-            continue;
-        }
-        if (strcmp(argv[i], "--no-save-latest") == 0) {
-            config.save_latest = false;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--early-stopping-patience");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 1000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --early-stopping-patience %s\n", value);
-                exit(2);
-            }
-            config.early_stopping_patience = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--generate-every-n-steps");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 1000000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --generate-every-n-steps %s\n", value);
-                exit(2);
-            }
-            config.generate_every_n_steps = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--max-new-tokens");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 1, GPT_CONTEXT_LENGTH, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --max-new-tokens %s\n", value);
-                exit(2);
-            }
-            config.max_new_tokens = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--temperature");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --temperature %s\n", value);
-                exit(2);
-            }
-            config.temperature = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--min-p");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 1.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --min-p %s\n", value);
-                exit(2);
-            }
-            config.min_p = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--repetition-penalty");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 1.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --repetition-penalty %s\n", value);
-                exit(2);
-            }
-            config.repetition_penalty = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--logits-softcap");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --logits-softcap %s\n", value);
-                exit(2);
-            }
-            config.logits_softcap = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--epochs");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 1000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --epochs %s\n", value);
-                exit(2);
-            }
-            config.epochs = (int)parsed_i64;
-            config.epochs_set = true;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--batch-size");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 1, 1024, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --batch-size %s\n", value);
-                exit(2);
-            }
-            config.batch_size = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--layers");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 1, 96, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --layers %s\n", value);
-                exit(2);
-            }
-            config.n_layers = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--architecture");
-        if (value == NULL) {
-            value = arg_value(argc, argv, &i, "--arch");
-        }
-        if (value != NULL) {
-            if (!parse_architecture_arg(value, &config.architecture)) {
-                fprintf(stderr, "gpt_lm: invalid --architecture %s (expected gpt or minimax_m3)\n", value);
-                exit(2);
-            }
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--minimax-topk-blocks");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 1, 16, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --minimax-topk-blocks %s\n", value);
-                exit(2);
-            }
-            config.minimax_m3_topk_blocks = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--minimax-init-blocks");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --minimax-init-blocks %s\n", value);
-                exit(2);
-            }
-            config.minimax_m3_init_blocks = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--minimax-local-blocks");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 16, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --minimax-local-blocks %s\n", value);
-                exit(2);
-            }
-            config.minimax_m3_local_blocks = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--dropout");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 0.95f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --dropout %s\n", value);
-                exit(2);
-            }
-            config.dropout_p = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--lr-max");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --lr-max %s\n", value);
-                exit(2);
-            }
-            config.lr_max = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--lr-min");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --lr-min %s\n", value);
-                exit(2);
-            }
-            config.lr_min = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--warmup-steps");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, -1, 1000000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --warmup-steps %s\n", value);
-                exit(2);
-            }
-            config.lr_warmup_steps = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--weight-decay");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 10.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --weight-decay %s\n", value);
-                exit(2);
-            }
-            config.weight_decay = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--grad-clip-norm");
-        if (value != NULL) {
-            if (!parse_float_arg(value, 0.0f, 1000000.0f, &parsed_f32)) {
-                fprintf(stderr, "gpt_lm: invalid --grad-clip-norm %s\n", value);
-                exit(2);
-            }
-            config.grad_clip_norm = parsed_f32;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--report-every");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 0, 1000000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --report-every %s\n", value);
-                exit(2);
-            }
-            config.report_every = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--eval-every-n-epochs");
-        if (value != NULL) {
-            if (!parse_i64_arg(value, 1, 1000000, &parsed_i64)) {
-                fprintf(stderr, "gpt_lm: invalid --eval-every-n-epochs %s\n", value);
-                exit(2);
-            }
-            config.eval_every_n_epochs = (int)parsed_i64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--overfit-num-samples");
-        if (value != NULL) {
-            if (!parse_u64_arg(value, UINT64_MAX, &parsed_u64)) {
-                fprintf(stderr, "gpt_lm: invalid --overfit-num-samples %s\n", value);
-                exit(2);
-            }
-            config.overfit_num_samples = parsed_u64;
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--shuffle-scope");
-        if (value != NULL) {
-            if (!parse_shuffle_scope_arg(value, &config.shuffle_scope)) {
-                fprintf(stderr, "gpt_lm: invalid --shuffle-scope %s (expected global, shard, or none)\n", value);
-                exit(2);
-            }
-            continue;
-        }
-        value = arg_value(argc, argv, &i, "--seed");
-        if (value != NULL) {
-            if (!parse_u64_arg(value, UINT64_MAX, &parsed_u64)) {
-                fprintf(stderr, "gpt_lm: invalid --seed %s\n", value);
-                exit(2);
-            }
-            config.seed = parsed_u64;
-            continue;
-        }
+        GPT_ARG_STRING("--data-dir", data_dir);
+        GPT_ARG_STRING("--tokenizer-path", tokenizer_path);
+        GPT_ARG_STRING("--generate", generate_prompt);
+        GPT_ARG_STRING("--checkpoint-path", checkpoint_path);
+        GPT_ARG_STRING("--latest-checkpoint-path", latest_checkpoint_path);
+        GPT_ARG_STRING("--load-checkpoint", load_checkpoint_path);
+        GPT_ARG_SIZE("--latest-every-n-steps", SIZE_MAX, latest_every_n_steps);
+        GPT_ARG_STRING("--resume-checkpoint", resume_checkpoint_path);
+        GPT_ARG_STRING("--val-split", val_split);
+        GPT_ARG_STRING("--metrics-dir", metrics_dir);
+        GPT_ARG_STRING("--metrics-project", metrics_project);
+        GPT_ARG_STRING("--metrics-run-id", metrics_run_id);
+        GPT_ARG_STRING_ALIAS("--local-shard-cache-dir", "--shard-cache-dir", local_shard_cache_dir);
+        GPT_ARG_FLAG("--keep-shard-cache", keep_shard_cache, true);
+        GPT_ARG_FLAG("--no-metrics", metrics_enabled, false);
+        GPT_ARG_FLAG("--no-save-best", save_best, false);
+        GPT_ARG_FLAG("--no-save-latest", save_latest, false);
+        GPT_ARG_I64_INT("--early-stopping-patience", 0, 1000000, early_stopping_patience);
+        GPT_ARG_I64_INT("--generate-every-n-steps", 0, 1000000000, generate_every_n_steps);
+        GPT_ARG_I64_INT("--max-new-tokens", 1, GPT_CONTEXT_LENGTH, max_new_tokens);
+        GPT_ARG_F32("--temperature", 0.0f, 10.0f, temperature);
+        GPT_ARG_F32("--min-p", 0.0f, 1.0f, min_p);
+        GPT_ARG_F32("--repetition-penalty", 1.0f, 10.0f, repetition_penalty);
+        GPT_ARG_F32("--logits-softcap", 0.0f, 1000000.0f, logits_softcap);
+        GPT_ARG_I64_SET("--epochs", 0, 1000000, config.epochs = (int)parsed_i64; config.epochs_set = true);
+        GPT_ARG_I64_INT("--batch-size", 1, 1024, batch_size);
+        GPT_ARG_I64_INT("--layers", 1, 96, n_layers);
+        GPT_ARG_ENUM_ALIAS("--architecture", "--arch", parse_architecture_arg, architecture,
+                           "--architecture", " (expected gpt or minimax_m3)");
+        GPT_ARG_I64_INT("--minimax-topk-blocks", 1, 16, minimax_m3_topk_blocks);
+        GPT_ARG_I64_INT("--minimax-init-blocks", 0, 16, minimax_m3_init_blocks);
+        GPT_ARG_I64_INT("--minimax-local-blocks", 0, 16, minimax_m3_local_blocks);
+        GPT_ARG_F32("--dropout", 0.0f, 0.95f, dropout_p);
+        GPT_ARG_F32("--lr-max", 0.0f, 10.0f, lr_max);
+        GPT_ARG_F32("--lr-min", 0.0f, 10.0f, lr_min);
+        GPT_ARG_I64_INT("--warmup-steps", -1, 1000000000, lr_warmup_steps);
+        GPT_ARG_F32("--weight-decay", 0.0f, 10.0f, weight_decay);
+        GPT_ARG_F32("--grad-clip-norm", 0.0f, 1000000.0f, grad_clip_norm);
+        GPT_ARG_I64_INT("--report-every", 0, 1000000000, report_every);
+        GPT_ARG_I64_INT("--eval-every-n-epochs", 1, 1000000, eval_every_n_epochs);
+        GPT_ARG_U64("--overfit-num-samples", UINT64_MAX, overfit_num_samples);
+        GPT_ARG_ENUM("--shuffle-scope", parse_shuffle_scope_arg, shuffle_scope,
+                     " (expected global, shard, or none)");
+        GPT_ARG_U64("--seed", UINT64_MAX, seed);
         fprintf(stderr, "gpt_lm: unknown argument %s\n", argv[i]);
         print_usage(argv[0]);
         exit(2);
     }
+
+#undef GPT_ARG_ENUM_ALIAS
+#undef GPT_ARG_ENUM
+#undef GPT_ARG_F32
+#undef GPT_ARG_SIZE
+#undef GPT_ARG_U64
+#undef GPT_ARG_U64_SET
+#undef GPT_ARG_I64_INT
+#undef GPT_ARG_I64_SET
+#undef GPT_ARG_FLAG
+#undef GPT_ARG_STRING_ALIAS
+#undef GPT_ARG_STRING
+
     if (config.generate_prompt != NULL && !config.epochs_set) {
         config.epochs = 0;
     }

@@ -67,6 +67,13 @@ typedef struct gd_gdds_sample_field {
     size_t nbytes;
 } gd_gdds_sample_field;
 
+typedef struct gd_gdds_shard_info {
+    const char *path; /* Borrowed from dataset; valid until dataset is destroyed. */
+    uint64_t sample_base;
+    uint64_t samples;
+    uint64_t bytes;
+} gd_gdds_shard_info;
+
 /* Sample-level field schema exposed by a transformed dataset. Shapes do not
    include the dataloader batch dimension; use -1 for the leading ragged
    dimension with pad_longest/packed_sequence. */
@@ -118,6 +125,10 @@ gd_status gd_dataset_open_gdds_split_with_transform(const char *dir,
 
 int gd_gdds_dataset_field_count(const gd_dataset *dataset);
 int gd_gdds_dataset_field_index(const gd_dataset *dataset, const char *name);
+int gd_gdds_dataset_shard_count(const gd_dataset *dataset);
+gd_status gd_gdds_dataset_shard_info(const gd_dataset *dataset,
+                                      int shard_index,
+                                      gd_gdds_shard_info *out);
 gd_status gd_gdds_dataset_field_info(const gd_dataset *dataset,
                                      int field_index,
                                      gd_gdds_field_info *out);

@@ -1283,6 +1283,41 @@ int gd_gdds_dataset_field_index(const gd_dataset *dataset, const char *name)
     return -1;
 }
 
+int gd_gdds_dataset_shard_count(const gd_dataset *dataset)
+{
+    const gd_gdds_dataset_impl *impl;
+    if (gd_gdds_impl_from_dataset(dataset, &impl) != GD_OK) {
+        return 0;
+    }
+    return impl->n_shards;
+}
+
+gd_status gd_gdds_dataset_shard_info(const gd_dataset *dataset,
+                                      int shard_index,
+                                      gd_gdds_shard_info *out)
+{
+    const gd_gdds_dataset_impl *impl;
+    const gd_gdds_shard *shard;
+    gd_status status;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    memset(out, 0, sizeof(*out));
+    status = gd_gdds_impl_from_dataset(dataset, &impl);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (shard_index < 0 || shard_index >= impl->n_shards) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    shard = &impl->shards[shard_index];
+    out->path = shard->path;
+    out->sample_base = shard->sample_base;
+    out->samples = shard->header.n_samples;
+    out->bytes = (uint64_t)shard->map_len;
+    return GD_OK;
+}
+
 gd_status gd_gdds_dataset_field_info(const gd_dataset *dataset,
                                      int field_index,
                                      gd_gdds_field_info *out)
@@ -1301,6 +1336,53 @@ gd_status gd_gdds_dataset_field_info(const gd_dataset *dataset,
         return GD_ERR_INVALID_ARGUMENT;
     }
     *out = impl->fields[field_index];
+    return GD_OK;
+}
+
+gd_status _gd_gdds_shard_sample_ranges(const gd_dataset *dataset,
+                                        uint64_t **starts_out,
+                                        uint64_t **lengths_out,
+                                        uint32_t *n_ranges_out)
+{
+    const gd_gdds_dataset_impl *impl;
+    uint64_t *starts;
+    uint64_t *lengths;
+    int i;
+    gd_status status;
+    if (starts_out == NULL || lengths_out == NULL || n_ranges_out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *starts_out = NULL;
+    *lengths_out = NULL;
+    *n_ranges_out = 0U;
+    status = gd_gdds_impl_from_dataset(dataset, &impl);
+    if (status != GD_OK) {
+        return status;
+    }
+    if (impl->n_shards <= 0) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    starts = (uint64_t *)calloc((size_t)impl->n_shards, sizeof(*starts));
+    lengths = (uint64_t *)calloc((size_t)impl->n_shards, sizeof(*lengths));
+    if (starts == NULL || lengths == NULL) {
+        free(lengths);
+        free(starts);
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    for (i = 0; i < impl->n_shards; ++i) {
+        const uint64_t start = impl->shards[i].sample_base;
+        const uint64_t length = impl->shards[i].header.n_samples;
+        if (length == 0U || start > impl->n_samples || length > impl->n_samples - start) {
+            free(lengths);
+            free(starts);
+            return GD_ERR_BAD_STATE;
+        }
+        starts[i] = start;
+        lengths[i] = length;
+    }
+    *starts_out = starts;
+    *lengths_out = lengths;
+    *n_ranges_out = (uint32_t)impl->n_shards;
     return GD_OK;
 }
 

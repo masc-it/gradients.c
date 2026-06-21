@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 static int parse_i64_arg(const char *text, int64_t min_value, int64_t max_value, int64_t *out)
 {
@@ -78,6 +80,43 @@ static const char *arg_value(int argc, char **argv, int *index, const char *name
     return NULL;
 }
 
+static char *gpt_vasprintf(const char *fmt, va_list ap)
+{
+    va_list ap_copy;
+    char *out;
+    int len;
+    int written;
+    if (fmt == NULL) {
+        return NULL;
+    }
+    va_copy(ap_copy, ap);
+    len = vsnprintf(NULL, 0U, fmt, ap_copy);
+    va_end(ap_copy);
+    if (len < 0) {
+        return NULL;
+    }
+    out = (char *)malloc((size_t)len + 1U);
+    if (out == NULL) {
+        return NULL;
+    }
+    written = vsnprintf(out, (size_t)len + 1U, fmt, ap);
+    if (written < 0 || written > len) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+static char *gpt_asprintf(const char *fmt, ...)
+{
+    va_list ap;
+    char *out;
+    va_start(ap, fmt);
+    out = gpt_vasprintf(fmt, ap);
+    va_end(ap);
+    return out;
+}
+
 static const char *gpt_architecture_name(gpt_architecture architecture)
 {
     return architecture == GPT_ARCH_MINIMAX_M3 ? "minimax_m3" : "gpt";
@@ -100,6 +139,37 @@ static int parse_architecture_arg(const char *text, gpt_architecture *out)
     return 0;
 }
 
+static const char *gpt_shuffle_scope_name(gpt_shuffle_scope scope)
+{
+    switch (scope) {
+    case GPT_SHUFFLE_SHARD: return "shard";
+    case GPT_SHUFFLE_NONE: return "none";
+    case GPT_SHUFFLE_GLOBAL:
+    default: return "global";
+    }
+}
+
+static int parse_shuffle_scope_arg(const char *text, gpt_shuffle_scope *out)
+{
+    if (text == NULL || out == NULL) {
+        return 0;
+    }
+    if (strcmp(text, "global") == 0 || strcmp(text, "all") == 0) {
+        *out = GPT_SHUFFLE_GLOBAL;
+        return 1;
+    }
+    if (strcmp(text, "shard") == 0 || strcmp(text, "intra-shard") == 0 ||
+        strcmp(text, "intra_shard") == 0) {
+        *out = GPT_SHUFFLE_SHARD;
+        return 1;
+    }
+    if (strcmp(text, "none") == 0 || strcmp(text, "sequential") == 0 || strcmp(text, "off") == 0) {
+        *out = GPT_SHUFFLE_NONE;
+        return 1;
+    }
+    return 0;
+}
+
 static void print_usage(const char *argv0)
 {
     printf("usage: %s [options]\n", argv0);
@@ -111,12 +181,15 @@ static void print_usage(const char *argv0)
     printf("  --generate-every-n-steps N  during training, generate batched a/e/i/o/u samples every N steps (default: 0)\n");
     printf("  --checkpoint-path PATH      best-val checkpoint path (default: checkpoints/gpt_lm_best.gdckpt)\n");
     printf("  --latest-checkpoint-path PATH full-resume checkpoint path saved every epoch (default: checkpoints/gpt_lm_latest.gdckpt)\n");
+    printf("  --latest-every-n-steps N save latest/full-resume checkpoint every N optimizer steps; 0 disables (default: 0)\n");
     printf("  --load-checkpoint PATH      load model weights only before training/generation\n");
     printf("  --resume-checkpoint PATH    resume model + optimizer + scaler/trainer sidecars\n");
     printf("  --val-split NAME            validation split name for validation/checkpointing (default: val)\n");
     printf("  --metrics-dir PATH          metrics JSONL root directory (default: data/metrics)\n");
     printf("  --metrics-project NAME      metrics project directory (default: gpt_lm)\n");
     printf("  --metrics-run-id ID         metrics run id/file stem (default: timestamp-pid)\n");
+    printf("  --local-shard-cache-dir PATH copy each train shard to PATH before training it (for --shuffle-scope shard)\n");
+    printf("  --keep-shard-cache          keep cached shard files after use; default deletes each shard after training it\n");
     printf("  --no-metrics                disable metrics JSONL logging\n");
     printf("  --no-save-best              disable best validation checkpoint writes\n");
     printf("  --no-save-latest            disable latest full-resume checkpoint writes\n");
@@ -147,6 +220,7 @@ static void print_usage(const char *argv0)
     printf("  --eval-every-n-epochs N    run validation every N epochs; final epoch is always evaluated (default: %d)\n",
            GPT_DEFAULT_EVAL_EVERY_N_EPOCHS);
     printf("  --overfit-num-samples N     repeatedly train on the first N samples; 0 disables (default: 0)\n");
+    printf("  --shuffle-scope S           global, shard, or none (default: global)\n");
     printf("  --seed N                    base seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
     printf("  --help                      show this help\n");
 }
@@ -166,10 +240,12 @@ static gpt_config gpt_config_default(void)
     config.metrics_dir = "data/metrics";
     config.metrics_project = "gpt_lm";
     config.metrics_run_id = NULL;
+    config.local_shard_cache_dir = NULL;
     config.epochs = GPT_DEFAULT_EPOCHS;
     config.batch_size = GPT_DEFAULT_BATCH_SIZE;
     config.n_layers = GPT_DEFAULT_LAYERS;
     config.architecture = GPT_ARCH_GPT;
+    config.shuffle_scope = GPT_SHUFFLE_GLOBAL;
     config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
     config.minimax_m3_init_blocks = GPT_MINIMAX_M3_INIT_BLOCKS;
     config.minimax_m3_local_blocks = GPT_MINIMAX_M3_LOCAL_BLOCKS;
@@ -178,11 +254,13 @@ static gpt_config gpt_config_default(void)
     config.early_stopping_patience = GPT_DEFAULT_EARLY_STOPPING_PATIENCE;
     config.lr_warmup_steps = -1;
     config.max_new_tokens = 64;
+    config.latest_every_n_steps = 0U;
     config.generate_every_n_steps = 0;
     config.epochs_set = false;
     config.save_best = true;
     config.save_latest = true;
     config.metrics_enabled = true;
+    config.keep_shard_cache = false;
     config.overfit_num_samples = 0U;
     config.seed = GPT_DEFAULT_SEED;
     config.dropout_p = GPT_DEFAULT_DROPOUT_P;
@@ -241,6 +319,15 @@ static gpt_config parse_args(int argc, char **argv)
             config.load_checkpoint_path = value;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--latest-every-n-steps");
+        if (value != NULL) {
+            if (!parse_u64_arg(value, (uint64_t)SIZE_MAX, &parsed_u64)) {
+                fprintf(stderr, "gpt_lm: invalid --latest-every-n-steps %s\n", value);
+                exit(2);
+            }
+            config.latest_every_n_steps = (size_t)parsed_u64;
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--resume-checkpoint");
         if (value != NULL) {
             config.resume_checkpoint_path = value;
@@ -264,6 +351,18 @@ static gpt_config parse_args(int argc, char **argv)
         value = arg_value(argc, argv, &i, "--metrics-run-id");
         if (value != NULL) {
             config.metrics_run_id = value;
+            continue;
+        }
+        value = arg_value(argc, argv, &i, "--local-shard-cache-dir");
+        if (value == NULL) {
+            value = arg_value(argc, argv, &i, "--shard-cache-dir");
+        }
+        if (value != NULL) {
+            config.local_shard_cache_dir = value;
+            continue;
+        }
+        if (strcmp(argv[i], "--keep-shard-cache") == 0) {
+            config.keep_shard_cache = true;
             continue;
         }
         if (strcmp(argv[i], "--no-metrics") == 0) {
@@ -488,6 +587,14 @@ static gpt_config parse_args(int argc, char **argv)
             config.overfit_num_samples = parsed_u64;
             continue;
         }
+        value = arg_value(argc, argv, &i, "--shuffle-scope");
+        if (value != NULL) {
+            if (!parse_shuffle_scope_arg(value, &config.shuffle_scope)) {
+                fprintf(stderr, "gpt_lm: invalid --shuffle-scope %s (expected global, shard, or none)\n", value);
+                exit(2);
+            }
+            continue;
+        }
         value = arg_value(argc, argv, &i, "--seed");
         if (value != NULL) {
             if (!parse_u64_arg(value, UINT64_MAX, &parsed_u64)) {
@@ -510,6 +617,10 @@ static gpt_config parse_args(int argc, char **argv)
     }
     if (config.lr_min > config.lr_max) {
         fprintf(stderr, "gpt_lm: --lr-min must be <= --lr-max\n");
+        exit(2);
+    }
+    if (config.local_shard_cache_dir != NULL && config.shuffle_scope != GPT_SHUFFLE_SHARD) {
+        fprintf(stderr, "gpt_lm: --local-shard-cache-dir requires --shuffle-scope shard\n");
         exit(2);
     }
     if (config.load_checkpoint_path != NULL && config.resume_checkpoint_path != NULL) {
@@ -587,6 +698,40 @@ static void print_param_set(const gd_param_set *params)
     }
 }
 
+#define GPT_TRAIN_STATE_EPOCH_END SIZE_MAX
+#define GPT_TRAIN_SHUFFLE_SEED_BASE UINT64_C(0x51504c)
+#define GPT_TRAIN_SHARD_SEED_STRIDE UINT64_C(0x9e3779b97f4a7c15)
+
+typedef enum gpt_compact_source_field {
+    GPT_COMPACT_SRC_TOKENS = 0,
+    GPT_COMPACT_SRC_SEGMENT_LENGTHS = 1,
+    GPT_COMPACT_SRC_FIELD_COUNT = 2,
+} gpt_compact_source_field;
+
+typedef enum gpt_runtime_field {
+    GPT_FIELD_INPUT_IDS = 0,
+    GPT_FIELD_POSITIONS = 1,
+    GPT_FIELD_TARGET_IDS = 2,
+    GPT_FIELD_SEGMENT_LENGTHS = 3,
+    GPT_FIELD_CU_SEQLENS = 4,
+    GPT_FIELD_COUNT = 5,
+} gpt_runtime_field;
+
+typedef enum gpt_progress_row {
+    GPT_PROGRESS_TRAIN = 0,
+    GPT_PROGRESS_TRAIN_METRICS = 1,
+    GPT_PROGRESS_EVAL = 2,
+    GPT_PROGRESS_CHECKPOINT = 3,
+    GPT_PROGRESS_SUMMARY = 4,
+    GPT_PROGRESS_COUNT = 5,
+} gpt_progress_row;
+
+typedef enum gpt_checkpoint_kind {
+    GPT_CHECKPOINT_BEST = 0,
+    GPT_CHECKPOINT_LATEST = 1,
+    GPT_CHECKPOINT_LATEST_STEP = 2,
+} gpt_checkpoint_kind;
+
 typedef struct gpt_lm_special_ids {
     int32_t pad_id;
     int32_t im_start_id;
@@ -602,8 +747,8 @@ typedef struct gpt_lm_compact_transform {
     int32_t im_end_id;
 } gpt_lm_compact_transform;
 
-static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
-    {
+static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[GPT_FIELD_COUNT] = {
+    [GPT_FIELD_INPUT_IDS] = {
         "input_ids",
         GD_DTYPE_I32,
         1,
@@ -614,7 +759,7 @@ static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
         -1,
         0U,
     },
-    {
+    [GPT_FIELD_POSITIONS] = {
         "positions",
         GD_DTYPE_I32,
         1,
@@ -625,7 +770,7 @@ static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
         -1,
         0U,
     },
-    {
+    [GPT_FIELD_TARGET_IDS] = {
         "target_ids",
         GD_DTYPE_I32,
         1,
@@ -636,7 +781,7 @@ static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
         -1,
         0U,
     },
-    {
+    [GPT_FIELD_SEGMENT_LENGTHS] = {
         "segment_lengths",
         GD_DTYPE_I32,
         1,
@@ -647,7 +792,7 @@ static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
         -1,
         0U,
     },
-    {
+    [GPT_FIELD_CU_SEQLENS] = {
         "cu_seqlens",
         GD_DTYPE_I32,
         1,
@@ -655,7 +800,7 @@ static const gd_dataset_field_spec gpt_lm_compact_runtime_fields[] = {
         GD_GDDS_COLLATE_GENERATED,
         GD_GDDS_GENERATED_CU_SEQLENS_FROM_LENGTHS,
         -1,
-        3,
+        GPT_FIELD_SEGMENT_LENGTHS,
         0U,
     },
 };
@@ -712,7 +857,7 @@ static int gpt_lm_dataset_is_compact(gd_dataset *dataset)
     }
     token_index = gd_gdds_dataset_field_index(dataset, "tokens");
     segment_index = gd_gdds_dataset_field_index(dataset, "segment_lengths");
-    if (token_index != 0 || segment_index != 1 ||
+    if (token_index != GPT_COMPACT_SRC_TOKENS || segment_index != GPT_COMPACT_SRC_SEGMENT_LENGTHS ||
         gd_gdds_dataset_field_info(dataset, token_index, &tokens) != GD_OK ||
         gd_gdds_dataset_field_info(dataset, segment_index, &segments) != GD_OK) {
         return 0;
@@ -762,37 +907,42 @@ static gd_status gpt_lm_compact_transform_fn(const gd_sample *src,
     if (cfg == NULL || src == NULL || dst == NULL || cfg->context_length <= 0 ||
         cfg->record_length != cfg->context_length + 1 || cfg->vocab_size <= 0 ||
         cfg->pad_id < 0 || cfg->pad_id >= cfg->vocab_size || cfg->im_start_id < 0 ||
-        cfg->im_end_id < 0 || gd_sample_field_count(src) < 2 || gd_sample_field_count(dst) < 5) {
+        cfg->im_end_id < 0 || gd_sample_field_count(src) < GPT_COMPACT_SRC_FIELD_COUNT ||
+        gd_sample_field_count(dst) < GPT_FIELD_COUNT) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (gd_sample_field_dtype(src, 0) != GD_DTYPE_U16 || gd_sample_field_rank(src, 0) != 1 ||
-        gd_sample_field_dim(src, 0, 0) != cfg->record_length ||
-        gd_sample_field_nbytes(src, 0) != (size_t)cfg->record_length * sizeof(uint16_t) ||
-        gd_sample_field_dtype(src, 1) != GD_DTYPE_I32 || gd_sample_field_rank(src, 1) != 1) {
+    if (gd_sample_field_dtype(src, GPT_COMPACT_SRC_TOKENS) != GD_DTYPE_U16 ||
+        gd_sample_field_rank(src, GPT_COMPACT_SRC_TOKENS) != 1 ||
+        gd_sample_field_dim(src, GPT_COMPACT_SRC_TOKENS, 0) != cfg->record_length ||
+        gd_sample_field_nbytes(src, GPT_COMPACT_SRC_TOKENS) !=
+            (size_t)cfg->record_length * sizeof(uint16_t) ||
+        gd_sample_field_dtype(src, GPT_COMPACT_SRC_SEGMENT_LENGTHS) != GD_DTYPE_I32 ||
+        gd_sample_field_rank(src, GPT_COMPACT_SRC_SEGMENT_LENGTHS) != 1) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    token_bytes = (const uint8_t *)gd_sample_field_data(src, 0);
-    segment_bytes = (const uint8_t *)gd_sample_field_data(src, 1);
-    n_segments_i64 = gd_sample_field_dim(src, 1, 0);
+    token_bytes = (const uint8_t *)gd_sample_field_data(src, GPT_COMPACT_SRC_TOKENS);
+    segment_bytes = (const uint8_t *)gd_sample_field_data(src, GPT_COMPACT_SRC_SEGMENT_LENGTHS);
+    n_segments_i64 = gd_sample_field_dim(src, GPT_COMPACT_SRC_SEGMENT_LENGTHS, 0);
     if (token_bytes == NULL || segment_bytes == NULL || n_segments_i64 <= 0 ||
         n_segments_i64 > (int64_t)cfg->context_length ||
-        gd_sample_field_nbytes(src, 1) != (size_t)n_segments_i64 * sizeof(int32_t)) {
+        gd_sample_field_nbytes(src, GPT_COMPACT_SRC_SEGMENT_LENGTHS) !=
+            (size_t)n_segments_i64 * sizeof(int32_t)) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     context_shape[0] = cfg->context_length;
     segments_shape[0] = n_segments_i64;
-    st = gd_sample_resize_field(dst, 0, GD_DTYPE_I32, 1, context_shape);
+    st = gd_sample_resize_field(dst, GPT_FIELD_INPUT_IDS, GD_DTYPE_I32, 1, context_shape);
     if (st != GD_OK) { return st; }
-    st = gd_sample_resize_field(dst, 1, GD_DTYPE_I32, 1, context_shape);
+    st = gd_sample_resize_field(dst, GPT_FIELD_POSITIONS, GD_DTYPE_I32, 1, context_shape);
     if (st != GD_OK) { return st; }
-    st = gd_sample_resize_field(dst, 2, GD_DTYPE_I32, 1, context_shape);
+    st = gd_sample_resize_field(dst, GPT_FIELD_TARGET_IDS, GD_DTYPE_I32, 1, context_shape);
     if (st != GD_OK) { return st; }
-    st = gd_sample_resize_field(dst, 3, GD_DTYPE_I32, 1, segments_shape);
+    st = gd_sample_resize_field(dst, GPT_FIELD_SEGMENT_LENGTHS, GD_DTYPE_I32, 1, segments_shape);
     if (st != GD_OK) { return st; }
-    input_ids = (int32_t *)gd_sample_mutable_field_data(dst, 0);
-    positions = (int32_t *)gd_sample_mutable_field_data(dst, 1);
-    target_ids = (int32_t *)gd_sample_mutable_field_data(dst, 2);
-    dst_segments = (int32_t *)gd_sample_mutable_field_data(dst, 3);
+    input_ids = (int32_t *)gd_sample_mutable_field_data(dst, GPT_FIELD_INPUT_IDS);
+    positions = (int32_t *)gd_sample_mutable_field_data(dst, GPT_FIELD_POSITIONS);
+    target_ids = (int32_t *)gd_sample_mutable_field_data(dst, GPT_FIELD_TARGET_IDS);
+    dst_segments = (int32_t *)gd_sample_mutable_field_data(dst, GPT_FIELD_SEGMENT_LENGTHS);
     if (input_ids == NULL || positions == NULL || target_ids == NULL || dst_segments == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
@@ -830,31 +980,16 @@ static gd_status gpt_lm_compact_transform_fn(const gd_sample *src,
     return GD_OK;
 }
 
-static gd_status gpt_lm_open_gdds_split(gd_context *ctx,
-                                        const gpt_config *config,
-                                        const char *split,
-                                        const gpt_lm_special_ids *special_ids,
-                                        gpt_lm_compact_transform *transform,
-                                        gd_dataset **out)
+typedef enum gpt_gdds_source_kind {
+    GPT_GDDS_SOURCE_SPLIT = 0,
+    GPT_GDDS_SOURCE_FILE = 1,
+} gpt_gdds_source_kind;
+
+static gd_status gpt_lm_init_compact_transform(const gpt_lm_special_ids *special_ids,
+                                               gpt_lm_compact_transform *transform)
 {
-    gd_dataset *raw = NULL;
-    gd_status st;
-    if (ctx == NULL || config == NULL || split == NULL || transform == NULL || out == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
-    *out = NULL;
-    st = gd_dataset_open_gdds_split(config->data_dir, split, &raw);
-    if (st != GD_OK) {
-        return st;
-    }
-    if (gpt_lm_dataset_is_compact(raw) == 0) {
-        *out = raw;
-        return GD_OK;
-    }
-    gd_dataset_destroy(raw);
-    if (special_ids == NULL || special_ids->pad_id < 0 || special_ids->im_start_id < 0 ||
-        special_ids->im_end_id < 0) {
-        (void)ctx;
+    if (special_ids == NULL || transform == NULL || special_ids->pad_id < 0 ||
+        special_ids->im_start_id < 0 || special_ids->im_end_id < 0) {
         return GD_ERR_INVALID_ARGUMENT;
     }
     transform->context_length = GPT_CONTEXT_LENGTH;
@@ -863,6 +998,41 @@ static gd_status gpt_lm_open_gdds_split(gd_context *ctx,
     transform->pad_id = special_ids->pad_id;
     transform->im_start_id = special_ids->im_start_id;
     transform->im_end_id = special_ids->im_end_id;
+    return GD_OK;
+}
+
+static gd_status gpt_lm_open_gdds_source(gd_context *ctx,
+                                         const gpt_config *config,
+                                         const char *name,
+                                         gpt_gdds_source_kind kind,
+                                         const gpt_lm_special_ids *special_ids,
+                                         gpt_lm_compact_transform *transform,
+                                         gd_dataset **out)
+{
+    gd_dataset *raw = NULL;
+    gd_status st;
+    if (ctx == NULL || name == NULL || transform == NULL || out == NULL ||
+        (kind == GPT_GDDS_SOURCE_SPLIT && config == NULL)) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    if (kind == GPT_GDDS_SOURCE_SPLIT) {
+        st = gd_dataset_open_gdds_split(config->data_dir, name, &raw);
+    } else {
+        st = gd_dataset_open_gdds_file(name, &raw);
+    }
+    if (st != GD_OK) {
+        return st;
+    }
+    if (gpt_lm_dataset_is_compact(raw) == 0) {
+        *out = raw;
+        return GD_OK;
+    }
+    gd_dataset_destroy(raw);
+    st = gpt_lm_init_compact_transform(special_ids, transform);
+    if (st != GD_OK) {
+        return st;
+    }
     {
         const gd_dataset_transform_config transform_cfg = {
             .transform = gpt_lm_compact_transform_fn,
@@ -870,9 +1040,44 @@ static gd_status gpt_lm_open_gdds_split(gd_context *ctx,
             .output_fields = gpt_lm_compact_runtime_fields,
             .n_output_fields = (int)GD_ARRAY_LEN(gpt_lm_compact_runtime_fields),
         };
-        st = gd_dataset_open_gdds_split_with_transform(config->data_dir, split, &transform_cfg, out);
+        if (kind == GPT_GDDS_SOURCE_SPLIT) {
+            st = gd_dataset_open_gdds_split_with_transform(config->data_dir, name, &transform_cfg, out);
+        } else {
+            st = gd_dataset_open_gdds_file_with_transform(name, &transform_cfg, out);
+        }
     }
     return st;
+}
+
+static gd_status gpt_lm_open_gdds_split(gd_context *ctx,
+                                        const gpt_config *config,
+                                        const char *split,
+                                        const gpt_lm_special_ids *special_ids,
+                                        gpt_lm_compact_transform *transform,
+                                        gd_dataset **out)
+{
+    return gpt_lm_open_gdds_source(ctx,
+                                   config,
+                                   split,
+                                   GPT_GDDS_SOURCE_SPLIT,
+                                   special_ids,
+                                   transform,
+                                   out);
+}
+
+static gd_status gpt_lm_open_gdds_file(gd_context *ctx,
+                                       const char *path,
+                                       const gpt_lm_special_ids *special_ids,
+                                       gpt_lm_compact_transform *transform,
+                                       gd_dataset **out)
+{
+    return gpt_lm_open_gdds_source(ctx,
+                                   NULL,
+                                   path,
+                                   GPT_GDDS_SOURCE_FILE,
+                                   special_ids,
+                                   transform,
+                                   out);
 }
 
 static gd_status create_gdds_loader(gd_context *ctx,
@@ -1057,11 +1262,34 @@ static void gpt_report_summary(gpt_report_state *report)
         (void)snprintf(best_epoch, sizeof(best_epoch), "n/a");
     }
     gd_progress_rowf(&report->progress,
-                     4U,
+                     GPT_PROGRESS_SUMMARY,
                      "last_train_loss=%s last_eval_loss=%s last_best_epoch=%s",
                      train_loss,
                      eval_loss,
                      best_epoch);
+}
+
+static void gpt_report_rowf(gd_context *ctx,
+                            gpt_report_state *report,
+                            gpt_progress_row row,
+                            const char *fmt,
+                            ...)
+{
+    va_list ap;
+    char *message;
+    if (report == NULL) {
+        return;
+    }
+    va_start(ap, fmt);
+    message = gpt_vasprintf(fmt, ap);
+    va_end(ap);
+    if (message == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "progress row format", __LINE__);
+    }
+    gd_progress_rowf(&report->progress, (unsigned)row, "%s", message);
+    free(message);
+    gpt_report_summary(report);
+    gd_progress_render(&report->progress);
 }
 
 static bool gpt_should_eval_epoch(const gpt_config *config, size_t epoch)
@@ -1163,21 +1391,21 @@ static void train_one_batch(gd_context *ctx,
                 report->last_train_loss = train_loss;
                 report->has_train_loss = true;
             }
-            gd_progress_rowf(&report->progress, 0U, "");
+            gd_progress_rowf(&report->progress, GPT_PROGRESS_TRAIN, "");
             gd_progress_row_append_bar(&report->progress,
-                                       0U,
+                                       GPT_PROGRESS_TRAIN,
                                        "train",
                                        (uint64_t)current_step,
                                        (uint64_t)total_steps);
             gd_progress_row_appendf(&report->progress,
-                                    0U,
+                                    GPT_PROGRESS_TRAIN,
                                     " epoch=%zu/%d batch=%zu/%zu",
                                     epoch,
                                     config->epochs,
                                     epoch_step,
                                     steps_per_epoch);
             gd_progress_rowf(&report->progress,
-                             1U,
+                             GPT_PROGRESS_TRAIN_METRICS,
                              "loss=%.6f lr=%.6g%s batch/s=%.2f tok/s=%.0f amp_scale=%.1f%s",
                              (double)train_loss,
                              (double)(step_result.has_lr ? step_result.lr : 0.0f),
@@ -1230,34 +1458,52 @@ static void train_one_batch(gd_context *ctx,
     }
 }
 
-static void ensure_checkpoint_parent_dir(gd_context *ctx, const char *path)
+static void gpt_mkdirs(gd_context *ctx, const char *path, bool include_leaf, const char *what)
 {
     char *copy;
+    size_t len;
     size_t i;
+    bool create_leaf = include_leaf;
     if (path == NULL || path[0] == '\0') {
-        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "checkpoint path", __LINE__);
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, what, __LINE__);
     }
     copy = (char *)malloc(strlen(path) + 1U);
     if (copy == NULL) {
-        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "checkpoint parent allocation", __LINE__);
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, what, __LINE__);
     }
     (void)strcpy(copy, path);
+    len = strlen(copy);
+    while (len > 1U && copy[len - 1U] == '/') {
+        create_leaf = true;
+        copy[len - 1U] = '\0';
+        len -= 1U;
+    }
     for (i = 1U; copy[i] != '\0'; ++i) {
         if (copy[i] == '/') {
             copy[i] = '\0';
             if (copy[0] != '\0' && mkdir(copy, 0775) != 0 && errno != EEXIST) {
                 free(copy);
-                gpt_fail_status(ctx, GD_ERR_IO, "checkpoint mkdir", __LINE__);
+                gpt_fail_status(ctx, GD_ERR_IO, what, __LINE__);
             }
             copy[i] = '/';
         }
     }
+    if (create_leaf && mkdir(copy, 0775) != 0 && errno != EEXIST) {
+        free(copy);
+        gpt_fail_status(ctx, GD_ERR_IO, what, __LINE__);
+    }
     free(copy);
+}
+
+static void ensure_checkpoint_parent_dir(gd_context *ctx, const char *path)
+{
+    gpt_mkdirs(ctx, path, false, "checkpoint mkdir");
 }
 
 typedef struct gpt_training_state {
     bool loaded;
     size_t epoch;
+    size_t epoch_step;
     size_t global_step;
     size_t epochs_without_improvement;
     float best_val_loss;
@@ -1269,6 +1515,280 @@ static bool gpt_has_suffix(const char *text, const char *suffix)
     const size_t suffix_len = suffix != NULL ? strlen(suffix) : 0U;
     return text_len >= suffix_len && suffix_len > 0U &&
            memcmp(text + text_len - suffix_len, suffix, suffix_len) == 0;
+}
+
+typedef struct gpt_gdds_shard_ref {
+    char *path;
+    uint64_t samples;
+    uint64_t bytes;
+} gpt_gdds_shard_ref;
+
+typedef struct gpt_gdds_shard_list {
+    gpt_gdds_shard_ref *items;
+    size_t count;
+} gpt_gdds_shard_list;
+
+static char *gpt_strdup_or_fail(gd_context *ctx, const char *text, const char *what)
+{
+    char *out;
+    size_t n;
+    if (text == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, what, __LINE__);
+    }
+    n = strlen(text);
+    out = (char *)malloc(n + 1U);
+    if (out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, what, __LINE__);
+    }
+    memcpy(out, text, n + 1U);
+    return out;
+}
+
+static void ensure_directory_path(gd_context *ctx, const char *path)
+{
+    gpt_mkdirs(ctx, path, true, "mkdir cache dir");
+}
+
+static const char *gpt_basename_ptr(const char *path)
+{
+    const char *slash;
+    if (path == NULL) {
+        return "";
+    }
+    slash = strrchr(path, '/');
+    return slash != NULL ? slash + 1 : path;
+}
+
+static char *gpt_join_dir_file(gd_context *ctx, const char *dir, const char *file)
+{
+    const size_t dir_len = dir != NULL ? strlen(dir) : 0U;
+    const size_t file_len = file != NULL ? strlen(file) : 0U;
+    const bool need_slash = dir_len > 0U && dir[dir_len - 1U] != '/';
+    char *out;
+    if (dir_len == 0U || file_len == 0U || dir_len > SIZE_MAX - file_len - (need_slash ? 2U : 1U)) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "join cache path", __LINE__);
+    }
+    out = (char *)malloc(dir_len + (need_slash ? 1U : 0U) + file_len + 1U);
+    if (out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "join cache path", __LINE__);
+    }
+    memcpy(out, dir, dir_len);
+    if (need_slash) {
+        out[dir_len] = '/';
+    }
+    memcpy(out + dir_len + (need_slash ? 1U : 0U), file, file_len + 1U);
+    return out;
+}
+
+static int gpt_file_size(const char *path, uint64_t *out_size)
+{
+    struct stat st;
+    if (out_size != NULL) {
+        *out_size = 0U;
+    }
+    if (path == NULL || stat(path, &st) != 0 || st.st_size < 0) {
+        return 0;
+    }
+    if (out_size != NULL) {
+        *out_size = (uint64_t)st.st_size;
+    }
+    return 1;
+}
+
+static char *gpt_copy_shard_to_local_cache(gd_context *ctx,
+                                           const char *src_path,
+                                           uint64_t expected_bytes,
+                                           const gpt_config *config)
+{
+    enum { COPY_BUFFER_BYTES = 8 * 1024 * 1024 };
+#define GPT_SHARD_CACHE_FAIL(status_value, message_value) \
+    do {                                                  \
+        fail_status = (status_value);                     \
+        fail_message = (message_value);                   \
+        goto fail;                                        \
+    } while (0)
+
+    const char *base;
+    char *dst_path = NULL;
+    char *tmp_path = NULL;
+    FILE *src = NULL;
+    FILE *dst = NULL;
+    unsigned char *buffer = NULL;
+    uint64_t existing_bytes = 0U;
+    uint64_t copied = 0U;
+    uint64_t next_report = UINT64_C(1024) * UINT64_C(1024) * UINT64_C(1024);
+    gd_status fail_status = GD_OK;
+    const char *fail_message = "shard cache copy";
+
+    if (config == NULL || config->local_shard_cache_dir == NULL || src_path == NULL) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_INVALID_ARGUMENT, "local shard cache arguments");
+    }
+    ensure_directory_path(ctx, config->local_shard_cache_dir);
+    base = gpt_basename_ptr(src_path);
+    dst_path = gpt_join_dir_file(ctx, config->local_shard_cache_dir, base);
+    if (gpt_file_size(dst_path, &existing_bytes) != 0 &&
+        (expected_bytes == 0U || existing_bytes == expected_bytes)) {
+        printf("shard_cache: reuse %s bytes=%llu\n", dst_path, (unsigned long long)existing_bytes);
+        return dst_path;
+    }
+    tmp_path = gpt_asprintf("%s.tmp.%ld", dst_path, (long)getpid());
+    if (tmp_path == NULL) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_OUT_OF_MEMORY, "cache temp path");
+    }
+    (void)remove(tmp_path);
+    src = fopen(src_path, "rb");
+    if (src == NULL) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "open source shard cache");
+    }
+    dst = fopen(tmp_path, "wb");
+    if (dst == NULL) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "open temp shard cache");
+    }
+    buffer = (unsigned char *)malloc(COPY_BUFFER_BYTES);
+    if (buffer == NULL) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_OUT_OF_MEMORY, "shard cache copy buffer");
+    }
+    printf("shard_cache: copy %s -> %s bytes=%llu\n",
+           src_path,
+           dst_path,
+           (unsigned long long)expected_bytes);
+    fflush(stdout);
+    for (;;) {
+        const size_t n = fread(buffer, 1U, COPY_BUFFER_BYTES, src);
+        if (n > 0U) {
+            if (fwrite(buffer, 1U, n, dst) != n) {
+                GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "write shard cache");
+            }
+            copied += (uint64_t)n;
+            if (copied >= next_report) {
+                printf("shard_cache: copied %.2f/%.2f GB\n",
+                       (double)copied / (1024.0 * 1024.0 * 1024.0),
+                       (double)expected_bytes / (1024.0 * 1024.0 * 1024.0));
+                fflush(stdout);
+                next_report += UINT64_C(1024) * UINT64_C(1024) * UINT64_C(1024);
+            }
+        }
+        if (n < COPY_BUFFER_BYTES) {
+            if (ferror(src)) {
+                GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "read shard cache");
+            }
+            break;
+        }
+    }
+    free(buffer);
+    buffer = NULL;
+    if (fclose(dst) != 0) {
+        dst = NULL;
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "close temp shard cache");
+    }
+    dst = NULL;
+    if (fclose(src) != 0) {
+        src = NULL;
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "close source shard cache");
+    }
+    src = NULL;
+    if (expected_bytes != 0U && copied != expected_bytes) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "shard cache size mismatch");
+    }
+    if (rename(tmp_path, dst_path) != 0) {
+        GPT_SHARD_CACHE_FAIL(GD_ERR_IO, "rename shard cache");
+    }
+    free(tmp_path);
+    return dst_path;
+
+fail:
+    free(buffer);
+    if (dst != NULL) {
+        (void)fclose(dst);
+    }
+    if (src != NULL) {
+        (void)fclose(src);
+    }
+    if (tmp_path != NULL) {
+        (void)remove(tmp_path);
+    }
+    free(tmp_path);
+    free(dst_path);
+#undef GPT_SHARD_CACHE_FAIL
+    gpt_fail_status(ctx, fail_status, fail_message, __LINE__);
+    return NULL;
+}
+
+static void gpt_gdds_shard_list_deinit(gpt_gdds_shard_list *list)
+{
+    size_t i;
+    if (list == NULL) {
+        return;
+    }
+    for (i = 0U; i < list->count; ++i) {
+        free(list->items[i].path);
+    }
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static void gpt_gdds_shard_list_from_dataset(gd_context *ctx,
+                                             const gd_dataset *dataset,
+                                             gpt_gdds_shard_list *out)
+{
+    const int shard_count = gd_gdds_dataset_shard_count(dataset);
+    int i;
+    if (out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "shard list output", __LINE__);
+    }
+    memset(out, 0, sizeof(*out));
+    if (shard_count <= 0) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty GDDS shard list", __LINE__);
+    }
+    out->items = (gpt_gdds_shard_ref *)calloc((size_t)shard_count, sizeof(out->items[0]));
+    if (out->items == NULL) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "allocate shard list", __LINE__);
+    }
+    out->count = (size_t)shard_count;
+    for (i = 0; i < shard_count; ++i) {
+        gd_gdds_shard_info info;
+        TRY(ctx, gd_gdds_dataset_shard_info(dataset, i, &info));
+        if (info.path == NULL || info.samples == 0U) {
+            gpt_gdds_shard_list_deinit(out);
+            gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GDDS shard info", __LINE__);
+        }
+        out->items[i].path = gpt_strdup_or_fail(ctx, info.path, "copy shard path");
+        out->items[i].samples = info.samples;
+        out->items[i].bytes = info.bytes;
+    }
+}
+
+static size_t gpt_shard_list_steps_per_epoch(const gpt_gdds_shard_list *list,
+                                             const gpt_config *config,
+                                             size_t *samples_per_epoch_out)
+{
+    size_t steps = 0U;
+    size_t samples = 0U;
+    size_t i;
+    if (samples_per_epoch_out != NULL) {
+        *samples_per_epoch_out = 0U;
+    }
+    if (list == NULL || config == NULL || config->batch_size <= 0) {
+        return 0U;
+    }
+    for (i = 0U; i < list->count; ++i) {
+        const size_t shard_steps = (size_t)(list->items[i].samples / (uint64_t)config->batch_size);
+        if (shard_steps > SIZE_MAX - steps) {
+            return 0U;
+        }
+        steps += shard_steps;
+        if (shard_steps > 0U) {
+            const size_t shard_samples = shard_steps * (size_t)config->batch_size;
+            if (shard_samples > SIZE_MAX - samples) {
+                return 0U;
+            }
+            samples += shard_samples;
+        }
+    }
+    if (samples_per_epoch_out != NULL) {
+        *samples_per_epoch_out = samples;
+    }
+    return steps;
 }
 
 static char *gpt_checkpoint_sidecar_path(const char *checkpoint_path, const char *suffix)
@@ -1297,143 +1817,83 @@ static char *gpt_checkpoint_sidecar_path(const char *checkpoint_path, const char
 
 static char *gpt_checkpoint_metadata(const gpt_config *config,
                                      size_t epoch,
+                                     size_t epoch_step,
                                      size_t global_step,
                                      float val_loss,
                                      float best_val_loss,
                                      const char *optimizer_path,
                                      const char *train_state_path)
 {
+    static const char metadata_format[] =
+        "model=gpt_lm\n"
+        "vocab_size=%d\n"
+        "context_length=%d\n"
+        "d_model=%d\n"
+        "n_layers=%d\n"
+        "n_heads=%d\n"
+        "head_dim=%d\n"
+        "mlp_hidden=%d\n"
+        "ffn_activation=swiglu\n"
+        "architecture=%s\n"
+        "minimax_m3_block_size=%d\n"
+        "minimax_m3_topk_blocks=%d\n"
+        "minimax_m3_init_blocks=%d\n"
+        "minimax_m3_local_blocks=%d\n"
+        "sdpa_window=%d\n"
+        "dropout=%.9g\n"
+        "logits_softcap=%.9g\n"
+        "grad_clip_norm=%.9g\n"
+        "eval_every_n_epochs=%d\n"
+        "early_stopping_patience=%d\n"
+        "epoch=%zu\n"
+        "epoch_step=%zu\n"
+        "global_step=%zu\n"
+        "val_loss=%.9g\n"
+        "best_val_loss=%.9g\n"
+        "tokenizer_path=%s\n"
+        "optimizer_path=%s\n"
+        "train_state_path=%s\n";
     char *default_tok_path = NULL;
     const char *tokenizer_path;
     const char *optimizer_text = optimizer_path != NULL ? optimizer_path : "";
     const char *train_state_text = train_state_path != NULL ? train_state_path : "";
     char *metadata;
-    int n;
     if (config == NULL) {
         return NULL;
     }
     default_tok_path = config->tokenizer_path == NULL ? gpt_default_tokenizer_path(config->data_dir) : NULL;
     tokenizer_path = config->tokenizer_path != NULL ? config->tokenizer_path : default_tok_path;
     if (tokenizer_path == NULL) {
-        return NULL;
-    }
-    n = snprintf(NULL,
-                 0U,
-                 "model=gpt_lm\n"
-                 "vocab_size=%d\n"
-                 "context_length=%d\n"
-                 "d_model=%d\n"
-                 "n_layers=%d\n"
-                 "n_heads=%d\n"
-                 "head_dim=%d\n"
-                 "mlp_hidden=%d\n"
-                 "ffn_activation=swiglu\n"
-                 "architecture=%s\n"
-                 "minimax_m3_block_size=%d\n"
-                 "minimax_m3_topk_blocks=%d\n"
-                 "minimax_m3_init_blocks=%d\n"
-                 "minimax_m3_local_blocks=%d\n"
-                 "sdpa_window=%d\n"
-                 "dropout=%.9g\n"
-                 "logits_softcap=%.9g\n"
-                 "grad_clip_norm=%.9g\n"
-                 "eval_every_n_epochs=%d\n"
-                 "early_stopping_patience=%d\n"
-                 "epoch=%zu\n"
-                 "global_step=%zu\n"
-                 "val_loss=%.9g\n"
-                 "best_val_loss=%.9g\n"
-                 "tokenizer_path=%s\n"
-                 "optimizer_path=%s\n"
-                 "train_state_path=%s\n",
-                 GPT_VOCAB_SIZE,
-                 GPT_CONTEXT_LENGTH,
-                 GPT_D_MODEL,
-                 config->n_layers,
-                 GPT_N_HEADS,
-                 GPT_HEAD_DIM,
-                 GPT_MLP_HIDDEN,
-                 gpt_architecture_name(config->architecture),
-                 GPT_MINIMAX_M3_BLOCK_SIZE,
-                 config->minimax_m3_topk_blocks,
-                 config->minimax_m3_init_blocks,
-                 config->minimax_m3_local_blocks,
-                 GPT_SDPA_WINDOW,
-                 (double)config->dropout_p,
-                 (double)config->logits_softcap,
-                 (double)config->grad_clip_norm,
-                 config->eval_every_n_epochs,
-                 config->early_stopping_patience,
-                 epoch,
-                 global_step,
-                 (double)val_loss,
-                 (double)best_val_loss,
-                 tokenizer_path,
-                 optimizer_text,
-                 train_state_text);
-    if (n < 0) {
         free(default_tok_path);
         return NULL;
     }
-    metadata = (char *)malloc((size_t)n + 1U);
-    if (metadata == NULL) {
-        free(default_tok_path);
-        return NULL;
-    }
-    (void)snprintf(metadata,
-                   (size_t)n + 1U,
-                   "model=gpt_lm\n"
-                   "vocab_size=%d\n"
-                   "context_length=%d\n"
-                   "d_model=%d\n"
-                   "n_layers=%d\n"
-                   "n_heads=%d\n"
-                   "head_dim=%d\n"
-                   "mlp_hidden=%d\n"
-                   "ffn_activation=swiglu\n"
-                   "architecture=%s\n"
-                   "minimax_m3_block_size=%d\n"
-                   "minimax_m3_topk_blocks=%d\n"
-                   "minimax_m3_init_blocks=%d\n"
-                   "minimax_m3_local_blocks=%d\n"
-                   "sdpa_window=%d\n"
-                   "dropout=%.9g\n"
-                   "logits_softcap=%.9g\n"
-                   "grad_clip_norm=%.9g\n"
-                   "eval_every_n_epochs=%d\n"
-                   "early_stopping_patience=%d\n"
-                   "epoch=%zu\n"
-                   "global_step=%zu\n"
-                   "val_loss=%.9g\n"
-                   "best_val_loss=%.9g\n"
-                   "tokenizer_path=%s\n"
-                   "optimizer_path=%s\n"
-                   "train_state_path=%s\n",
-                   GPT_VOCAB_SIZE,
-                   GPT_CONTEXT_LENGTH,
-                   GPT_D_MODEL,
-                   config->n_layers,
-                   GPT_N_HEADS,
-                   GPT_HEAD_DIM,
-                   GPT_MLP_HIDDEN,
-                   gpt_architecture_name(config->architecture),
-                   GPT_MINIMAX_M3_BLOCK_SIZE,
-                   config->minimax_m3_topk_blocks,
-                   config->minimax_m3_init_blocks,
-                   config->minimax_m3_local_blocks,
-                   GPT_SDPA_WINDOW,
-                   (double)config->dropout_p,
-                   (double)config->logits_softcap,
-                   (double)config->grad_clip_norm,
-                   config->eval_every_n_epochs,
-                   config->early_stopping_patience,
-                   epoch,
-                   global_step,
-                   (double)val_loss,
-                   (double)best_val_loss,
-                   tokenizer_path,
-                   optimizer_text,
-                   train_state_text);
+    metadata = gpt_asprintf(metadata_format,
+                            GPT_VOCAB_SIZE,
+                            GPT_CONTEXT_LENGTH,
+                            GPT_D_MODEL,
+                            config->n_layers,
+                            GPT_N_HEADS,
+                            GPT_HEAD_DIM,
+                            GPT_MLP_HIDDEN,
+                            gpt_architecture_name(config->architecture),
+                            GPT_MINIMAX_M3_BLOCK_SIZE,
+                            config->minimax_m3_topk_blocks,
+                            config->minimax_m3_init_blocks,
+                            config->minimax_m3_local_blocks,
+                            GPT_SDPA_WINDOW,
+                            (double)config->dropout_p,
+                            (double)config->logits_softcap,
+                            (double)config->grad_clip_norm,
+                            config->eval_every_n_epochs,
+                            config->early_stopping_patience,
+                            epoch,
+                            epoch_step,
+                            global_step,
+                            (double)val_loss,
+                            (double)best_val_loss,
+                            tokenizer_path,
+                            optimizer_text,
+                            train_state_text);
     free(default_tok_path);
     return metadata;
 }
@@ -1445,6 +1905,7 @@ static void gpt_write_training_state(gd_context *ctx,
                                      const gd_lr_scheduler_config *lr_config,
                                      gd_amp_scaler *scaler,
                                      size_t epoch,
+                                     size_t epoch_step,
                                      size_t global_step,
                                      size_t epochs_without_improvement,
                                      float val_loss,
@@ -1462,10 +1923,11 @@ static void gpt_write_training_state(gd_context *ctx,
     if (file == NULL) {
         gpt_fail_status(ctx, GD_ERR_IO, "training state open", __LINE__);
     }
-    fprintf(file, "format=gpt_lm_train_state_v1\n");
+    fprintf(file, "format=gpt_lm_train_state_v2\n");
     fprintf(file, "model_checkpoint=%s\n", model_path);
     fprintf(file, "optimizer_checkpoint=%s\n", optimizer_path);
     fprintf(file, "epoch=%zu\n", epoch);
+    fprintf(file, "epoch_step=%zu\n", epoch_step);
     fprintf(file, "global_step=%zu\n", global_step);
     fprintf(file, "epochs_without_improvement=%zu\n", epochs_without_improvement);
     fprintf(file, "val_loss=%.9g\n", (double)val_loss);
@@ -1646,13 +2108,17 @@ static void gpt_load_training_state(gd_context *ctx,
     }
     text = gpt_read_text_file(ctx, path);
     gpt_state_copy_value(ctx, text, "format", format, sizeof(format));
-    if (strcmp(format, "gpt_lm_train_state_v1") != 0) {
+    if (strcmp(format, "gpt_lm_train_state_v1") != 0 &&
+        strcmp(format, "gpt_lm_train_state_v2") != 0) {
         free(text);
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "training state format", __LINE__);
     }
     memset(out, 0, sizeof(*out));
     out->loaded = true;
     out->epoch = gpt_state_size(ctx, text, "epoch");
+    out->epoch_step = strcmp(format, "gpt_lm_train_state_v2") == 0 ?
+                          gpt_state_size(ctx, text, "epoch_step") :
+                          GPT_TRAIN_STATE_EPOCH_END;
     out->global_step = gpt_state_size(ctx, text, "global_step");
     out->epochs_without_improvement = gpt_state_size(ctx, text, "epochs_without_improvement");
     out->best_val_loss = gpt_state_f32(ctx, text, "best_val_loss");
@@ -1688,9 +2154,10 @@ static void gpt_load_training_state(gd_context *ctx,
     amp_state.last_found_inf = gpt_state_bool(ctx, text, "amp.last_found_inf");
     TRY(ctx, gd_amp_scaler_set_state(ctx, scaler, &amp_state));
     free(text);
-    printf("resumed_training_state: path=%s epoch=%zu global_step=%zu best_val_loss=%.6f amp_scale=%.1f\n",
+    printf("resumed_training_state: path=%s epoch=%zu epoch_step=%s global_step=%zu best_val_loss=%.6f amp_scale=%.1f\n",
            path,
            out->epoch,
+           out->epoch_step == GPT_TRAIN_STATE_EPOCH_END ? "epoch_end" : "mid_epoch",
            out->global_step,
            (double)out->best_val_loss,
            (double)gd_amp_scaler_scale(scaler));
@@ -1732,6 +2199,7 @@ static void gpt_save_checkpoint_bundle(gd_context *ctx,
                                        const char *checkpoint_path,
                                        const char *print_key,
                                        size_t epoch,
+                                       size_t epoch_step,
                                        size_t global_step,
                                        size_t epochs_without_improvement,
                                        float val_loss,
@@ -1754,6 +2222,7 @@ static void gpt_save_checkpoint_bundle(gd_context *ctx,
     }
     metadata = gpt_checkpoint_metadata(config,
                                        epoch,
+                                       epoch_step,
                                        global_step,
                                        val_loss,
                                        best_val_loss,
@@ -1779,6 +2248,7 @@ static void gpt_save_checkpoint_bundle(gd_context *ctx,
                              lr_config,
                              scaler,
                              epoch,
+                             epoch_step,
                              global_step,
                              epochs_without_improvement,
                              val_loss,
@@ -1791,6 +2261,114 @@ static void gpt_save_checkpoint_bundle(gd_context *ctx,
     free(train_state_path);
 }
 
+static const char *gpt_checkpoint_kind_name(gpt_checkpoint_kind kind)
+{
+    switch (kind) {
+    case GPT_CHECKPOINT_BEST: return "best";
+    case GPT_CHECKPOINT_LATEST_STEP: return "latest_step";
+    case GPT_CHECKPOINT_LATEST:
+    default: return "latest";
+    }
+}
+
+static void gpt_log_checkpoint_event(gd_metrics_logger *metrics,
+                                     gpt_checkpoint_kind kind,
+                                     const char *path,
+                                     size_t epoch,
+                                     size_t epoch_step,
+                                     size_t global_step,
+                                     size_t epochs_without_improvement,
+                                     float val_loss,
+                                     float best_val_loss)
+{
+    if (metrics == NULL) {
+        return;
+    }
+    switch (kind) {
+    case GPT_CHECKPOINT_BEST: {
+        const gd_metrics_field fields[] = {
+            gd_metrics_string("kind", gpt_checkpoint_kind_name(kind)),
+            gd_metrics_string("path", path),
+            gd_metrics_u64("epoch", (uint64_t)epoch),
+            gd_metrics_u64("step", (uint64_t)global_step),
+            gd_metrics_f64("val_loss", (double)val_loss),
+            gd_metrics_f64("best_val_loss", (double)best_val_loss),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
+        break;
+    }
+    case GPT_CHECKPOINT_LATEST_STEP: {
+        const gd_metrics_field fields[] = {
+            gd_metrics_string("kind", gpt_checkpoint_kind_name(kind)),
+            gd_metrics_string("path", path),
+            gd_metrics_u64("epoch", (uint64_t)epoch),
+            gd_metrics_u64("epoch_step", (uint64_t)epoch_step),
+            gd_metrics_u64("step", (uint64_t)global_step),
+            gd_metrics_u64("epochs_without_improvement", (uint64_t)epochs_without_improvement),
+            gd_metrics_f64("val_loss", (double)val_loss),
+            gd_metrics_f64("best_val_loss", (double)best_val_loss),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
+        break;
+    }
+    case GPT_CHECKPOINT_LATEST:
+    default: {
+        const gd_metrics_field fields[] = {
+            gd_metrics_string("kind", gpt_checkpoint_kind_name(kind)),
+            gd_metrics_string("path", path),
+            gd_metrics_u64("epoch", (uint64_t)epoch),
+            gd_metrics_u64("step", (uint64_t)global_step),
+            gd_metrics_u64("epochs_without_improvement", (uint64_t)epochs_without_improvement),
+            gd_metrics_f64("val_loss", (double)val_loss),
+            gd_metrics_f64("best_val_loss", (double)best_val_loss),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
+        break;
+    }
+    }
+}
+
+static void gpt_save_and_log_checkpoint(gd_context *ctx,
+                                        gpt_lm *model,
+                                        gd_optimizer *optimizer,
+                                        gd_amp_scaler *scaler,
+                                        const gd_lr_scheduler_config *lr_config,
+                                        const gpt_config *config,
+                                        gd_metrics_logger *metrics,
+                                        gpt_checkpoint_kind kind,
+                                        const char *checkpoint_path,
+                                        size_t epoch,
+                                        size_t epoch_step,
+                                        size_t global_step,
+                                        size_t epochs_without_improvement,
+                                        float val_loss,
+                                        float best_val_loss)
+{
+    gpt_save_checkpoint_bundle(ctx,
+                               model,
+                               optimizer,
+                               scaler,
+                               lr_config,
+                               config,
+                               checkpoint_path,
+                               NULL,
+                               epoch,
+                               epoch_step,
+                               global_step,
+                               epochs_without_improvement,
+                               val_loss,
+                               best_val_loss);
+    gpt_log_checkpoint_event(metrics,
+                             kind,
+                             checkpoint_path,
+                             epoch,
+                             epoch_step,
+                             global_step,
+                             epochs_without_improvement,
+                             val_loss,
+                             best_val_loss);
+}
+
 static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                           gpt_lm *model,
                                           gd_optimizer *optimizer,
@@ -1801,6 +2379,7 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
                                           gpt_report_state *report,
                                           gd_metrics_logger *metrics,
                                           size_t epoch,
+                                          size_t epoch_step,
                                           size_t global_step,
                                           float *best_val_loss,
                                           float *out_val_loss,
@@ -1819,11 +2398,13 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
     }
     if (report != NULL) {
         gd_progress_rowf(&report->progress,
-                         2U,
+                         GPT_PROGRESS_EVAL,
                          "eval epoch=%zu step=%zu running...",
                          epoch,
                          global_step);
-        gd_progress_rowf(&report->progress, 3U, "checkpoint best=pending latest=pending");
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_CHECKPOINT,
+                         "checkpoint best=pending latest=pending");
         gpt_report_summary(report);
         gd_progress_render(&report->progress);
     }
@@ -1835,38 +2416,26 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
         *best_val_loss = val_loss;
         improved = true;
         if (config->save_best) {
-            if (report != NULL) {
-                gd_progress_rowf(&report->progress,
-                                 3U,
-                                 "checkpoint best=saving path=%s latest=pending",
-                                 config->checkpoint_path);
-                gpt_report_summary(report);
-                gd_progress_render(&report->progress);
-            }
-            gpt_save_checkpoint_bundle(ctx,
-                                       model,
-                                       optimizer,
-                                       scaler,
-                                       lr_config,
-                                       config,
-                                       config->checkpoint_path,
-                                       NULL,
-                                       epoch,
-                                       global_step,
-                                       0U,
-                                       val_loss,
-                                       *best_val_loss);
-            if (metrics != NULL) {
-                const gd_metrics_field fields[] = {
-                    gd_metrics_string("kind", "best"),
-                    gd_metrics_string("path", config->checkpoint_path),
-                    gd_metrics_u64("epoch", (uint64_t)epoch),
-                    gd_metrics_u64("step", (uint64_t)global_step),
-                    gd_metrics_f64("val_loss", (double)val_loss),
-                    gd_metrics_f64("best_val_loss", (double)*best_val_loss),
-                };
-                (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
-            }
+            gpt_report_rowf(ctx,
+                            report,
+                            GPT_PROGRESS_CHECKPOINT,
+                            "checkpoint best=saving path=%s latest=pending",
+                            config->checkpoint_path);
+            gpt_save_and_log_checkpoint(ctx,
+                                        model,
+                                        optimizer,
+                                        scaler,
+                                        lr_config,
+                                        config,
+                                        metrics,
+                                        GPT_CHECKPOINT_BEST,
+                                        config->checkpoint_path,
+                                        epoch,
+                                        epoch_step,
+                                        global_step,
+                                        0U,
+                                        val_loss,
+                                        *best_val_loss);
         }
     }
     if (out_improved != NULL) {
@@ -1886,6 +2455,156 @@ static bool validate_and_maybe_checkpoint(gd_context *ctx,
     return true;
 }
 
+static void gpt_skip_loader_batches(gd_context *ctx, gd_dataloader *loader, size_t batches)
+{
+    size_t i;
+    if (batches == 0U) {
+        return;
+    }
+    for (i = 0U; i < batches; ++i) {
+        gd_batch *batch = NULL;
+        TRY(ctx, gd_dataloader_next(loader, &batch));
+        TRY(ctx, gd_dataloader_release(loader, batch));
+        TRY(ctx, gd_dataloader_prefetch(loader));
+    }
+}
+
+static void maybe_save_step_latest_checkpoint(gd_context *ctx,
+                                              gpt_lm *model,
+                                              gd_optimizer *optimizer,
+                                              gd_amp_scaler *scaler,
+                                              const gd_lr_scheduler_config *lr_config,
+                                              const gpt_config *config,
+                                              gpt_report_state *report,
+                                              gd_metrics_logger *metrics,
+                                              size_t epoch,
+                                              size_t epoch_step,
+                                              size_t steps_per_epoch,
+                                              size_t global_step,
+                                              size_t epochs_without_improvement,
+                                              float best_val_loss)
+{
+    const float checkpoint_val_loss = report != NULL && report->has_eval_loss ?
+                                          report->last_eval_loss :
+                                          NAN;
+    if (config == NULL || !config->save_latest || config->latest_every_n_steps == 0U ||
+        global_step == 0U || (global_step % config->latest_every_n_steps) != 0U ||
+        epoch_step == steps_per_epoch) {
+        return;
+    }
+    gpt_report_rowf(ctx,
+                    report,
+                    GPT_PROGRESS_CHECKPOINT,
+                    "checkpoint latest=step-saving step=%zu path=%s",
+                    global_step,
+                    config->latest_checkpoint_path);
+    gpt_save_and_log_checkpoint(ctx,
+                                model,
+                                optimizer,
+                                scaler,
+                                lr_config,
+                                config,
+                                metrics,
+                                GPT_CHECKPOINT_LATEST_STEP,
+                                config->latest_checkpoint_path,
+                                epoch,
+                                epoch_step,
+                                global_step,
+                                epochs_without_improvement,
+                                checkpoint_val_loss,
+                                best_val_loss);
+    gpt_report_rowf(ctx,
+                    report,
+                    GPT_PROGRESS_CHECKPOINT,
+                    "checkpoint latest=step-saved step=%zu path=%s",
+                    global_step,
+                    config->latest_checkpoint_path);
+}
+
+typedef struct gpt_train_epoch_runner {
+    gpt_lm *model;
+    gd_optimizer *optimizer;
+    gd_amp_scaler *scaler;
+    const gd_lr_scheduler_config *lr_config;
+    const gpt_config *config;
+    const gpt_generation_tokenizer *generation_tokenizer;
+    gpt_report_state *report;
+    gd_metrics_logger *metrics;
+    size_t total_steps;
+    double *last_report_time;
+    size_t *last_report_step;
+    size_t *global_step;
+} gpt_train_epoch_runner;
+
+static void gpt_train_epoch_step(gd_context *ctx,
+                                 const gpt_train_epoch_runner *runner,
+                                 gd_dataloader *loader,
+                                 size_t epoch,
+                                 size_t *epoch_step,
+                                 size_t steps_per_epoch,
+                                 size_t epochs_without_improvement,
+                                 float best_val_loss)
+{
+    if (runner == NULL || runner->global_step == NULL || epoch_step == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train epoch step", __LINE__);
+    }
+    train_one_batch(ctx,
+                    runner->model,
+                    loader,
+                    runner->optimizer,
+                    runner->scaler,
+                    runner->lr_config,
+                    runner->config,
+                    runner->generation_tokenizer,
+                    runner->report,
+                    runner->metrics,
+                    *runner->global_step,
+                    runner->total_steps,
+                    epoch,
+                    *epoch_step,
+                    steps_per_epoch,
+                    runner->last_report_time,
+                    runner->last_report_step);
+    *runner->global_step += 1U;
+    maybe_save_step_latest_checkpoint(ctx,
+                                      runner->model,
+                                      runner->optimizer,
+                                      runner->scaler,
+                                      runner->lr_config,
+                                      runner->config,
+                                      runner->report,
+                                      runner->metrics,
+                                      epoch,
+                                      *epoch_step,
+                                      steps_per_epoch,
+                                      *runner->global_step,
+                                      epochs_without_improvement,
+                                      best_val_loss);
+    *epoch_step += 1U;
+}
+
+static void gpt_resume_start_position(const gpt_training_state *resume_state,
+                                      size_t steps_per_epoch,
+                                      size_t *start_epoch,
+                                      size_t *start_epoch_step)
+{
+    if (start_epoch == NULL || start_epoch_step == NULL) {
+        return;
+    }
+    *start_epoch = 1U;
+    *start_epoch_step = 1U;
+    if (resume_state == NULL || !resume_state->loaded) {
+        return;
+    }
+    if (resume_state->epoch_step != GPT_TRAIN_STATE_EPOCH_END &&
+        resume_state->epoch_step < steps_per_epoch) {
+        *start_epoch = resume_state->epoch;
+        *start_epoch_step = resume_state->epoch_step + 1U;
+    } else {
+        *start_epoch = resume_state->epoch + 1U;
+    }
+}
+
 static void train_gpt(gd_context *ctx,
                       gpt_lm *model,
                       gd_dataset *dataset,
@@ -1894,6 +2613,8 @@ static void train_gpt(gd_context *ctx,
                       gd_amp_scaler *scaler,
                       const gd_lr_scheduler_config *lr_config,
                       const gpt_config *config,
+                      const gpt_lm_special_ids *special_ids,
+                      const gpt_gdds_shard_list *train_shards,
                       const gpt_training_state *resume_state,
                       gd_metrics_logger *metrics,
                       size_t steps_per_epoch,
@@ -1905,10 +2626,12 @@ static void train_gpt(gd_context *ctx,
     size_t epochs_without_improvement = resume_state != NULL && resume_state->loaded ?
                                             resume_state->epochs_without_improvement :
                                             0U;
-    size_t start_epoch = resume_state != NULL && resume_state->loaded ? resume_state->epoch + 1U : 1U;
+    size_t start_epoch = 1U;
+    size_t start_epoch_step = 1U;
     size_t epoch;
     gpt_report_state report;
     gpt_generation_tokenizer generation_tokenizer;
+    gpt_train_epoch_runner runner;
     const gpt_generation_tokenizer *generation_tokenizer_ptr = NULL;
     float best_val_loss = resume_state != NULL && resume_state->loaded ? resume_state->best_val_loss : INFINITY;
 
@@ -1916,63 +2639,143 @@ static void train_gpt(gd_context *ctx,
     report.last_train_loss = NAN;
     report.last_eval_loss = NAN;
     gd_progress_init(&report.progress, stdout);
-    if (!gd_progress_set_row_count(&report.progress, 5U)) {
+    if (!gd_progress_set_row_count(&report.progress, (unsigned)GPT_PROGRESS_COUNT)) {
         gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "progress rows", __LINE__);
     }
-    gd_progress_rowf(&report.progress, 0U, "train pending");
-    gd_progress_rowf(&report.progress, 1U, "train metrics pending");
-    gd_progress_rowf(&report.progress, 2U, "eval pending");
-    gd_progress_rowf(&report.progress, 3U, "checkpoint pending");
+    gd_progress_rowf(&report.progress, GPT_PROGRESS_TRAIN, "train pending");
+    gd_progress_rowf(&report.progress, GPT_PROGRESS_TRAIN_METRICS, "train metrics pending");
+    gd_progress_rowf(&report.progress, GPT_PROGRESS_EVAL, "eval pending");
+    gd_progress_rowf(&report.progress, GPT_PROGRESS_CHECKPOINT, "checkpoint pending");
     gpt_report_summary(&report);
     memset(&generation_tokenizer, 0, sizeof(generation_tokenizer));
     if (config->generate_every_n_steps > 0) {
         gpt_generation_tokenizer_init(ctx, config, &generation_tokenizer);
         generation_tokenizer_ptr = &generation_tokenizer;
     }
+    runner = (gpt_train_epoch_runner){
+        .model = model,
+        .optimizer = optimizer,
+        .scaler = scaler,
+        .lr_config = lr_config,
+        .config = config,
+        .generation_tokenizer = generation_tokenizer_ptr,
+        .report = &report,
+        .metrics = metrics,
+        .total_steps = total_steps,
+        .last_report_time = &last_report_time,
+        .last_report_step = &last_report_step,
+        .global_step = &global_step,
+    };
+    gpt_resume_start_position(resume_state, steps_per_epoch, &start_epoch, &start_epoch_step);
 
     if (resume_state != NULL && resume_state->loaded) {
-        printf("resume_training: next_epoch=%zu/%d global_step=%zu best_val_loss=%.6f epochs_without_improvement=%zu\n",
+        printf("resume_training: next_epoch=%zu/%d next_epoch_step=%zu/%zu global_step=%zu best_val_loss=%.6f epochs_without_improvement=%zu\n",
                start_epoch,
                config->epochs,
+               start_epoch_step,
+               steps_per_epoch,
                global_step,
                (double)best_val_loss,
                epochs_without_improvement);
     }
     for (epoch = start_epoch; epoch <= (size_t)config->epochs; ++epoch) {
-        gd_sampler *sampler = NULL;
-        gd_dataloader *loader = NULL;
-        size_t epoch_step;
+        const size_t epoch_first_step = epoch == start_epoch ? start_epoch_step : 1U;
+        size_t epoch_step = epoch_first_step;
         gd_module_set_training(&model->mod, true);
-        if (config->overfit_num_samples == 0U) {
-            TRY(ctx, gd_sampler_create_random(dataset,
-                                              config->seed ^ UINT64_C(0x51504c) ^ (uint64_t)epoch,
-                                              &sampler));
-            TRY(ctx, create_gdds_loader(ctx, dataset, sampler, config->batch_size, &loader));
+        if (config->local_shard_cache_dir != NULL && config->overfit_num_samples == 0U &&
+            train_shards != NULL && train_shards->count > 0U) {
+            size_t shard_index;
+            size_t shard_epoch_step_base = 1U;
+            for (shard_index = 0U; shard_index < train_shards->count; ++shard_index) {
+                const gpt_gdds_shard_ref *shard = &train_shards->items[shard_index];
+                const size_t shard_steps = (size_t)(shard->samples / (uint64_t)config->batch_size);
+                const size_t shard_first_step = shard_epoch_step_base;
+                const size_t shard_last_step = shard_steps > 0U ? shard_first_step + shard_steps - 1U : shard_first_step;
+                char *cached_path;
+                gd_dataset *shard_dataset = NULL;
+                gd_sampler *sampler = NULL;
+                gd_dataloader *loader = NULL;
+                gpt_lm_compact_transform shard_transform;
+                size_t local_first_step;
+                size_t local_step;
+                if (shard_steps == 0U) {
+                    continue;
+                }
+                if (shard_last_step < epoch_first_step) {
+                    shard_epoch_step_base += shard_steps;
+                    continue;
+                }
+                local_first_step = epoch_first_step > shard_first_step ?
+                                       epoch_first_step - shard_first_step + 1U :
+                                       1U;
+                memset(&shard_transform, 0, sizeof(shard_transform));
+                cached_path = gpt_copy_shard_to_local_cache(ctx, shard->path, shard->bytes, config);
+                TRY(ctx, gpt_lm_open_gdds_file(ctx,
+                                               cached_path,
+                                               special_ids,
+                                               &shard_transform,
+                                               &shard_dataset));
+                TRY(ctx, gd_sampler_create_random(shard_dataset,
+                                                  config->seed ^ GPT_TRAIN_SHUFFLE_SEED_BASE ^
+                                                      (uint64_t)epoch ^
+                                                      (uint64_t)(shard_index + 1U) * GPT_TRAIN_SHARD_SEED_STRIDE,
+                                                  &sampler));
+                TRY(ctx, create_gdds_loader(ctx, shard_dataset, sampler, config->batch_size, &loader));
+                if (local_first_step > 1U) {
+                    gpt_skip_loader_batches(ctx, loader, local_first_step - 1U);
+                }
+                for (local_step = local_first_step; local_step <= shard_steps; ++local_step) {
+                    gpt_train_epoch_step(ctx,
+                                         &runner,
+                                         loader,
+                                         epoch,
+                                         &epoch_step,
+                                         steps_per_epoch,
+                                         epochs_without_improvement,
+                                         best_val_loss);
+                }
+                gd_dataloader_destroy(loader);
+                gd_sampler_destroy(sampler);
+                gd_dataset_destroy(shard_dataset);
+                if (!config->keep_shard_cache && strcmp(cached_path, shard->path) != 0) {
+                    (void)remove(cached_path);
+                }
+                free(cached_path);
+                shard_epoch_step_base += shard_steps;
+            }
+            if (epoch_step != steps_per_epoch + 1U) {
+                gpt_fail_status(ctx, GD_ERR_BAD_STATE, "cached shard epoch step mismatch", __LINE__);
+            }
         } else {
-            TRY(ctx, create_gdds_loader(ctx, dataset, NULL, config->batch_size, &loader));
+            gd_sampler *sampler = NULL;
+            gd_dataloader *loader = NULL;
+            if (config->overfit_num_samples == 0U) {
+                const uint64_t shuffle_seed = config->seed ^ GPT_TRAIN_SHUFFLE_SEED_BASE ^ (uint64_t)epoch;
+                if (config->shuffle_scope == GPT_SHUFFLE_GLOBAL) {
+                    TRY(ctx, gd_sampler_create_random(dataset, shuffle_seed, &sampler));
+                } else if (config->shuffle_scope == GPT_SHUFFLE_SHARD) {
+                    TRY(ctx, gd_sampler_create_gdds_shard_random(dataset, shuffle_seed, &sampler));
+                }
+                TRY(ctx, create_gdds_loader(ctx, dataset, sampler, config->batch_size, &loader));
+            } else {
+                TRY(ctx, create_gdds_loader(ctx, dataset, NULL, config->batch_size, &loader));
+            }
+            if (epoch_first_step > 1U) {
+                gpt_skip_loader_batches(ctx, loader, epoch_first_step - 1U);
+            }
+            for (; epoch_step <= steps_per_epoch;) {
+                gpt_train_epoch_step(ctx,
+                                     &runner,
+                                     loader,
+                                     epoch,
+                                     &epoch_step,
+                                     steps_per_epoch,
+                                     epochs_without_improvement,
+                                     best_val_loss);
+            }
+            gd_dataloader_destroy(loader);
+            gd_sampler_destroy(sampler);
         }
-        for (epoch_step = 1U; epoch_step <= steps_per_epoch; ++epoch_step) {
-            train_one_batch(ctx,
-                            model,
-                            loader,
-                            optimizer,
-                            scaler,
-                            lr_config,
-                            config,
-                            generation_tokenizer_ptr,
-                            &report,
-                            metrics,
-                            global_step,
-                            total_steps,
-                            epoch,
-                            epoch_step,
-                            steps_per_epoch,
-                            &last_report_time,
-                            &last_report_step);
-            global_step += 1U;
-        }
-        gd_dataloader_destroy(loader);
-        gd_sampler_destroy(sampler);
         {
             bool validated = false;
             bool val_improved = false;
@@ -1990,6 +2793,7 @@ static void train_gpt(gd_context *ctx,
                                                           &report,
                                                           metrics,
                                                           epoch,
+                                                          steps_per_epoch,
                                                           global_step,
                                                           &best_val_loss,
                                                           &val_loss,
@@ -2014,7 +2818,7 @@ static void train_gpt(gd_context *ctx,
                 }
                 if (config->early_stopping_patience > 0) {
                     gd_progress_rowf(&report.progress,
-                                     2U,
+                                     GPT_PROGRESS_EVAL,
                                      "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=%zu/%d",
                                      epoch,
                                      global_step,
@@ -2025,7 +2829,7 @@ static void train_gpt(gd_context *ctx,
                                      config->early_stopping_patience);
                 } else {
                     gd_progress_rowf(&report.progress,
-                                     2U,
+                                     GPT_PROGRESS_EVAL,
                                      "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=off",
                                      epoch,
                                      global_step,
@@ -2036,13 +2840,15 @@ static void train_gpt(gd_context *ctx,
             } else if (val_dataset != NULL) {
                 const size_t next_eval_epoch = gpt_next_eval_epoch(config, epoch);
                 gd_progress_rowf(&report.progress,
-                                 2U,
+                                 GPT_PROGRESS_EVAL,
                                  "eval skipped epoch=%zu next_eval_epoch=%zu every=%d",
                                  epoch,
                                  next_eval_epoch,
                                  config->eval_every_n_epochs);
             } else {
-                gd_progress_rowf(&report.progress, 2U, "eval skipped no validation split loaded");
+                gd_progress_rowf(&report.progress,
+                                 GPT_PROGRESS_EVAL,
+                                 "eval skipped no validation split loaded");
             }
             if (config->save_latest) {
                 const float checkpoint_val_loss = validated ?
@@ -2053,65 +2859,54 @@ static void train_gpt(gd_context *ctx,
                                                    (config->save_best ? "saved" : "improved save_best=off") :
                                                    "unchanged") :
                                               (val_dataset != NULL ? "deferred" : "skipped");
-                gd_progress_rowf(&report.progress,
-                                 3U,
-                                 "checkpoint best=%s latest=saving path=%s",
-                                 best_status,
-                                 config->latest_checkpoint_path);
-                gpt_report_summary(&report);
-                gd_progress_render(&report.progress);
-                gpt_save_checkpoint_bundle(ctx,
-                                           model,
-                                           optimizer,
-                                           scaler,
-                                           lr_config,
-                                           config,
-                                           config->latest_checkpoint_path,
-                                           NULL,
-                                           epoch,
-                                           global_step,
-                                           epochs_without_improvement,
-                                           checkpoint_val_loss,
-                                           best_val_loss);
-                gd_progress_rowf(&report.progress,
-                                 3U,
-                                 "checkpoint best=%s latest=saved path=%s",
-                                 best_status,
-                                 config->latest_checkpoint_path);
-                gpt_report_summary(&report);
-                gd_progress_render(&report.progress);
-                if (metrics != NULL) {
-                    const gd_metrics_field fields[] = {
-                        gd_metrics_string("kind", "latest"),
-                        gd_metrics_string("path", config->latest_checkpoint_path),
-                        gd_metrics_u64("epoch", (uint64_t)epoch),
-                        gd_metrics_u64("step", (uint64_t)global_step),
-                        gd_metrics_u64("epochs_without_improvement", (uint64_t)epochs_without_improvement),
-                        gd_metrics_f64("val_loss", (double)checkpoint_val_loss),
-                        gd_metrics_f64("best_val_loss", (double)best_val_loss),
-                    };
-                    (void)gd_metrics_logger_log_event(metrics, "checkpoint", fields, GD_ARRAY_LEN(fields));
-                }
+                gpt_report_rowf(ctx,
+                                &report,
+                                GPT_PROGRESS_CHECKPOINT,
+                                "checkpoint best=%s latest=saving path=%s",
+                                best_status,
+                                config->latest_checkpoint_path);
+                gpt_save_and_log_checkpoint(ctx,
+                                            model,
+                                            optimizer,
+                                            scaler,
+                                            lr_config,
+                                            config,
+                                            metrics,
+                                            GPT_CHECKPOINT_LATEST,
+                                            config->latest_checkpoint_path,
+                                            epoch,
+                                            steps_per_epoch,
+                                            global_step,
+                                            epochs_without_improvement,
+                                            checkpoint_val_loss,
+                                            best_val_loss);
+                gpt_report_rowf(ctx,
+                                &report,
+                                GPT_PROGRESS_CHECKPOINT,
+                                "checkpoint best=%s latest=saved path=%s",
+                                best_status,
+                                config->latest_checkpoint_path);
             } else {
                 const char *best_status = validated ?
                                               (val_improved ?
                                                    (config->save_best ? "saved" : "improved save_best=off") :
                                                    "unchanged") :
                                               (val_dataset != NULL ? "deferred" : "skipped");
-                gd_progress_rowf(&report.progress, 3U, "checkpoint best=%s latest=off", best_status);
-                gpt_report_summary(&report);
-                gd_progress_render(&report.progress);
+                gpt_report_rowf(ctx,
+                                &report,
+                                GPT_PROGRESS_CHECKPOINT,
+                                "checkpoint best=%s latest=off",
+                                best_status);
             }
             if (should_stop) {
-                gd_progress_rowf(&report.progress,
-                                 3U,
-                                 "early_stopping epoch=%zu step=%zu patience=%d best_val_loss=%.6f",
-                                 epoch,
-                                 global_step,
-                                 config->early_stopping_patience,
-                                 (double)best_val_loss);
-                gpt_report_summary(&report);
-                gd_progress_render(&report.progress);
+                gpt_report_rowf(ctx,
+                                &report,
+                                GPT_PROGRESS_CHECKPOINT,
+                                "early_stopping epoch=%zu step=%zu patience=%d best_val_loss=%.6f",
+                                epoch,
+                                global_step,
+                                config->early_stopping_patience,
+                                (double)best_val_loss);
                 if (metrics != NULL) {
                     const gd_metrics_field fields[] = {
                         gd_metrics_u64("epoch", (uint64_t)epoch),
@@ -2128,6 +2923,358 @@ static void train_gpt(gd_context *ctx,
     gd_progress_finish(&report.progress);
     gpt_generation_tokenizer_deinit(&generation_tokenizer);
     gd_progress_deinit(&report.progress);
+}
+
+static void gpt_start_metrics(gd_context *ctx,
+                              const gpt_config *config,
+                              gd_metrics_logger **out)
+{
+    if (config == NULL || out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "metrics init", __LINE__);
+    }
+    *out = NULL;
+    if (config->metrics_enabled) {
+        gd_metrics_config metrics_config = gd_metrics_config_default(config->metrics_project);
+        metrics_config.root_dir = config->metrics_dir;
+        metrics_config.run_id = config->metrics_run_id;
+        TRY(ctx, gd_metrics_logger_start(&metrics_config, out));
+        printf("metrics: path=%s project=%s run_id=%s\n",
+               gd_metrics_logger_path(*out),
+               gd_metrics_logger_project(*out),
+               gd_metrics_logger_run_id(*out));
+    } else {
+        printf("metrics: disabled\n");
+    }
+}
+
+static void gpt_open_training_data(gd_context *ctx,
+                                   gpt_config *config,
+                                   gpt_lm_special_ids *special_ids,
+                                   gpt_lm_compact_transform *train_transform,
+                                   gpt_lm_compact_transform *val_transform,
+                                   gd_dataset **dataset_out,
+                                   gd_dataset **val_dataset_out,
+                                   gpt_gdds_shard_list *train_shards,
+                                   size_t *dataset_samples_out,
+                                   size_t *dataset_tokens_out,
+                                   size_t *val_samples_out,
+                                   size_t *val_tokens_out,
+                                   size_t *samples_per_epoch_out,
+                                   size_t *steps_per_epoch_out,
+                                   size_t *total_steps_out)
+{
+    size_t dataset_samples = 0U;
+    size_t dataset_tokens = 0U;
+    size_t val_samples = 0U;
+    size_t val_tokens = 0U;
+    size_t samples_per_epoch = 0U;
+    size_t steps_per_epoch = 0U;
+    size_t total_steps = 0U;
+    if (config == NULL || special_ids == NULL || train_transform == NULL || val_transform == NULL ||
+        dataset_out == NULL || val_dataset_out == NULL || train_shards == NULL ||
+        dataset_samples_out == NULL || dataset_tokens_out == NULL || val_samples_out == NULL ||
+        val_tokens_out == NULL || samples_per_epoch_out == NULL || steps_per_epoch_out == NULL ||
+        total_steps_out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "training data outputs", __LINE__);
+    }
+    if (config->epochs <= 0) {
+        return;
+    }
+    TRY(ctx, gpt_lm_resolve_special_ids(ctx, config, special_ids));
+    if (special_ids->pad_id >= 0) {
+        config->pad_token_id = special_ids->pad_id;
+    }
+    TRY(ctx, gpt_lm_open_gdds_split(ctx, config, "train", special_ids, train_transform, dataset_out));
+    dataset_samples = (size_t)gd_dataset_num_samples(*dataset_out);
+    if (dataset_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "dataset token count overflow", __LINE__);
+    }
+    dataset_tokens = dataset_samples * (size_t)GPT_CONTEXT_LENGTH;
+    if (config->local_shard_cache_dir != NULL && config->overfit_num_samples == 0U) {
+        gpt_gdds_shard_list_from_dataset(ctx, *dataset_out, train_shards);
+        steps_per_epoch = gpt_shard_list_steps_per_epoch(train_shards, config, &samples_per_epoch);
+    } else {
+        steps_per_epoch = effective_steps_per_epoch((uint64_t)dataset_samples,
+                                                    config,
+                                                    &samples_per_epoch);
+    }
+    if (steps_per_epoch == 0U || (size_t)config->epochs > SIZE_MAX / steps_per_epoch) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
+    }
+    total_steps = (size_t)config->epochs * steps_per_epoch;
+    if (config->save_best || config->early_stopping_patience > 0) {
+        TRY(ctx, gpt_lm_open_gdds_split(ctx,
+                                        config,
+                                        config->val_split,
+                                        special_ids,
+                                        val_transform,
+                                        val_dataset_out));
+        val_samples = (size_t)gd_dataset_num_samples(*val_dataset_out);
+        if (val_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
+            gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "validation token count overflow", __LINE__);
+        }
+        val_tokens = val_samples * (size_t)GPT_CONTEXT_LENGTH;
+        if (val_samples == 0U) {
+            gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty validation split", __LINE__);
+        }
+    }
+    *dataset_samples_out = dataset_samples;
+    *dataset_tokens_out = dataset_tokens;
+    *val_samples_out = val_samples;
+    *val_tokens_out = val_tokens;
+    *samples_per_epoch_out = samples_per_epoch;
+    *steps_per_epoch_out = steps_per_epoch;
+    *total_steps_out = total_steps;
+}
+
+static void gpt_load_requested_checkpoint(gd_context *ctx,
+                                          gpt_lm *model,
+                                          const gpt_config *config)
+{
+    if (model == NULL || config == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "checkpoint load args", __LINE__);
+    }
+    if (config->load_checkpoint_path != NULL || config->resume_checkpoint_path != NULL) {
+        const char *load_path = config->resume_checkpoint_path != NULL ?
+                                    config->resume_checkpoint_path :
+                                    config->load_checkpoint_path;
+        gd_module_load_options load_options;
+        load_options.strict = true;
+        load_options.load_buffers = true;
+        TRY(ctx, gd_module_load_state(ctx, &model->mod, load_path, &load_options));
+        printf("loaded_checkpoint: %s%s\n",
+               load_path,
+               config->resume_checkpoint_path != NULL ? " (resume)" : "");
+    }
+}
+
+static void gpt_create_training_optimizer(gd_context *ctx,
+                                          const gpt_config *config,
+                                          const gd_param_set *params,
+                                          gd_optimizer **optimizer_out,
+                                          gd_amp_scaler **scaler_out)
+{
+    if (config == NULL || params == NULL || optimizer_out == NULL || scaler_out == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "optimizer init", __LINE__);
+    }
+    if (config->epochs <= 0) {
+        return;
+    }
+    {
+        const gd_adamw_config adam = gpt_adamw_config(config->lr_max, config->weight_decay);
+        const gd_amp_config amp = gpt_amp_config();
+        TRY(ctx, gd_adamw_create(ctx, params, &adam, optimizer_out));
+        TRY(ctx, gd_amp_scaler_create(ctx, &amp, scaler_out));
+    }
+}
+
+static gd_lr_scheduler_config gpt_lr_scheduler_config(const gpt_config *config, size_t total_steps)
+{
+    gd_lr_scheduler_config lr_config = gd_lr_scheduler_config_default();
+    lr_config.max_lr = config->lr_max;
+    lr_config.min_lr = config->lr_min;
+    lr_config.total_steps = (uint64_t)total_steps;
+    if (config->lr_warmup_steps >= 0) {
+        lr_config.warmup_steps = (uint64_t)config->lr_warmup_steps;
+    } else {
+        lr_config.warmup_steps = (uint64_t)(total_steps / 10U);
+    }
+    return lr_config;
+}
+
+static void gpt_resume_training_checkpoint(gd_context *ctx,
+                                           const gpt_config *config,
+                                           gd_optimizer *optimizer,
+                                           gd_amp_scaler *scaler,
+                                           gd_lr_scheduler_config *lr_config,
+                                           gpt_training_state *resume_state)
+{
+    char *optimizer_path;
+    char *train_state_path;
+    if (config == NULL || lr_config == NULL || resume_state == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "resume checkpoint args", __LINE__);
+    }
+    if (config->resume_checkpoint_path == NULL || config->epochs <= 0) {
+        return;
+    }
+    if (optimizer == NULL || scaler == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "resume optimizer state", __LINE__);
+    }
+    optimizer_path = gpt_checkpoint_sidecar_path(config->resume_checkpoint_path, ".optim.gdckpt");
+    train_state_path = gpt_checkpoint_sidecar_path(config->resume_checkpoint_path, ".train");
+    if (optimizer_path == NULL || train_state_path == NULL) {
+        free(optimizer_path);
+        free(train_state_path);
+        gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "resume sidecar path", __LINE__);
+    }
+    TRY(ctx, gd_optimizer_load_state(ctx, optimizer, optimizer_path, true));
+    printf("loaded_optimizer_state: %s\n", optimizer_path);
+    gpt_load_training_state(ctx, train_state_path, scaler, lr_config, resume_state);
+    free(optimizer_path);
+    free(train_state_path);
+}
+
+static void gpt_log_run_config_metrics(gd_metrics_logger *metrics,
+                                       const gpt_config *config,
+                                       const gd_memory_config *mem,
+                                       size_t dataset_samples,
+                                       size_t dataset_tokens,
+                                       size_t val_samples,
+                                       size_t val_tokens,
+                                       size_t steps_per_epoch,
+                                       size_t samples_per_epoch,
+                                       size_t total_steps,
+                                       uint64_t total_params,
+                                       uint64_t trainable_params,
+                                       uint64_t param_bytes)
+{
+    if (metrics == NULL) {
+        return;
+    }
+    {
+        const gd_metrics_field fields[] = {
+            gd_metrics_string("data_dir", config->data_dir),
+            gd_metrics_string("tokenizer_path", config->tokenizer_path),
+            gd_metrics_string("checkpoint_path", config->checkpoint_path),
+            gd_metrics_string("latest_checkpoint_path", config->latest_checkpoint_path),
+            gd_metrics_string("load_checkpoint_path", config->load_checkpoint_path),
+            gd_metrics_string("resume_checkpoint_path", config->resume_checkpoint_path),
+            gd_metrics_string("val_split", config->val_split),
+            gd_metrics_i64("epochs", (int64_t)config->epochs),
+            gd_metrics_i64("batch_size", (int64_t)config->batch_size),
+            gd_metrics_i64("layers", (int64_t)config->n_layers),
+            gd_metrics_string("architecture", gpt_architecture_name(config->architecture)),
+            gd_metrics_string("shuffle_scope", gpt_shuffle_scope_name(config->shuffle_scope)),
+            gd_metrics_i64("minimax_m3_block_size", (int64_t)GPT_MINIMAX_M3_BLOCK_SIZE),
+            gd_metrics_i64("minimax_m3_topk_blocks", (int64_t)config->minimax_m3_topk_blocks),
+            gd_metrics_i64("minimax_m3_init_blocks", (int64_t)config->minimax_m3_init_blocks),
+            gd_metrics_i64("minimax_m3_local_blocks", (int64_t)config->minimax_m3_local_blocks),
+            gd_metrics_i64("context_length", (int64_t)GPT_CONTEXT_LENGTH),
+            gd_metrics_i64("vocab_size", (int64_t)GPT_VOCAB_SIZE),
+            gd_metrics_i64("d_model", (int64_t)GPT_D_MODEL),
+            gd_metrics_i64("heads", (int64_t)GPT_N_HEADS),
+            gd_metrics_i64("head_dim", (int64_t)GPT_HEAD_DIM),
+            gd_metrics_i64("mlp_hidden", (int64_t)GPT_MLP_HIDDEN),
+            gd_metrics_i64("report_every", (int64_t)config->report_every),
+            gd_metrics_i64("eval_every_n_epochs", (int64_t)config->eval_every_n_epochs),
+            gd_metrics_i64("early_stopping_patience", (int64_t)config->early_stopping_patience),
+            gd_metrics_i64("warmup_steps", (int64_t)config->lr_warmup_steps),
+            gd_metrics_u64("latest_every_n_steps", (uint64_t)config->latest_every_n_steps),
+            gd_metrics_u64("seed", config->seed),
+            gd_metrics_f64("dropout", (double)config->dropout_p),
+            gd_metrics_f64("lr_max", (double)config->lr_max),
+            gd_metrics_f64("lr_min", (double)config->lr_min),
+            gd_metrics_f64("weight_decay", (double)config->weight_decay),
+            gd_metrics_f64("grad_clip_norm", (double)config->grad_clip_norm),
+            gd_metrics_u64("dataset_samples", (uint64_t)dataset_samples),
+            gd_metrics_u64("dataset_tokens", (uint64_t)dataset_tokens),
+            gd_metrics_u64("val_samples", (uint64_t)val_samples),
+            gd_metrics_u64("val_tokens", (uint64_t)val_tokens),
+            gd_metrics_u64("steps_per_epoch", (uint64_t)steps_per_epoch),
+            gd_metrics_u64("samples_per_epoch", (uint64_t)samples_per_epoch),
+            gd_metrics_u64("total_steps", (uint64_t)total_steps),
+            gd_metrics_u64("total_params", total_params),
+            gd_metrics_u64("trainable_params", trainable_params),
+            gd_metrics_u64("param_bytes", param_bytes),
+            gd_metrics_u64("memory_params_bytes", (uint64_t)mem->params_bytes),
+            gd_metrics_u64("memory_state_bytes", (uint64_t)mem->state_bytes),
+            gd_metrics_u64("memory_scratch_slot_bytes", (uint64_t)mem->scratch_slot_bytes),
+            gd_metrics_u64("memory_data_slot_bytes", (uint64_t)mem->data_slot_bytes),
+            gd_metrics_bool("save_best", config->save_best),
+            gd_metrics_bool("save_latest", config->save_latest),
+        };
+        (void)gd_metrics_logger_log_event(metrics, "run_config", fields, GD_ARRAY_LEN(fields));
+    }
+}
+
+static void gpt_print_startup_summary(const gpt_config *config,
+                                      const gd_memory_config *mem,
+                                      const gd_lr_scheduler_config *lr_config,
+                                      gd_amp_scaler *scaler,
+                                      const gpt_gdds_shard_list *train_shards,
+                                      size_t dataset_samples,
+                                      size_t dataset_tokens,
+                                      size_t val_samples,
+                                      size_t val_tokens,
+                                      size_t steps_per_epoch,
+                                      size_t samples_per_epoch,
+                                      size_t total_steps)
+{
+    printf("dataset: dir=%s samples=%zu train_tokens=%zu val_samples=%zu val_tokens=%zu batch=%d context=%d shuffle=%s steps_per_epoch=%zu samples_per_epoch=%zu epochs=%d total_steps=%zu%s\n",
+           config->data_dir,
+           dataset_samples,
+           dataset_tokens,
+           val_samples,
+           val_tokens,
+           config->batch_size,
+           GPT_CONTEXT_LENGTH,
+           gpt_shuffle_scope_name(config->shuffle_scope),
+           steps_per_epoch,
+           samples_per_epoch,
+           config->epochs,
+           total_steps,
+           config->overfit_num_samples > 0U ? " overfit" : "");
+    if (config->overfit_num_samples > 0U && samples_per_epoch != (size_t)config->overfit_num_samples) {
+        printf("overfit: requested=%llu using=%zu full-batch samples\n",
+               (unsigned long long)config->overfit_num_samples,
+               samples_per_epoch);
+    }
+    if (config->local_shard_cache_dir != NULL) {
+        printf("shard_cache: dir=%s shards=%zu keep=%s\n",
+               config->local_shard_cache_dir,
+               train_shards != NULL ? train_shards->count : 0U,
+               config->keep_shard_cache ? "yes" : "no");
+    }
+    printf("model: arch=%s vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d ffn=swiglu sdpa_window=%d minimax=(block=%d topk=%d init=%d local=%d) dropout=%.3f logits_softcap=%.3f\n",
+           gpt_architecture_name(config->architecture),
+           GPT_VOCAB_SIZE,
+           GPT_D_MODEL,
+           config->n_layers,
+           GPT_N_HEADS,
+           GPT_HEAD_DIM,
+           GPT_MLP_HIDDEN,
+           GPT_SDPA_WINDOW,
+           GPT_MINIMAX_M3_BLOCK_SIZE,
+           config->minimax_m3_topk_blocks,
+           config->minimax_m3_init_blocks,
+           config->minimax_m3_local_blocks,
+           (double)config->dropout_p,
+           (double)config->logits_softcap);
+    if (config->generate_prompt != NULL || config->generate_every_n_steps > 0) {
+        printf("generation: max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f every_n_steps=%d batched_vowels=%s\n",
+               config->max_new_tokens,
+               (double)config->temperature,
+               (double)config->min_p,
+               (double)config->repetition_penalty,
+               (double)config->logits_softcap,
+               config->generate_every_n_steps,
+               config->generate_every_n_steps > 0 ? "yes" : "no");
+    }
+    if (config->epochs > 0) {
+        printf("checkpoint: save_best=%s path=%s save_latest=%s latest_path=%s val_split=%s eval_every_n_epochs=%d early_stopping_patience=%d\n",
+               config->save_best ? "yes" : "no",
+               config->checkpoint_path,
+               config->save_latest ? "yes" : "no",
+               config->latest_checkpoint_path,
+               config->val_split,
+               config->eval_every_n_epochs,
+               config->early_stopping_patience);
+        printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g grad_clip=%.4g amp_scale=%.1f\n",
+               (double)lr_config->max_lr,
+               (double)lr_config->min_lr,
+               (unsigned long long)lr_config->warmup_steps,
+               (unsigned long long)lr_config->total_steps,
+               (double)config->weight_decay,
+               (double)config->grad_clip_norm,
+               (double)gd_amp_scaler_scale(scaler));
+    } else {
+        printf("optim: skipped (generation-only run)\n");
+    }
+    printf("memory: params=%zuMB state=%zuMB scratch_slot=%zuMB data_slot=%zuMB\n",
+           mem->params_bytes / (1024U * 1024U),
+           mem->state_bytes / (1024U * 1024U),
+           mem->scratch_slot_bytes / (1024U * 1024U),
+           mem->data_slot_bytes / (1024U * 1024U));
 }
 
 
@@ -2147,6 +3294,7 @@ int main(int argc, char **argv)
     gd_lr_scheduler_config lr_config;
     gpt_training_state resume_state;
     gpt_lm_special_ids special_ids;
+    gpt_gdds_shard_list train_shards;
     gpt_lm_compact_transform train_transform;
     gpt_lm_compact_transform val_transform;
     size_t dataset_samples = 0U;
@@ -2167,6 +3315,7 @@ int main(int argc, char **argv)
     memset(&lr_config, 0, sizeof(lr_config));
     memset(&resume_state, 0, sizeof(resume_state));
     memset(&special_ids, 0, sizeof(special_ids));
+    memset(&train_shards, 0, sizeof(train_shards));
     memset(&train_transform, 0, sizeof(train_transform));
     memset(&val_transform, 0, sizeof(val_transform));
 
@@ -2181,61 +3330,25 @@ int main(int argc, char **argv)
         gpt_fail_status(ctx, GD_ERR_BAD_STATE, "invalid GPT head config", __LINE__);
     }
 
-    if (config.metrics_enabled) {
-        gd_metrics_config metrics_config = gd_metrics_config_default(config.metrics_project);
-        metrics_config.root_dir = config.metrics_dir;
-        metrics_config.run_id = config.metrics_run_id;
-        TRY(ctx, gd_metrics_logger_start(&metrics_config, &metrics));
-        printf("metrics: path=%s project=%s run_id=%s\n",
-               gd_metrics_logger_path(metrics),
-               gd_metrics_logger_project(metrics),
-               gd_metrics_logger_run_id(metrics));
-    } else {
-        printf("metrics: disabled\n");
-    }
-
-    if (config.epochs > 0) {
-        TRY(ctx, gpt_lm_resolve_special_ids(ctx, &config, &special_ids));
-        if (special_ids.pad_id >= 0) {
-            config.pad_token_id = special_ids.pad_id;
-        }
-        TRY(ctx, gpt_lm_open_gdds_split(ctx, &config, "train", &special_ids, &train_transform, &dataset));
-        dataset_samples = (size_t)gd_dataset_num_samples(dataset);
-        if (dataset_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
-            gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "dataset token count overflow", __LINE__);
-        }
-        dataset_tokens = dataset_samples * (size_t)GPT_CONTEXT_LENGTH;
-        steps_per_epoch = effective_steps_per_epoch((uint64_t)dataset_samples, &config, &samples_per_epoch);
-        if (steps_per_epoch == 0U || (size_t)config.epochs > SIZE_MAX / steps_per_epoch) {
-            gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "dataset too small for requested batch size", __LINE__);
-        }
-        total_steps = (size_t)config.epochs * steps_per_epoch;
-        if (config.save_best || config.early_stopping_patience > 0) {
-            TRY(ctx, gpt_lm_open_gdds_split(ctx, &config, config.val_split, &special_ids, &val_transform, &val_dataset));
-            val_samples = (size_t)gd_dataset_num_samples(val_dataset);
-            if (val_samples > SIZE_MAX / (size_t)GPT_CONTEXT_LENGTH) {
-                gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "validation token count overflow", __LINE__);
-            }
-            val_tokens = val_samples * (size_t)GPT_CONTEXT_LENGTH;
-            if (val_samples == 0U) {
-                gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "empty validation split", __LINE__);
-            }
-        }
-    }
+    gpt_start_metrics(ctx, &config, &metrics);
+    gpt_open_training_data(ctx,
+                           &config,
+                           &special_ids,
+                           &train_transform,
+                           &val_transform,
+                           &dataset,
+                           &val_dataset,
+                           &train_shards,
+                           &dataset_samples,
+                           &dataset_tokens,
+                           &val_samples,
+                           &val_tokens,
+                           &samples_per_epoch,
+                           &steps_per_epoch,
+                           &total_steps);
 
     gpt_lm_init(ctx, &model, &config);
-    if (config.load_checkpoint_path != NULL || config.resume_checkpoint_path != NULL) {
-        const char *load_path = config.resume_checkpoint_path != NULL ?
-                                    config.resume_checkpoint_path :
-                                    config.load_checkpoint_path;
-        gd_module_load_options load_options;
-        load_options.strict = true;
-        load_options.load_buffers = true;
-        TRY(ctx, gd_module_load_state(ctx, &model.mod, load_path, &load_options));
-        printf("loaded_checkpoint: %s%s\n",
-               load_path,
-               config.resume_checkpoint_path != NULL ? " (resume)" : "");
-    }
+    gpt_load_requested_checkpoint(ctx, &model, &config);
     {
         const gd_param_group groups[] = {
             gd_param_group_build("no_decay_norm", "gpt_lm.*norm_w", 1.0f, 0.0f, true),
@@ -2252,160 +3365,37 @@ int main(int argc, char **argv)
            (double)trainable_params / 1000000.0,
            (double)param_bytes / (1024.0 * 1024.0));
     print_param_set(&params);
-    if (config.epochs > 0) {
-        const gd_adamw_config adam = gpt_adamw_config(config.lr_max, config.weight_decay);
-        const gd_amp_config amp = gpt_amp_config();
-        TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
-        TRY(ctx, gd_amp_scaler_create(ctx, &amp, &scaler));
-    }
-
-    lr_config = gd_lr_scheduler_config_default();
-    lr_config.max_lr = config.lr_max;
-    lr_config.min_lr = config.lr_min;
-    lr_config.total_steps = (uint64_t)total_steps;
-    if (config.lr_warmup_steps >= 0) {
-        lr_config.warmup_steps = (uint64_t)config.lr_warmup_steps;
-    } else {
-        lr_config.warmup_steps = (uint64_t)(total_steps / 10U);
-    }
-
-    if (config.resume_checkpoint_path != NULL && config.epochs > 0) {
-        char *optimizer_path = gpt_checkpoint_sidecar_path(config.resume_checkpoint_path, ".optim.gdckpt");
-        char *train_state_path = gpt_checkpoint_sidecar_path(config.resume_checkpoint_path, ".train");
-        if (optimizer_path == NULL || train_state_path == NULL) {
-            free(optimizer_path);
-            free(train_state_path);
-            gpt_fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "resume sidecar path", __LINE__);
-        }
-        TRY(ctx, gd_optimizer_load_state(ctx, optimizer, optimizer_path, true));
-        printf("loaded_optimizer_state: %s\n", optimizer_path);
-        gpt_load_training_state(ctx, train_state_path, scaler, &lr_config, &resume_state);
-        free(optimizer_path);
-        free(train_state_path);
-    }
+    gpt_create_training_optimizer(ctx, &config, &params, &optimizer, &scaler);
+    lr_config = gpt_lr_scheduler_config(&config, total_steps);
+    gpt_resume_training_checkpoint(ctx, &config, optimizer, scaler, &lr_config, &resume_state);
 
     TRY(ctx, gd_context_seal_params(ctx));
 
-    printf("dataset: dir=%s samples=%zu train_tokens=%zu val_samples=%zu val_tokens=%zu batch=%d context=%d steps_per_epoch=%zu samples_per_epoch=%zu epochs=%d total_steps=%zu%s\n",
-           config.data_dir,
-           dataset_samples,
-           dataset_tokens,
-           val_samples,
-           val_tokens,
-           config.batch_size,
-           GPT_CONTEXT_LENGTH,
-           steps_per_epoch,
-           samples_per_epoch,
-           config.epochs,
-           total_steps,
-           config.overfit_num_samples > 0U ? " overfit" : "");
-    if (config.overfit_num_samples > 0U && samples_per_epoch != (size_t)config.overfit_num_samples) {
-        printf("overfit: requested=%llu using=%zu full-batch samples\n",
-               (unsigned long long)config.overfit_num_samples,
-               samples_per_epoch);
-    }
-    printf("model: arch=%s vocab=%d d_model=%d layers=%d heads=%d head_dim=%d mlp_hidden=%d ffn=swiglu sdpa_window=%d minimax=(block=%d topk=%d init=%d local=%d) dropout=%.3f logits_softcap=%.3f\n",
-           gpt_architecture_name(config.architecture),
-           GPT_VOCAB_SIZE,
-           GPT_D_MODEL,
-           config.n_layers,
-           GPT_N_HEADS,
-           GPT_HEAD_DIM,
-           GPT_MLP_HIDDEN,
-           GPT_SDPA_WINDOW,
-           GPT_MINIMAX_M3_BLOCK_SIZE,
-           config.minimax_m3_topk_blocks,
-           config.minimax_m3_init_blocks,
-           config.minimax_m3_local_blocks,
-           (double)config.dropout_p,
-           (double)config.logits_softcap);
-    if (config.generate_prompt != NULL || config.generate_every_n_steps > 0) {
-        printf("generation: max_new_tokens=%d temperature=%.3f min_p=%.3f repetition_penalty=%.3f logits_softcap=%.3f every_n_steps=%d batched_vowels=%s\n",
-               config.max_new_tokens,
-               (double)config.temperature,
-               (double)config.min_p,
-               (double)config.repetition_penalty,
-               (double)config.logits_softcap,
-               config.generate_every_n_steps,
-               config.generate_every_n_steps > 0 ? "yes" : "no");
-    }
-    if (config.epochs > 0) {
-        printf("checkpoint: save_best=%s path=%s save_latest=%s latest_path=%s val_split=%s eval_every_n_epochs=%d early_stopping_patience=%d\n",
-               config.save_best ? "yes" : "no",
-               config.checkpoint_path,
-               config.save_latest ? "yes" : "no",
-               config.latest_checkpoint_path,
-               config.val_split,
-               config.eval_every_n_epochs,
-               config.early_stopping_patience);
-        printf("optim: adamw lr_max=%.6g lr_min=%.6g warmup=%llu total=%llu weight_decay=%.4g grad_clip=%.4g amp_scale=%.1f\n",
-               (double)lr_config.max_lr,
-               (double)lr_config.min_lr,
-               (unsigned long long)lr_config.warmup_steps,
-               (unsigned long long)lr_config.total_steps,
-               (double)config.weight_decay,
-               (double)config.grad_clip_norm,
-               (double)gd_amp_scaler_scale(scaler));
-    } else {
-        printf("optim: skipped (generation-only run)\n");
-    }
-    printf("memory: params=%zuMB state=%zuMB scratch_slot=%zuMB data_slot=%zuMB\n",
-           mem.params_bytes / (1024U * 1024U),
-           mem.state_bytes / (1024U * 1024U),
-           mem.scratch_slot_bytes / (1024U * 1024U),
-           mem.data_slot_bytes / (1024U * 1024U));
-    if (metrics != NULL) {
-        const gd_metrics_field fields[] = {
-            gd_metrics_string("data_dir", config.data_dir),
-            gd_metrics_string("tokenizer_path", config.tokenizer_path),
-            gd_metrics_string("checkpoint_path", config.checkpoint_path),
-            gd_metrics_string("latest_checkpoint_path", config.latest_checkpoint_path),
-            gd_metrics_string("load_checkpoint_path", config.load_checkpoint_path),
-            gd_metrics_string("resume_checkpoint_path", config.resume_checkpoint_path),
-            gd_metrics_string("val_split", config.val_split),
-            gd_metrics_i64("epochs", (int64_t)config.epochs),
-            gd_metrics_i64("batch_size", (int64_t)config.batch_size),
-            gd_metrics_i64("layers", (int64_t)config.n_layers),
-            gd_metrics_string("architecture", gpt_architecture_name(config.architecture)),
-            gd_metrics_i64("minimax_m3_block_size", (int64_t)GPT_MINIMAX_M3_BLOCK_SIZE),
-            gd_metrics_i64("minimax_m3_topk_blocks", (int64_t)config.minimax_m3_topk_blocks),
-            gd_metrics_i64("minimax_m3_init_blocks", (int64_t)config.minimax_m3_init_blocks),
-            gd_metrics_i64("minimax_m3_local_blocks", (int64_t)config.minimax_m3_local_blocks),
-            gd_metrics_i64("context_length", (int64_t)GPT_CONTEXT_LENGTH),
-            gd_metrics_i64("vocab_size", (int64_t)GPT_VOCAB_SIZE),
-            gd_metrics_i64("d_model", (int64_t)GPT_D_MODEL),
-            gd_metrics_i64("heads", (int64_t)GPT_N_HEADS),
-            gd_metrics_i64("head_dim", (int64_t)GPT_HEAD_DIM),
-            gd_metrics_i64("mlp_hidden", (int64_t)GPT_MLP_HIDDEN),
-            gd_metrics_i64("report_every", (int64_t)config.report_every),
-            gd_metrics_i64("eval_every_n_epochs", (int64_t)config.eval_every_n_epochs),
-            gd_metrics_i64("early_stopping_patience", (int64_t)config.early_stopping_patience),
-            gd_metrics_i64("warmup_steps", (int64_t)config.lr_warmup_steps),
-            gd_metrics_u64("seed", config.seed),
-            gd_metrics_f64("dropout", (double)config.dropout_p),
-            gd_metrics_f64("lr_max", (double)config.lr_max),
-            gd_metrics_f64("lr_min", (double)config.lr_min),
-            gd_metrics_f64("weight_decay", (double)config.weight_decay),
-            gd_metrics_f64("grad_clip_norm", (double)config.grad_clip_norm),
-            gd_metrics_u64("dataset_samples", (uint64_t)dataset_samples),
-            gd_metrics_u64("dataset_tokens", (uint64_t)dataset_tokens),
-            gd_metrics_u64("val_samples", (uint64_t)val_samples),
-            gd_metrics_u64("val_tokens", (uint64_t)val_tokens),
-            gd_metrics_u64("steps_per_epoch", (uint64_t)steps_per_epoch),
-            gd_metrics_u64("samples_per_epoch", (uint64_t)samples_per_epoch),
-            gd_metrics_u64("total_steps", (uint64_t)total_steps),
-            gd_metrics_u64("total_params", total_params),
-            gd_metrics_u64("trainable_params", trainable_params),
-            gd_metrics_u64("param_bytes", param_bytes),
-            gd_metrics_u64("memory_params_bytes", (uint64_t)mem.params_bytes),
-            gd_metrics_u64("memory_state_bytes", (uint64_t)mem.state_bytes),
-            gd_metrics_u64("memory_scratch_slot_bytes", (uint64_t)mem.scratch_slot_bytes),
-            gd_metrics_u64("memory_data_slot_bytes", (uint64_t)mem.data_slot_bytes),
-            gd_metrics_bool("save_best", config.save_best),
-            gd_metrics_bool("save_latest", config.save_latest),
-        };
-        (void)gd_metrics_logger_log_event(metrics, "run_config", fields, GD_ARRAY_LEN(fields));
-    }
+    gpt_print_startup_summary(&config,
+                              &mem,
+                              &lr_config,
+                              scaler,
+                              &train_shards,
+                              dataset_samples,
+                              dataset_tokens,
+                              val_samples,
+                              val_tokens,
+                              steps_per_epoch,
+                              samples_per_epoch,
+                              total_steps);
+    gpt_log_run_config_metrics(metrics,
+                               &config,
+                               &mem,
+                               dataset_samples,
+                               dataset_tokens,
+                               val_samples,
+                               val_tokens,
+                               steps_per_epoch,
+                               samples_per_epoch,
+                               total_steps,
+                               total_params,
+                               trainable_params,
+                               param_bytes);
 
     if (config.epochs > 0) {
         train_gpt(ctx,
@@ -2416,6 +3406,8 @@ int main(int argc, char **argv)
                   scaler,
                   &lr_config,
                   &config,
+                  &special_ids,
+                  &train_shards,
                   &resume_state,
                   metrics,
                   steps_per_epoch,
@@ -2462,6 +3454,7 @@ int main(int argc, char **argv)
     gd_optimizer_destroy(optimizer);
     gd_param_set_free(&params);
     gpt_lm_deinit(&model);
+    gpt_gdds_shard_list_deinit(&train_shards);
     gd_dataset_destroy(val_dataset);
     gd_dataset_destroy(dataset);
     gd_context_destroy(ctx);

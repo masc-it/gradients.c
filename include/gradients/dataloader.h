@@ -25,6 +25,12 @@ typedef struct gd_sampler gd_sampler;
 gd_status gd_sampler_create_random(const gd_dataset *dataset,
                                    uint64_t seed,
                                    gd_sampler **out);
+/* Randomize samples independently within each GDDS shard while keeping shard
+   order fixed. This improves locality versus global random sampling for
+   mmap-backed datasets on seek-sensitive storage. */
+gd_status gd_sampler_create_gdds_shard_random(const gd_dataset *dataset,
+                                              uint64_t seed,
+                                              gd_sampler **out);
 void gd_sampler_destroy(gd_sampler *sampler);
 
 typedef enum gd_batch_state {

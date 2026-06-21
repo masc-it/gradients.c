@@ -62,12 +62,16 @@ typedef struct gd_dataloader_fill_stats {
 
 typedef enum gd_sampler_kind {
     GD_SAMPLER_KIND_RANDOM = 1,
+    GD_SAMPLER_KIND_GDDS_SHARD_RANDOM = 2,
 } gd_sampler_kind;
 
 struct gd_sampler {
     gd_sampler_kind kind;
     uint64_t n_samples;
     uint64_t seed;
+    uint64_t *range_starts;
+    uint64_t *range_lengths;
+    uint32_t n_ranges;
 };
 
 struct gd_dataloader {
@@ -115,6 +119,10 @@ gd_status _gd_gdds_init_batch_fields(const gd_dataset *dataset,
                                       int batch_size,
                                       gd_batch_field_desc **fields_out,
                                       int *n_fields_out);
+gd_status _gd_gdds_shard_sample_ranges(const gd_dataset *dataset,
+                                        uint64_t **starts_out,
+                                        uint64_t **lengths_out,
+                                        uint32_t *n_ranges_out);
 gd_status _gd_collate_gdds(gd_dataset *dataset,
                             const uint64_t *sample_ids,
                             int batch_size,

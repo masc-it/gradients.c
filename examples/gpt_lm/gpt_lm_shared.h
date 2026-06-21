@@ -78,6 +78,12 @@ typedef enum gpt_architecture {
     GPT_ARCH_MINIMAX_M3 = 1,
 } gpt_architecture;
 
+typedef enum gpt_shuffle_scope {
+    GPT_SHUFFLE_GLOBAL = 0,
+    GPT_SHUFFLE_SHARD = 1,
+    GPT_SHUFFLE_NONE = 2,
+} gpt_shuffle_scope;
+
 typedef struct gpt_block {
     gd_module mod;
     gd_tensor attn_norm_w;
@@ -140,6 +146,7 @@ typedef struct gpt_config {
     const char *metrics_dir;
     const char *metrics_project;
     const char *metrics_run_id;
+    const char *local_shard_cache_dir;
     int epochs;
     int batch_size;
     int n_layers;
@@ -148,8 +155,10 @@ typedef struct gpt_config {
     int early_stopping_patience;
     int lr_warmup_steps;
     int max_new_tokens;
+    size_t latest_every_n_steps;
     int generate_every_n_steps;
     gpt_architecture architecture;
+    gpt_shuffle_scope shuffle_scope;
     int minimax_m3_topk_blocks;
     int minimax_m3_init_blocks;
     int minimax_m3_local_blocks;
@@ -157,6 +166,7 @@ typedef struct gpt_config {
     bool save_best;
     bool save_latest;
     bool metrics_enabled;
+    bool keep_shard_cache;
     uint64_t overfit_num_samples;
     uint64_t seed;
     float dropout_p;

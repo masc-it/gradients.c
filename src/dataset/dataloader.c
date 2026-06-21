@@ -84,31 +84,69 @@ static uint64_t gd_sampler_feistel_permute(uint64_t x,
     return (left << half_bits) | right;
 }
 
-static uint64_t gd_sampler_random_index(const gd_sampler *sampler,
-                                        uint64_t epoch,
-                                        uint64_t position)
+static uint64_t gd_sampler_permute_bounded(uint64_t value,
+                                           uint64_t bound,
+                                           uint64_t key)
 {
     uint64_t x;
-    uint64_t key;
     uint32_t bits;
     uint32_t half_bits;
-    if (sampler == NULL || sampler->n_samples == 0U) {
+    if (bound <= 1U) {
         return 0U;
     }
-    if (sampler->n_samples == 1U) {
-        return 0U;
-    }
-    bits = gd_sampler_ceil_log2_u64(sampler->n_samples);
+    bits = gd_sampler_ceil_log2_u64(bound);
     half_bits = (bits + 1U) / 2U;
     if (half_bits > 32U) {
         half_bits = 32U;
     }
-    key = gd_dl_splitmix64_value(sampler->seed ^ gd_dl_splitmix64_value(epoch));
-    x = position;
+    x = value;
     do {
         x = gd_sampler_feistel_permute(x, key, half_bits);
-    } while (x >= sampler->n_samples);
+    } while (x >= bound);
     return x;
+}
+
+static uint64_t gd_sampler_random_index(const gd_sampler *sampler,
+                                        uint64_t epoch,
+                                        uint64_t position)
+{
+    uint64_t key;
+    if (sampler == NULL || sampler->n_samples == 0U) {
+        return 0U;
+    }
+    key = gd_dl_splitmix64_value(sampler->seed ^ gd_dl_splitmix64_value(epoch));
+    return gd_sampler_permute_bounded(position, sampler->n_samples, key);
+}
+
+static uint64_t gd_sampler_gdds_shard_random_index(const gd_sampler *sampler,
+                                                   uint64_t epoch,
+                                                   uint64_t position)
+{
+    uint32_t lo;
+    uint32_t hi;
+    if (sampler == NULL || sampler->range_starts == NULL || sampler->range_lengths == NULL ||
+        sampler->n_ranges == 0U || position >= sampler->n_samples) {
+        return position;
+    }
+    lo = 0U;
+    hi = sampler->n_ranges;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2U;
+        const uint64_t start = sampler->range_starts[mid];
+        const uint64_t length = sampler->range_lengths[mid];
+        if (position < start) {
+            hi = mid;
+        } else if (position - start >= length) {
+            lo = mid + 1U;
+        } else {
+            const uint64_t local = position - start;
+            const uint64_t key = gd_dl_splitmix64_value(sampler->seed ^
+                                                        gd_dl_splitmix64_value(epoch) ^
+                                                        gd_dl_splitmix64_value((uint64_t)mid));
+            return start + gd_sampler_permute_bounded(local, length, key);
+        }
+    }
+    return position;
 }
 
 gd_status gd_sampler_create_random(const gd_dataset *dataset,
@@ -139,8 +177,54 @@ gd_status gd_sampler_create_random(const gd_dataset *dataset,
     return GD_OK;
 }
 
+gd_status gd_sampler_create_gdds_shard_random(const gd_dataset *dataset,
+                                              uint64_t seed,
+                                              gd_sampler **out)
+{
+    gd_sampler *sampler;
+    uint64_t *starts = NULL;
+    uint64_t *lengths = NULL;
+    uint32_t n_ranges = 0U;
+    uint64_t n_samples;
+    gd_status status;
+    if (out == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    *out = NULL;
+    if (dataset == NULL) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    n_samples = gd_dataset_num_samples(dataset);
+    if (n_samples == 0U) {
+        return GD_ERR_INVALID_ARGUMENT;
+    }
+    status = _gd_gdds_shard_sample_ranges(dataset, &starts, &lengths, &n_ranges);
+    if (status != GD_OK) {
+        return status;
+    }
+    sampler = (gd_sampler *)calloc(1U, sizeof(*sampler));
+    if (sampler == NULL) {
+        free(lengths);
+        free(starts);
+        return GD_ERR_OUT_OF_MEMORY;
+    }
+    sampler->kind = GD_SAMPLER_KIND_GDDS_SHARD_RANDOM;
+    sampler->n_samples = n_samples;
+    sampler->seed = seed;
+    sampler->range_starts = starts;
+    sampler->range_lengths = lengths;
+    sampler->n_ranges = n_ranges;
+    *out = sampler;
+    return GD_OK;
+}
+
 void gd_sampler_destroy(gd_sampler *sampler)
 {
+    if (sampler == NULL) {
+        return;
+    }
+    free(sampler->range_lengths);
+    free(sampler->range_starts);
     free(sampler);
 }
 
@@ -315,7 +399,14 @@ static uint64_t gd_dataloader_sample_at_locked(const gd_dataloader *dl,
                                                 uint64_t position)
 {
     if (dl->sampler != NULL) {
-        return gd_sampler_random_index(dl->sampler, dl->epoch, position);
+        switch (dl->sampler->kind) {
+        case GD_SAMPLER_KIND_RANDOM:
+            return gd_sampler_random_index(dl->sampler, dl->epoch, position);
+        case GD_SAMPLER_KIND_GDDS_SHARD_RANDOM:
+            return gd_sampler_gdds_shard_random_index(dl->sampler, dl->epoch, position);
+        default:
+            return position;
+        }
     }
     return position;
 }
@@ -698,7 +789,8 @@ gd_status gd_dataloader_create(gd_context *ctx,
         return GD_ERR_INVALID_ARGUMENT;
     }
     if (sampler != NULL &&
-        (sampler->kind != GD_SAMPLER_KIND_RANDOM ||
+        ((sampler->kind != GD_SAMPLER_KIND_RANDOM &&
+          sampler->kind != GD_SAMPLER_KIND_GDDS_SHARD_RANDOM) ||
          sampler->n_samples != gd_dataset_num_samples(dataset))) {
         return GD_ERR_INVALID_ARGUMENT;
     }

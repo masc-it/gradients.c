@@ -72,7 +72,7 @@ static void write_id_record(FILE *f, int32_t id)
     CHECK(fwrite(record, 1U, sizeof(record), f) == sizeof(record), "write record");
 }
 
-static void write_id_gdds(const char *path, int n_samples)
+static void write_id_gdds_range(const char *path, int n_samples, int32_t id_base)
 {
     enum {
         SCHEMA_OFFSET = 128,
@@ -119,9 +119,14 @@ static void write_id_gdds(const char *path, int n_samples)
         CHECK(fputc(0, f) != EOF, "pad index");
     }
     for (i = 0; i < n_samples; ++i) {
-        write_id_record(f, i);
+        write_id_record(f, id_base + i);
     }
     CHECK(fclose(f) == 0, "close fixture");
+}
+
+static void write_id_gdds(const char *path, int n_samples)
+{
+    write_id_gdds_range(path, n_samples, 0);
 }
 
 static void collect_ids(gd_context *ctx,
@@ -214,6 +219,49 @@ static void test_random_sampler_no_replacement(gd_context *ctx, gd_dataset *data
     gd_sampler_destroy(sampler);
 }
 
+static void expect_range_unique(const int32_t *ids, int count, int lo, int hi)
+{
+    int seen[128];
+    int i;
+    CHECK(lo >= 0 && hi > lo && hi <= (int)(sizeof(seen) / sizeof(seen[0])), "range helper bounds");
+    memset(seen, 0, sizeof(seen));
+    for (i = 0; i < count; ++i) {
+        CHECK(ids[i] >= lo && ids[i] < hi, "shard-local id stays in shard range");
+        CHECK(seen[ids[i]] == 0, "shard-local id appears once");
+        seen[ids[i]] = 1;
+    }
+}
+
+static void test_gdds_shard_random_sampler(gd_context *ctx)
+{
+    enum { BATCH = 2, STEPS = 5, COUNT = BATCH * STEPS };
+    const char *path0 = "/tmp/gd_v2_dataloader_shard-00000.gdds";
+    const char *path1 = "/tmp/gd_v2_dataloader_shard-00001.gdds";
+    gd_dataset *dataset = NULL;
+    gd_sampler *sampler = NULL;
+    gd_dataloader *loader = NULL;
+    gd_dataloader_config cfg = gd_dataloader_config_default(BATCH);
+    int32_t ids[COUNT];
+
+    write_id_gdds_range(path0, 5, 0);
+    write_id_gdds_range(path1, 5, 5);
+    CHECK_OK(gd_dataset_open_gdds_split("/tmp", "gd_v2_dataloader_shard", &dataset));
+    CHECK_OK(gd_sampler_create_gdds_shard_random(dataset, 777U, &sampler));
+    cfg.num_workers = 1;
+    cfg.prefetch_factor = 2;
+    CHECK_OK(gd_dataloader_create(ctx, dataset, sampler, &cfg, &loader));
+    CHECK_OK(gd_dataloader_prefetch(loader));
+    collect_ids(ctx, loader, STEPS, BATCH, ids);
+    expect_range_unique(ids, 5, 0, 5);
+    expect_range_unique(ids + 5, 5, 5, 10);
+
+    gd_dataloader_destroy(loader);
+    gd_sampler_destroy(sampler);
+    gd_dataset_destroy(dataset);
+    (void)remove(path1);
+    (void)remove(path0);
+}
+
 int main(void)
 {
     const char *path = "/tmp/gd_v2_dataloader_ids.gdds";
@@ -234,6 +282,7 @@ int main(void)
     CHECK(gd_dataset_num_samples(dataset) == 10U, "dataset samples");
     test_sequential_loader(ctx, dataset);
     test_random_sampler_no_replacement(ctx, dataset);
+    test_gdds_shard_random_sampler(ctx);
     gd_dataset_destroy(dataset);
     gd_context_destroy(ctx);
     (void)remove(path);

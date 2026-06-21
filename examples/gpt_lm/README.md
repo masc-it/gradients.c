@@ -162,6 +162,7 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --minimax-local-blocks N
 --dropout P
 --overfit-num-samples N
+--shuffle-scope S           # global, shard, or none
 --report-every N
 --lr-max LR
 --lr-min LR
@@ -172,6 +173,7 @@ Resume loads model weights plus optimizer/scaler/trainer sidecars. The current C
 --generate-every-n-steps N
 --checkpoint-path PATH        # best-val model checkpoint
 --latest-checkpoint-path PATH # full-resume checkpoint saved every epoch
+--latest-every-n-steps N      # additionally save latest checkpoint every N steps; 0 disables
 --load-checkpoint PATH        # model weights only
 --resume-checkpoint PATH      # model + optimizer/scaler/trainer sidecars
 --val-split NAME
@@ -216,7 +218,9 @@ GRADIENTS_METALLIB="$(pwd)/build/gradients.metallib" \
      --weight-decay 1e-5 \
      --lr-min 3e-5 \
      --lr-max 3e-4 \
-     --eval-every-n-epochs 10 \
+     --eval-every-n-epochs 1 \
      --logits-softcap 0 \
-     --architecture gpt
+     --architecture gpt \
+     --latest-checkpoint-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/checkpoints/gpt_lm_latest.gdckpt" \
+     --latest-every-n-steps 1000
      ```

@@ -1150,6 +1150,22 @@ static size_t gpt_next_eval_epoch(const gpt_config *config, size_t epoch)
     return next;
 }
 
+static bool gpt_should_generate_step(const gpt_config *config, size_t step)
+{
+    return config != NULL && config->generate_every_n_steps > 0 &&
+           (step % (size_t)config->generate_every_n_steps) == 0U;
+}
+
+static bool gpt_should_save_step_latest_checkpoint(const gpt_config *config,
+                                                   size_t epoch_step,
+                                                   size_t steps_per_epoch,
+                                                   size_t global_step)
+{
+    return config != NULL && config->save_latest && config->latest_every_n_steps > 0U &&
+           global_step > 0U && (global_step % config->latest_every_n_steps) == 0U &&
+           epoch_step != steps_per_epoch;
+}
+
 static void train_one_batch(gd_context *ctx,
                             gpt_lm *model,
                             gd_dataloader *loader,
@@ -1165,6 +1181,7 @@ static void train_one_batch(gd_context *ctx,
                             size_t epoch,
                             size_t epoch_step,
                             size_t steps_per_epoch,
+                            bool prefetch_next,
                             double *last_report_time,
                             size_t *last_report_step)
 {
@@ -1181,7 +1198,7 @@ static void train_one_batch(gd_context *ctx,
         .lr_schedule = lr_config,
         .global_step = (uint64_t)global_step,
         .grad_clip_norm = config->grad_clip_norm,
-        .prefetch_next = true,
+        .prefetch_next = prefetch_next,
         .read_loss_value = should_report != 0,
         .read_grad_norm = should_report != 0 && config->grad_clip_norm > 0.0f,
         .sync_scaler = should_report != 0,
@@ -1276,8 +1293,7 @@ static void train_one_batch(gd_context *ctx,
         *last_report_step = current_step;
     }
 
-    if (config->generate_every_n_steps > 0 &&
-        (current_step % (size_t)config->generate_every_n_steps) == 0U) {
+    if (gpt_should_generate_step(config, current_step)) {
         if (report != NULL) {
             gd_progress_finish(&report->progress);
         }
@@ -2232,9 +2248,7 @@ static void maybe_save_step_latest_checkpoint(gd_context *ctx,
     const float checkpoint_val_loss = report != NULL && report->has_eval_loss ?
                                           report->last_eval_loss :
                                           NAN;
-    if (config == NULL || !config->save_latest || config->latest_every_n_steps == 0U ||
-        global_step == 0U || (global_step % config->latest_every_n_steps) != 0U ||
-        epoch_step == steps_per_epoch) {
+    if (!gpt_should_save_step_latest_checkpoint(config, epoch_step, steps_per_epoch, global_step)) {
         return;
     }
     gpt_report_rowf(ctx,
@@ -2290,9 +2304,17 @@ static void gpt_train_epoch_step(gd_context *ctx,
                                  size_t epochs_without_improvement,
                                  float best_val_loss)
 {
+    size_t current_step;
+    bool defer_prefetch;
     if (runner == NULL || runner->global_step == NULL || epoch_step == NULL) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train epoch step", __LINE__);
     }
+    current_step = *runner->global_step + 1U;
+    defer_prefetch = gpt_should_generate_step(runner->config, current_step) ||
+                     gpt_should_save_step_latest_checkpoint(runner->config,
+                                                            *epoch_step,
+                                                            steps_per_epoch,
+                                                            current_step);
     train_one_batch(ctx,
                     runner->model,
                     loader,
@@ -2308,9 +2330,10 @@ static void gpt_train_epoch_step(gd_context *ctx,
                     epoch,
                     *epoch_step,
                     steps_per_epoch,
+                    !defer_prefetch,
                     runner->last_report_time,
                     runner->last_report_step);
-    *runner->global_step += 1U;
+    *runner->global_step = current_step;
     maybe_save_step_latest_checkpoint(ctx,
                                       runner->model,
                                       runner->optimizer,
@@ -2325,6 +2348,9 @@ static void gpt_train_epoch_step(gd_context *ctx,
                                       *runner->global_step,
                                       epochs_without_improvement,
                                       best_val_loss);
+    if (defer_prefetch && *epoch_step < steps_per_epoch) {
+        TRY(ctx, gd_dataloader_prefetch(loader));
+    }
     *epoch_step += 1U;
 }
 

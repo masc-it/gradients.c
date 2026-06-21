@@ -1,6 +1,8 @@
+#include "gd_example_config.h"
+
 #include <gradients/gradients.h>
 
-#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,15 +12,9 @@
 #define MNIST_INPUT_DIM 784
 #define MNIST_HIDDEN_DIM 128
 #define MNIST_CLASSES 10
-#define MNIST_TRAIN_BATCH 128
-#define MNIST_EVAL_BATCH 100
-
-#define MNIST_DEFAULT_EPOCHS 2
-#define MNIST_DEFAULT_REPORT_EVERY 100
-#define MNIST_DEFAULT_DROPOUT_P 0.10f
-#define MNIST_DEFAULT_LR_MAX 1.0e-3f
-#define MNIST_DEFAULT_LR_MIN 1.0e-4f
-#define MNIST_DROPOUT_SEED UINT64_C(0xd00d5eed12340000)
+#define MNIST_MAX_BATCH_SIZE 100000
+#define MNIST_MAX_DATALOADER_WORKERS 64
+#define MNIST_MAX_DATALOADER_PREFETCH_FACTOR 16
 
 typedef struct mnist_mlp {
     gd_module mod;
@@ -28,15 +24,30 @@ typedef struct mnist_mlp {
 } mnist_mlp;
 
 typedef struct mnist_config {
-    const char *data_dir;
+    const char *config_path;
+    char *data_dir;
     int train_epochs;
     int report_every;
     int train_batch;
     int eval_batch;
+    int dataloader_workers;
+    int dataloader_prefetch_factor;
+    uint64_t train_seed;
+    uint64_t dropout_seed;
     float dropout_p;
     float lr_max;
     float lr_min;
     int lr_warmup_steps; /* -1 means auto after total_steps is known. */
+    float weight_decay;
+    float amp_init_scale;
+    uint32_t amp_growth_interval;
+    float amp_max_scale;
+
+    /* Derived once after validation; downstream code assumes these are valid. */
+    size_t data_slot_bytes;
+    uint32_t data_slots;
+    size_t eval_logits_count;
+    size_t eval_target_bytes;
 } mnist_config;
 
 typedef struct mnist_transform_state {
@@ -79,47 +90,266 @@ static void fail_status(gd_context *ctx, gd_status st, const char *expr, int lin
         }                                                                     \
     } while (0)
 
-static int env_int(const char *name, int fallback, int min_value, int max_value)
+static void print_usage(const char *argv0)
 {
-    const char *text = getenv(name);
-    char *end = NULL;
-    long parsed;
-    if (text == NULL || text[0] == '\0') {
-        return fallback;
-    }
-    errno = 0;
-    parsed = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || parsed < (long)min_value ||
-        parsed > (long)max_value) {
-        fprintf(stderr,
-                "mlp_mnist: ignoring invalid %s=%s; using %d\n",
-                name,
-                text,
-                fallback);
-        return fallback;
-    }
-    return (int)parsed;
+    printf("usage: %s --config PATH\n", argv0);
+    printf("\n");
+    printf("Options:\n");
+    printf("  --config, -c PATH   YAML configuration file\n");
+    printf("  --help, -h          show this help\n");
 }
 
-static float env_float(const char *name, float fallback, float min_value, float max_value)
+static const char *arg_value(int argc, char **argv, int *index, const char *name)
 {
-    const char *text = getenv(name);
-    char *end = NULL;
-    float parsed;
-    if (text == NULL || text[0] == '\0') {
-        return fallback;
+    const size_t name_len = strlen(name);
+    const char *arg = argv[*index];
+    if (strncmp(arg, name, name_len) == 0 && arg[name_len] == '=') {
+        return arg + name_len + 1U;
     }
-    errno = 0;
-    parsed = strtof(text, &end);
-    if (errno != 0 || end == text || *end != '\0' || parsed < min_value || parsed > max_value) {
+    if (strcmp(arg, name) == 0) {
+        if (*index + 1 >= argc) {
+            fprintf(stderr, "mlp_mnist: missing value for %s\n", name);
+            exit(2);
+        }
+        *index += 1;
+        return argv[*index];
+    }
+    return NULL;
+}
+
+static const char *parse_config_path(int argc, char **argv)
+{
+    const char *config_path = NULL;
+    int i;
+    for (i = 1; i < argc; ++i) {
+        const char *value;
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        }
+        value = arg_value(argc, argv, &i, "--config");
+        if (value == NULL && strcmp(argv[i], "-c") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "mlp_mnist: missing value for -c\n");
+                exit(2);
+            }
+            ++i;
+            value = argv[i];
+        }
+        if (value == NULL && argv[i][0] != '-') {
+            value = argv[i];
+        }
+        if (value != NULL) {
+            if (config_path != NULL) {
+                fprintf(stderr, "mlp_mnist: --config specified more than once\n");
+                exit(2);
+            }
+            config_path = value;
+            continue;
+        }
+        fprintf(stderr, "mlp_mnist: unknown argument %s\n", argv[i]);
+        print_usage(argv[0]);
+        exit(2);
+    }
+    if (config_path == NULL || config_path[0] == '\0') {
+        fprintf(stderr, "mlp_mnist: --config PATH is required\n");
+        print_usage(argv[0]);
+        exit(2);
+    }
+    return config_path;
+}
+
+static char *mnist_strdup(const char *text)
+{
+    const size_t len = text != NULL ? strlen(text) : 0U;
+    char *out;
+    if (text == NULL || len > SIZE_MAX - 1U) {
+        return NULL;
+    }
+    out = (char *)malloc(len + 1U);
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, text, len + 1U);
+    return out;
+}
+
+static void mnist_config_deinit(mnist_config *config)
+{
+    if (config == NULL) {
+        return;
+    }
+    free(config->data_dir);
+    config->data_dir = NULL;
+}
+
+static void mnist_config_die(const char *path, const gd_example_config_error *error)
+{
+    if (error != NULL && error->line > 0U) {
         fprintf(stderr,
-                "mlp_mnist: ignoring invalid %s=%s; using %.3f\n",
-                name,
-                text,
-                (double)fallback);
-        return fallback;
+                "mlp_mnist: invalid config %s:%u: %s\n",
+                path != NULL ? path : "(null)",
+                error->line,
+                gd_example_config_error_message(error));
+    } else {
+        fprintf(stderr,
+                "mlp_mnist: invalid config %s: %s\n",
+                path != NULL ? path : "(null)",
+                gd_example_config_error_message(error));
     }
-    return parsed;
+    exit(2);
+}
+
+static size_t mnist_max_size(size_t a, size_t b)
+{
+    return a > b ? a : b;
+}
+
+static size_t mnist_align_up_size(size_t value, size_t alignment)
+{
+    return ((value + alignment - 1U) / alignment) * alignment;
+}
+
+static void mnist_config_invalid(mnist_config *config, const char *message)
+{
+    fprintf(stderr,
+            "mlp_mnist: invalid config %s: %s\n",
+            config->config_path != NULL ? config->config_path : "(null)",
+            message != NULL ? message : "invalid value");
+    mnist_config_deinit(config);
+    exit(2);
+}
+
+static void mnist_config_finalize(mnist_config *config)
+{
+    const size_t sample_bytes = (size_t)MNIST_INPUT_DIM * sizeof(uint16_t) + sizeof(int32_t);
+    const size_t max_batch = mnist_max_size((size_t)config->train_batch,
+                                            (size_t)config->eval_batch);
+    const uint64_t requested_slots = (uint64_t)config->dataloader_workers *
+                                         (uint64_t)config->dataloader_prefetch_factor +
+                                     1U;
+    const size_t slot_padding = 64U * 1024U;
+    size_t batch_bytes;
+    size_t slot_payload_bytes;
+
+    if (config->data_dir == NULL || config->data_dir[0] == '\0') {
+        mnist_config_invalid(config, "data_dir must not be empty");
+    }
+    if (config->lr_min > config->lr_max) {
+        mnist_config_invalid(config, "lr_min must be <= lr_max");
+    }
+    if (config->amp_growth_interval == 0U) {
+        mnist_config_invalid(config, "amp_growth_interval must be > 0");
+    }
+    if (config->amp_max_scale < config->amp_init_scale) {
+        mnist_config_invalid(config, "amp_max_scale must be >= amp_init_scale");
+    }
+    if (sample_bytes > SIZE_MAX / max_batch) {
+        mnist_config_invalid(config, "train_batch/eval_batch is too large for batch buffers");
+    }
+    batch_bytes = sample_bytes * max_batch;
+    if (batch_bytes > SIZE_MAX - slot_padding) {
+        mnist_config_invalid(config, "train_batch/eval_batch is too large for data slots");
+    }
+    slot_payload_bytes = batch_bytes + slot_padding;
+    if (mnist_max_size(1U * 1024U * 1024U, slot_payload_bytes) > SIZE_MAX - 255U) {
+        mnist_config_invalid(config, "data slot size is too large");
+    }
+    if (requested_slots > (uint64_t)UINT32_MAX) {
+        mnist_config_invalid(config, "dataloader_workers * dataloader_prefetch_factor is too large");
+    }
+    if ((size_t)config->eval_batch > SIZE_MAX / (size_t)MNIST_CLASSES) {
+        mnist_config_invalid(config, "eval_batch is too large for logits buffer");
+    }
+
+    config->data_slot_bytes = mnist_align_up_size(mnist_max_size(1U * 1024U * 1024U,
+                                                                 slot_payload_bytes),
+                                                  256U);
+    config->data_slots = (uint32_t)requested_slots;
+    if (config->data_slots < 4U) {
+        config->data_slots = 4U;
+    }
+    config->eval_logits_count = (size_t)config->eval_batch * (size_t)MNIST_CLASSES;
+    if (config->eval_logits_count > SIZE_MAX / sizeof(float) ||
+        (size_t)config->eval_batch > SIZE_MAX / sizeof(int32_t)) {
+        mnist_config_invalid(config, "eval_batch is too large for evaluation buffers");
+    }
+    config->eval_target_bytes = (size_t)config->eval_batch * sizeof(int32_t);
+}
+
+static mnist_config mnist_config_from_yaml(const char *path)
+{
+    static const char *const known_keys[] = {
+        "data_dir",
+        "train_epochs",
+        "report_every",
+        "train_batch",
+        "eval_batch",
+        "dataloader_workers",
+        "dataloader_prefetch_factor",
+        "train_seed",
+        "dropout_seed",
+        "dropout_p",
+        "lr_max",
+        "lr_min",
+        "lr_warmup_steps",
+        "weight_decay",
+        "amp_init_scale",
+        "amp_growth_interval",
+        "amp_max_scale",
+    };
+    gd_example_config_doc doc;
+    gd_example_config_error error;
+    mnist_config config;
+    const char *data_dir = NULL;
+    uint64_t parsed_u64 = 0U;
+    memset(&config, 0, sizeof(config));
+    config.config_path = path;
+    if (!gd_example_config_load_yaml_file(path, &doc, &error) ||
+        !gd_example_config_validate_keys(&doc, known_keys, GD_ARRAY_LEN(known_keys), &error) ||
+        !gd_example_config_require_string(&doc, "data_dir", &data_dir, &error) ||
+        !gd_example_config_require_int(&doc, "train_epochs", 1, 1000000, &config.train_epochs, &error) ||
+        !gd_example_config_require_int(&doc, "report_every", 0, 1000000, &config.report_every, &error) ||
+        !gd_example_config_require_int(&doc, "train_batch", 1, MNIST_MAX_BATCH_SIZE, &config.train_batch, &error) ||
+        !gd_example_config_require_int(&doc, "eval_batch", 1, MNIST_MAX_BATCH_SIZE, &config.eval_batch, &error) ||
+        !gd_example_config_require_int(&doc,
+                                       "dataloader_workers",
+                                       1,
+                                       MNIST_MAX_DATALOADER_WORKERS,
+                                       &config.dataloader_workers,
+                                       &error) ||
+        !gd_example_config_require_int(&doc,
+                                       "dataloader_prefetch_factor",
+                                       1,
+                                       MNIST_MAX_DATALOADER_PREFETCH_FACTOR,
+                                       &config.dataloader_prefetch_factor,
+                                       &error) ||
+        !gd_example_config_require_u64(&doc, "train_seed", UINT64_MAX, &config.train_seed, &error) ||
+        !gd_example_config_require_u64(&doc, "dropout_seed", UINT64_MAX, &config.dropout_seed, &error) ||
+        !gd_example_config_require_f32(&doc, "dropout_p", 0.0f, 0.95f, &config.dropout_p, &error) ||
+        !gd_example_config_require_f32(&doc, "lr_max", 0.0f, 100.0f, &config.lr_max, &error) ||
+        !gd_example_config_require_f32(&doc, "lr_min", 0.0f, 100.0f, &config.lr_min, &error) ||
+        !gd_example_config_require_int(&doc, "lr_warmup_steps", -1, 1000000000, &config.lr_warmup_steps, &error) ||
+        !gd_example_config_require_f32(&doc, "weight_decay", 0.0f, 100.0f, &config.weight_decay, &error) ||
+        !gd_example_config_require_f32(&doc, "amp_init_scale", 1.0f, 1000000000.0f, &config.amp_init_scale, &error) ||
+        !gd_example_config_require_u64(&doc,
+                                       "amp_growth_interval",
+                                       (uint64_t)UINT32_MAX,
+                                       &parsed_u64,
+                                       &error) ||
+        !gd_example_config_require_f32(&doc, "amp_max_scale", 1.0f, 1000000000.0f, &config.amp_max_scale, &error)) {
+        gd_example_config_doc_free(&doc);
+        mnist_config_die(path, &error);
+    }
+    config.amp_growth_interval = (uint32_t)parsed_u64;
+    config.data_dir = mnist_strdup(data_dir);
+    gd_example_config_doc_free(&doc);
+    if (config.data_dir == NULL) {
+        fprintf(stderr, "mlp_mnist: out of memory while storing data_dir from %s\n", path);
+        exit(2);
+    }
+    mnist_config_finalize(&config);
+    return config;
 }
 
 static uint16_t mnist_f32_to_f16_bits(float value)
@@ -223,28 +453,6 @@ static gd_status mnist_u8_normalize_transform(const gd_sample *src,
     return gd_sample_copy_field(dst, 1, src, 1);
 }
 
-static mnist_config mnist_config_from_env(void)
-{
-    const char *data_dir_env = getenv("GD_MNIST_DATA_DIR");
-    const char *data_dir = (data_dir_env != NULL && data_dir_env[0] != '\0') ? data_dir_env : "data";
-    const float lr_max = env_float("GD_MNIST_LR_MAX", MNIST_DEFAULT_LR_MAX, 0.0f, 100.0f);
-    const float lr_min_fallback = MNIST_DEFAULT_LR_MIN <= lr_max ?
-                                      MNIST_DEFAULT_LR_MIN :
-                                      lr_max * 0.1f;
-    const float lr_min = env_float("GD_MNIST_LR_MIN", lr_min_fallback, 0.0f, lr_max);
-    return (mnist_config){
-        .data_dir = data_dir,
-        .train_epochs = env_int("GD_MNIST_EPOCHS", MNIST_DEFAULT_EPOCHS, 1, 1000000),
-        .report_every = env_int("GD_MNIST_REPORT_EVERY", MNIST_DEFAULT_REPORT_EVERY, 0, 1000000),
-        .train_batch = MNIST_TRAIN_BATCH,
-        .eval_batch = MNIST_EVAL_BATCH,
-        .dropout_p = env_float("GD_MNIST_DROPOUT_P", MNIST_DEFAULT_DROPOUT_P, 0.0f, 0.95f),
-        .lr_max = lr_max,
-        .lr_min = lr_min,
-        .lr_warmup_steps = env_int("GD_MNIST_LR_WARMUP", -1, -1, 1000000000),
-    };
-}
-
 static double wall_seconds(void)
 {
     struct timeval tv;
@@ -254,33 +462,33 @@ static double wall_seconds(void)
     return (double)tv.tv_sec + (double)tv.tv_usec * 1.0e-6;
 }
 
-static gd_memory_config mnist_memory_config(void)
+static gd_memory_config mnist_memory_config(const mnist_config *config)
 {
     return (gd_memory_config){
         .params_bytes = 4U * 1024U * 1024U,
         .state_bytes = 16U * 1024U * 1024U,
         .scratch_slot_bytes = 32U * 1024U * 1024U,
-        .data_slot_bytes = 1U * 1024U * 1024U,
+        .data_slot_bytes = config->data_slot_bytes,
         .scratch_slots = 3U,
-        .data_slots = 4U,
+        .data_slots = config->data_slots,
         .default_alignment = 256U,
     };
 }
 
-static gd_adamw_config mnist_adamw_config(float lr)
+static gd_adamw_config mnist_adamw_config(const mnist_config *config, float lr)
 {
     gd_adamw_config cfg = gd_adamw_config_default();
     cfg.lr = lr;
-    cfg.weight_decay = 1.0e-4f;
+    cfg.weight_decay = config->weight_decay;
     return cfg;
 }
 
-static gd_amp_config mnist_amp_config(void)
+static gd_amp_config mnist_amp_config(const mnist_config *config)
 {
     gd_amp_config cfg = gd_amp_config_default();
-    cfg.init_scale = 128.0f;
-    cfg.growth_interval = 64U;
-    cfg.max_scale = 4096.0f;
+    cfg.init_scale = config->amp_init_scale;
+    cfg.growth_interval = config->amp_growth_interval;
+    cfg.max_scale = config->amp_max_scale;
     return cfg;
 }
 
@@ -369,17 +577,15 @@ static gd_status create_gdds_loader(gd_context *ctx,
                                     gd_dataset *dataset,
                                     gd_sampler *sampler,
                                     int batch_size,
+                                    const mnist_config *config,
                                     gd_dataloader **out)
 {
     gd_dataloader_config cfg;
     gd_status st;
-    if (out == NULL) {
-        return GD_ERR_INVALID_ARGUMENT;
-    }
     *out = NULL;
     cfg = gd_dataloader_config_default(batch_size);
-    cfg.num_workers = 1;
-    cfg.prefetch_factor = 2;
+    cfg.num_workers = config->dataloader_workers;
+    cfg.prefetch_factor = config->dataloader_prefetch_factor;
     st = gd_dataloader_create(ctx, dataset, sampler, &cfg, out);
     if (st != GD_OK) {
         return st;
@@ -417,21 +623,36 @@ static int argmax10(const float *values)
 static void evaluate_accuracy(gd_context *ctx,
                               mnist_mlp *model,
                               gd_dataloader *loader,
+                              const mnist_config *config,
                               size_t n_samples,
                               int *correct_out,
                               size_t *total_out)
 {
-    float logits[MNIST_EVAL_BATCH * MNIST_CLASSES];
-    int32_t labels[MNIST_EVAL_BATCH];
+    const size_t eval_batch = (size_t)config->eval_batch;
+    const size_t logits_count = config->eval_logits_count;
+    float *logits = NULL;
+    int32_t *labels = NULL;
     size_t seen = 0U;
     int correct = 0;
+    *correct_out = 0;
+    *total_out = 0U;
+    if (n_samples == 0U) {
+        return;
+    }
+    logits = (float *)malloc(logits_count * sizeof(logits[0]));
+    labels = (int32_t *)malloc(config->eval_target_bytes);
+    if (logits == NULL || labels == NULL) {
+        free(logits);
+        free(labels);
+        fail_status(ctx, GD_ERR_OUT_OF_MEMORY, "evaluate_accuracy malloc", __LINE__);
+    }
     while (seen < n_samples) {
         gd_batch *batch = NULL;
         gd_tensor *image;
         gd_tensor *target;
         gd_tensor pred;
         size_t remaining = n_samples - seen;
-        size_t rows = remaining < (size_t)MNIST_EVAL_BATCH ? remaining : (size_t)MNIST_EVAL_BATCH;
+        size_t rows = remaining < eval_batch ? remaining : eval_batch;
         size_t row;
         TRY(ctx, gd_dataloader_next(loader, &batch));
         TRY(ctx, gd_begin_step(ctx, GD_SCOPE_EVAL, batch));
@@ -439,18 +660,20 @@ static void evaluate_accuracy(gd_context *ctx,
         target = required_batch_tensor(ctx, batch, "target", __LINE__);
         TRY(ctx, mnist_mlp_forward(ctx, model, image, 0U, &pred));
         TRY(ctx, gd_end_step(ctx));
-        TRY(ctx, gd_tensor_read_f32(ctx, &pred, logits, GD_ARRAY_LEN(logits)));
-        TRY(ctx, gd_tensor_read(ctx, target, labels, sizeof(labels)));
+        TRY(ctx, gd_tensor_read_f32(ctx, &pred, logits, logits_count));
+        TRY(ctx, gd_tensor_read(ctx, target, labels, config->eval_target_bytes));
         TRY(ctx, gd_dataloader_release(loader, batch));
         TRY(ctx, gd_dataloader_prefetch(loader));
         for (row = 0U; row < rows; ++row) {
-            int predicted = argmax10(&logits[row * MNIST_CLASSES]);
+            int predicted = argmax10(&logits[row * (size_t)MNIST_CLASSES]);
             if (predicted == labels[row]) {
                 correct += 1;
             }
         }
         seen += rows;
     }
+    free(labels);
+    free(logits);
     *correct_out = correct;
     *total_out = n_samples;
 }
@@ -467,10 +690,7 @@ static void train_mnist(gd_context *ctx,
 {
     double last_report_time;
     size_t last_report_step = 0U;
-    const size_t report_every = config != NULL ? (size_t)config->report_every : 0U;
-    if (config == NULL || lr_config == NULL || steps_per_epoch == 0U || train_steps == 0U) {
-        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train_mnist", __LINE__);
-    }
+    const size_t report_every = (size_t)config->report_every;
     gd_module_set_training(&model->mod, true);
     last_report_time = wall_seconds();
     for (size_t step = 0U; step < train_steps; ++step) {
@@ -494,7 +714,7 @@ static void train_mnist(gd_context *ctx,
         TRY(ctx, mnist_mlp_forward(ctx,
                                     model,
                                     image,
-                                    MNIST_DROPOUT_SEED ^ current_step,
+                                    config->dropout_seed ^ (uint64_t)current_step,
                                     &logits));
         TRY(ctx, gd_cross_entropy(ctx, &logits, target, &loss));
         TRY(ctx, gd_backward_amp(ctx, &loss, NULL, scaler));
@@ -525,10 +745,10 @@ static void train_mnist(gd_context *ctx,
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    const mnist_config config = mnist_config_from_env();
-    const gd_memory_config mem = mnist_memory_config();
+    mnist_config config = mnist_config_from_yaml(parse_config_path(argc, argv));
+    const gd_memory_config mem = mnist_memory_config(&config);
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
     mnist_transform_state transform_state;
@@ -589,14 +809,14 @@ int main(void)
                 .name = "encoder",
                 .match = "mnist_mlp.fc1.*",
                 .lr_mult = 1.0f,
-                .weight_decay = 1.0e-4f,
+                .weight_decay = config.weight_decay,
                 .trainable = true,
             },
             {
                 .name = "classifier",
                 .match = "mnist_mlp.fc2.*",
                 .lr_mult = 1.0f,
-                .weight_decay = 1.0e-4f,
+                .weight_decay = config.weight_decay,
                 .trainable = true,
             },
         };
@@ -605,21 +825,22 @@ int main(void)
     print_param_set(&params);
 
     {
-        const gd_adamw_config adam = mnist_adamw_config(config.lr_max);
-        const gd_amp_config amp = mnist_amp_config();
+        const gd_adamw_config adam = mnist_adamw_config(&config, config.lr_max);
+        const gd_amp_config amp = mnist_amp_config(&config);
         TRY(ctx, gd_adamw_create(ctx, &params, &adam, &optimizer));
         TRY(ctx, gd_amp_scaler_create(ctx, &amp, &scaler));
     }
     TRY(ctx, gd_context_seal_params(ctx));
-    TRY(ctx, gd_sampler_create_random(train_dataset, 1234U, &train_sampler));
+    TRY(ctx, gd_sampler_create_random(train_dataset, config.train_seed, &train_sampler));
     TRY(ctx, create_gdds_loader(ctx,
                                 train_dataset,
                                 train_sampler,
                                 config.train_batch,
+                                &config,
                                 &train_loader));
     steps_per_epoch = (size_t)gd_dataloader_steps_per_epoch(train_loader);
     if (steps_per_epoch == 0U || (size_t)config.train_epochs > SIZE_MAX / steps_per_epoch) {
-        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "GD_MNIST_EPOCHS", __LINE__);
+        fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train_epochs", __LINE__);
     }
     samples_per_epoch = (size_t)gd_dataloader_samples_per_epoch(train_loader);
     train_steps = (size_t)config.train_epochs * steps_per_epoch;
@@ -638,22 +859,28 @@ int main(void)
         TRY(ctx, gd_lr_scheduler_value(&lr_config, 0U, &initial_lr));
         (void)initial_lr;
     }
-    printf("dataset: dir=%s train=%zu test=%zu storage=u8 transform=f16_normalize batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
+    printf("config: path=%s\n", config.config_path);
+    printf("dataset: dir=%s train=%zu test=%zu storage=u8 transform=f16_normalize train_batch=%d eval_batch=%d epochs=%d dropout_p=%.3f steps_per_epoch=%zu samples_per_epoch=%zu total_steps=%zu\n",
            config.data_dir,
            train_samples,
            test_samples,
            config.train_batch,
+           config.eval_batch,
            config.train_epochs,
            (double)config.dropout_p,
            steps_per_epoch,
            samples_per_epoch,
            train_steps);
+    printf("dataloader: workers=%d prefetch_factor=%d slots=%d\n",
+           config.dataloader_workers,
+           config.dataloader_prefetch_factor,
+           gd_dataloader_slot_count(train_loader));
     printf("optim: cosine_lr max=%.6g min=%.6g warmup=%llu total=%llu weight_decay=%.4g amp_scale=%.4g\n",
            (double)lr_config.max_lr,
            (double)lr_config.min_lr,
            (unsigned long long)lr_config.warmup_steps,
            (unsigned long long)lr_config.total_steps,
-           1.0e-4,
+           (double)config.weight_decay,
            (double)gd_amp_scaler_scale(scaler));
 
     train_mnist(ctx,
@@ -674,9 +901,10 @@ int main(void)
                                 test_dataset,
                                 NULL,
                                 config.eval_batch,
+                                &config,
                                 &test_loader));
     eval_samples = (size_t)gd_dataloader_samples_per_epoch(test_loader);
-    evaluate_accuracy(ctx, &model, test_loader, eval_samples, &correct, &total);
+    evaluate_accuracy(ctx, &model, test_loader, &config, eval_samples, &correct, &total);
     accuracy = total > 0U ? (float)correct / (float)total : 0.0f;
     optimizer_steps = (size_t)gd_optimizer_step_count(optimizer);
     printf("test_accuracy=%.4f correct=%d/%zu optimizer_steps=%zu\n",
@@ -699,5 +927,6 @@ cleanup:
     gd_param_set_free(&params);
     mnist_mlp_deinit(&model);
     gd_context_destroy(ctx);
+    mnist_config_deinit(&config);
     return exit_code;
 }

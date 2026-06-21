@@ -1,0 +1,21 @@
+# Runtime configuration for examples/mlp_mnist/main.c.
+# Format: flat YAML, one scalar `key: value` per line.
+# The executable accepts this file with: ./gd_main_mlp_mnist --config config.yaml
+
+data_dir: data
+train_epochs: 2
+report_every: 100
+train_batch: 128
+eval_batch: 100
+dataloader_workers: 1
+dataloader_prefetch_factor: 2
+train_seed: 1234
+dropout_seed: 0xd00d5eed12340000
+dropout_p: 0.10
+lr_max: 0.001
+lr_min: 0.0001
+lr_warmup_steps: -1
+weight_decay: 0.0001
+amp_init_scale: 128
+amp_growth_interval: 64
+amp_max_scale: 4096

@@ -21,6 +21,12 @@ Run from this directory:
 make run
 ```
 
+Runtime options live in a flat `key: value` YAML file (`config.yaml` by default); the executable only takes a config path:
+
+```sh
+./gd_main_mlp_mnist --config config.yaml
+```
+
 The Makefile first runs:
 
 ```sh
@@ -31,12 +37,22 @@ which writes `data/train-*.gdds`, `data/test-*.gdds`, and `data/manifest.json`.
 Subsequent `make run` calls reuse matching GDDS shards instead of rebuilding them.
 Raw MNIST gzip files are cached under `data/raw`.
 
-Useful knobs:
+Useful knobs are edited in YAML instead of environment variables:
+
+```yaml
+train_epochs: 3
+report_every: 100
+dropout_p: 0.10
+lr_max: 0.001
+lr_min: 0.0001
+lr_warmup_steps: 100
+```
+
+Use another config file with:
 
 ```sh
-GD_MNIST_EPOCHS=3 GD_MNIST_REPORT_EVERY=100 GD_MNIST_DROPOUT_P=0.10 make run
-GD_MNIST_LR_MAX=0.001 GD_MNIST_LR_MIN=0.0001 GD_MNIST_LR_WARMUP=100 make run
-make smoke  # uses DATA_DIR=data_smoke and a small GDDS subset
+make run CONFIG=my_config.yaml
+make smoke  # writes data_smoke/config.yaml and uses a small GDDS subset
 ```
 
 To create a smaller local GDDS dataset manually:
@@ -48,14 +64,15 @@ python3 dataset.py --out-dir data --train-limit 4096 --test-limit 1000
 Dataset prep writes shards with dynamic byte-based flushing. Use
 `--max-shard-bytes` to cap shard file size.
 
-`main.c` opens `data` by default; set `GD_MNIST_DATA_DIR=/path/to/gdds`
-or run `make DATA_DIR=/path/to/gdds run` to use another directory.
+`main.c` opens the `data_dir` named in the YAML config. If you run dataset
+prep with another `DATA_DIR`, point the runtime config at the same directory.
 
 Then rebuild/run:
 
 ```sh
 make -C ../.. build
-cc -I../../include -std=c11 -O2 main.c ../../build/libgradients.a \
+cc -I../../include -I../common -std=c11 -O2 \
+  main.c ../common/gd_example_config.c ../../build/libgradients.a \
   -pthread -framework Foundation -framework Metal -o gd_main_mlp_mnist
-GRADIENTS_METALLIB=../../build/gradients.metallib ./gd_main_mlp_mnist
+GRADIENTS_METALLIB=../../build/gradients.metallib ./gd_main_mlp_mnist --config config.yaml
 ```

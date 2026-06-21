@@ -1,5 +1,6 @@
 ROOT := ../..
 BIN := gd_main_mlp_mnist
+CONFIG ?= config.yaml
 DATA_DIR ?= data
 DATA_STAMP := $(DATA_DIR)/.mnist_gdds.stamp
 DATA_ARGS_FILE := $(DATA_DIR)/.mnist_gdds.args
@@ -46,16 +47,34 @@ $(DATA_STAMP): FORCE dataset.py $(ROOT)/tools/gdds_utils.py
 		touch '$(DATA_STAMP)'; \
 	fi
 
-$(BIN): main.c $(LIB) $(DATA_STAMP)
-	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(LIB) $(LDLIBS) -o $@
+$(BIN): main.c $(GD_EXAMPLE_CONFIG_DEPS) $(LIB) $(DATA_STAMP)
+	$(CC) $(CPPFLAGS) $(CFLAGS) main.c $(GD_EXAMPLE_CONFIG_SRC) $(LIB) $(LDLIBS) -o $@
 
-run: $(BIN)
-	GRADIENTS_METALLIB=$(METALLIB) GD_MNIST_DATA_DIR=$(DATA_DIR) ./$(BIN)
+run: $(BIN) $(CONFIG)
+	GRADIENTS_METALLIB=$(METALLIB) ./$(BIN) --config $(CONFIG)
 
 smoke:
 	$(MAKE) clean DATA_DIR=data_smoke
-	GD_MNIST_EPOCHS=1 GD_MNIST_REPORT_EVERY=5 \
-		$(MAKE) run DATA_DIR=data_smoke MNIST_TRAIN_LIMIT=4096 MNIST_TEST_LIMIT=1000
+	@mkdir -p data_smoke
+	@printf '%s\n' \
+		'data_dir: data_smoke' \
+		'train_epochs: 1' \
+		'report_every: 5' \
+		'train_batch: 128' \
+		'eval_batch: 100' \
+		'dataloader_workers: 1' \
+		'dataloader_prefetch_factor: 2' \
+		'train_seed: 1234' \
+		'dropout_seed: 0xd00d5eed12340000' \
+		'dropout_p: 0.10' \
+		'lr_max: 0.001' \
+		'lr_min: 0.0001' \
+		'lr_warmup_steps: -1' \
+		'weight_decay: 0.0001' \
+		'amp_init_scale: 128' \
+		'amp_growth_interval: 64' \
+		'amp_max_scale: 4096' > data_smoke/config.yaml
+	$(MAKE) run DATA_DIR=data_smoke CONFIG=data_smoke/config.yaml MNIST_TRAIN_LIMIT=4096 MNIST_TEST_LIMIT=1000
 
 clean:
 	rm -f $(BIN)

@@ -191,6 +191,7 @@ struct gd_backend {
     void *adamw_pso;
     void *adamw_commit_pso;
     void *active_command_buffer;
+    void *scope_autorelease_pool;
     bool scope_active;
 };
 

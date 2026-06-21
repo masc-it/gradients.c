@@ -11,6 +11,17 @@
 
 #define GD_METAL_MAX_THREADS_PER_GROUP 256U
 
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+
+static void gd_metal_scope_autorelease_pool_pop(gd_backend *backend)
+{
+    if (backend != NULL && backend->scope_autorelease_pool != NULL) {
+        objc_autoreleasePoolPop(backend->scope_autorelease_pool);
+        backend->scope_autorelease_pool = NULL;
+    }
+}
+
 static id<MTLDevice> gd_metal_device(gd_backend *backend)
 {
     return (__bridge id<MTLDevice>)backend->device;
@@ -441,6 +452,7 @@ void gd_backend_destroy(gd_backend *backend)
         return;
     }
     gd_metal_release_retained(&backend->active_command_buffer);
+    gd_metal_scope_autorelease_pool_pop(backend);
     gd_metal_release_pipelines(backend);
     gd_metal_release_retained(&backend->qkv_split_rope_table_f32_buffer);
     gd_metal_release_retained(&backend->mps_matmul_kernel);
@@ -522,16 +534,21 @@ bool gd_backend_buffer_is_host_visible(const gd_backend_buffer *buffer)
 gd_status gd_backend_scope_begin(gd_backend *backend)
 {
     id<MTLCommandBuffer> command_buffer;
+    void *pool;
     if (backend == NULL) {
         return GD_ERR_INVALID_ARGUMENT;
     }
-    if (backend->scope_active || backend->active_command_buffer != NULL) {
+    if (backend->scope_active || backend->active_command_buffer != NULL ||
+        backend->scope_autorelease_pool != NULL) {
         return GD_ERR_BAD_STATE;
     }
+    pool = objc_autoreleasePoolPush();
     command_buffer = [gd_metal_queue(backend) commandBuffer];
     if (command_buffer == nil) {
+        objc_autoreleasePoolPop(pool);
         return GD_ERR_INTERNAL;
     }
+    backend->scope_autorelease_pool = pool;
     backend->active_command_buffer = (void *)CFBridgingRetain(command_buffer);
     backend->scope_active = true;
     return GD_OK;
@@ -829,15 +846,18 @@ gd_status gd_backend_record_fence(gd_backend *backend, gd_backend_fence *out_fen
         out_fence->handle = backend->active_command_buffer;
         backend->active_command_buffer = NULL;
         backend->scope_active = false;
+        gd_metal_scope_autorelease_pool_pop(backend);
         return GD_OK;
     }
     backend->scope_active = false;
     command_buffer = [gd_metal_queue(backend) commandBuffer];
     if (command_buffer == nil) {
+        gd_metal_scope_autorelease_pool_pop(backend);
         return GD_ERR_INTERNAL;
     }
     [command_buffer commit];
     out_fence->handle = (void *)CFBridgingRetain(command_buffer);
+    gd_metal_scope_autorelease_pool_pop(backend);
     return GD_OK;
 }
 

@@ -140,6 +140,7 @@ typedef struct gpt_lm {
 } gpt_lm;
 
 typedef struct gpt_config {
+    const char *config_path;
     const char *data_dir;
     const char *tokenizer_path;
     const char *generate_prompt;

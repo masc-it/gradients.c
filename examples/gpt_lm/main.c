@@ -1,5 +1,6 @@
 #include "gpt_lm_shared.h"
 #include "gd_progress.h"
+#include "gd_example_config.h"
 
 #include <errno.h>
 #include <math.h>
@@ -12,55 +13,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-static int parse_i64_arg(const char *text, int64_t min_value, int64_t max_value, int64_t *out)
-{
-    char *end = NULL;
-    long long parsed;
-    if (text == NULL || text[0] == '\0' || out == NULL) {
-        return 0;
-    }
-    errno = 0;
-    parsed = strtoll(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || parsed < min_value || parsed > max_value) {
-        return 0;
-    }
-    *out = (int64_t)parsed;
-    return 1;
-}
-
-static int parse_u64_arg(const char *text, uint64_t max_value, uint64_t *out)
-{
-    char *end = NULL;
-    unsigned long long parsed;
-    if (text == NULL || text[0] == '\0' || out == NULL) {
-        return 0;
-    }
-    errno = 0;
-    parsed = strtoull(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || (uint64_t)parsed > max_value) {
-        return 0;
-    }
-    *out = (uint64_t)parsed;
-    return 1;
-}
-
-static int parse_float_arg(const char *text, float min_value, float max_value, float *out)
-{
-    char *end = NULL;
-    float parsed;
-    if (text == NULL || text[0] == '\0' || out == NULL) {
-        return 0;
-    }
-    errno = 0;
-    parsed = strtof(text, &end);
-    if (errno != 0 || end == text || *end != '\0' || !isfinite(parsed) || parsed < min_value ||
-        parsed > max_value) {
-        return 0;
-    }
-    *out = parsed;
-    return 1;
-}
 
 static const char *arg_value(int argc, char **argv, int *index, const char *name)
 {
@@ -172,311 +124,496 @@ static int parse_shuffle_scope_arg(const char *text, gpt_shuffle_scope *out)
 
 static void print_usage(const char *argv0)
 {
-    printf("usage: %s [options]\n", argv0);
+    printf("usage: %s --config PATH\n", argv0);
     printf("\n");
     printf("Options:\n");
-    printf("  --data-dir PATH             GDDS directory (default: examples/gpt_lm/data)\n");
-    printf("  --tokenizer-path PATH       tokenizer JSON for generation (default: DATA/tokenizer-v%d.json)\n", GPT_VOCAB_SIZE);
-    printf("  --generate TEXT             run KV-cache generation from TEXT; skips training unless --epochs is set\n");
-    printf("  --generate-every-n-steps N  during training, generate batched a/e/i/o/u samples every N steps (default: 0)\n");
-    printf("  --checkpoint-path PATH      best-val checkpoint path (default: checkpoints/gpt_lm_best.gdckpt)\n");
-    printf("  --latest-checkpoint-path PATH full-resume checkpoint path saved every epoch (default: checkpoints/gpt_lm_latest.gdckpt)\n");
-    printf("  --latest-every-n-steps N save latest/full-resume checkpoint every N optimizer steps; 0 disables (default: 0)\n");
-    printf("  --load-checkpoint PATH      load model weights only before training/generation\n");
-    printf("  --resume-checkpoint PATH    resume model + optimizer + scaler/trainer sidecars\n");
-    printf("  --val-split NAME            validation split name for validation/checkpointing (default: val)\n");
-    printf("  --metrics-dir PATH          metrics JSONL root directory (default: data/metrics)\n");
-    printf("  --metrics-project NAME      metrics project directory (default: gpt_lm)\n");
-    printf("  --metrics-run-id ID         metrics run id/file stem (default: timestamp-pid)\n");
-    printf("  --local-shard-cache-dir PATH copy each train shard to PATH before training it (for --shuffle-scope shard)\n");
-    printf("  --keep-shard-cache          keep cached shard files after use; default deletes each shard after training it\n");
-    printf("  --no-metrics                disable metrics JSONL logging\n");
-    printf("  --no-save-best              disable best validation checkpoint writes\n");
-    printf("  --no-save-latest            disable latest full-resume checkpoint writes\n");
-    printf("  --early-stopping-patience N validation epochs without improvement before stopping; 0 disables (default: %d)\n",
-           GPT_DEFAULT_EARLY_STOPPING_PATIENCE);
-    printf("  --max-new-tokens N          generated tokens for --generate / periodic generation (default: 64)\n");
-    printf("  --temperature T             sampling temperature; 0 means greedy (default: 0)\n");
-    printf("  --min-p P                   min-p sampling cutoff relative to top token; 0 disables (default: 0)\n");
-    printf("  --repetition-penalty P      repetition penalty; 1 disables (default: 1)\n");
-    printf("  --logits-softcap C          final logits softcap; 0 disables (default: 30)\n");
-    printf("  --epochs N                  training epochs (default: %d; 0 allowed with --generate)\n", GPT_DEFAULT_EPOCHS);
-    printf("  --batch-size N              batch size in 512-token sequences (default: %d)\n", GPT_DEFAULT_BATCH_SIZE);
-    printf("  --dataloader-workers N      training dataloader workers (default: %d)\n", GPT_DEFAULT_DATALOADER_WORKERS);
-    printf("  --dataloader-prefetch-factor N batches queued per worker (default: %d; workers*prefetch <= %u)\n",
-           GPT_DEFAULT_DATALOADER_PREFETCH_FACTOR,
-           (unsigned)GPT_MAX_DATALOADER_SLOTS);
-    printf("  --layers N                  decoder blocks (default: %d)\n", GPT_DEFAULT_LAYERS);
-    printf("  --architecture NAME         gpt or minimax_m3 sparse attention (default: gpt)\n");
-    printf("  --minimax-topk-blocks N     MiniMax M3 sparse top-k blocks (default: %d)\n", GPT_MINIMAX_M3_TOPK_BLOCKS);
-    printf("  --minimax-init-blocks N     MiniMax M3 forced initial blocks (default: %d)\n", GPT_MINIMAX_M3_INIT_BLOCKS);
-    printf("  --minimax-local-blocks N    MiniMax M3 forced local blocks (default: %d)\n", GPT_MINIMAX_M3_LOCAL_BLOCKS);
-    printf("  --dropout P                 dropout probability (default: %.2f)\n", (double)GPT_DEFAULT_DROPOUT_P);
-    printf("  --lr-max LR                 cosine schedule max LR (default: %.6g)\n", (double)GPT_DEFAULT_LR_MAX);
-    printf("  --lr-min LR                 cosine schedule min LR (default: %.6g)\n", (double)GPT_DEFAULT_LR_MIN);
-    printf("  --warmup-steps N            LR warmup steps; -1 means 10%% of total steps (default: -1)\n");
-    printf("  --weight-decay WD           AdamW weight decay for non-norm weights (default: %.3g)\n",
-           (double)GPT_DEFAULT_WEIGHT_DECAY);
-    printf("  --grad-clip-norm N          global grad norm clip; 0 disables (default: %.3g)\n",
-           (double)GPT_DEFAULT_GRAD_CLIP_NORM);
-    printf("  --report-every N            report every N steps; 0 disables periodic reports (default: %d)\n",
-           GPT_DEFAULT_REPORT_EVERY);
-    printf("  --eval-every-n-epochs N    run validation every N epochs; final epoch is always evaluated (default: %d)\n",
-           GPT_DEFAULT_EVAL_EVERY_N_EPOCHS);
-    printf("  --overfit-num-samples N     repeatedly train on the first N samples; 0 disables (default: 0)\n");
-    printf("  --shuffle-scope S           global, shard, or none (default: global)\n");
-    printf("  --seed N                    base seed (default: %llu)\n", (unsigned long long)GPT_DEFAULT_SEED);
-    printf("  --help                      show this help\n");
+    printf("  --config, -c PATH   YAML configuration file\n");
+    printf("  --help, -h          show this help\n");
 }
 
-static gpt_config gpt_config_default(void)
+static const char *parse_config_path(int argc, char **argv)
 {
-    gpt_config config;
-    memset(&config, 0, sizeof(config));
-    config.data_dir = "examples/gpt_lm/data";
-    config.tokenizer_path = NULL;
-    config.generate_prompt = NULL;
-    config.checkpoint_path = "checkpoints/gpt_lm_best.gdckpt";
-    config.latest_checkpoint_path = "checkpoints/gpt_lm_latest.gdckpt";
-    config.load_checkpoint_path = NULL;
-    config.resume_checkpoint_path = NULL;
-    config.val_split = "val";
-    config.metrics_dir = "data/metrics";
-    config.metrics_project = "gpt_lm";
-    config.metrics_run_id = NULL;
-    config.local_shard_cache_dir = NULL;
-    config.epochs = GPT_DEFAULT_EPOCHS;
-    config.batch_size = GPT_DEFAULT_BATCH_SIZE;
-    config.n_layers = GPT_DEFAULT_LAYERS;
-    config.dataloader_workers = GPT_DEFAULT_DATALOADER_WORKERS;
-    config.dataloader_prefetch_factor = GPT_DEFAULT_DATALOADER_PREFETCH_FACTOR;
-    config.architecture = GPT_ARCH_GPT;
-    config.shuffle_scope = GPT_SHUFFLE_GLOBAL;
-    config.minimax_m3_topk_blocks = GPT_MINIMAX_M3_TOPK_BLOCKS;
-    config.minimax_m3_init_blocks = GPT_MINIMAX_M3_INIT_BLOCKS;
-    config.minimax_m3_local_blocks = GPT_MINIMAX_M3_LOCAL_BLOCKS;
-    config.report_every = GPT_DEFAULT_REPORT_EVERY;
-    config.eval_every_n_epochs = GPT_DEFAULT_EVAL_EVERY_N_EPOCHS;
-    config.early_stopping_patience = GPT_DEFAULT_EARLY_STOPPING_PATIENCE;
-    config.lr_warmup_steps = -1;
-    config.max_new_tokens = 64;
-    config.latest_every_n_steps = 0U;
-    config.generate_every_n_steps = 0;
-    config.epochs_set = false;
-    config.save_best = true;
-    config.save_latest = true;
-    config.metrics_enabled = true;
-    config.keep_shard_cache = false;
-    config.overfit_num_samples = 0U;
-    config.seed = GPT_DEFAULT_SEED;
-    config.dropout_p = GPT_DEFAULT_DROPOUT_P;
-    config.lr_max = GPT_DEFAULT_LR_MAX;
-    config.lr_min = GPT_DEFAULT_LR_MIN;
-    config.weight_decay = GPT_DEFAULT_WEIGHT_DECAY;
-    config.grad_clip_norm = GPT_DEFAULT_GRAD_CLIP_NORM;
-    config.temperature = 0.0f;
-    config.min_p = GPT_DEFAULT_MIN_P;
-    config.repetition_penalty = GPT_DEFAULT_REPETITION_PENALTY;
-    config.logits_softcap = 30.0f;
-    config.pad_token_id = -1;
-    return config;
-}
-
-static gpt_config parse_args(int argc, char **argv)
-{
-    gpt_config config = gpt_config_default();
+    const char *config_path = NULL;
     int i;
-
-#define GPT_ARG_STRING(name, field)                \
-    value = arg_value(argc, argv, &i, (name));     \
-    if (value != NULL) {                           \
-        config.field = value;                      \
-        continue;                                  \
-    }
-
-#define GPT_ARG_STRING_ALIAS(name, alias_name, field)       \
-    value = arg_value(argc, argv, &i, (name));              \
-    if (value == NULL) {                                    \
-        value = arg_value(argc, argv, &i, (alias_name));    \
-    }                                                       \
-    if (value != NULL) {                                    \
-        config.field = value;                               \
-        continue;                                           \
-    }
-
-#define GPT_ARG_FLAG(name, field, flag_value)      \
-    if (strcmp(argv[i], (name)) == 0) {             \
-        config.field = (flag_value);                \
-        continue;                                  \
-    }
-
-#define GPT_ARG_I64_SET(name, min_value, max_value, set_stmt)                                \
-    value = arg_value(argc, argv, &i, (name));                                              \
-    if (value != NULL) {                                                                    \
-        if (!parse_i64_arg(value, (int64_t)(min_value), (int64_t)(max_value), &parsed_i64)) { \
-            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value);                     \
-            exit(2);                                                                        \
-        }                                                                                   \
-        { set_stmt; }                                                                       \
-        continue;                                                                           \
-    }
-
-#define GPT_ARG_I64_INT(name, min_value, max_value, field) \
-    GPT_ARG_I64_SET((name), (min_value), (max_value), config.field = (int)parsed_i64)
-
-#define GPT_ARG_U64_SET(name, max_value, set_stmt)                       \
-    value = arg_value(argc, argv, &i, (name));                          \
-    if (value != NULL) {                                                \
-        if (!parse_u64_arg(value, (uint64_t)(max_value), &parsed_u64)) { \
-            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value); \
-            exit(2);                                                    \
-        }                                                               \
-        { set_stmt; }                                                   \
-        continue;                                                       \
-    }
-
-#define GPT_ARG_U64(name, max_value, field) \
-    GPT_ARG_U64_SET((name), (max_value), config.field = parsed_u64)
-
-#define GPT_ARG_SIZE(name, max_value, field) \
-    GPT_ARG_U64_SET((name), (max_value), config.field = (size_t)parsed_u64)
-
-#define GPT_ARG_F32(name, min_value, max_value, field)                      \
-    value = arg_value(argc, argv, &i, (name));                             \
-    if (value != NULL) {                                                   \
-        if (!parse_float_arg(value, (min_value), (max_value), &parsed_f32)) { \
-            fprintf(stderr, "gpt_lm: invalid %s %s\n", (name), value);    \
-            exit(2);                                                       \
-        }                                                                  \
-        config.field = parsed_f32;                                         \
-        continue;                                                          \
-    }
-
-#define GPT_ARG_ENUM(name, parse_fn, field, expected_text)              \
-    value = arg_value(argc, argv, &i, (name));                         \
-    if (value != NULL) {                                               \
-        if (!(parse_fn)(value, &config.field)) {                       \
-            fprintf(stderr, "gpt_lm: invalid %s %s%s\n", (name), value, (expected_text)); \
-            exit(2);                                                   \
-        }                                                              \
-        continue;                                                      \
-    }
-
-#define GPT_ARG_ENUM_ALIAS(name, alias_name, parse_fn, field, error_name, expected_text) \
-    value = arg_value(argc, argv, &i, (name));                         \
-    if (value == NULL) {                                               \
-        value = arg_value(argc, argv, &i, (alias_name));               \
-    }                                                                  \
-    if (value != NULL) {                                               \
-        if (!(parse_fn)(value, &config.field)) {                       \
-            fprintf(stderr, "gpt_lm: invalid %s %s%s\n", (error_name), value, (expected_text)); \
-            exit(2);                                                   \
-        }                                                              \
-        continue;                                                      \
-    }
-
     for (i = 1; i < argc; ++i) {
         const char *value;
-        int64_t parsed_i64 = 0;
-        uint64_t parsed_u64 = 0U;
-        float parsed_f32 = 0.0f;
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             exit(0);
         }
-        GPT_ARG_STRING("--data-dir", data_dir);
-        GPT_ARG_STRING("--tokenizer-path", tokenizer_path);
-        GPT_ARG_STRING("--generate", generate_prompt);
-        GPT_ARG_STRING("--checkpoint-path", checkpoint_path);
-        GPT_ARG_STRING("--latest-checkpoint-path", latest_checkpoint_path);
-        GPT_ARG_STRING("--load-checkpoint", load_checkpoint_path);
-        GPT_ARG_SIZE("--latest-every-n-steps", SIZE_MAX, latest_every_n_steps);
-        GPT_ARG_STRING("--resume-checkpoint", resume_checkpoint_path);
-        GPT_ARG_STRING("--val-split", val_split);
-        GPT_ARG_STRING("--metrics-dir", metrics_dir);
-        GPT_ARG_STRING("--metrics-project", metrics_project);
-        GPT_ARG_STRING("--metrics-run-id", metrics_run_id);
-        GPT_ARG_STRING_ALIAS("--local-shard-cache-dir", "--shard-cache-dir", local_shard_cache_dir);
-        GPT_ARG_FLAG("--keep-shard-cache", keep_shard_cache, true);
-        GPT_ARG_FLAG("--no-metrics", metrics_enabled, false);
-        GPT_ARG_FLAG("--no-save-best", save_best, false);
-        GPT_ARG_FLAG("--no-save-latest", save_latest, false);
-        GPT_ARG_I64_INT("--early-stopping-patience", 0, 1000000, early_stopping_patience);
-        GPT_ARG_I64_INT("--generate-every-n-steps", 0, 1000000000, generate_every_n_steps);
-        GPT_ARG_I64_INT("--max-new-tokens", 1, GPT_CONTEXT_LENGTH, max_new_tokens);
-        GPT_ARG_F32("--temperature", 0.0f, 10.0f, temperature);
-        GPT_ARG_F32("--min-p", 0.0f, 1.0f, min_p);
-        GPT_ARG_F32("--repetition-penalty", 1.0f, 10.0f, repetition_penalty);
-        GPT_ARG_F32("--logits-softcap", 0.0f, 1000000.0f, logits_softcap);
-        GPT_ARG_I64_SET("--epochs", 0, 1000000, config.epochs = (int)parsed_i64; config.epochs_set = true);
-        GPT_ARG_I64_INT("--batch-size", 1, 1024, batch_size);
-        GPT_ARG_I64_INT("--dataloader-workers", 1, 64, dataloader_workers);
-        GPT_ARG_I64_INT("--dataloader-prefetch-factor", 1, 16, dataloader_prefetch_factor);
-        GPT_ARG_I64_INT("--layers", 1, 96, n_layers);
-        GPT_ARG_ENUM_ALIAS("--architecture", "--arch", parse_architecture_arg, architecture,
-                           "--architecture", " (expected gpt or minimax_m3)");
-        GPT_ARG_I64_INT("--minimax-topk-blocks", 1, 16, minimax_m3_topk_blocks);
-        GPT_ARG_I64_INT("--minimax-init-blocks", 0, 16, minimax_m3_init_blocks);
-        GPT_ARG_I64_INT("--minimax-local-blocks", 0, 16, minimax_m3_local_blocks);
-        GPT_ARG_F32("--dropout", 0.0f, 0.95f, dropout_p);
-        GPT_ARG_F32("--lr-max", 0.0f, 10.0f, lr_max);
-        GPT_ARG_F32("--lr-min", 0.0f, 10.0f, lr_min);
-        GPT_ARG_I64_INT("--warmup-steps", -1, 1000000000, lr_warmup_steps);
-        GPT_ARG_F32("--weight-decay", 0.0f, 10.0f, weight_decay);
-        GPT_ARG_F32("--grad-clip-norm", 0.0f, 1000000.0f, grad_clip_norm);
-        GPT_ARG_I64_INT("--report-every", 0, 1000000000, report_every);
-        GPT_ARG_I64_INT("--eval-every-n-epochs", 1, 1000000, eval_every_n_epochs);
-        GPT_ARG_U64("--overfit-num-samples", UINT64_MAX, overfit_num_samples);
-        GPT_ARG_ENUM("--shuffle-scope", parse_shuffle_scope_arg, shuffle_scope,
-                     " (expected global, shard, or none)");
-        GPT_ARG_U64("--seed", UINT64_MAX, seed);
+        value = arg_value(argc, argv, &i, "--config");
+        if (value == NULL && strcmp(argv[i], "-c") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "gpt_lm: missing value for -c\n");
+                exit(2);
+            }
+            ++i;
+            value = argv[i];
+        }
+        if (value == NULL && argv[i][0] != '-') {
+            value = argv[i];
+        }
+        if (value != NULL) {
+            if (config_path != NULL) {
+                fprintf(stderr, "gpt_lm: --config specified more than once\n");
+                exit(2);
+            }
+            config_path = value;
+            continue;
+        }
         fprintf(stderr, "gpt_lm: unknown argument %s\n", argv[i]);
         print_usage(argv[0]);
         exit(2);
     }
-
-#undef GPT_ARG_ENUM_ALIAS
-#undef GPT_ARG_ENUM
-#undef GPT_ARG_F32
-#undef GPT_ARG_SIZE
-#undef GPT_ARG_U64
-#undef GPT_ARG_U64_SET
-#undef GPT_ARG_I64_INT
-#undef GPT_ARG_I64_SET
-#undef GPT_ARG_FLAG
-#undef GPT_ARG_STRING_ALIAS
-#undef GPT_ARG_STRING
-
-    if (config.generate_prompt != NULL && !config.epochs_set) {
-        config.epochs = 0;
-    }
-    if (config.epochs == 0 && config.generate_prompt == NULL) {
-        fprintf(stderr, "gpt_lm: --epochs 0 requires --generate\n");
+    if (config_path == NULL || config_path[0] == '\0') {
+        fprintf(stderr, "gpt_lm: --config PATH is required\n");
+        print_usage(argv[0]);
         exit(2);
     }
-    if ((size_t)config.dataloader_workers > (size_t)GPT_MAX_DATALOADER_SLOTS /
-                                             (size_t)config.dataloader_prefetch_factor) {
-        fprintf(stderr,
-                "gpt_lm: --dataloader-workers * --dataloader-prefetch-factor must be <= %u "
-                "(one data slot is reserved for generation/checkpoint sync)\n",
-                (unsigned)GPT_MAX_DATALOADER_SLOTS);
-        exit(2);
-    }
-    if (config.lr_min > config.lr_max) {
-        fprintf(stderr, "gpt_lm: --lr-min must be <= --lr-max\n");
-        exit(2);
-    }
-    if (config.local_shard_cache_dir != NULL && config.shuffle_scope != GPT_SHUFFLE_SHARD) {
-        fprintf(stderr, "gpt_lm: --local-shard-cache-dir requires --shuffle-scope shard\n");
-        exit(2);
-    }
-    if (config.load_checkpoint_path != NULL && config.resume_checkpoint_path != NULL) {
-        fprintf(stderr, "gpt_lm: use either --load-checkpoint or --resume-checkpoint, not both\n");
-        exit(2);
-    }
-    return config;
+    return config_path;
 }
 
+static void gpt_config_set_error(gd_example_config_error *error,
+                                 unsigned line,
+                                 const char *fmt,
+                                 ...)
+{
+    va_list ap;
+    if (error == NULL) {
+        return;
+    }
+    error->line = line;
+    va_start(ap, fmt);
+    (void)vsnprintf(error->message, sizeof(error->message), fmt, ap);
+    va_end(ap);
+}
+
+static void gpt_config_die(const char *path, const gd_example_config_error *error)
+{
+    if (error != NULL && error->line > 0U) {
+        fprintf(stderr,
+                "gpt_lm: invalid config %s:%u: %s\n",
+                path != NULL ? path : "(null)",
+                error->line,
+                gd_example_config_error_message(error));
+    } else {
+        fprintf(stderr,
+                "gpt_lm: invalid config %s: %s\n",
+                path != NULL ? path : "(null)",
+                gd_example_config_error_message(error));
+    }
+    exit(2);
+}
+
+static void gpt_config_deinit(gpt_config *config)
+{
+    if (config == NULL) {
+        return;
+    }
+    free((void *)config->data_dir);
+    free((void *)config->tokenizer_path);
+    free((void *)config->generate_prompt);
+    free((void *)config->checkpoint_path);
+    free((void *)config->latest_checkpoint_path);
+    free((void *)config->load_checkpoint_path);
+    free((void *)config->resume_checkpoint_path);
+    free((void *)config->val_split);
+    free((void *)config->metrics_dir);
+    free((void *)config->metrics_project);
+    free((void *)config->metrics_run_id);
+    free((void *)config->local_shard_cache_dir);
+    config->data_dir = NULL;
+    config->tokenizer_path = NULL;
+    config->generate_prompt = NULL;
+    config->checkpoint_path = NULL;
+    config->latest_checkpoint_path = NULL;
+    config->load_checkpoint_path = NULL;
+    config->resume_checkpoint_path = NULL;
+    config->val_split = NULL;
+    config->metrics_dir = NULL;
+    config->metrics_project = NULL;
+    config->metrics_run_id = NULL;
+    config->local_shard_cache_dir = NULL;
+}
+
+static void gpt_config_invalid(gpt_config *config, const char *message)
+{
+    fprintf(stderr,
+            "gpt_lm: invalid config %s: %s\n",
+            config->config_path != NULL ? config->config_path : "(null)",
+            message != NULL ? message : "invalid value");
+    gpt_config_deinit(config);
+    exit(2);
+}
+
+static char *gpt_strdup(const char *text)
+{
+    const size_t len = text != NULL ? strlen(text) : 0U;
+    char *out;
+    if (text == NULL || len > SIZE_MAX - 1U) {
+        return NULL;
+    }
+    out = (char *)malloc(len + 1U);
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, text, len + 1U);
+    return out;
+}
+
+static char *gpt_config_dup_string(gpt_config *config,
+                                   const char *key,
+                                   const char *value,
+                                   bool empty_means_null)
+{
+    char *copy;
+    char message[256];
+    if (empty_means_null && (value == NULL || value[0] == '\0')) {
+        return NULL;
+    }
+    copy = gpt_strdup(value);
+    if (copy == NULL) {
+        (void)snprintf(message,
+                       sizeof(message),
+                       "out of memory while storing string key '%s'",
+                       key != NULL ? key : "(unknown)");
+        gpt_config_invalid(config, message);
+    }
+    return copy;
+}
+
+static bool gpt_config_string_empty(const char *text)
+{
+    return text == NULL || text[0] == '\0';
+}
+
+static void gpt_config_finalize(gpt_config *config)
+{
+    const size_t dataloader_slots = (size_t)config->dataloader_workers *
+                                    (size_t)config->dataloader_prefetch_factor;
+    if (gpt_config_string_empty(config->data_dir)) {
+        gpt_config_invalid(config, "data_dir must not be empty");
+    }
+    if (gpt_config_string_empty(config->checkpoint_path)) {
+        gpt_config_invalid(config, "checkpoint_path must not be empty");
+    }
+    if (gpt_config_string_empty(config->latest_checkpoint_path)) {
+        gpt_config_invalid(config, "latest_checkpoint_path must not be empty");
+    }
+    if (gpt_config_string_empty(config->val_split)) {
+        gpt_config_invalid(config, "val_split must not be empty");
+    }
+    if (gpt_config_string_empty(config->metrics_dir)) {
+        gpt_config_invalid(config, "metrics_dir must not be empty");
+    }
+    if (gpt_config_string_empty(config->metrics_project)) {
+        gpt_config_invalid(config, "metrics_project must not be empty");
+    }
+    if (config->epochs == 0 && config->generate_prompt == NULL) {
+        gpt_config_invalid(config, "epochs: 0 requires a non-empty generate_prompt");
+    }
+    if (dataloader_slots > (size_t)GPT_MAX_DATALOADER_SLOTS) {
+        gpt_config_invalid(config,
+                           "dataloader_workers * dataloader_prefetch_factor exceeds the data slot limit");
+    }
+    if (config->lr_min > config->lr_max) {
+        gpt_config_invalid(config, "lr_min must be <= lr_max");
+    }
+    if (config->local_shard_cache_dir != NULL && config->shuffle_scope != GPT_SHUFFLE_SHARD) {
+        gpt_config_invalid(config, "local_shard_cache_dir requires shuffle_scope: shard");
+    }
+    if (config->load_checkpoint_path != NULL && config->resume_checkpoint_path != NULL) {
+        gpt_config_invalid(config,
+                           "use either load_checkpoint_path or resume_checkpoint_path, not both");
+    }
+}
+
+static int gpt_config_require_architecture(const gd_example_config_doc *doc,
+                                           gpt_architecture *out,
+                                           gd_example_config_error *error)
+{
+    const gd_example_config_entry *entry;
+    const char *text = NULL;
+    if (!gd_example_config_require_string(doc, "architecture", &text, error)) {
+        return 0;
+    }
+    if (parse_architecture_arg(text, out)) {
+        return 1;
+    }
+    entry = gd_example_config_find(doc, "architecture");
+    gpt_config_set_error(error,
+                         entry != NULL ? entry->line : 0U,
+                         "key 'architecture' must be 'gpt' or 'minimax_m3'; got '%s'",
+                         text);
+    return 0;
+}
+
+static int gpt_config_require_shuffle_scope(const gd_example_config_doc *doc,
+                                            gpt_shuffle_scope *out,
+                                            gd_example_config_error *error)
+{
+    const gd_example_config_entry *entry;
+    const char *text = NULL;
+    if (!gd_example_config_require_string(doc, "shuffle_scope", &text, error)) {
+        return 0;
+    }
+    if (parse_shuffle_scope_arg(text, out)) {
+        return 1;
+    }
+    entry = gd_example_config_find(doc, "shuffle_scope");
+    gpt_config_set_error(error,
+                         entry != NULL ? entry->line : 0U,
+                         "key 'shuffle_scope' must be 'global', 'shard', or 'none'; got '%s'",
+                         text);
+    return 0;
+}
+
+static gpt_config gpt_config_from_yaml(const char *path)
+{
+    static const char *const known_keys[] = {
+        "data_dir",
+        "tokenizer_path",
+        "generate_prompt",
+        "checkpoint_path",
+        "latest_checkpoint_path",
+        "load_checkpoint_path",
+        "resume_checkpoint_path",
+        "val_split",
+        "metrics_dir",
+        "metrics_project",
+        "metrics_run_id",
+        "local_shard_cache_dir",
+        "epochs",
+        "batch_size",
+        "dataloader_workers",
+        "dataloader_prefetch_factor",
+        "layers",
+        "architecture",
+        "shuffle_scope",
+        "minimax_m3_topk_blocks",
+        "minimax_m3_init_blocks",
+        "minimax_m3_local_blocks",
+        "report_every",
+        "eval_every_n_epochs",
+        "early_stopping_patience",
+        "warmup_steps",
+        "max_new_tokens",
+        "latest_every_n_steps",
+        "generate_every_n_steps",
+        "save_best",
+        "save_latest",
+        "metrics_enabled",
+        "keep_shard_cache",
+        "overfit_num_samples",
+        "seed",
+        "dropout_p",
+        "lr_max",
+        "lr_min",
+        "weight_decay",
+        "grad_clip_norm",
+        "temperature",
+        "min_p",
+        "repetition_penalty",
+        "logits_softcap",
+    };
+    gd_example_config_doc doc;
+    gd_example_config_error error;
+    gpt_config config;
+    uint64_t parsed_u64 = 0U;
+    const char *data_dir = NULL;
+    const char *tokenizer_path = NULL;
+    const char *generate_prompt = NULL;
+    const char *checkpoint_path = NULL;
+    const char *latest_checkpoint_path = NULL;
+    const char *load_checkpoint_path = NULL;
+    const char *resume_checkpoint_path = NULL;
+    const char *val_split = NULL;
+    const char *metrics_dir = NULL;
+    const char *metrics_project = NULL;
+    const char *metrics_run_id = NULL;
+    const char *local_shard_cache_dir = NULL;
+    int ok;
+
+    memset(&config, 0, sizeof(config));
+    config.config_path = path;
+    config.epochs_set = true;
+    config.pad_token_id = -1;
+
+    ok = gd_example_config_load_yaml_file(path, &doc, &error) &&
+         gd_example_config_validate_keys(&doc, known_keys, GD_ARRAY_LEN(known_keys), &error) &&
+         gd_example_config_require_string(&doc, "data_dir", &data_dir, &error) &&
+         gd_example_config_require_string_allow_empty(&doc, "tokenizer_path", &tokenizer_path, &error) &&
+         gd_example_config_require_string_allow_empty(&doc, "generate_prompt", &generate_prompt, &error) &&
+         gd_example_config_require_string(&doc, "checkpoint_path", &checkpoint_path, &error) &&
+         gd_example_config_require_string(&doc,
+                                          "latest_checkpoint_path",
+                                          &latest_checkpoint_path,
+                                          &error) &&
+         gd_example_config_require_string_allow_empty(&doc,
+                                                      "load_checkpoint_path",
+                                                      &load_checkpoint_path,
+                                                      &error) &&
+         gd_example_config_require_string_allow_empty(&doc,
+                                                      "resume_checkpoint_path",
+                                                      &resume_checkpoint_path,
+                                                      &error) &&
+         gd_example_config_require_string(&doc, "val_split", &val_split, &error) &&
+         gd_example_config_require_string(&doc, "metrics_dir", &metrics_dir, &error) &&
+         gd_example_config_require_string(&doc, "metrics_project", &metrics_project, &error) &&
+         gd_example_config_require_string_allow_empty(&doc, "metrics_run_id", &metrics_run_id, &error) &&
+         gd_example_config_require_string_allow_empty(&doc,
+                                                      "local_shard_cache_dir",
+                                                      &local_shard_cache_dir,
+                                                      &error) &&
+         gd_example_config_require_int(&doc, "epochs", 0, 1000000, &config.epochs, &error) &&
+         gd_example_config_require_int(&doc, "batch_size", 1, 1024, &config.batch_size, &error) &&
+         gd_example_config_require_int(&doc,
+                                       "dataloader_workers",
+                                       1,
+                                       64,
+                                       &config.dataloader_workers,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "dataloader_prefetch_factor",
+                                       1,
+                                       16,
+                                       &config.dataloader_prefetch_factor,
+                                       &error) &&
+         gd_example_config_require_int(&doc, "layers", 1, 96, &config.n_layers, &error) &&
+         gpt_config_require_architecture(&doc, &config.architecture, &error) &&
+         gpt_config_require_shuffle_scope(&doc, &config.shuffle_scope, &error) &&
+         gd_example_config_require_int(&doc,
+                                       "minimax_m3_topk_blocks",
+                                       1,
+                                       16,
+                                       &config.minimax_m3_topk_blocks,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "minimax_m3_init_blocks",
+                                       0,
+                                       16,
+                                       &config.minimax_m3_init_blocks,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "minimax_m3_local_blocks",
+                                       0,
+                                       16,
+                                       &config.minimax_m3_local_blocks,
+                                       &error) &&
+         gd_example_config_require_int(&doc, "report_every", 0, 1000000000, &config.report_every, &error) &&
+         gd_example_config_require_int(&doc,
+                                       "eval_every_n_epochs",
+                                       1,
+                                       1000000,
+                                       &config.eval_every_n_epochs,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "early_stopping_patience",
+                                       0,
+                                       1000000,
+                                       &config.early_stopping_patience,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "warmup_steps",
+                                       -1,
+                                       1000000000,
+                                       &config.lr_warmup_steps,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "max_new_tokens",
+                                       1,
+                                       GPT_CONTEXT_LENGTH,
+                                       &config.max_new_tokens,
+                                       &error) &&
+         gd_example_config_require_u64(&doc,
+                                       "latest_every_n_steps",
+                                       (uint64_t)SIZE_MAX,
+                                       &parsed_u64,
+                                       &error) &&
+         gd_example_config_require_int(&doc,
+                                       "generate_every_n_steps",
+                                       0,
+                                       1000000000,
+                                       &config.generate_every_n_steps,
+                                       &error) &&
+         gd_example_config_require_bool(&doc, "save_best", &config.save_best, &error) &&
+         gd_example_config_require_bool(&doc, "save_latest", &config.save_latest, &error) &&
+         gd_example_config_require_bool(&doc, "metrics_enabled", &config.metrics_enabled, &error) &&
+         gd_example_config_require_bool(&doc, "keep_shard_cache", &config.keep_shard_cache, &error) &&
+         gd_example_config_require_u64(&doc,
+                                       "overfit_num_samples",
+                                       UINT64_MAX,
+                                       &config.overfit_num_samples,
+                                       &error) &&
+         gd_example_config_require_u64(&doc, "seed", UINT64_MAX, &config.seed, &error) &&
+         gd_example_config_require_f32(&doc, "dropout_p", 0.0f, 0.95f, &config.dropout_p, &error) &&
+         gd_example_config_require_f32(&doc, "lr_max", 0.0f, 10.0f, &config.lr_max, &error) &&
+         gd_example_config_require_f32(&doc, "lr_min", 0.0f, 10.0f, &config.lr_min, &error) &&
+         gd_example_config_require_f32(&doc,
+                                       "weight_decay",
+                                       0.0f,
+                                       10.0f,
+                                       &config.weight_decay,
+                                       &error) &&
+         gd_example_config_require_f32(&doc,
+                                       "grad_clip_norm",
+                                       0.0f,
+                                       1000000.0f,
+                                       &config.grad_clip_norm,
+                                       &error) &&
+         gd_example_config_require_f32(&doc,
+                                       "temperature",
+                                       0.0f,
+                                       10.0f,
+                                       &config.temperature,
+                                       &error) &&
+         gd_example_config_require_f32(&doc, "min_p", 0.0f, 1.0f, &config.min_p, &error) &&
+         gd_example_config_require_f32(&doc,
+                                       "repetition_penalty",
+                                       1.0f,
+                                       10.0f,
+                                       &config.repetition_penalty,
+                                       &error) &&
+         gd_example_config_require_f32(&doc,
+                                       "logits_softcap",
+                                       0.0f,
+                                       1000000.0f,
+                                       &config.logits_softcap,
+                                       &error);
+    if (!ok) {
+        gd_example_config_doc_free(&doc);
+        gpt_config_die(path, &error);
+    }
+
+    config.latest_every_n_steps = (size_t)parsed_u64;
+    config.data_dir = gpt_config_dup_string(&config, "data_dir", data_dir, false);
+    config.tokenizer_path = gpt_config_dup_string(&config, "tokenizer_path", tokenizer_path, true);
+    config.generate_prompt = gpt_config_dup_string(&config, "generate_prompt", generate_prompt, true);
+    config.checkpoint_path = gpt_config_dup_string(&config, "checkpoint_path", checkpoint_path, false);
+    config.latest_checkpoint_path = gpt_config_dup_string(&config,
+                                                          "latest_checkpoint_path",
+                                                          latest_checkpoint_path,
+                                                          false);
+    config.load_checkpoint_path = gpt_config_dup_string(&config,
+                                                        "load_checkpoint_path",
+                                                        load_checkpoint_path,
+                                                        true);
+    config.resume_checkpoint_path = gpt_config_dup_string(&config,
+                                                          "resume_checkpoint_path",
+                                                          resume_checkpoint_path,
+                                                          true);
+    config.val_split = gpt_config_dup_string(&config, "val_split", val_split, false);
+    config.metrics_dir = gpt_config_dup_string(&config, "metrics_dir", metrics_dir, false);
+    config.metrics_project = gpt_config_dup_string(&config, "metrics_project", metrics_project, false);
+    config.metrics_run_id = gpt_config_dup_string(&config, "metrics_run_id", metrics_run_id, true);
+    config.local_shard_cache_dir = gpt_config_dup_string(&config,
+                                                         "local_shard_cache_dir",
+                                                         local_shard_cache_dir,
+                                                         true);
+    gd_example_config_doc_free(&doc);
+    gpt_config_finalize(&config);
+    return config;
+}
 
 static gd_status param_set_stats(const gd_param_set *params,
                                   uint64_t *total_out,
@@ -678,8 +815,8 @@ static gd_status gpt_lm_resolve_special_ids(gd_context *ctx,
     if (st != GD_OK) {
         fprintf(stderr,
                 "gpt_lm: failed to load tokenizer '%s' while resolving special ids; "
-                "ensure --data-dir points at the rebuilt dataset and rebuild with "
-                "GPT_LM_VOCAB_SIZE matching manifest.json (or pass --tokenizer-path).\n",
+                "ensure config data_dir points at the rebuilt dataset and rebuild with "
+                "GPT_LM_VOCAB_SIZE matching manifest.json (or set tokenizer_path).\n",
                 tokenizer_path);
         free(default_tok_path);
         (void)ctx;
@@ -2987,6 +3124,7 @@ static void gpt_log_run_config_metrics(gd_metrics_logger *metrics,
     }
     {
         const gd_metrics_field fields[] = {
+            gd_metrics_string("config_path", config->config_path),
             gd_metrics_string("data_dir", config->data_dir),
             gd_metrics_string("tokenizer_path", config->tokenizer_path),
             gd_metrics_string("checkpoint_path", config->checkpoint_path),
@@ -3062,6 +3200,7 @@ static void gpt_print_startup_summary(const gpt_config *config,
                                       size_t samples_per_epoch,
                                       size_t total_steps)
 {
+    printf("config: path=%s\n", config->config_path);
     printf("dataset: dir=%s samples=%zu train_tokens=%zu val_samples=%zu val_tokens=%zu batch=%d context=%d shuffle=%s steps_per_epoch=%zu samples_per_epoch=%zu epochs=%d total_steps=%zu%s\n",
            config->data_dir,
            dataset_samples,
@@ -3150,7 +3289,7 @@ static void gpt_print_startup_summary(const gpt_config *config,
 
 int main(int argc, char **argv)
 {
-    gpt_config config = parse_args(argc, argv);
+    gpt_config config = gpt_config_from_yaml(parse_config_path(argc, argv));
     const gd_memory_config mem = gpt_memory_config(&config);
     gd_context *ctx = NULL;
     gd_status st = gd_context_create(&mem, &ctx);
@@ -3191,6 +3330,7 @@ int main(int argc, char **argv)
 
     if (st == GD_ERR_UNSUPPORTED) {
         printf("gpt_lm: skipped (no supported gradients.c backend)\n");
+        gpt_config_deinit(&config);
         return 0;
     }
     if (st != GD_OK) {
@@ -3328,5 +3468,6 @@ int main(int argc, char **argv)
     gd_dataset_destroy(val_dataset);
     gd_dataset_destroy(dataset);
     gd_context_destroy(ctx);
+    gpt_config_deinit(&config);
     return exit_code;
 }

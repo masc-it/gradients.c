@@ -10,12 +10,12 @@ The Makefile still supports the older Promessi Sposi dataset via `GPT_LM_DATASET
 - context length: 512 tokens
 - `d_model = 512`
 - `n_layers = 3` by default, about 8.93M trainable parameters
-  - use `--layers 2` for about 6.30M trainable parameters
+  - set `layers: 2` in the YAML config for about 6.30M trainable parameters
 - `n_heads = 8`
 - `head_dim = 64`
 - MLP hidden size: 1024 (`2 * d_model`)
 - default architecture: dense GPT attention (`sdpa_varlen`) with a 256-token sliding window for training/prompt prefill
-- optional `--architecture minimax_m3`: MiniMax M3-style attention; the example now auto-falls back to the fast dense 256-token window at the default 512-token context, and uses the Metal lightning indexer (`gd_minimax_m3_index_topk`) plus sparse attention (`gd_minimax_m3_sparse_attention`) only when the context is long enough for sparsity to win
+- optional `architecture: minimax_m3`: MiniMax M3-style attention; the example now auto-falls back to the fast dense 256-token window at the default 512-token context, and uses the Metal lightning indexer (`gd_minimax_m3_index_topk`) plus sparse attention (`gd_minimax_m3_sparse_attention`) only when the context is long enough for sparsity to win
 - batched decode-time KV cache with `kv_cache_append_packed`, `kv_cache_append_positions`, and `sdpa_decode_positions`
 - biased dense projections throughout the transformer block, plus a tied LM head that reuses `token_embedding` with a separate `lm_head_bias` for fused LM cross-entropy and generation logits
 - RMSNorm, RoPE, SwiGLU gated MLP, dropout, AMP AdamW, gradient clipping, and optional logits softcap
@@ -74,21 +74,31 @@ DATA_DIR=data
 
 ## Train
 
-```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 2 --batch-size 64"
-```
-
-Select the sparse MiniMax M3 attention architecture with:
+Training runtime options live in a flat YAML file (`config.yaml` by default). Edit values such as `epochs`, `batch_size`, `layers`, and learning-rate settings there, then run:
 
 ```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--architecture minimax_m3 --epochs 2 --batch-size 64"
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run
 ```
 
-Sparse attention knobs are `--minimax-topk-blocks`, `--minimax-init-blocks`, and `--minimax-local-blocks` (block size is fixed at 128). At the default 512-token context, `minimax_m3` uses the dense-window fallback because sparse M3 would attend most blocks and pay indexer overhead; the true sparse kernels are selected automatically for longer contexts. The implementation uses the regular GPT Q/K projections as lightning-index Q/K and supports the example head size (`head_dim=64`).
+Use another config with:
+
+```sh
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run CONFIG=my_config.yaml
+```
+
+Select the sparse MiniMax M3 attention architecture in YAML:
+
+```yaml
+architecture: minimax_m3
+epochs: 2
+batch_size: 64
+```
+
+Sparse attention knobs are `minimax_m3_topk_blocks`, `minimax_m3_init_blocks`, and `minimax_m3_local_blocks` (block size is fixed at 128). At the default 512-token context, `minimax_m3` uses the dense-window fallback because sparse M3 would attend most blocks and pay indexer overhead; the true sparse kernels are selected automatically for longer contexts. The implementation uses the regular GPT Q/K projections as lightning-index Q/K and supports the example head size (`head_dim=64`).
 
 By default, training evaluates the `val` split at the end of each epoch, writes `checkpoints/gpt_lm_best.gdckpt` when validation improves, writes `checkpoints/gpt_lm_latest.gdckpt` for full resume, emits async JSONL metrics under `data/metrics/gpt_lm/`, and stops after 10 validation epochs without improvement. Optimizer/scaler/trainer state lives in sidecars next to each model checkpoint: `*.optim.gdckpt` and `*.train`.
 
-If both `--no-save-best` and `--early-stopping-patience 0` are set, validation is skipped. `--no-save-latest` disables latest/full-resume checkpoint writes. Metrics can be disabled with `--no-metrics`, or routed with `--metrics-dir`, `--metrics-project`, and `--metrics-run-id`.
+If both `save_best: false` and `early_stopping_patience: 0` are set, validation is skipped. `save_latest: false` disables latest/full-resume checkpoint writes. Metrics can be disabled with `metrics_enabled: false`, or routed with `metrics_dir`, `metrics_project`, and `metrics_run_id`.
 
 Run the live dashboard from the repository root with:
 
@@ -101,25 +111,21 @@ uv run tools/gd_dash/main.py --metrics-dir data/metrics
 Tiny overfit smoke test:
 
 ```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 1 --batch-size 1 --layers 1 --overfit-num-samples 1 --report-every 1 --no-save-best --no-save-latest --early-stopping-patience 0"
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict overfit-smoke
 ```
 
-MiniMax M3 architecture smoke test (dense fallback at the default 512-token context):
-
-```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--architecture minimax_m3 --epochs 1 --batch-size 1 --layers 1 --overfit-num-samples 1 --report-every 1 --no-save-best --no-save-latest --early-stopping-patience 0"
-```
+The smoke configs live under `examples/gpt_lm/configs/`; copy one and edit `architecture: minimax_m3` for a MiniMax M3 smoke test (dense fallback at the default 512-token context).
 
 Generation-only smoke test with random/current in-memory weights:
 
 ```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 0 --generate '<|im_start|>Termine: casa Definizioni:' --max-new-tokens 32"
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict generate-smoke
 ```
 
 Periodic batched generation during training:
 
 ```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--epochs 1 --batch-size 1 --layers 1 --overfit-num-samples 1 --report-every 1 --generate-every-n-steps 1 --max-new-tokens 4 --no-save-best --no-save-latest --early-stopping-patience 0"
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict periodic-generate-smoke
 ```
 
 The periodic path currently runs one batched generation over the five debug prefixes `a/e/i/o/u`.
@@ -142,85 +148,111 @@ Interactive mode prefixes each line you type with `<|im_start|>` and stops early
 
 ## Resume training
 
-```sh
-make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run ARGS="--resume-checkpoint checkpoints/gpt_lm_latest.gdckpt --epochs 500 --batch-size 64"
+Set these in a YAML config:
+
+```yaml
+resume_checkpoint_path: checkpoints/gpt_lm_latest.gdckpt
+epochs: 500
+batch_size: 64
 ```
 
-Resume loads model weights plus optimizer/scaler/trainer sidecars. The current CLI LR schedule is used for the resumed run.
+then run:
 
-## Useful runtime options
+```sh
+make -C examples/gpt_lm GPT_LM_DATASET=ita_dict run CONFIG=my_resume.yaml
+```
 
-```text
---data-dir PATH
---tokenizer-path PATH
---epochs N                  # 0 allowed with --generate
---batch-size N
---dataloader-workers N
---dataloader-prefetch-factor N # workers * prefetch <= 63; one data slot is reserved
---layers N
---architecture NAME          # gpt or minimax_m3
---minimax-topk-blocks N
---minimax-init-blocks N
---minimax-local-blocks N
---dropout P
---overfit-num-samples N
---shuffle-scope S           # global, shard, or none
---report-every N
---lr-max LR
---lr-min LR
---warmup-steps N            # default -1 means total_steps / 10
---weight-decay WD
---grad-clip-norm N          # 0 disables
---generate TEXT             # skips training unless --epochs is set
---generate-every-n-steps N
---checkpoint-path PATH        # best-val model checkpoint
---latest-checkpoint-path PATH # full-resume checkpoint saved every epoch
---latest-every-n-steps N      # additionally save latest checkpoint every N steps; 0 disables
---load-checkpoint PATH        # model weights only
---resume-checkpoint PATH      # model + optimizer/scaler/trainer sidecars
---val-split NAME
---metrics-dir PATH          # default data/metrics
---metrics-project NAME      # default gpt_lm
---metrics-run-id ID         # default timestamp-pid
---no-metrics
---no-save-best
---no-save-latest
---early-stopping-patience N # 0 disables; default 10
---max-new-tokens N
---temperature T             # 0 means greedy
---min-p P                   # filter tokens below P * top probability; 0 disables
---repetition-penalty P      # 1 disables
---logits-softcap C          # final logits softcap; 0 disables
---seed N
+Resume loads model weights plus optimizer/scaler/trainer sidecars. The current YAML LR schedule is used for the resumed run.
+
+## Useful runtime config keys
+
+The training binary accepts only `--config PATH`. The YAML file must contain all runtime keys; optional paths/prompts use an empty string when unset.
+
+```yaml
+data_dir: data
+tokenizer_path: ""
+generate_prompt: ""        # epochs: 0 requires this to be non-empty
+checkpoint_path: checkpoints/gpt_lm_best.gdckpt
+latest_checkpoint_path: checkpoints/gpt_lm_latest.gdckpt
+load_checkpoint_path: ""    # model weights only
+resume_checkpoint_path: ""  # model + optimizer/scaler/trainer sidecars
+val_split: val
+metrics_dir: ../../data/metrics
+metrics_project: gpt_lm
+metrics_run_id: ""
+local_shard_cache_dir: ""
+
+epochs: 2
+batch_size: 64
+dataloader_workers: 2
+dataloader_prefetch_factor: 4 # workers * prefetch <= 63; one data slot is reserved
+layers: 3
+architecture: gpt             # gpt or minimax_m3
+shuffle_scope: global          # global, shard, or none
+minimax_m3_topk_blocks: 3
+minimax_m3_init_blocks: 1
+minimax_m3_local_blocks: 1
+report_every: 10
+eval_every_n_epochs: 1
+early_stopping_patience: 10    # 0 disables
+warmup_steps: -1               # -1 means total_steps / 10
+latest_every_n_steps: 0
+generate_every_n_steps: 0
+save_best: true
+save_latest: true
+metrics_enabled: true
+keep_shard_cache: false
+overfit_num_samples: 0
+seed: 0x6750746c6d5eed00
+
+dropout_p: 0.05
+lr_max: 0.0003
+lr_min: 0.00005
+weight_decay: 0.0001
+grad_clip_norm: 1.0            # 0 disables
+
+max_new_tokens: 64
+temperature: 0.0               # 0 means greedy
+min_p: 0.0                     # filter tokens below P * top probability; 0 disables
+repetition_penalty: 1.0        # 1 disables
+logits_softcap: 30.0           # final logits softcap; 0 disables
 ```
 
 Generation uses the selected architecture for batched prompt prefill (`sdpa_varlen` for `gpt`, MiniMax M3 sparse attention for long enough `minimax_m3` contexts, otherwise the dense-window fallback), `kv_cache_append_packed` to materialize variable-length prompt K/V, then appends one token per batch row with `kv_cache_append_positions` and currently calls dense `sdpa_decode_positions` for each autoregressive step. Sampling is CPU-side, so very small generations are latency-bound by per-step logits readback.
 
 
 ---
-fineweb2
 
+## fineweb2 sketch
+
+Copy `examples/gpt_lm/config.yaml` to a separate YAML file and edit the dataset-specific keys, for example:
+
+```yaml
+data_dir: "/Volumes/Seagate 2TB/datasets/gd_fineweb2/gdds"
+tokenizer_path: "/Volumes/Seagate 2TB/datasets/gd_fineweb2/tokenizer/tokenizer-v8192.json"
+epochs: 1
+batch_size: 8
+report_every: 4
+generate_every_n_steps: 1000
+early_stopping_patience: 0
+weight_decay: 0.00001
+lr_min: 0.00003
+lr_max: 0.0003
+eval_every_n_epochs: 1
+logits_softcap: 0
+architecture: gpt
+latest_checkpoint_path: "/Volumes/Seagate 2TB/datasets/gd_fineweb2/checkpoints/gpt_lm_latest.gdckpt"
+latest_every_n_steps: 1000
+shuffle_scope: shard
 ```
 
+Then build with the matching compile-time shape and run the config:
+
+```sh
 make -C examples/gpt_lm \
   GPT_LM_VOCAB_SIZE=8192 \
   GPT_LM_CONTEXT_LENGTH=2048 \
-  all && GRADIENTS_METALLIB="$(pwd)/build-gpt_lm/gradients.metallib" \
-   examples/gpt_lm/gd_main_gpt_lm \
-     --data-dir "/Volumes/Seagate 2TB/datasets/gd_fineweb2/gdds" \
-     --tokenizer-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/tokenizer/tokenizer-v8192.json" \
-     --epochs 1 \
-     --batch-size 8 \
-     --report-every 4 \
-     --generate-every-n-steps 1000 \
-     --early-stopping-patience 0 \
-     --weight-decay 1e-5 \
-     --lr-min 3e-5 \
-     --lr-max 3e-4 \
-     --eval-every-n-epochs 1 \
-     --logits-softcap 0 \
-     --architecture gpt \
-     --latest-checkpoint-path "/Volumes/Seagate 2TB/datasets/gd_fineweb2/checkpoints/gpt_lm_latest.gdckpt" \
-     --latest-every-n-steps 1000 \
-     --shuffle-scope shard
-     ```
+  all
+GRADIENTS_METALLIB="$(pwd)/build-gpt_lm/gradients.metallib" \
+  examples/gpt_lm/gd_main_gpt_lm --config /path/to/fineweb2.yaml
+```

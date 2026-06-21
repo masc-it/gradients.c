@@ -50,6 +50,10 @@ int gd_example_config_require_string(const gd_example_config_doc *doc,
                                      const char *key,
                                      const char **out,
                                      gd_example_config_error *error);
+int gd_example_config_require_string_allow_empty(const gd_example_config_doc *doc,
+                                                 const char *key,
+                                                 const char **out,
+                                                 gd_example_config_error *error);
 int gd_example_config_require_i64(const gd_example_config_doc *doc,
                                   const char *key,
                                   int64_t min_value,

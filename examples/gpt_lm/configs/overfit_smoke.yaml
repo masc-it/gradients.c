@@ -1,0 +1,47 @@
+# Runtime config for `overfit_smoke.yaml`.
+# Format: flat YAML, one scalar `key: value` per line.
+
+data_dir: data
+tokenizer_path: ""
+generate_prompt: ""
+checkpoint_path: checkpoints/gpt_lm_best.gdckpt
+latest_checkpoint_path: checkpoints/gpt_lm_latest.gdckpt
+load_checkpoint_path: ""
+resume_checkpoint_path: ""
+val_split: val
+metrics_dir: ../../data/metrics
+metrics_project: gpt_lm
+metrics_run_id: ""
+local_shard_cache_dir: ""
+epochs: 1
+batch_size: 1
+dataloader_workers: 2
+dataloader_prefetch_factor: 4
+layers: 3
+architecture: gpt
+shuffle_scope: global
+minimax_m3_topk_blocks: 3
+minimax_m3_init_blocks: 1
+minimax_m3_local_blocks: 1
+report_every: 1
+eval_every_n_epochs: 1
+early_stopping_patience: 0
+warmup_steps: -1
+latest_every_n_steps: 0
+generate_every_n_steps: 0
+save_best: false
+save_latest: false
+metrics_enabled: false
+keep_shard_cache: false
+overfit_num_samples: 1
+seed: 0x6750746c6d5eed00
+dropout_p: 0.05
+lr_max: 0.0003
+lr_min: 0.00005
+weight_decay: 0.0001
+grad_clip_norm: 1.0
+max_new_tokens: 64
+temperature: 0.0
+min_p: 0.0
+repetition_penalty: 1.0
+logits_softcap: 30.0

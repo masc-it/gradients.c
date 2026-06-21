@@ -618,10 +618,10 @@ static const gd_example_config_entry *gd_example_config_require_entry(const gd_e
     return entry;
 }
 
-int gd_example_config_require_string(const gd_example_config_doc *doc,
-                                     const char *key,
-                                     const char **out,
-                                     gd_example_config_error *error)
+int gd_example_config_require_string_allow_empty(const gd_example_config_doc *doc,
+                                                 const char *key,
+                                                 const char **out,
+                                                 gd_example_config_error *error)
 {
     const gd_example_config_entry *entry;
     if (out == NULL) {
@@ -633,11 +633,26 @@ int gd_example_config_require_string(const gd_example_config_doc *doc,
     if (entry == NULL) {
         return 0;
     }
-    if (entry->value[0] == '\0') {
-        gd_example_config_set_error(error, entry->line, "key '%s' must not be empty", key);
+    *out = entry->value;
+    return 1;
+}
+
+int gd_example_config_require_string(const gd_example_config_doc *doc,
+                                     const char *key,
+                                     const char **out,
+                                     gd_example_config_error *error)
+{
+    if (!gd_example_config_require_string_allow_empty(doc, key, out, error)) {
         return 0;
     }
-    *out = entry->value;
+    if (*out == NULL || (*out)[0] == '\0') {
+        const gd_example_config_entry *entry = gd_example_config_find(doc, key);
+        gd_example_config_set_error(error,
+                                    entry != NULL ? entry->line : 0U,
+                                    "key '%s' must not be empty",
+                                    key);
+        return 0;
+    }
     return 1;
 }
 

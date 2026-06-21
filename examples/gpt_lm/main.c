@@ -2200,92 +2200,6 @@ static void gpt_save_and_log_checkpoint(gd_context *ctx,
                              best_val_loss);
 }
 
-static bool validate_and_maybe_checkpoint(gd_context *ctx,
-                                          gpt_lm *model,
-                                          gd_optimizer *optimizer,
-                                          gd_amp_scaler *scaler,
-                                          const gd_lr_scheduler_config *lr_config,
-                                          gd_dataset *val_dataset,
-                                          const gpt_config *config,
-                                          gpt_report_state *report,
-                                          gd_metrics_logger *metrics,
-                                          size_t epoch,
-                                          size_t epoch_step,
-                                          size_t global_step,
-                                          float *best_val_loss,
-                                          float *out_val_loss,
-                                          bool *out_improved)
-{
-    bool improved = false;
-    float val_loss;
-    if (out_improved != NULL) {
-        *out_improved = false;
-    }
-    if (out_val_loss != NULL) {
-        *out_val_loss = NAN;
-    }
-    if (val_dataset == NULL) {
-        return false;
-    }
-    if (report != NULL) {
-        gd_progress_rowf(&report->progress,
-                         GPT_PROGRESS_EVAL,
-                         "eval epoch=%zu step=%zu running...",
-                         epoch,
-                         global_step);
-        gd_progress_rowf(&report->progress,
-                         GPT_PROGRESS_CHECKPOINT,
-                         "checkpoint best=pending latest=pending");
-        gpt_report_summary(report);
-        gd_progress_render(&report->progress);
-    }
-    val_loss = evaluate_gpt_loss(ctx, model, val_dataset, config);
-    if (out_val_loss != NULL) {
-        *out_val_loss = val_loss;
-    }
-    if (isfinite(val_loss) && best_val_loss != NULL && val_loss < *best_val_loss) {
-        *best_val_loss = val_loss;
-        improved = true;
-        if (config->save_best) {
-            gpt_report_rowf(ctx,
-                            report,
-                            GPT_PROGRESS_CHECKPOINT,
-                            "checkpoint best=saving path=%s latest=pending",
-                            config->checkpoint_path);
-            gpt_save_and_log_checkpoint(ctx,
-                                        model,
-                                        optimizer,
-                                        scaler,
-                                        lr_config,
-                                        config,
-                                        metrics,
-                                        GPT_CHECKPOINT_BEST,
-                                        config->checkpoint_path,
-                                        epoch,
-                                        epoch_step,
-                                        global_step,
-                                        0U,
-                                        val_loss,
-                                        *best_val_loss);
-        }
-    }
-    if (out_improved != NULL) {
-        *out_improved = improved;
-    }
-    if (metrics != NULL) {
-        const gd_metrics_field fields[] = {
-            gd_metrics_u64("epoch", (uint64_t)epoch),
-            gd_metrics_u64("step", (uint64_t)global_step),
-            gd_metrics_f64("val_loss", (double)val_loss),
-            gd_metrics_f64("best_val_loss", best_val_loss != NULL ? (double)*best_val_loss : (double)val_loss),
-            gd_metrics_bool("improved", improved),
-            gd_metrics_bool("save_best", config->save_best),
-        };
-        (void)gd_metrics_logger_log_event(metrics, "eval", fields, GD_ARRAY_LEN(fields));
-    }
-    return true;
-}
-
 static void gpt_skip_loader_batches(gd_context *ctx, gd_dataloader *loader, size_t batches)
 {
     size_t i;
@@ -2434,6 +2348,207 @@ static void gpt_resume_start_position(const gpt_training_state *resume_state,
     } else {
         *start_epoch = resume_state->epoch + 1U;
     }
+}
+
+static const char *gpt_epoch_best_checkpoint_status(bool validated,
+                                                    bool val_improved,
+                                                    bool has_val_dataset,
+                                                    bool save_best)
+{
+    return !validated ? (has_val_dataset ? "deferred" : "skipped") :
+           !val_improved ? "unchanged" :
+           save_best ? "saved" : "improved save_best=off";
+}
+
+static bool gpt_finish_epoch(gd_context *ctx,
+                             const gpt_train_epoch_runner *runner,
+                             gd_dataset *val_dataset,
+                             size_t epoch,
+                             size_t steps_per_epoch,
+                             size_t *epochs_without_improvement,
+                             float *best_val_loss)
+{
+    const gpt_config *config;
+    gpt_report_state *report;
+    size_t global_step;
+    bool validated = false;
+    bool val_improved = false;
+    bool should_stop = false;
+    float val_loss = NAN;
+    const char *best_status;
+
+    if (runner == NULL || runner->model == NULL || runner->optimizer == NULL ||
+        runner->scaler == NULL || runner->lr_config == NULL || runner->config == NULL ||
+        runner->report == NULL || runner->global_step == NULL || epochs_without_improvement == NULL ||
+        best_val_loss == NULL) {
+        gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "finish epoch", __LINE__);
+    }
+    config = runner->config;
+    report = runner->report;
+    global_step = *runner->global_step;
+
+    if (val_dataset != NULL && gpt_should_eval_epoch(config, epoch)) {
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_EVAL,
+                         "eval epoch=%zu step=%zu running...",
+                         epoch,
+                         global_step);
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_CHECKPOINT,
+                         "checkpoint best=pending latest=pending");
+        gpt_report_summary(report);
+        gd_progress_render(&report->progress);
+        val_loss = evaluate_gpt_loss(ctx, runner->model, val_dataset, config);
+        if (isfinite(val_loss) && val_loss < *best_val_loss) {
+            *best_val_loss = val_loss;
+            val_improved = true;
+            if (config->save_best) {
+                gpt_report_rowf(ctx,
+                                report,
+                                GPT_PROGRESS_CHECKPOINT,
+                                "checkpoint best=saving path=%s latest=pending",
+                                config->checkpoint_path);
+                gpt_save_and_log_checkpoint(ctx,
+                                            runner->model,
+                                            runner->optimizer,
+                                            runner->scaler,
+                                            runner->lr_config,
+                                            config,
+                                            runner->metrics,
+                                            GPT_CHECKPOINT_BEST,
+                                            config->checkpoint_path,
+                                            epoch,
+                                            steps_per_epoch,
+                                            global_step,
+                                            0U,
+                                            val_loss,
+                                            *best_val_loss);
+            }
+        }
+        if (runner->metrics != NULL) {
+            const gd_metrics_field fields[] = {
+                gd_metrics_u64("epoch", (uint64_t)epoch),
+                gd_metrics_u64("step", (uint64_t)global_step),
+                gd_metrics_f64("val_loss", (double)val_loss),
+                gd_metrics_f64("best_val_loss", (double)*best_val_loss),
+                gd_metrics_bool("improved", val_improved),
+                gd_metrics_bool("save_best", config->save_best),
+            };
+            (void)gd_metrics_logger_log_event(runner->metrics, "eval", fields, GD_ARRAY_LEN(fields));
+        }
+        validated = true;
+    }
+    if (validated && config->early_stopping_patience > 0) {
+        if (val_improved) {
+            *epochs_without_improvement = 0U;
+        } else {
+            *epochs_without_improvement += 1U;
+            should_stop = *epochs_without_improvement >= (size_t)config->early_stopping_patience;
+        }
+    }
+
+    if (validated) {
+        char patience_text[64];
+        report->last_eval_loss = val_loss;
+        report->has_eval_loss = true;
+        if (val_improved) {
+            report->best_epoch = epoch;
+            report->has_best_epoch = true;
+        }
+        if (config->early_stopping_patience > 0) {
+            (void)snprintf(patience_text,
+                           sizeof(patience_text),
+                           "%zu/%d",
+                           *epochs_without_improvement,
+                           config->early_stopping_patience);
+        } else {
+            (void)snprintf(patience_text, sizeof(patience_text), "off");
+        }
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_EVAL,
+                         "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=%s",
+                         epoch,
+                         global_step,
+                         (double)val_loss,
+                         (double)*best_val_loss,
+                         val_improved ? "yes" : "no",
+                         patience_text);
+    } else if (val_dataset != NULL) {
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_EVAL,
+                         "eval skipped epoch=%zu next_eval_epoch=%zu every=%d",
+                         epoch,
+                         gpt_next_eval_epoch(config, epoch),
+                         config->eval_every_n_epochs);
+    } else {
+        gd_progress_rowf(&report->progress,
+                         GPT_PROGRESS_EVAL,
+                         "eval skipped no validation split loaded");
+    }
+
+    best_status = gpt_epoch_best_checkpoint_status(validated,
+                                                   val_improved,
+                                                   val_dataset != NULL,
+                                                   config->save_best);
+    if (config->save_latest) {
+        const float checkpoint_val_loss = validated ?
+                                            val_loss :
+                                            (report->has_eval_loss ? report->last_eval_loss : NAN);
+        gpt_report_rowf(ctx,
+                        report,
+                        GPT_PROGRESS_CHECKPOINT,
+                        "checkpoint best=%s latest=saving path=%s",
+                        best_status,
+                        config->latest_checkpoint_path);
+        gpt_save_and_log_checkpoint(ctx,
+                                    runner->model,
+                                    runner->optimizer,
+                                    runner->scaler,
+                                    runner->lr_config,
+                                    config,
+                                    runner->metrics,
+                                    GPT_CHECKPOINT_LATEST,
+                                    config->latest_checkpoint_path,
+                                    epoch,
+                                    steps_per_epoch,
+                                    global_step,
+                                    *epochs_without_improvement,
+                                    checkpoint_val_loss,
+                                    *best_val_loss);
+        gpt_report_rowf(ctx,
+                        report,
+                        GPT_PROGRESS_CHECKPOINT,
+                        "checkpoint best=%s latest=saved path=%s",
+                        best_status,
+                        config->latest_checkpoint_path);
+    } else {
+        gpt_report_rowf(ctx,
+                        report,
+                        GPT_PROGRESS_CHECKPOINT,
+                        "checkpoint best=%s latest=off",
+                        best_status);
+    }
+
+    if (should_stop) {
+        gpt_report_rowf(ctx,
+                        report,
+                        GPT_PROGRESS_CHECKPOINT,
+                        "early_stopping epoch=%zu step=%zu patience=%d best_val_loss=%.6f",
+                        epoch,
+                        global_step,
+                        config->early_stopping_patience,
+                        (double)*best_val_loss);
+        if (runner->metrics != NULL) {
+            const gd_metrics_field fields[] = {
+                gd_metrics_u64("epoch", (uint64_t)epoch),
+                gd_metrics_u64("step", (uint64_t)global_step),
+                gd_metrics_i64("patience", (int64_t)config->early_stopping_patience),
+                gd_metrics_f64("best_val_loss", (double)*best_val_loss),
+            };
+            (void)gd_metrics_logger_log_event(runner->metrics, "early_stopping", fields, GD_ARRAY_LEN(fields));
+        }
+    }
+    return should_stop;
 }
 
 static void train_gpt(gd_context *ctx,
@@ -2607,148 +2722,14 @@ static void train_gpt(gd_context *ctx,
             gd_dataloader_destroy(loader);
             gd_sampler_destroy(sampler);
         }
-        {
-            bool validated = false;
-            bool val_improved = false;
-            bool should_stop = false;
-            const bool should_eval = val_dataset != NULL && gpt_should_eval_epoch(config, epoch);
-            float val_loss = NAN;
-            if (should_eval) {
-                validated = validate_and_maybe_checkpoint(ctx,
-                                                          model,
-                                                          optimizer,
-                                                          scaler,
-                                                          lr_config,
-                                                          val_dataset,
-                                                          config,
-                                                          &report,
-                                                          metrics,
-                                                          epoch,
-                                                          steps_per_epoch,
-                                                          global_step,
-                                                          &best_val_loss,
-                                                          &val_loss,
-                                                          &val_improved);
-            }
-            if (validated && config->early_stopping_patience > 0) {
-                if (val_improved) {
-                    epochs_without_improvement = 0U;
-                } else {
-                    epochs_without_improvement += 1U;
-                    if (epochs_without_improvement >= (size_t)config->early_stopping_patience) {
-                        should_stop = true;
-                    }
-                }
-            }
-            if (validated) {
-                report.last_eval_loss = val_loss;
-                report.has_eval_loss = true;
-                if (val_improved) {
-                    report.best_epoch = epoch;
-                    report.has_best_epoch = true;
-                }
-                if (config->early_stopping_patience > 0) {
-                    gd_progress_rowf(&report.progress,
-                                     GPT_PROGRESS_EVAL,
-                                     "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=%zu/%d",
-                                     epoch,
-                                     global_step,
-                                     (double)val_loss,
-                                     (double)best_val_loss,
-                                     val_improved ? "yes" : "no",
-                                     epochs_without_improvement,
-                                     config->early_stopping_patience);
-                } else {
-                    gd_progress_rowf(&report.progress,
-                                     GPT_PROGRESS_EVAL,
-                                     "eval epoch=%zu step=%zu val_loss=%.6f best_val_loss=%.6f improved=%s patience=off",
-                                     epoch,
-                                     global_step,
-                                     (double)val_loss,
-                                     (double)best_val_loss,
-                                     val_improved ? "yes" : "no");
-                }
-            } else if (val_dataset != NULL) {
-                const size_t next_eval_epoch = gpt_next_eval_epoch(config, epoch);
-                gd_progress_rowf(&report.progress,
-                                 GPT_PROGRESS_EVAL,
-                                 "eval skipped epoch=%zu next_eval_epoch=%zu every=%d",
-                                 epoch,
-                                 next_eval_epoch,
-                                 config->eval_every_n_epochs);
-            } else {
-                gd_progress_rowf(&report.progress,
-                                 GPT_PROGRESS_EVAL,
-                                 "eval skipped no validation split loaded");
-            }
-            if (config->save_latest) {
-                const float checkpoint_val_loss = validated ?
-                                                    val_loss :
-                                                    (report.has_eval_loss ? report.last_eval_loss : NAN);
-                const char *best_status = validated ?
-                                              (val_improved ?
-                                                   (config->save_best ? "saved" : "improved save_best=off") :
-                                                   "unchanged") :
-                                              (val_dataset != NULL ? "deferred" : "skipped");
-                gpt_report_rowf(ctx,
-                                &report,
-                                GPT_PROGRESS_CHECKPOINT,
-                                "checkpoint best=%s latest=saving path=%s",
-                                best_status,
-                                config->latest_checkpoint_path);
-                gpt_save_and_log_checkpoint(ctx,
-                                            model,
-                                            optimizer,
-                                            scaler,
-                                            lr_config,
-                                            config,
-                                            metrics,
-                                            GPT_CHECKPOINT_LATEST,
-                                            config->latest_checkpoint_path,
-                                            epoch,
-                                            steps_per_epoch,
-                                            global_step,
-                                            epochs_without_improvement,
-                                            checkpoint_val_loss,
-                                            best_val_loss);
-                gpt_report_rowf(ctx,
-                                &report,
-                                GPT_PROGRESS_CHECKPOINT,
-                                "checkpoint best=%s latest=saved path=%s",
-                                best_status,
-                                config->latest_checkpoint_path);
-            } else {
-                const char *best_status = validated ?
-                                              (val_improved ?
-                                                   (config->save_best ? "saved" : "improved save_best=off") :
-                                                   "unchanged") :
-                                              (val_dataset != NULL ? "deferred" : "skipped");
-                gpt_report_rowf(ctx,
-                                &report,
-                                GPT_PROGRESS_CHECKPOINT,
-                                "checkpoint best=%s latest=off",
-                                best_status);
-            }
-            if (should_stop) {
-                gpt_report_rowf(ctx,
-                                &report,
-                                GPT_PROGRESS_CHECKPOINT,
-                                "early_stopping epoch=%zu step=%zu patience=%d best_val_loss=%.6f",
-                                epoch,
-                                global_step,
-                                config->early_stopping_patience,
-                                (double)best_val_loss);
-                if (metrics != NULL) {
-                    const gd_metrics_field fields[] = {
-                        gd_metrics_u64("epoch", (uint64_t)epoch),
-                        gd_metrics_u64("step", (uint64_t)global_step),
-                        gd_metrics_i64("patience", (int64_t)config->early_stopping_patience),
-                        gd_metrics_f64("best_val_loss", (double)best_val_loss),
-                    };
-                    (void)gd_metrics_logger_log_event(metrics, "early_stopping", fields, GD_ARRAY_LEN(fields));
-                }
-                break;
-            }
+        if (gpt_finish_epoch(ctx,
+                             &runner,
+                             val_dataset,
+                             epoch,
+                             steps_per_epoch,
+                             &epochs_without_improvement,
+                             &best_val_loss)) {
+            break;
         }
     }
     gd_progress_finish(&report.progress);

@@ -100,7 +100,7 @@ static int gd_sdpa_varlen_env_int(const char *name, int fallback, int min_value,
     return (int)parsed;
 }
 
-static uint32_t gd_sdpa_varlen_num_splits(uint32_t seqlen)
+static uint32_t gd_sdpa_varlen_num_splits_for_extent(uint32_t extent)
 {
     const int split_min = gd_sdpa_varlen_env_int("GD_METAL_SDPA_SPLIT_MIN",
                                                  (int)GD_METAL_SDPA_SPLIT_MIN,
@@ -110,14 +110,47 @@ static uint32_t gd_sdpa_varlen_num_splits(uint32_t seqlen)
                                                  (int)GD_METAL_SDPA_SPLIT_MAX,
                                                  1,
                                                  1024);
-    uint32_t splits = (seqlen + (uint32_t)split_min - 1U) / (uint32_t)split_min;
-    if (splits < 1U) {
-        splits = 1U;
+    const uint32_t split_min_u = (uint32_t)split_min;
+    const uint32_t split_max_u = (uint32_t)split_max;
+    uint64_t splits64;
+    if (extent == 0U) {
+        return 1U;
     }
-    if (splits > (uint32_t)split_max) {
-        splits = (uint32_t)split_max;
+    splits64 = ((uint64_t)extent + (uint64_t)split_min_u - 1ULL) / (uint64_t)split_min_u;
+    if (splits64 > (uint64_t)split_max_u) {
+        return split_max_u;
     }
-    return splits;
+    return splits64 < 1ULL ? 1U : (uint32_t)splits64;
+}
+
+static uint32_t gd_sdpa_varlen_dkv_split_extent(const gd_backend_sdpa_varlen_args *args)
+{
+    uint32_t local_extent;
+    if (args == NULL || args->max_seqlen == 0U) {
+        return 1U;
+    }
+    if (args->causal == 0U || args->sliding_window == 0U || args->prefix_len != 0U) {
+        return args->max_seqlen;
+    }
+
+    /* Prefix-free causal local attention only lets a key block receive
+     * gradients from the union of queries in [k0, k0 + key_block + window).
+     * Split dK/dV over that local extent rather than the full sequence; for
+     * GPT-style window=256 this keeps n_splits at 1 even when T >> 512 and
+     * avoids allocating a large mostly-empty partial dK/dV buffer.  Prefix-LM
+     * keeps the full-sequence extent because prefix keys can be seen by every
+     * query. */
+    if (args->sliding_window > UINT32_MAX - (GD_METAL_SDPA_DKV_WIDE_KEYS - 1U)) {
+        local_extent = UINT32_MAX;
+    } else {
+        local_extent = args->sliding_window + GD_METAL_SDPA_DKV_WIDE_KEYS - 1U;
+    }
+    return local_extent < args->max_seqlen ? local_extent : args->max_seqlen;
+}
+
+static uint32_t gd_sdpa_varlen_num_dkv_splits(const gd_backend_sdpa_varlen_args *args)
+{
+    return gd_sdpa_varlen_num_splits_for_extent(gd_sdpa_varlen_dkv_split_extent(args));
 }
 
 static bool gd_sdpa_varlen_env_enabled(const char *name, bool fallback)
@@ -624,7 +657,7 @@ gd_status gd_backend_sdpa_varlen_backward(gd_backend *backend,
         const uint32_t n_qb = (args->max_seqlen + GD_METAL_SDPA_CAUSAL_QROWS - 1U) /
                                GD_METAL_SDPA_CAUSAL_QROWS;
         const uint32_t n_kb = gd_sdpa_varlen_kblock_count(args->max_seqlen);
-        const uint32_t n_splits = gd_sdpa_varlen_num_splits(args->max_seqlen);
+        const uint32_t n_splits = gd_sdpa_varlen_num_dkv_splits(args);
         const bool compact = gd_sdpa_varlen_compact_enabled();
         id<MTLBuffer> part_buffer = nil;
         p.n_qb_max = n_qb;

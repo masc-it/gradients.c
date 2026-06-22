@@ -247,18 +247,25 @@ static void ref_varlen_bwd(const uint16_t *go,
                            float *dv)
 {
     const uint32_t N = (uint32_t)cu[B];
-    float m[512];
-    float l[512];
-    float D[512];
+    const size_t rows = (size_t)N * (size_t)Hq;
+    float *m;
+    float *l;
+    float *D;
+    size_t stat_index;
     uint32_t b;
+    CHECK(Hq == 0U || rows / (size_t)Hq == (size_t)N, "reference stats size overflow");
+    CHECK(rows <= SIZE_MAX / sizeof(*m), "reference stats byte overflow");
+    m = (float *)malloc(rows * sizeof(*m));
+    l = (float *)malloc(rows * sizeof(*l));
+    D = (float *)malloc(rows * sizeof(*D));
+    CHECK(m != NULL && l != NULL && D != NULL, "reference stats allocation");
     memset(dq, 0, (size_t)N * Hq * Dh * sizeof(float));
     memset(dk, 0, (size_t)N * Hkv * Dh * sizeof(float));
     memset(dv, 0, (size_t)N * Hkv * Dh * sizeof(float));
-    CHECK(N * Hq <= 512U, "reference stats capacity");
-    for (b = 0U; b < N * Hq; ++b) {
-        m[b] = -INFINITY;
-        l[b] = 0.0f;
-        D[b] = 0.0f;
+    for (stat_index = 0U; stat_index < rows; ++stat_index) {
+        m[stat_index] = -INFINITY;
+        l[stat_index] = 0.0f;
+        D[stat_index] = 0.0f;
     }
     for (b = 0U; b < B; ++b) {
         uint32_t start = (uint32_t)cu[b];
@@ -358,6 +365,9 @@ static void ref_varlen_bwd(const uint16_t *go,
             }
         }
     }
+    free(m);
+    free(l);
+    free(D);
 }
 
 static void test_varlen_fwd_bwd(gd_context *ctx)
@@ -515,6 +525,77 @@ static void test_varlen_dh64_window_case(gd_context *ctx, int prefix_len)
     CHECK_OK(gd_end_step(ctx));
 }
 
+static void test_varlen_dh64_long_sequence_window_no_split(gd_context *ctx)
+{
+    enum { N = 520, Hq = 1, Hkv = 1, Dh = 64, B = 1 };
+    const int64_t q_shape[3] = {N, Hq, Dh};
+    const int64_t k_shape[3] = {N, Hkv, Dh};
+    const int64_t cu_shape[1] = {B + 1};
+    uint16_t q_data[N * Hq * Dh];
+    uint16_t k_data[N * Hkv * Dh];
+    uint16_t v_data[N * Hkv * Dh];
+    uint16_t go_data[N * Hq * Dh];
+    int32_t cu_data[B + 1] = {0, N};
+    uint16_t dq_got[N * Hq * Dh];
+    uint16_t dk_got[N * Hkv * Dh];
+    uint16_t dv_got[N * Hkv * Dh];
+    float dq_ref[N * Hq * Dh];
+    float dk_ref[N * Hkv * Dh];
+    float dv_ref[N * Hkv * Dh];
+    gd_tensor q;
+    gd_tensor k;
+    gd_tensor v;
+    gd_tensor cu;
+    gd_tensor go;
+    gd_tensor dq;
+    gd_tensor dk;
+    gd_tensor dv;
+    gd_sdpa_varlen_config cfg;
+    uint32_t i;
+    fill_tokens(q_data, N * Hq * Dh, -0.046875f);
+    fill_tokens(k_data, N * Hkv * Dh, 0.0234375f);
+    fill_tokens(v_data, N * Hkv * Dh, -0.078125f);
+    fill_tokens(go_data, N * Hq * Dh, 0.01171875f);
+    cfg.scale = 0.125f;
+    cfg.causal = true;
+    cfg.sliding_window = 32;
+    cfg.prefix_len = 0;
+    cfg.max_seqlen = N;
+
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, q_shape), 256U, &q));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, k_shape), 256U, &k));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, k_shape), 256U, &v));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_I32, gd_shape_make(1U, cu_shape), 256U, &cu));
+    CHECK_OK(gd_tensor_empty(ctx, GD_ARENA_PARAMS, GD_DTYPE_F16, gd_shape_make(3U, q_shape), 256U, &go));
+    CHECK_OK(gd_tensor_write(ctx, &q, q_data, sizeof(q_data)));
+    CHECK_OK(gd_tensor_write(ctx, &k, k_data, sizeof(k_data)));
+    CHECK_OK(gd_tensor_write(ctx, &v, v_data, sizeof(v_data)));
+    CHECK_OK(gd_tensor_write(ctx, &cu, cu_data, sizeof(cu_data)));
+    CHECK_OK(gd_tensor_write(ctx, &go, go_data, sizeof(go_data)));
+
+    /* T exceeds the default split threshold, but the prefix-free local dK/dV
+     * query span is only window + key_block - 1.  This covers the window-aware
+     * path that keeps n_splits at 1 and avoids the partial dK/dV buffer. */
+    CHECK_OK(gd_begin_step(ctx, GD_SCOPE_TRAIN, gd_batch_empty()));
+    CHECK_OK(gd_sdpa_varlen_backward(ctx, &q, &k, &v, &cu, &go, &cfg, &dq, &dk, &dv));
+    CHECK_OK(gd_tensor_read(ctx, &dq, dq_got, sizeof(dq_got)));
+    CHECK_OK(gd_tensor_read(ctx, &dk, dk_got, sizeof(dk_got)));
+    CHECK_OK(gd_tensor_read(ctx, &dv, dv_got, sizeof(dv_got)));
+    ref_varlen_bwd(go_data, q_data, k_data, v_data, cu_data, B, Hq, Hkv, Dh, cfg.scale, 1,
+                   cfg.sliding_window, cfg.prefix_len, dq_ref, dk_ref, dv_ref);
+    for (i = 0U; i < N * Hq * Dh; ++i) {
+        CHECK(absf32(f16_bits_to_f32(dq_got[i]) - dq_ref[i]) < 4.0e-3f,
+              "dh64 long window dq mismatch");
+    }
+    for (i = 0U; i < N * Hkv * Dh; ++i) {
+        CHECK(absf32(f16_bits_to_f32(dk_got[i]) - dk_ref[i]) < 4.0e-3f,
+              "dh64 long window dk mismatch");
+        CHECK(absf32(f16_bits_to_f32(dv_got[i]) - dv_ref[i]) < 4.0e-3f,
+              "dh64 long window dv mismatch");
+    }
+    CHECK_OK(gd_end_step(ctx));
+}
+
 static int decode_allowed(int qpos, int j, int window, int prefix_len)
 {
     return allowed(qpos, j, 1, window, prefix_len);
@@ -652,6 +733,7 @@ int main(void)
     test_varlen_fwd_bwd(ctx);
     test_varlen_dh64_window_case(ctx, 4);
     test_varlen_dh64_window_case(ctx, 0);
+    test_varlen_dh64_long_sequence_window_no_split(ctx);
     test_decode(ctx);
     gd_context_destroy(ctx);
     printf("test_sdpa_varlen: ok\n");

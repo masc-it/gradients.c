@@ -1335,8 +1335,8 @@ static void train_one_batch(gd_context *ctx,
                             size_t epoch_step,
                             size_t steps_per_epoch,
                             bool prefetch_next,
-                            double *last_report_time,
-                            size_t *last_report_step)
+                            double *report_train_seconds,
+                            size_t *report_train_batches)
 {
     const size_t current_step = global_step + 1U;
     const int epoch_complete = epoch_step == steps_per_epoch;
@@ -1360,12 +1360,22 @@ static void train_one_batch(gd_context *ctx,
         .model = model,
     };
     gd_train_batch_result step_result;
+    /* Keep train throughput scoped to gd_train_batch work.  Epoch eval,
+     * checkpoint writes, and periodic generation run outside this call and
+     * can otherwise make the next train report look like a GPU slowdown. */
+    const double train_start = gpt_wall_seconds();
     TRY(ctx, gd_train_batch(ctx, &step_config, gpt_train_loss_fn, &step_user, &step_result));
+    {
+        const double train_seconds = gpt_wall_seconds() - train_start;
+        if (train_seconds > 0.0) {
+            *report_train_seconds += train_seconds;
+        }
+        *report_train_batches += 1U;
+    }
 
     if (should_report) {
         float grad_norm = 0.0f;
         char grad_norm_text[64];
-        double now;
         double elapsed;
         size_t batches;
         size_t tokens;
@@ -1381,9 +1391,8 @@ static void train_one_batch(gd_context *ctx,
         } else {
             (void)snprintf(grad_norm_text, sizeof(grad_norm_text), " grad_norm=off");
         }
-        now = gpt_wall_seconds();
-        elapsed = now - *last_report_time;
-        batches = current_step - *last_report_step;
+        elapsed = *report_train_seconds;
+        batches = *report_train_batches;
         tokens = batches * (size_t)config->batch_size * (size_t)GPT_CONTEXT_LENGTH;
         batches_per_sec = elapsed > 0.0 ? (double)batches / elapsed : 0.0;
         tokens_per_sec = elapsed > 0.0 ? (double)tokens / elapsed : 0.0;
@@ -1442,8 +1451,8 @@ static void train_one_batch(gd_context *ctx,
             };
             (void)gd_metrics_logger_log_event(metrics, "train", fields, GD_ARRAY_LEN(fields));
         }
-        *last_report_time = now;
-        *last_report_step = current_step;
+        *report_train_seconds = 0.0;
+        *report_train_batches = 0U;
     }
 
     if (gpt_should_generate_step(config, current_step)) {
@@ -2443,8 +2452,8 @@ typedef struct gpt_train_epoch_runner {
     gpt_report_state *report;
     gd_metrics_logger *metrics;
     size_t total_steps;
-    double *last_report_time;
-    size_t *last_report_step;
+    double *report_train_seconds;
+    size_t *report_train_batches;
     size_t *global_step;
 } gpt_train_epoch_runner;
 
@@ -2459,7 +2468,9 @@ static void gpt_train_epoch_step(gd_context *ctx,
 {
     size_t current_step;
     bool defer_prefetch;
-    if (runner == NULL || runner->global_step == NULL || epoch_step == NULL) {
+    if (runner == NULL || runner->global_step == NULL ||
+        runner->report_train_seconds == NULL || runner->report_train_batches == NULL ||
+        epoch_step == NULL) {
         gpt_fail_status(ctx, GD_ERR_INVALID_ARGUMENT, "train epoch step", __LINE__);
     }
     current_step = *runner->global_step + 1U;
@@ -2484,8 +2495,8 @@ static void gpt_train_epoch_step(gd_context *ctx,
                     *epoch_step,
                     steps_per_epoch,
                     !defer_prefetch,
-                    runner->last_report_time,
-                    runner->last_report_step);
+                    runner->report_train_seconds,
+                    runner->report_train_batches);
     *runner->global_step = current_step;
     maybe_save_step_latest_checkpoint(ctx,
                                       runner->model,
@@ -2745,8 +2756,8 @@ static void train_gpt(gd_context *ctx,
                       size_t steps_per_epoch,
                       size_t total_steps)
 {
-    double last_report_time = gpt_wall_seconds();
-    size_t last_report_step = resume_state != NULL && resume_state->loaded ? resume_state->global_step : 0U;
+    double report_train_seconds = 0.0;
+    size_t report_train_batches = 0U;
     size_t global_step = resume_state != NULL && resume_state->loaded ? resume_state->global_step : 0U;
     size_t epochs_without_improvement = resume_state != NULL && resume_state->loaded ?
                                             resume_state->epochs_without_improvement :
@@ -2787,8 +2798,8 @@ static void train_gpt(gd_context *ctx,
         .report = &report,
         .metrics = metrics,
         .total_steps = total_steps,
-        .last_report_time = &last_report_time,
-        .last_report_step = &last_report_step,
+        .report_train_seconds = &report_train_seconds,
+        .report_train_batches = &report_train_batches,
         .global_step = &global_step,
     };
     gpt_resume_start_position(resume_state, steps_per_epoch, &start_epoch, &start_epoch_step);

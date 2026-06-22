@@ -260,7 +260,7 @@ build/tools/gen_ops --stamp build/.ops-registry
 At minimum:
 
 ```sh
-make check
+make test
 ```
 
 For differentiable ops, also add:
@@ -286,4 +286,4 @@ make op-perf OP=my_op
 - [ ] Forward/backward PyTorch harnesses in `src/ops/my_op/fwd.py` / `src/ops/my_op/bwd.py`
 - [ ] C tests and PyTorch comparison
 - [ ] Op-local perf probe in `src/ops/my_op/perf_test.c` (`make op-perf OP=my_op`)
-- [ ] `make check`
+- [ ] `make test`

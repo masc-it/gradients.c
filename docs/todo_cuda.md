@@ -8,7 +8,7 @@ Validated during audit:
 
 - `make BUILD_DIR=/tmp/gradients-linux-audit UNAME_S=Linux build` succeeds.
 - The Linux build currently compiles only the null backend; `gd_backend_create_default()` returns `GD_ERR_UNSUPPORTED` there, so real tensor execution/tests cannot run on Linux yet.
-- `make docs-check` currently fails because `Makefile` expects `docs/design_spec.md`, which is missing.
+- The old `make check` / `make docs-check` path has been removed; use `make test` for the core test suite.
 - `README.md` points at stale `docs/rules/add_new_op.md`; the actual op guide is `docs/guides/register_op.md`.
 
 ## Build system readiness

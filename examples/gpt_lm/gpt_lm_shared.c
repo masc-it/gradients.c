@@ -1601,7 +1601,6 @@ static int gpt_generate_prompts_loaded(gd_context *ctx,
     }
 
     if (stream_tokens) {
-        printf("  prefix=\"%s\" prompt_tokens=%d generated_text:", prompts[0], prompt_len[0]);
         fflush(stdout);
     }
 

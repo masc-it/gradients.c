@@ -144,7 +144,7 @@ Interactive checkpoint generation:
 make -C examples/gpt_lm GPT_LM_DATASET=ita_dict interactive ARGS="--checkpoint checkpoints/gpt_lm_best.gdckpt --temperature 0.8 --min-p 0.05 --repetition-penalty 1.1"
 ```
 
-Interactive mode prefixes each line you type with `<|im_start|>` and stops early when `<|im_end|>` is emitted.
+Interactive mode sends prompts verbatim (include `<|im_start|>` yourself if desired) and stops early when `<|im_end|>` is emitted. Multi-line pastes that arrive together are grouped into one prompt; for explicit paste mode, type `:paste`, paste the text, then finish with a line containing only `:end`.
 
 ## Resume training
 

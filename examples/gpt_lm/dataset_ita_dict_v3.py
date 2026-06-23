@@ -335,7 +335,7 @@ def load_sft_documents(
                 TextDocument(
                     term=term,
                     kind="sft_quiz",
-                    text=format_sibling_document(term, "Quiz", item),
+                    text=format_quiz_document(item),
                 )
             )
     stats["parsed_files"] = sum(1 for path in paths if path.is_file()) - stats.get("unreadable_files", 0) - stats.get("empty_files", 0) - stats.get("empty_quiz_item_files", 0)
@@ -386,6 +386,14 @@ def write_jsonl_documents(path: Path, documents: Sequence[TextDocument]) -> None
         for doc in documents:
             f.write(json.dumps({"text": doc.text, "term": doc.term, "kind": doc.kind}, ensure_ascii=False))
             f.write("\n")
+
+
+def format_quiz_document(body: str) -> str:
+    # Keep SFT quiz prompts free of the injected ``Termine: X`` header.  The
+    # term is still stored in JSONL metadata and used for term-level splitting,
+    # but removing it from the model-visible prompt avoids exact-copy shortcuts
+    # in cloze examples.
+    return f"## Quiz\n{body}"
 
 
 def format_documents(documents: Sequence[TextDocument]) -> str:

@@ -1,3 +1,7 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "gpt_lm_shared.h"
 
 #include <errno.h>
@@ -7,8 +11,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #define GPT_GENERATE_LINE_MAX 8192U
+#define GPT_GENERATE_PROMPT_MAX (64U * 1024U)
+#define GPT_GENERATE_PASTE_POLL_USEC 50000L
+#define GPT_GENERATE_PASTE_END ":end"
 #define GPT_GENERATE_IM_START "<|im_start|>"
 
 static int parse_i64_arg(const char *text, int64_t min_value, int64_t max_value, int64_t *out)
@@ -104,7 +114,9 @@ static void print_usage(const char *argv0)
 {
     printf("usage: %s [options]\n", argv0);
     printf("\n");
-    printf("Interactive GPT LM generation. Type a prefix and press enter; :q, :quit, exit, or quit ends the session.\n");
+    printf("Interactive GPT LM generation. Type or paste a prefix and press enter; :q, :quit, exit, or quit ends the session.\n");
+    printf("Pasted multi-line input is grouped into one prompt when it arrives together.\n");
+    printf("For explicit multi-line entry, type :paste, paste text, then finish with a line containing only :end.\n");
     printf("Each prefix is used exactly as typed after escape decoding; include <|im_start|> yourself if desired.\n");
     printf("Use literal \\n in a prefix to insert a newline, e.g. Termine: mangiare\\n\\n## Definizioni.\n");
     printf("Generation stops early when the tokenizer emits <|im_end|>.\n");
@@ -113,7 +125,9 @@ static void print_usage(const char *argv0)
     printf("  --checkpoint PATH      checkpoint to load (default: checkpoints/gpt_lm_best.gdckpt)\n");
     printf("  --data-dir PATH        data directory for default tokenizer (default: examples/gpt_lm/data)\n");
     printf("  --tokenizer-path PATH  tokenizer JSON; metadata value is used when available\n");
-    printf("  --max-new-tokens N     generated token budget per prefix; capped by 512-token context (default: 512)\n");
+    printf("  --max-new-tokens N     generated token budget per prefix; capped by %d-token context (default: %d)\n",
+           GPT_CONTEXT_LENGTH,
+           GPT_CONTEXT_LENGTH);
     printf("  --temperature T        sampling temperature; 0 means greedy (default: 0)\n");
     printf("  --min-p P              min-p sampling cutoff relative to top token; 0 disables (default: 0)\n");
     printf("  --repetition-penalty P repetition penalty; 1 disables (default: 1)\n");
@@ -433,6 +447,143 @@ static bool should_quit(const char *line)
             strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0);
 }
 
+static bool is_paste_command(const char *line)
+{
+    return line != NULL && (strcmp(line, ":paste") == 0 || strcmp(line, ":p") == 0);
+}
+
+static bool is_paste_end_line(const char *line)
+{
+    const size_t marker_len = strlen(GPT_GENERATE_PASTE_END);
+    size_t len;
+    if (line == NULL) {
+        return false;
+    }
+    len = strlen(line);
+    while (len > 0U && (line[len - 1U] == '\n' || line[len - 1U] == '\r')) {
+        len -= 1U;
+    }
+    return len == marker_len && strncmp(line, GPT_GENERATE_PASTE_END, marker_len) == 0;
+}
+
+static bool append_prompt_text(char *prompt, size_t prompt_size, size_t *prompt_len, const char *text)
+{
+    const size_t text_len = text != NULL ? strlen(text) : 0U;
+    if (prompt == NULL || prompt_size == 0U || prompt_len == NULL || text == NULL ||
+        *prompt_len >= prompt_size || text_len >= prompt_size - *prompt_len) {
+        return false;
+    }
+    memcpy(prompt + *prompt_len, text, text_len);
+    *prompt_len += text_len;
+    prompt[*prompt_len] = '\0';
+    return true;
+}
+
+static bool stdin_ready_soon(void)
+{
+    fd_set readfds;
+    struct timeval timeout;
+    const int fd = fileno(stdin);
+    int selected;
+    if (fd < 0) {
+        return false;
+    }
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+    timeout.tv_sec = 0;
+    timeout.tv_usec = GPT_GENERATE_PASTE_POLL_USEC;
+    selected = select(fd + 1, &readfds, NULL, NULL, &timeout);
+    return selected > 0 && FD_ISSET(fd, &readfds);
+}
+
+static void drain_ready_input(void)
+{
+    char discard[GPT_GENERATE_LINE_MAX];
+    while (stdin_ready_soon()) {
+        if (fgets(discard, sizeof(discard), stdin) == NULL) {
+            break;
+        }
+    }
+}
+
+static void discard_paste_until_end(void)
+{
+    char line[GPT_GENERATE_LINE_MAX];
+    bool at_line_start = true;
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        if (at_line_start && is_paste_end_line(line)) {
+            break;
+        }
+        at_line_start = strchr(line, '\n') != NULL;
+    }
+}
+
+static int read_paste_prompt(char *prompt, size_t prompt_size)
+{
+    char line[GPT_GENERATE_LINE_MAX];
+    size_t prompt_len = 0U;
+    bool at_line_start = true;
+    if (prompt == NULL || prompt_size == 0U) {
+        return -1;
+    }
+    prompt[0] = '\0';
+    printf("paste mode: paste prompt text, then finish with a line containing only %s\n", GPT_GENERATE_PASTE_END);
+    fflush(stdout);
+    for (;;) {
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\n");
+            return prompt_len > 0U ? 1 : 0;
+        }
+        if (at_line_start && is_paste_end_line(line)) {
+            break;
+        }
+        if (!append_prompt_text(prompt, prompt_size, &prompt_len, line)) {
+            fprintf(stderr, "gpt_lm_generate: pasted prompt too long; max is %u bytes\n",
+                    GPT_GENERATE_PROMPT_MAX - 1U);
+            discard_paste_until_end();
+            return -1;
+        }
+        at_line_start = strchr(line, '\n') != NULL;
+    }
+    trim_line(prompt);
+    return 1;
+}
+
+static int collect_prompt_from_first_line(const char *first_line, char *prompt, size_t prompt_size)
+{
+    char line[GPT_GENERATE_LINE_MAX];
+    const char *chunk = first_line;
+    size_t prompt_len = 0U;
+    if (first_line == NULL || prompt == NULL || prompt_size == 0U) {
+        return -1;
+    }
+    prompt[0] = '\0';
+    for (;;) {
+        if (!append_prompt_text(prompt, prompt_size, &prompt_len, chunk)) {
+            fprintf(stderr, "gpt_lm_generate: prompt too long; max is %u bytes\n",
+                    GPT_GENERATE_PROMPT_MAX - 1U);
+            drain_ready_input();
+            return -1;
+        }
+        if (strchr(chunk, '\n') == NULL && strlen(chunk) == GPT_GENERATE_LINE_MAX - 1U) {
+            if (fgets(line, sizeof(line), stdin) == NULL) {
+                break;
+            }
+            chunk = line;
+            continue;
+        }
+        if (!stdin_ready_soon()) {
+            break;
+        }
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            break;
+        }
+        chunk = line;
+    }
+    trim_line(prompt);
+    return 1;
+}
+
 static void decode_interactive_escapes(char *line)
 {
     char *read;
@@ -499,7 +650,8 @@ int main(int argc, char **argv)
     bool generation_tokenizer_ready = false;
     gd_module_load_options load_options;
     char line[GPT_GENERATE_LINE_MAX];
-    char prompt[GPT_GENERATE_LINE_MAX + sizeof(GPT_GENERATE_IM_START)];
+    char command_line[GPT_GENERATE_LINE_MAX];
+    char prompt[GPT_GENERATE_PROMPT_MAX];
     int exit_code = 1;
 
     memset(&model, 0, sizeof(model));
@@ -552,6 +704,7 @@ int main(int argc, char **argv)
            (double)config.logits_softcap);
     printf("prompt template: {input}\n");
     printf("note: no automatic <|im_start|> prefix is added; type it explicitly if desired\n");
+    printf("multi-line: paste normally, or type :paste and finish with a line containing only :end\n");
     printf("escapes: type literal \\n for newline, \\t for tab, \\\\ for backslash\n");
     printf("stop: <|im_end|> when present in tokenizer; commands: :q, :quit, quit, exit\n");
 
@@ -565,34 +718,34 @@ int main(int argc, char **argv)
     generation_tokenizer_ready = true;
 
     for (;;) {
+        int prompt_status;
         printf("prefix> ");
         fflush(stdout);
         if (fgets(line, sizeof(line), stdin) == NULL) {
             printf("\n");
             break;
         }
-        if (strchr(line, '\n') == NULL && strlen(line) == sizeof(line) - 1U) {
-            int ch;
-            while ((ch = getchar()) != '\n' && ch != EOF) {
-                /* discard overlong line tail */
-            }
-            fprintf(stderr, "gpt_lm_generate: prefix too long; max is %u bytes\n", GPT_GENERATE_LINE_MAX - 2U);
-            continue;
-        }
-        trim_line(line);
-        if (should_quit(line)) {
+        (void)snprintf(command_line, sizeof(command_line), "%s", line);
+        trim_line(command_line);
+        if (should_quit(command_line)) {
             break;
         }
-        decode_interactive_escapes(line);
-        if (line[0] == '\0') {
+        if (is_paste_command(command_line)) {
+            prompt_status = read_paste_prompt(prompt, sizeof(prompt));
+        } else {
+            prompt_status = collect_prompt_from_first_line(line, prompt, sizeof(prompt));
+        }
+        if (prompt_status == 0) {
+            break;
+        }
+        if (prompt_status < 0) {
             continue;
         }
-        /* No automatic <|im_start|> prepend: send the decoded line verbatim. */
-        const int n = snprintf(prompt, sizeof(prompt), "%s", line);
-        if (n < 0 || (size_t)n >= sizeof(prompt)) {
-            fprintf(stderr, "gpt_lm_generate: formatted prompt too long\n");
+        decode_interactive_escapes(prompt);
+        if (prompt[0] == '\0') {
             continue;
         }
+        /* No automatic <|im_start|> prepend: send the decoded prompt verbatim. */
         config.generate_prompt = prompt;
         {
             const double prompt_start = gpt_wall_seconds();

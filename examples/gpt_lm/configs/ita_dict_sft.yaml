@@ -1,0 +1,50 @@
+# Runtime config for Italian dictionary SFT using examples/gpt_lm/main.c.
+# Format: flat YAML, one scalar `key: value` per line.
+
+data_dir: "/Volumes/Seagate 2TB/datasets/ita_dict/sft"
+tokenizer_path: "/Volumes/Seagate 2TB/datasets/gd_fineweb2/tokenizer/tokenizer-v8192.json"
+generate_prompt: ""
+checkpoint_path: "/Volumes/Seagate 2TB/datasets/ita_dict/sft/checkpoints/gpt_lm_best_sft.gdckpt"
+latest_checkpoint_path: "/Volumes/Seagate 2TB/datasets/ita_dict/sft/checkpoints/gpt_lm_latest_sft.gdckpt"
+load_checkpoint_path: "/Volumes/Seagate 2TB/datasets/ita_dict/midtrain/checkpoints/gpt_lm_latest_midtrain.gdckpt"
+resume_checkpoint_path: ""
+val_split: val
+metrics_dir: data/metrics
+metrics_project: gpt_lm
+metrics_run_id: ""
+local_shard_cache_dir: /tmp/gd_itadict_sft_cache
+
+epochs: 20
+batch_size: 8
+dataloader_workers: 4
+dataloader_prefetch_factor: 2
+layers: 6
+architecture: gpt
+shuffle_scope: shard
+minimax_m3_topk_blocks: 3
+minimax_m3_init_blocks: 1
+minimax_m3_local_blocks: 1
+report_every: 4
+eval_every_n_epochs: 1
+early_stopping_patience: 3
+warmup_steps: -1
+latest_every_n_steps: 1000
+generate_every_n_steps: 1000
+save_best: true
+save_latest: true
+metrics_enabled: true
+keep_shard_cache: false
+overfit_num_samples: 0
+seed: 0x6750746c6d5eed00
+
+dropout_p: 0.05
+lr_max: 0.00005
+lr_min: 0.00001
+weight_decay: 0.00001
+grad_clip_norm: 1.0
+
+max_new_tokens: 64
+temperature: 0.0
+min_p: 0.0
+repetition_penalty: 1.0
+logits_softcap: 0.0

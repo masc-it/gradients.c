@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = ["datasets>=2.18.0", "numpy>=1.26", "python-dotenv>=1.0.0"]
+# ///
 """Prepare separate Italian dictionary mid-training and quiz/SFT GDDS datasets.
 
 This builder is intentionally close to ``dataset_ita_dict_v2.py`` but it does
@@ -8,7 +11,9 @@ not train a tokenizer and it keeps the two data stages separate:
   ``*.story.md`` siblings.  It excludes ``*.quiz.md`` siblings.  Base pages
   preserve the source Markdown structure, except for the v2 normalization that
   removes the leading ``# `` before ``Termine:``; story pages are emitted as
-  standalone ``## Story`` documents.
+  standalone ``## Story`` documents.  It also mixes in 100k deterministic
+  random records from ``AdaMLLab/ItaMix`` (``matched`` subset, ``train`` split),
+  reading the dataset's ``text`` column.
 * ``sft`` uses only quiz Markdown pages matching ``*.quiz.md``.  Each quiz file
   is split on Markdown horizontal rules (``---``), producing one Q&A document
   per block.
@@ -50,7 +55,6 @@ from dataset_ita_dict_v2 import (  # noqa: E402
     TERM_RE,
     TextDocument,
     clean_inline_markdown,
-    ensure_clean_dir,
     fields_for_context,
     file_sha256,
     filename_slug_term,
@@ -70,13 +74,19 @@ from dataset_ita_dict_v2 import (  # noqa: E402
 )
 from tok_utils import TokenizedCorpus  # noqa: E402
 
-DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v3-md-story-and-quiz-existing-tokenizer-compact-u16"
+DATA_FORMAT_VERSION = "gpt-lm-ita-dict-v3-md-story-quiz-itamix-existing-tokenizer-compact-u16"
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "data_v3"
 DEFAULT_MIDTRAIN_SUBDIR = "midtrain"
 DEFAULT_SFT_SUBDIR = "sft"
 DEFAULT_QUIZ_GLOB = "*.quiz.md"
 DEFAULT_STORY_GLOB = "*.story.md"
 DEFAULT_CONTEXT_LENGTH = 2048
+DEFAULT_ITAMIX_DATASET = "AdaMLLab/ItaMix"
+DEFAULT_ITAMIX_CONFIG = "matched"
+DEFAULT_ITAMIX_SPLIT = "train"
+DEFAULT_ITAMIX_TEXT_COLUMN = "text"
+DEFAULT_ITAMIX_RECORDS = 100_000
+DEFAULT_ITAMIX_SHUFFLE_BUFFER = 100_000
 
 
 @dataclass(frozen=True)
@@ -116,6 +126,21 @@ class DatasetSummary:
     val_tokens: int
 
 
+def _ignore_missing_rmtree_error(func: object, path: str, exc_info: object) -> None:
+    exc_type, exc, _tb = exc_info
+    if isinstance(exc, FileNotFoundError) or exc_type is FileNotFoundError:
+        return
+    raise exc
+
+
+def ensure_clean_dir(path: Path) -> None:
+    """Clean an output directory, tolerating disappearing AppleDouble files on HDDs."""
+
+    if path.exists():
+        shutil.rmtree(path, onerror=_ignore_missing_rmtree_error)
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def path_is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -149,6 +174,136 @@ def iter_story_markdown_files(directory: Path, pattern: str) -> Iterable[Path]:
 
 def iter_quiz_markdown_files(directory: Path, pattern: str) -> Iterable[Path]:
     yield from sorted((path for path in directory.glob(pattern) if path.is_file()), key=source_sort_key)
+
+
+def close_iterable(obj: object) -> None:
+    """Best-effort close for HF streaming iterators/generators stopped early."""
+
+    close = getattr(obj, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def normalize_external_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.replace("\ufeff", "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def load_itamix_documents(
+    *,
+    dataset_name: str,
+    config_name: str | None,
+    split: str,
+    text_column: str,
+    requested_records: int,
+    seed: int,
+    shuffle_buffer: int,
+) -> tuple[list[TextDocument], dict[str, object]]:
+    stats: dict[str, object] = {
+        "itamix_enabled": requested_records > 0,
+        "itamix_dataset": dataset_name,
+        "itamix_config": config_name or "",
+        "itamix_split": split,
+        "itamix_text_column": text_column,
+        "itamix_requested_records": requested_records,
+        "itamix_seed": seed,
+        "itamix_shuffle_buffer": shuffle_buffer,
+        "itamix_streaming": True,
+    }
+    if requested_records <= 0:
+        stats.update(
+            {
+                "itamix_scanned_records": 0,
+                "itamix_loaded_records": 0,
+                "itamix_chars": 0,
+                "itamix_missing_text_records": 0,
+                "itamix_non_string_text_records": 0,
+                "itamix_empty_text_records": 0,
+            }
+        )
+        return [], stats
+
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:  # pragma: no cover - depends on local env
+        raise RuntimeError(
+            "datasets is required to load AdaMLLab/ItaMix records; run with "
+            "`uv run examples/gpt_lm/dataset_ita_dict_v3.py ...` or pass "
+            "--itamix-records 0 to disable this mixture source"
+        ) from exc
+
+    print(
+        "Loading ItaMix records: "
+        f"dataset={dataset_name} config={config_name or '<default>'} split={split} "
+        f"count={requested_records} seed={seed} shuffle_buffer={shuffle_buffer}"
+    )
+    if config_name:
+        dataset = load_dataset(dataset_name, config_name, split=split, streaming=True)
+    else:
+        dataset = load_dataset(dataset_name, split=split, streaming=True)
+    if shuffle_buffer > 0:
+        dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
+
+    safe_config = "".join(ch if ch.isalnum() else "_" for ch in (config_name or "default")).strip("_")
+    kind = f"midtrain_itamix_{(safe_config or 'default').lower()}"
+    documents: list[TextDocument] = []
+    scanned_records = 0
+    missing_text_records = 0
+    non_string_text_records = 0
+    empty_text_records = 0
+    chars = 0
+    iterator = iter(dataset)
+    try:
+        for record in iterator:
+            scanned_records += 1
+            if not isinstance(record, Mapping):
+                missing_text_records += 1
+                continue
+            if text_column not in record:
+                missing_text_records += 1
+                continue
+            raw_text = record.get(text_column)
+            if not isinstance(raw_text, str):
+                non_string_text_records += 1
+            text = normalize_external_text(raw_text)
+            if not text:
+                empty_text_records += 1
+                continue
+            sample_index = len(documents) + 1
+            documents.append(
+                TextDocument(
+                    term=f"{dataset_name} {config_name or 'default'} {split} #{sample_index:06d}",
+                    kind=kind,
+                    text=text,
+                )
+            )
+            chars += len(text)
+            if len(documents) >= requested_records:
+                break
+    finally:
+        close_iterable(iterator)
+        close_iterable(dataset)
+
+    stats.update(
+        {
+            "itamix_scanned_records": scanned_records,
+            "itamix_loaded_records": len(documents),
+            "itamix_chars": chars,
+            "itamix_missing_text_records": missing_text_records,
+            "itamix_non_string_text_records": non_string_text_records,
+            "itamix_empty_text_records": empty_text_records,
+        }
+    )
+    if len(documents) < requested_records:
+        print(
+            f"warning: requested {requested_records} ItaMix records but loaded {len(documents)}",
+            file=sys.stderr,
+        )
+    return documents, stats
 
 
 def term_from_heading(text: str) -> str:
@@ -566,7 +721,7 @@ def write_manifest(
             "val_jsonl_path": "raw_ita_dict_v3/val.jsonl",
         },
         "dictionary_format": {
-            "midtrain": "base *.md dictionary pages plus *.story.md siblings; .quiz.md siblings excluded",
+            "midtrain": "base *.md dictionary pages plus *.story.md siblings; .quiz.md siblings excluded; plus sampled AdaMLLab/ItaMix matched train text records",
             "sft": "*.quiz.md pages only; split on Markdown horizontal rules (`---`) into one Q&A document per block",
             "sequence_delimiters": "tokenizer inserts <|im_start|>/<|im_end|> around every JSONL row before stream packing",
         },
@@ -751,6 +906,25 @@ def write_parent_manifest(out_dir: Path, tokenizer: TokenizerInfo, summaries: Se
     )
 
 
+def load_project_dotenv() -> None:
+    """Load .env from the working directory or one of its parents.
+
+    This makes HF_TOKEN/HF_HOME/HF_DATASETS_CACHE available without requiring
+    callers to source .env before launching the script. Existing environment
+    variables still win over .env values.
+    """
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    for directory in (Path.cwd(), *Path.cwd().parents):
+        dotenv_path = directory / ".env"
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path=dotenv_path, override=False)
+            return
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
@@ -763,6 +937,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiz-glob", default=DEFAULT_QUIZ_GLOB)
     parser.add_argument("--story-suffix", default=DEFAULT_STORY_SUFFIX)
     parser.add_argument("--quiz-suffix", default=DEFAULT_QUIZ_SUFFIX)
+    parser.add_argument("--itamix-dataset", default=DEFAULT_ITAMIX_DATASET)
+    parser.add_argument("--itamix-config", default=DEFAULT_ITAMIX_CONFIG)
+    parser.add_argument("--itamix-split", default=DEFAULT_ITAMIX_SPLIT)
+    parser.add_argument("--itamix-text-column", default=DEFAULT_ITAMIX_TEXT_COLUMN)
+    parser.add_argument(
+        "--itamix-records",
+        type=int,
+        default=DEFAULT_ITAMIX_RECORDS,
+        help="number of random AdaMLLab/ItaMix records to mix into midtrain; use 0 to disable",
+    )
+    parser.add_argument(
+        "--itamix-seed",
+        type=int,
+        default=None,
+        help="random seed for ItaMix streaming shuffle; defaults to --split-seed",
+    )
+    parser.add_argument(
+        "--itamix-shuffle-buffer",
+        type=int,
+        default=DEFAULT_ITAMIX_SHUFFLE_BUFFER,
+        help="Hugging Face streaming shuffle buffer for ItaMix records; use 0 for no shuffle",
+    )
     parser.add_argument("--tokenizer", type=Path, required=True, help="pre-trained gd-bpe tokenizer JSON")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="parent directory for midtrain/ and sft/")
     parser.add_argument("--midtrain-out-dir", type=Path, default=None)
@@ -784,6 +980,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    load_project_dotenv()
     args = parse_args()
     source_dir = args.source_dir.expanduser()
     tokenizer_path = args.tokenizer.expanduser()
@@ -808,6 +1005,10 @@ def main() -> int:
         raise ValueError("--val-fraction must satisfy 0 <= val_fraction < 1")
     if args.max_shard_bytes <= 0:
         raise ValueError("--max-shard-bytes must be positive")
+    if args.itamix_records < 0:
+        raise ValueError("--itamix-records must be non-negative")
+    if args.itamix_shuffle_buffer < 0:
+        raise ValueError("--itamix-shuffle-buffer must be non-negative")
 
     tokenizer = load_tokenizer_info(tokenizer_path)
     print(
@@ -825,15 +1026,60 @@ def main() -> int:
             story_suffix=args.story_suffix,
             quiz_suffix=args.quiz_suffix,
         )
+        mid_stats["dictionary_documents"] = mid_stats.get("documents", len(mid_docs))
+        mid_stats["dictionary_terms"] = mid_stats.get("terms", 0)
+        mid_stats["dictionary_chars"] = mid_stats.get("chars", 0)
+        if args.itamix_records > 0:
+            itamix_seed = args.itamix_seed if args.itamix_seed is not None else args.split_seed
+            itamix_docs, itamix_stats = load_itamix_documents(
+                dataset_name=args.itamix_dataset,
+                config_name=args.itamix_config or None,
+                split=args.itamix_split,
+                text_column=args.itamix_text_column,
+                requested_records=args.itamix_records,
+                seed=itamix_seed,
+                shuffle_buffer=args.itamix_shuffle_buffer,
+            )
+            mid_docs.extend(itamix_docs)
+            mid_stats.update(itamix_stats)
+            mid_stats.update(document_stats(mid_docs))
+        else:
+            itamix_seed = args.itamix_seed if args.itamix_seed is not None else args.split_seed
+            mid_stats.update(
+                {
+                    "itamix_enabled": False,
+                    "itamix_dataset": args.itamix_dataset,
+                    "itamix_config": args.itamix_config,
+                    "itamix_split": args.itamix_split,
+                    "itamix_text_column": args.itamix_text_column,
+                    "itamix_requested_records": 0,
+                    "itamix_seed": itamix_seed,
+                    "itamix_shuffle_buffer": args.itamix_shuffle_buffer,
+                    "itamix_streaming": True,
+                    "itamix_scanned_records": 0,
+                    "itamix_loaded_records": 0,
+                    "itamix_chars": 0,
+                    "itamix_missing_text_records": 0,
+                    "itamix_non_string_text_records": 0,
+                    "itamix_empty_text_records": 0,
+                }
+            )
         print(
-            "Loaded midtrain Markdown: "
-            f"source_files={mid_stats.get('source_files', 0)} documents={len(mid_docs)} "
-            f"terms={mid_stats.get('terms', 0)} chars={mid_stats.get('chars', 0)}"
+            "Loaded midtrain mixture: "
+            f"source_files={mid_stats.get('source_files', 0)} "
+            f"itamix_records={mid_stats.get('itamix_loaded_records', 0)} "
+            f"documents={len(mid_docs)} terms={mid_stats.get('terms', 0)} "
+            f"chars={mid_stats.get('chars', 0)}"
+        )
+        mid_objective = (
+            "causal_lm_midtraining_base_story_markdown_plus_itamix_matched"
+            if args.itamix_records > 0
+            else "causal_lm_midtraining_base_and_story_markdown"
         )
         summaries.append(
             build_dataset(
                 kind="midtrain",
-                objective="causal_lm_midtraining_base_and_story_markdown",
+                objective=mid_objective,
                 documents=mid_docs,
                 source_stats=mid_stats,
                 source_dir=source_dir,
